@@ -11,7 +11,10 @@ pub mod pure;
 pub mod read;
 pub mod refine;
 pub(crate) mod regions;
+pub mod resize;
 pub mod sample;
+
+use std::sync::Arc;
 
 /// Single-channel image, row-major, 0.0 black to 1.0 white.
 #[derive(Clone, Debug, PartialEq)]
@@ -19,6 +22,12 @@ pub struct Luma {
     pub width: usize,
     pub height: usize,
     pub data: Vec<f32>,
+    /// The image at its own size, when this is a small photo enlarged
+    /// for the pipeline ([`photo::enlarged`]): a whole number of times
+    /// smaller each way. The enlargement smooths every edge and rounds
+    /// every corner, and a symbol rendered pixel for pixel is read off
+    /// the pixels it had ([`pure`]), which are these.
+    pub unenlarged: Option<Arc<Luma>>,
 }
 
 /// The pixels that copies of a photo worked side by side may come to
@@ -31,7 +40,7 @@ const PIXELS_AT_ONCE: usize = 48_000_000;
 impl Luma {
     pub fn new(width: usize, height: usize, data: Vec<f32>) -> Self {
         assert_eq!(data.len(), width * height);
-        Self { width, height, data }
+        Self { width, height, data, unenlarged: None }
     }
 
     /// How many copies the size of this image may be worked side by
@@ -59,10 +68,16 @@ impl Luma {
         Some(top * (1.0 - ty) + bottom * ty)
     }
 
+    /// The image made `width` by `height`, larger or smaller, with Magic
+    /// Kernel Sharp 2013: see [`resize`].
+    pub fn resized(&self, width: usize, height: usize) -> Luma {
+        Luma::new(width, height, resize::resize(&self.data, self.width, self.height, 1, width, height))
+    }
+
     /// The image turned clockwise by `quarters` quarter turns, pixel for
-    /// pixel.
+    /// pixel, and the image at its own size turned with it.
     pub fn rotated_cw(&self, quarters: u8) -> Luma {
-        let mut out = self.clone();
+        let mut out = Luma::new(self.width, self.height, self.data.clone());
         for _ in 0..quarters % 4 {
             let (w, h) = (out.width, out.height);
             // Each column of the source becomes a row of the result, read
@@ -75,6 +90,7 @@ impl Luma {
             }
             out = Luma::new(h, w, data);
         }
+        out.unenlarged = self.unenlarged.as_ref().map(|small| Arc::new(small.rotated_cw(quarters)));
         out
     }
 }
@@ -122,6 +138,11 @@ mod tests {
         assert_eq!(once.data, vec![5.0, 3.0, 1.0, 6.0, 4.0, 2.0]);
         assert_eq!(image.rotated_cw(4), image);
         assert_eq!(once.rotated_cw(3), image);
+        // An enlarged image turns with the image it was enlarged from.
+        let small = Luma::new(1, 2, vec![0.25, 0.75]);
+        let large = Luma { unenlarged: Some(Arc::new(small.clone())), ..Luma::new(2, 4, vec![0.5; 8]) };
+        assert_eq!(large.rotated_cw(1).unenlarged.as_deref(), Some(&small.rotated_cw(1)));
+        assert_eq!(large.rotated_cw(4), large);
         for quarters in 0..4u8 {
             for p in [[0.0, 0.0], [2.0, 3.0], [0.7, 2.1]] {
                 let turned = rotate_point_cw(p, quarters, 2, 3);
@@ -136,7 +157,7 @@ mod tests {
 
     #[test]
     fn the_larger_the_photo_the_fewer_copies_of_it_at_once() {
-        let of = |width: usize, height: usize| Luma { width, height, data: Vec::new() }.copies_at_once();
+        let of = |width: usize, height: usize| Luma { width, height, data: Vec::new(), unenlarged: None }.copies_at_once();
         assert!(of(1280, 960) >= 8, "a small photo has every rung of the ladder at once");
         assert_eq!(of(4032, 3024), 3);
         assert_eq!(of(8064, 6048), 1);

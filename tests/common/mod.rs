@@ -195,10 +195,7 @@ pub fn load_photo(path: &std::path::Path) -> Result<Luma, String> {
     let image = image::open(path)
         .map_err(|e| format!("{}: {e}", path.display()))?
         .to_rgba8();
-    let image = qr_forensics::imaging::photo::normalize_size(image);
-    let (width, height) = (image.width() as usize, image.height() as usize);
-    let (_, luma) = Adjust::default().apply(image.as_raw(), width, height);
-    Ok(luma)
+    Ok(qr_forensics::imaging::photo::luma(image, &Adjust::default()))
 }
 
 /// What the photo pipeline made of one outline.
@@ -285,7 +282,7 @@ pub fn is_photo_file(path: &std::path::Path) -> bool {
 /// symbol should read whichever way up the camera held it, and the same
 /// is asked here.
 pub fn rotate_luma(image: &Luma, turns: u8) -> Luma {
-    let mut out = image.clone();
+    let mut out = Luma::new(image.width, image.height, image.data.clone());
     for _ in 0..turns % 4 {
         let (w, h) = (out.width, out.height);
         // Clockwise, each column of the source becomes a row of the
@@ -298,6 +295,8 @@ pub fn rotate_luma(image: &Luma, turns: u8) -> Luma {
         }
         out = Luma::new(h, w, data);
     }
+    // A photo that was enlarged turns with the photo at its own size.
+    out.unenlarged = image.unenlarged.as_ref().map(|small| Arc::new(rotate_luma(small, turns)));
     out
 }
 

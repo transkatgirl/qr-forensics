@@ -348,6 +348,10 @@ pub struct Photo {
     /// RGBA of the part on show: the photo as loaded itself, when the
     /// whole of it is on show and it was not so small as to be enlarged.
     pub original: Arc<image::RgbaImage>,
+    /// The part on show at its own size, when `original` is an
+    /// enlargement of it: what a symbol rendered pixel for pixel is read
+    /// off.
+    pub unenlarged: Option<Arc<image::RgbaImage>>,
     pub adjust: Adjust,
     /// What sampling reads: the adjusted image as luminance. Shared, so
     /// that a search or a job on its own thread starts without copying

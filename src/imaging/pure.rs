@@ -8,6 +8,14 @@
 //! the size. A photo never passes: its ink has no clean box and no clean
 //! runs, and the fit of the fixed patterns, which the caller checks, is
 //! the last word.
+//!
+//! A small photo is enlarged before the pipeline sees it
+//! ([`super::photo::enlarged`]), smoothly, and a render so enlarged has
+//! no clean runs either: its edges are ramps and its corners round. It
+//! is read off the pixels it had, which the enlarged image keeps beside
+//! it ([`Luma::unenlarged`]), each counted as the pixels it was made
+//! into, so that what is measured and where is in the pixels the photo
+//! has now.
 
 use super::Luma;
 use super::sample::otsu;
@@ -49,9 +57,16 @@ pub fn find(image: &Luma, family: Family, region: [[f64; 2]; 4]) -> Option<PureS
 /// finder down its diagonal often enough, and must not hide the symbol
 /// the other reading finds.
 pub fn find_each(image: &Luma, family: Family, region: [[f64; 2]; 4]) -> Vec<PureSymbol> {
+    // An enlarged photo is read at its own size, each of its pixels
+    // `times` of the enlarged across.
+    let (image, times) = match &image.unenlarged {
+        Some(own) => (&**own, (image.width / own.width.max(1)).max(1)),
+        None => (image, 1),
+    };
     let (width, height) = (image.width, image.height);
     let edge = |axis: usize, limit: usize, up: bool| {
         let v = region.iter().map(|p| p[axis]).fold(if up { f64::NEG_INFINITY } else { f64::INFINITY }, if up { f64::max } else { f64::min });
+        let v = v / times as f64;
         if !v.is_finite() {
             return None;
         }
@@ -62,7 +77,7 @@ pub fn find_each(image: &Luma, family: Family, region: [[f64; 2]; 4]) -> Vec<Pur
     else {
         return Vec::new();
     };
-    if x1 < x0 + MIN_REGION_PX || y1 < y0 + MIN_REGION_PX {
+    if (x1 - x0) * times < MIN_REGION_PX || (y1 - y0) * times < MIN_REGION_PX {
         return Vec::new();
     }
     let threshold = otsu((y0..y1).flat_map(|y| (x0..x1).map(move |x| image.data[y * width + x])));
@@ -71,14 +86,16 @@ pub fn find_each(image: &Luma, family: Family, region: [[f64; 2]; 4]) -> Vec<Pur
         .into_iter()
         .filter_map(|inverted| {
             let ink = |x: usize, y: usize| (image.data[y * width + x] < threshold) != inverted;
-            find_ink(family, [x0, y0, x1, y1], &ink, inverted)
+            find_ink(family, [x0, y0, x1, y1], &ink, inverted, times)
         })
         .collect()
 }
 
 /// The symbol whose ink fills `bounds` (`[x0, y0, x1, y1]`, exclusive at
-/// the far side), read with the `ink` predicate.
-fn find_ink(family: Family, bounds: [usize; 4], ink: &dyn Fn(usize, usize) -> bool, inverted: bool) -> Option<PureSymbol> {
+/// the far side), read with the `ink` predicate. Each pixel `ink` reads
+/// is `times` pixels of the photo across, and the symbol is measured and
+/// placed in those.
+fn find_ink(family: Family, bounds: [usize; 4], ink: &dyn Fn(usize, usize) -> bool, inverted: bool, times: usize) -> Option<PureSymbol> {
     let [x0, y0, x1, y1] = bounds;
     // The box the ink fills, inclusive.
     let (mut l, mut t, mut r, mut b) = (usize::MAX, usize::MAX, 0usize, 0usize);
@@ -92,10 +109,11 @@ fn find_ink(family: Family, bounds: [usize; 4], ink: &dyn Fn(usize, usize) -> bo
             }
         }
     }
-    if l == usize::MAX || r < l + 6 || b < t + 6 {
+    if l == usize::MAX || (r - l + 1) * times < 7 || (b - t + 1) * times < 7 {
         return None;
     }
-    let (bw, bh) = ((r - l + 1) as f64, (b - t + 1) as f64);
+    let scale = times as f64;
+    let (bw, bh) = ((r - l + 1) as f64 * scale, (b - t + 1) as f64 * scale);
     // A step past the box, where the paper ends the last run of a finder
     // that fills a symbol's whole height, as an rMQR's does.
     let reach = (r - l).min(b - t) + 2;
@@ -117,7 +135,7 @@ fn find_ink(family: Family, bounds: [usize; 4], ink: &dyn Fn(usize, usize) -> bo
         x >= x0 as i64 && x < x1 as i64 && y >= y0 as i64 && y < y1 as i64 && ink(x as usize, y as usize)
     };
     let finders: Vec<(usize, f64)> =
-        (0..4).filter_map(|c| finder_module(runs::<5>(|i| along(c, i), reach)?).map(|m| (c, m))).collect();
+        (0..4).filter_map(|c| finder_module(runs::<5>(|i| along(c, i), reach, scale)?).map(|m| (c, m))).collect();
     // The placements the finders allow, as the quarter turns the symbol
     // sits at and the module each measures. A symbol only seven modules
     // tall has its finder at two corners of the box at once, and the box
@@ -140,12 +158,13 @@ fn find_ink(family: Family, bounds: [usize; 4], ink: &dyn Fn(usize, usize) -> bo
         Family::Rmqr => finders
             .into_iter()
             .filter(|&(corner, module)| {
-                sub_module(runs::<4>(|i| along((corner + 2) % 4, i), reach).unwrap_or([0.0; 4]))
+                sub_module(runs::<4>(|i| along((corner + 2) % 4, i), reach, scale).unwrap_or([0.0; 4]))
                     .is_some_and(|sub| (sub - module).abs() <= (RUN_TOLERANCE * module).max(1.0))
             })
             .collect(),
     };
-    let edges = [[l as f64, t as f64], [r as f64 + 1.0, t as f64], [r as f64 + 1.0, b as f64 + 1.0], [l as f64, b as f64 + 1.0]];
+    let edges = [[l as f64, t as f64], [r as f64 + 1.0, t as f64], [r as f64 + 1.0, b as f64 + 1.0], [l as f64, b as f64 + 1.0]]
+        .map(|[x, y]| [x * scale, y * scale]);
     let mut found: Vec<PureSymbol> = placements
         .into_iter()
         .filter_map(|(turns, module)| {
@@ -187,9 +206,10 @@ fn find_ink(family: Family, bounds: [usize; 4], ink: &dyn Fn(usize, usize) -> bo
 }
 
 /// The first `N` runs of ink, paper, ink, ... along a line, by length in
-/// steps, starting on ink; `None` when the line does not start on ink or
-/// the last run has not ended within `reach` steps.
-fn runs<const N: usize>(ink: impl Fn(i64) -> bool, reach: usize) -> Option<[f64; N]> {
+/// pixels of `step` to each step along it, starting on ink; `None` when
+/// the line does not start on ink or the last run has not ended within
+/// `reach` steps.
+fn runs<const N: usize>(ink: impl Fn(i64) -> bool, reach: usize, step: f64) -> Option<[f64; N]> {
     if !ink(0) {
         return None;
     }
@@ -203,7 +223,7 @@ fn runs<const N: usize>(ink: impl Fn(i64) -> bool, reach: usize) -> Option<[f64;
                 return Some(out);
             }
         }
-        out[run] += 1.0;
+        out[run] += step;
     }
     None
 }
@@ -289,6 +309,44 @@ mod tests {
                         let edges = [[q, q], [q + tw, q], [q + tw, q + th], [q, q + th]];
                         assert_eq!(found.corners[0], edges[turns], "{version} turn {turns}");
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_enlarged_render_reads_as_it_would_with_each_pixel_repeated() {
+        for (version, family, px, quiet) in [
+            (SymbolVersion::Qr(1), Family::Qr, 1, 2),
+            (SymbolVersion::Qr(2), Family::Qr, 1, 2),
+            (SymbolVersion::Qr(5), Family::Qr, 1, 2),
+            (SymbolVersion::Qr(12), Family::Qr, 1, 0),
+            (SymbolVersion::Micro(1), Family::Micro, 1, 0),
+            (SymbolVersion::Micro(3), Family::Micro, 2, 2),
+            (SymbolVersion::Rmqr(0), Family::Rmqr, 1, 0),
+            (SymbolVersion::Rmqr(31), Family::Rmqr, 3, 1),
+        ] {
+            for (turns, times, inverted) in [(0, 2, false), (1, 3, true), (2, 7, false), (3, 24, false)] {
+                let own = render(version, px, quiet, turns, inverted);
+                let (width, height) = (own.width * times, own.height * times);
+                // Every pixel repeated: what enlarging once made of it.
+                let repeated = Luma::new(width, height, (0..width * height).map(|i| own.data[i / width / times * own.width + i % width / times]).collect());
+                // Enlarged as it is now, with its own pixels beside it.
+                let enlarged = Luma { unenlarged: Some(std::sync::Arc::new(own.clone())), ..own.resized(width, height) };
+                let whole = [[0.0, 0.0], [width as f64, 0.0], [width as f64, height as f64], [0.0, height as f64]];
+                let name = format!("{version} at {px} px, quiet {quiet}, turn {turns}, {times} times, inverted {inverted}");
+                let found = find(&enlarged, family, whole).unwrap_or_else(|| panic!("{name}"));
+                assert_eq!((found.version, found.turns as usize, found.inverted, found.module), (version, turns, inverted, (px * times) as f64), "{name}");
+                assert_eq!(find_each(&enlarged, family, whole), find_each(&repeated, family, whole), "{name}");
+                // An outline in the enlarged pixels, a little way into
+                // the quiet zone, says where to look as the whole does.
+                let inset = (quiet * px * times) as f64 / 2.0;
+                let outline = [[inset, inset], [width as f64 - inset, inset], [width as f64 - inset, height as f64 - inset], [inset, height as f64 - inset]];
+                assert_eq!(find_each(&enlarged, family, outline), find_each(&repeated, family, outline), "{name}, in an outline");
+                // Asked for another family, it is no more one enlarged
+                // than repeated.
+                for other in [Family::Qr, Family::Micro, Family::Rmqr].into_iter().filter(|&other| other != family) {
+                    assert_eq!(find_each(&enlarged, other, whole), find_each(&repeated, other, whole), "{name}, as {other:?}");
                 }
             }
         }

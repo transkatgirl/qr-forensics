@@ -3,16 +3,19 @@
 
 use std::path::Path;
 
-use image::imageops::FilterType;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader, ImageResult, RgbaImage};
+
+use super::Luma;
+use super::adjust::Adjust;
+use super::resize::resize;
 
 /// The longest a small photo's longer side is enlarged to: see
 /// [`MIN_PHOTO_SIDE`].
 pub const MAX_ENLARGED_SIDE: u32 = 4096;
-/// Photos smaller than this on their shorter side are scaled up, pixel for
-/// pixel, so that a symbol rendered at a few pixels a module gets modules
-/// the finder scan can see. A long thin rMQR render is judged by its
+/// Photos smaller than this on their shorter side are scaled up by a
+/// whole factor, so that a symbol rendered at a few pixels a module gets
+/// modules the finder scan can see. A long thin rMQR render is judged by its
 /// height. zxing-cpp has a separate path for such "pure" images; here they
 /// are simply made bigger.
 pub const MIN_PHOTO_SIDE: u32 = 256;
@@ -54,11 +57,15 @@ pub fn flatten_alpha(image: &mut RgbaImage) {
 
 /// The photo as the pipeline works on it: on white paper where it was
 /// transparent (see [`flatten_alpha`]), and, when it is small, enlarged
-/// by a whole factor with no smoothing, so that its edges stay sharp, as
-/// far as the longer side allows. Smooth enlargement was tried for
-/// photographs and lost more of the corpus than it gained: a cubic rings
-/// at every edge, and even a linear ramp moves the corners the edge
-/// tracer finds on crumpled paper.
+/// by a whole factor with Magic Kernel Sharp 2013 ([`super::resize`]),
+/// as far as the longer side allows. Cubic and linear enlargement were
+/// tried before it and lost more of the corpus than they gained: a
+/// cubic rings at every edge, and even a linear ramp moves the corners
+/// the edge tracer finds on crumpled paper. This kernel reads the
+/// corpus as enlarging pixel for pixel did. It rounds the square
+/// corners [`super::pure`] reads a rendered symbol off its pixels by,
+/// so a render is read off the pixels it had before it was enlarged,
+/// which [`luma`] keeps beside those it has after.
 ///
 /// A large photo is left at its size. It was once reduced to 4096 pixels
 /// on its longer side, and a small symbol in a large photo lost to that
@@ -73,6 +80,18 @@ pub fn normalize_size(mut image: RgbaImage) -> RgbaImage {
     enlarged(&image).unwrap_or(image)
 }
 
+/// The luminance the pipeline reads a photo by, under `adjust`: that of
+/// the photo as [`normalize_size`] leaves it, and, where that enlarged
+/// it, with the luminance of the photo at its own size kept beside it
+/// ([`Luma::unenlarged`]).
+pub fn luma(mut image: RgbaImage, adjust: &Adjust) -> Luma {
+    flatten_alpha(&mut image);
+    match enlarged(&image) {
+        Some(larger) => adjust.apply_photo(&larger, Some(&image)).1,
+        None => adjust.apply_photo(&image, None).1,
+    }
+}
+
 /// An opaque photo enlarged as [`normalize_size`] enlarges a small one;
 /// `None` for a photo that needs none of it, which is every photo of
 /// [`MIN_PHOTO_SIDE`] or more on its shorter side.
@@ -83,7 +102,11 @@ pub fn enlarged(image: &RgbaImage) -> Option<RgbaImage> {
         return None;
     }
     let factor = MIN_PHOTO_SIDE.div_ceil(shortest).min(MAX_ENLARGED_SIDE / longest).max(1);
-    (factor > 1).then(|| image::imageops::resize(image, image.width() * factor, image.height() * factor, FilterType::Nearest))
+    (factor > 1).then(|| {
+        let (width, height) = (image.width() * factor, image.height() * factor);
+        let pixels = resize(image.as_raw(), image.width() as usize, image.height() as usize, 4, width as usize, height as usize);
+        RgbaImage::from_raw(width, height, pixels).expect("the pixels are of the size asked for")
+    })
 }
 
 /// How much wider than itself, on each side, the box about an outline is
@@ -122,10 +145,16 @@ mod tests {
         });
         let big = normalize_size(tiny.clone());
         assert_eq!((big.width(), big.height()), (11 * 24, 11 * 24));
-        // Nearest-neighbour: every enlarged pixel keeps its source value.
-        assert_eq!(big.get_pixel(0, 0), tiny.get_pixel(0, 0));
-        assert_eq!(big.get_pixel(23, 23), tiny.get_pixel(0, 0));
-        assert_eq!(big.get_pixel(24, 0), tiny.get_pixel(1, 0));
+        // Each pixel keeps its value across its middle, and the edge
+        // between two lies where it lay: either side of it is the
+        // nearer pixel's.
+        let level = |x: u32, y: u32| i32::from(big.get_pixel(x, y)[0]);
+        for (x, y) in [(4, 7), (5, 5), (7, 4), (8, 8)] {
+            let source = i32::from(tiny.get_pixel(x, y)[0]);
+            assert!((level(24 * x + 12, 24 * y + 12) - source).abs() <= 2, "{x}, {y}: {}", level(24 * x + 12, 24 * y + 12));
+        }
+        assert!(level(5 * 24 - 1, 5 * 24 + 12) > 128 && level(5 * 24, 5 * 24 + 12) < 128);
+        assert!(big.pixels().all(|pixel| pixel[1] == pixel[0] && pixel[2] == pixel[0] && pixel[3] == 255));
         let fine = RgbaImage::new(640, 480);
         assert_eq!(normalize_size(fine.clone()).dimensions(), (640, 480));
         // A large photo keeps every pixel it has.
@@ -144,6 +173,25 @@ mod tests {
         assert!(enlarged(&RgbaImage::new(8192, 4096)).is_none());
         assert!(enlarged(&RgbaImage::new(5000, 100)).is_none());
         assert_eq!(enlarged(&RgbaImage::new(100, 60)).map(|i| i.dimensions()), Some((500, 300)));
+    }
+
+    #[test]
+    fn a_small_photo_is_read_enlarged_with_its_own_pixels_beside_it() {
+        // Opaque ink in squares on transparent black, 100 by 60.
+        let small = RgbaImage::from_fn(100, 60, |x, y| image::Rgba([0, 0, 0, if (x / 10 + y / 10) % 2 == 0 { 255 } else { 0 }]));
+        let read = luma(small, &Adjust::default());
+        assert_eq!((read.width, read.height), (500, 300));
+        let own = read.unenlarged.as_ref().expect("a photo enlarged keeps its own pixels");
+        assert_eq!((own.width, own.height), (100, 60));
+        // Its own pixels, on white where they were transparent, each
+        // ink or paper; enlarged, the edges between them are ramps.
+        assert!((own.data[0] - 0.0).abs() < 1e-6 && (own.data[10] - 1.0).abs() < 1e-6);
+        assert!(own.data.iter().all(|&v| !(1e-6..=1.0 - 1e-6).contains(&v)));
+        assert!(read.data.iter().any(|&v| (0.3..=0.7).contains(&v)));
+        // A photo that needs no enlarging is read as it is.
+        let fine = luma(RgbaImage::new(640, 480), &Adjust::default());
+        assert_eq!((fine.width, fine.height, fine.unenlarged.is_none()), (640, 480, true));
+        assert!(fine.data.iter().all(|&v| (v - 1.0).abs() < 1e-6), "transparent, so white");
     }
 
     #[test]

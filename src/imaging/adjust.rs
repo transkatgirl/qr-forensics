@@ -1,6 +1,10 @@
 //! Tone adjustments and neighbourhood filters applied to the photo before
 //! it is shown and sampled.
 
+use std::sync::Arc;
+
+use image::RgbaImage;
+
 use super::Luma;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -406,6 +410,19 @@ impl Adjust {
         }
         (display, Luma::new(width, height, luma))
     }
+
+    /// [`Self::apply`] to the pixels a photo is worked on at, with
+    /// `unenlarged` the photo at its own size when those are an
+    /// enlargement of it: the luminance then keeps that of the photo at
+    /// its own size beside it ([`Luma::unenlarged`]), under the same
+    /// adjustments less the filter, whose neighbourhood is measured in
+    /// the enlarged pixels and would be that many times too wide.
+    pub fn apply_photo(&self, working: &RgbaImage, unenlarged: Option<&RgbaImage>) -> (Vec<u8>, Luma) {
+        let of = |adjust: &Adjust, image: &RgbaImage| adjust.apply(image.as_raw(), image.width() as usize, image.height() as usize);
+        let (display, mut luma) = of(self, working);
+        luma.unenlarged = unenlarged.map(|small| Arc::new(of(&Adjust { filter: Filter::None, ..*self }, small).1));
+        (display, luma)
+    }
 }
 
 #[cfg(test)]
@@ -419,6 +436,29 @@ mod tests {
         assert_eq!(display, rgba);
         assert!((luma.data[0] - (0.299 * 10.0 + 0.587 * 120.0 + 0.114 * 250.0) / 255.0).abs() < 1e-6);
         assert_eq!(luma.data[1], 0.0);
+    }
+
+    #[test]
+    fn a_photo_enlarged_keeps_its_own_size_adjusted_but_not_filtered() {
+        // Ink on the left half and paper on the right, at its own size
+        // and twice it.
+        let halves = |width: u32, height: u32| RgbaImage::from_fn(width, height, |x, _| image::Rgba(if x < width / 2 { [0, 0, 0, 255] } else { [255; 4] }));
+        let (own, working) = (halves(4, 2), halves(8, 4));
+        let adjust = Adjust { invert: true, filter: Filter::Blur, radius: 1, ..Default::default() };
+        let (display, luma) = adjust.apply_photo(&working, Some(&own));
+        assert_eq!((display.len(), luma.width, luma.height), (8 * 4 * 4, 8, 4));
+        // The working pixels are inverted and blurred across the edge...
+        assert!((luma.data[0] - 1.0).abs() < 1e-6 && (luma.data[7] - 0.0).abs() < 1e-6, "{:?}", &luma.data[..8]);
+        assert!(luma.data[3] < 0.9 && luma.data[4] > 0.1, "{:?}", &luma.data[..8]);
+        // ...and the photo's own inverted alike, with its edge as it was.
+        let small = luma.unenlarged.as_ref().expect("the photo's own pixels are kept");
+        assert_eq!((small.width, small.height), (4, 2));
+        for (value, want) in small.data.iter().zip([1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]) {
+            assert!((value - want).abs() < 1e-6, "{:?}", small.data);
+        }
+        assert!(small.unenlarged.is_none());
+        // A photo worked on at its own size keeps nothing beside it.
+        assert!(adjust.apply_photo(&working, None).1.unenlarged.is_none());
     }
 
     #[test]

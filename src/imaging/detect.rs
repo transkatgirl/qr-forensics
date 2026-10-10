@@ -95,7 +95,8 @@
 //! again through a ladder of transformed copies, as zxing-cpp retries with
 //! `tryDenoise` and `tryDownscale`: the dark closed over small gaps for a
 //! print made of dots, the photo shrunk for a halftone screen, and the
-//! photo enlarged pixel for pixel for a symbol a pixel or two a module.
+//! photo enlarged for a symbol a pixel or two a module, each copy of
+//! another size made with Magic Kernel Sharp 2013 ([`super::resize`]).
 //! One rung transforms nothing but the scan's own threshold: the
 //! neighbourhood each pixel is judged against, a sixth of the outline
 //! wide, is narrowed to a few tens of pixels, so that a finder in a
@@ -636,8 +637,8 @@ pub enum Retry {
     Closed { radius: u8 },
     /// Shrunk by a whole factor, which averages a screen or grain away.
     Downscaled { factor: u8 },
-    /// Enlarged by a whole factor, pixel for pixel, which gives a symbol
-    /// of a pixel a module runs the scan can see.
+    /// Enlarged by a whole factor, which gives a symbol of a pixel a
+    /// module runs the scan can see.
     Upscaled { factor: u8 },
     /// Turned clockwise by so many quarter turns, as zxing-cpp retries a
     /// failed read with `tryRotate`: the fits that place the corners and
@@ -924,8 +925,7 @@ pub fn detect_candidates(
         return vec![found];
     }
     // A small outline holds small modules, which the scan cannot see
-    // below a pixel and a half: the photo around it is enlarged first,
-    // pixel for pixel, so that its edges stay sharp.
+    // below a pixel and a half: the photo around it is enlarged first.
     let enlarge = needed_upscale(region, version.family());
     if enlarge > 1 {
         let found = detect_candidates_through(image, version, region, params, Retry::Upscaled { factor: enlarge });
@@ -1753,19 +1753,11 @@ impl View {
                 if vw < 8 || vh < 8 {
                     return None;
                 }
-                let mut data = Vec::with_capacity(vw * vh);
-                for vy in 0..vh {
-                    for vx in 0..vw {
-                        let mut sum = 0.0f32;
-                        for dy in 0..k {
-                            for dx in 0..k {
-                                sum += at(x0 + vx * k + dx, y0 + vy * k + dy);
-                            }
-                        }
-                        data.push(sum / (k * k) as f32);
-                    }
-                }
-                (Luma::new(vw, vh, data), k as f64)
+                // The whole pixels of the view, so that each is `k` of
+                // the photo's on a side: what is left over at the far
+                // edges is left out.
+                let whole: Vec<f32> = (y0..y0 + vh * k).flat_map(|y| (x0..x0 + vw * k).map(move |x| at(x, y))).collect();
+                (Luma::new(vw * k, vh * k, whole).resized(vw, vh), k as f64)
             }
             Retry::Upscaled { factor } => {
                 let f = factor as usize;
@@ -1773,8 +1765,7 @@ impl View {
                 if vw.max(vh) > MAX_VIEW_SIDE {
                     return None;
                 }
-                let data = (0..vh).flat_map(|vy| (0..vw).map(move |vx| at(x0 + vx / f, y0 + vy / f))).collect();
-                (Luma::new(vw, vh, data), 1.0 / f as f64)
+                (Luma::new(w, h, crop()).resized(vw, vh), 1.0 / f as f64)
             }
             // A turn is not a view of a window: the whole photo is turned
             // and read in full by `read`, which brings the result back.
@@ -4129,10 +4120,8 @@ fn reduced_for_search(image: &Luma) -> Option<Luma> {
         return None;
     }
     let scale = SEARCH_SIDE as f32 / longest as f32;
-    let (width, height) = (((image.width as f32 * scale) as u32).max(1), ((image.height as f32 * scale) as u32).max(1));
-    let full = image::ImageBuffer::<image::Luma<f32>, &[f32]>::from_raw(image.width as u32, image.height as u32, &image.data[..])?;
-    let reduced = image::imageops::resize(&full, width, height, image::imageops::FilterType::Triangle);
-    Some(Luma::new(width as usize, height as usize, reduced.into_raw()))
+    let (width, height) = (((image.width as f32 * scale) as usize).max(1), ((image.height as f32 * scale) as usize).max(1));
+    Some(image.resized(width, height))
 }
 
 /// [`find_symbols_of_families`] of a photo, or a copy of one, that is no
@@ -7454,7 +7443,7 @@ mod tests {
 
     #[test]
     fn views_map_back_to_the_photo() {
-        // Ink and paper: a render, enlarged pixel for pixel.
+        // Ink and paper: a render, enlarged.
         let image = Luma::new(40, 30, (0..1200).map(|i| if i % 7 < 3 { 0.0 } else { 1.0 }).collect());
         let region = [[10.0, 8.0], [30.0, 8.0], [30.0, 24.0], [10.0, 24.0]];
         let up = View::around(&image, region, Retry::Upscaled { factor: 3 }).unwrap();
@@ -7462,15 +7451,24 @@ mod tests {
         let p = up.to_view([12.5, 9.0]);
         let back = up.to_photo(p);
         assert!(distance(back, [12.5, 9.0]) < 1e-9);
-        // Pixel for pixel: the view's pixel (3i, 3j) holds the photo's (x0 + i, y0 + j).
+        // The view's pixel (3i + 1, 3j + 1) lies on the middle of the
+        // photo's (x0 + i, y0 + j), and holds its ink or its paper.
         let (x0, y0) = (up.origin[0] as usize, up.origin[1] as usize);
-        assert_eq!(up.luma.data[0], image.data[y0 * 40 + x0]);
-        assert_eq!(up.luma.data[2 * up.luma.width + 5], image.data[y0 * 40 + x0 + 1]);
+        for (i, j) in [(2, 2), (3, 2), (5, 4), (6, 7)] {
+            let value = up.luma.data[(3 * j + 1) * up.luma.width + 3 * i + 1];
+            assert!((value - image.data[(y0 + j) * 40 + x0 + i]).abs() < 0.01, "{i}, {j}: {value}");
+        }
+        // Shrunk, the whole photo is the photo resized, and what its
+        // far edges have over a whole number of the view's pixels is
+        // left out.
         let down = View::whole(&image, Retry::Downscaled { factor: 2 }).unwrap();
         assert_eq!((down.luma.width, down.luma.height), (20, 15));
         assert_eq!(down.scale, 2.0);
-        let mean = (image.data[0] + image.data[1] + image.data[40] + image.data[41]) / 4.0;
-        assert!((down.luma.data[0] - mean).abs() < 1e-6);
+        assert_eq!(down.luma, image.resized(20, 15));
+        let thirds = View::whole(&image, Retry::Downscaled { factor: 3 }).unwrap();
+        assert_eq!((thirds.luma.width, thirds.luma.height, thirds.scale), (13, 10, 3.0));
+        let whole = Luma::new(39, 30, (0..1200).filter(|i| i % 40 < 39).map(|i| image.data[i]).collect());
+        assert_eq!(thirds.luma, whole.resized(13, 10));
         assert!(View::whole(&image, Retry::Downscaled { factor: 5 }).is_none(), "too small to hold a symbol");
         let closed = View::whole(&image, Retry::Closed { radius: 1 }).unwrap();
         assert_eq!((closed.luma.width, closed.luma.height), (40, 30));
@@ -7478,6 +7476,45 @@ mod tests {
         assert_eq!(needed_upscale([[0.0, 0.0], [25.0, 0.0], [25.0, 25.0], [0.0, 25.0]], Family::Qr), 3);
         assert_eq!(needed_upscale([[0.0, 0.0], [200.0, 0.0], [200.0, 200.0], [0.0, 200.0]], Family::Qr), 1);
         assert_eq!(needed_upscale([[0.0, 0.0], [100.0, 0.0], [100.0, 10.0], [0.0, 10.0]], Family::Rmqr), 3);
+    }
+
+    #[test]
+    fn a_small_render_enlarged_is_read_off_the_pixels_it_had() {
+        // Renders of a pixel or two a module, as an encoder writes them,
+        // each small enough to be enlarged when it is loaded.
+        for (version, px, quiet) in
+            [(SymbolVersion::Qr(1), 1, 2), (SymbolVersion::Qr(12), 1, 0), (SymbolVersion::Micro(3), 2, 2), (SymbolVersion::Rmqr(0), 2, 1)]
+        {
+            let func = FunctionMap::new(version);
+            let side = |modules: usize| ((modules + 2 * quiet) * px) as u32;
+            let render = image::RgbaImage::from_fn(side(func.width), side(func.height), |x, y| {
+                let (mx, my) = ((x as usize / px).wrapping_sub(quiet), (y as usize / px).wrapping_sub(quiet));
+                let dark = mx < func.width && my < func.height && func.expected(mx, my) == Some(true);
+                image::Rgba(if dark { [0, 0, 0, 255] } else { [255, 255, 255, 255] })
+            });
+            let image = crate::imaging::photo::luma(render.clone(), &crate::imaging::adjust::Adjust::default());
+            let own = image.unenlarged.as_ref().unwrap_or_else(|| panic!("{version} at {px} px is enlarged"));
+            assert_eq!((own.width, own.height), (render.width() as usize, render.height() as usize));
+            let times = image.width / own.width;
+            assert!(times > 1 && (image.width, image.height) == (own.width * times, own.height * times));
+            // Read off its own pixels, it is placed in the enlarged ones,
+            // its corners on the edges its pixels had.
+            let whole = [[0.0, 0.0], [image.width as f64, 0.0], [image.width as f64, image.height as f64], [0.0, image.height as f64]];
+            let found = detect_pure(&image, version.family(), whole, &SampleParams::default()).unwrap_or_else(|| panic!("{version} at {px} px"));
+            assert_eq!(found.version, version);
+            let at = |modules: usize| ((quiet + modules) * px * times) as f64;
+            let truth = [[at(0), at(0)], [at(func.width), at(0)], [at(func.width), at(func.height)], [at(0), at(func.height)]];
+            assert_eq!(found.corners, truth, "{version} at {px} px");
+            // An outline in the enlarged pixels says where to look, as
+            // the whole photo does, and the photo turned reads as well.
+            let outline = [[at(0) - 3.0, at(0) - 2.0], [at(func.width) + 4.0, at(0) - 1.0], truth[2], truth[3]];
+            let inside = detect_pure(&image, version.family(), outline, &SampleParams::default());
+            assert_eq!(inside.map(|found| found.corners), Some(truth), "{version} at {px} px, in an outline");
+            let turned = image.rotated_cw(1);
+            let whole = [[0.0, 0.0], [turned.width as f64, 0.0], [turned.width as f64, turned.height as f64], [0.0, turned.height as f64]];
+            let found = detect_pure(&turned, version.family(), whole, &SampleParams::default()).unwrap_or_else(|| panic!("{version}, turned"));
+            assert_eq!((found.version, found.corners[0]), (version, [turned.width as f64 - at(0), at(0)]), "{version}, turned");
+        }
     }
 
     /// Paper `width` by `height` with a Micro QR M2 symbol on it at each

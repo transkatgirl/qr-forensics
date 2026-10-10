@@ -112,7 +112,7 @@ use qr_forensics::decode::text::Charset;
 use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::adjust::Adjust;
 use qr_forensics::imaging::detect::{SearchParams, find_symbols_with};
-use qr_forensics::imaging::photo::{self, normalize_size};
+use qr_forensics::imaging::photo;
 use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline};
 use qr_forensics::imaging::sample::SampleParams;
 use qr_forensics::symbol::{Family, SymbolVersion};
@@ -260,9 +260,7 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
 /// photo is small and never shrunk, as luminance, with the default tone
 /// adjustments.
 fn load(path: &Path) -> Result<Luma, String> {
-    let image = normalize_size(photo::open(path).map_err(|e| e.to_string())?);
-    let (width, height) = (image.width() as usize, image.height() as usize);
-    Ok(Adjust::default().apply(image.as_raw(), width, height).1)
+    Ok(photo::luma(photo::open(path).map_err(|e| e.to_string())?, &Adjust::default()))
 }
 
 /// The version a search of `family` starts from, as the window starts.

@@ -22,6 +22,7 @@ use qr_forensics::decode::sequence::Part;
 use qr_forensics::decode::text::Charset;
 use qr_forensics::imaging::adjust::{Adjust, LENS_MIN_PAIRS, estimate_k1, remap_point, undistort};
 use qr_forensics::imaging::photo::{crop_box, enlarged, flatten_alpha};
+use qr_forensics::imaging::resize::resize;
 use qr_forensics::imaging::detect::{
     Anchor, AnchorKind, Detection, SEARCH_SIDE, SearchParams, anchor_sites, decodes_as_found, find_symbols_of_families,
     find_symbols_with, refine_anchors, settle_loose_corners,
@@ -636,14 +637,15 @@ impl App {
     /// whatever was found or under way on the photo shown before
     /// dropped. Where the outline and anchors go is the caller's to say.
     fn show_photo(&mut self, ctx: &egui::Context, name: String, source: Arc<image::RgbaImage>, crop: Option<Crop>, adjust: Adjust) {
-        let original = working_copy(&source, crop);
+        let (original, unenlarged) = working_copy(&source, crop);
         let (width, height) = (original.width() as usize, original.height() as usize);
-        let (display, luma) = adjust.apply(original.as_raw(), width, height);
+        let (display, luma) = adjust.apply_photo(&original, unenlarged.as_deref());
         self.texture_limit = ctx.input(|i| i.max_texture_side);
         let texture = ctx.load_texture("photo", texture_image(display, width, height, self.texture_limit), egui::TextureOptions::LINEAR);
         self.history.photo_changed(&self.doc);
         self.doc.adjust = adjust;
-        self.photo = Some(Photo { name, width, height, source, crop, original, adjust, luma: Arc::new(luma), texture, binarised: None });
+        self.photo =
+            Some(Photo { name, width, height, source, crop, original, unenlarged, adjust, luma: Arc::new(luma), texture, binarised: None });
         self.view.stage = Stage::Align;
         self.view.align_view.auto_fit = true;
         self.view.binarize_auto = true;
@@ -737,7 +739,7 @@ impl App {
     /// adjustments.
     fn reapply_adjust(&mut self) {
         if let Some(photo) = &mut self.photo {
-            let (display, luma) = photo.adjust.apply(photo.original.as_raw(), photo.width, photo.height);
+            let (display, luma) = photo.adjust.apply_photo(&photo.original, photo.unenlarged.as_deref());
             photo.luma = Arc::new(luma);
             photo.texture.set(texture_image(display, photo.width, photo.height, self.texture_limit), egui::TextureOptions::LINEAR);
             photo.binarised = None;
@@ -2678,8 +2680,15 @@ fn listed(luma: &Luma, mut all: Vec<Detection>, params: &SampleParams) -> Vec<De
 /// of the part `crop` of it, enlarged when they are too few for modules
 /// to be seen and otherwise as they are. They are the photo's own,
 /// shared, when the whole of it is on show and needed no enlarging.
-fn working_copy(source: &Arc<image::RgbaImage>, crop: Option<Crop>) -> Arc<image::RgbaImage> {
-    let Some(crop) = crop else { return enlarged(source).map_or_else(|| source.clone(), Arc::new) };
+/// With them, when they are an enlargement, the pixels at their own
+/// size.
+fn working_copy(source: &Arc<image::RgbaImage>, crop: Option<Crop>) -> (Arc<image::RgbaImage>, Option<Arc<image::RgbaImage>>) {
+    let Some(crop) = crop else {
+        return match enlarged(source) {
+            Some(larger) => (Arc::new(larger), Some(source.clone())),
+            None => (source.clone(), None),
+        };
+    };
     let [x, y, w, h] = crop.rect;
     let cut = if crop.k1 == 0.0 {
         image::imageops::crop_imm(&**source, x, y, w, h).to_image()
@@ -2690,10 +2699,10 @@ fn working_copy(source: &Arc<image::RgbaImage>, crop: Option<Crop>) -> Arc<image
         let straightened = image::RgbaImage::from_raw(width, height, straightened).expect("straightening keeps the photo's size");
         image::imageops::crop_imm(&straightened, x, y, w, h).to_image()
     };
-    Arc::new(match enlarged(&cut) {
-        Some(larger) => larger,
-        None => cut,
-    })
+    match enlarged(&cut) {
+        Some(larger) => (Arc::new(larger), Some(Arc::new(cut))),
+        None => (Arc::new(cut), None),
+    }
 }
 
 /// Pixels as a texture holds them: as they are when they fit within
@@ -2708,9 +2717,8 @@ pub(crate) fn texture_image(rgba: Vec<u8>, width: usize, height: usize, limit: u
     if (shown_width, shown_height) == (width, height) {
         return egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
     }
-    let full = image::RgbaImage::from_raw(width as u32, height as u32, rgba).expect("the pixels are of the size given");
-    let shown = image::imageops::thumbnail(&full, shown_width as u32, shown_height as u32);
-    egui::ColorImage::from_rgba_unmultiplied([shown_width, shown_height], shown.as_raw())
+    let shown = resize(&rgba, width, height, 4, shown_width, shown_height);
+    egui::ColorImage::from_rgba_unmultiplied([shown_width, shown_height], &shown)
 }
 
 /// [`texture_image`] for one channel, a byte a pixel.
@@ -2719,9 +2727,8 @@ pub(crate) fn texture_gray(gray: Vec<u8>, width: usize, height: usize, limit: us
     if (shown_width, shown_height) == (width, height) {
         return egui::ColorImage::from_gray([width, height], &gray);
     }
-    let full = image::GrayImage::from_raw(width as u32, height as u32, gray).expect("the pixels are of the size given");
-    let shown = image::imageops::thumbnail(&full, shown_width as u32, shown_height as u32);
-    egui::ColorImage::from_gray([shown_width, shown_height], shown.as_raw())
+    let shown = resize(&gray, width, height, 1, shown_width, shown_height);
+    egui::ColorImage::from_gray([shown_width, shown_height], &shown)
 }
 
 /// The size an image `width` by `height` is drawn through a texture at:
@@ -2858,9 +2865,7 @@ mod tests {
     /// A photo as the app loads it, for the search helpers.
     fn load(name: &str) -> Luma {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/photos").join(name);
-        let image = qr_forensics::imaging::photo::normalize_size(image::open(&path).expect("photo opens").to_rgba8());
-        let (width, height) = (image.width() as usize, image.height() as usize);
-        Adjust::default().apply(image.as_raw(), width, height).1
+        qr_forensics::imaging::photo::luma(image::open(&path).expect("photo opens").to_rgba8(), &Adjust::default())
     }
 
     #[test]
@@ -4119,6 +4124,7 @@ mod tests {
         assert_eq!((photo.width, photo.height, photo.scale()), (5000, 1500, 1.0));
         assert_eq!((photo.luma.width, photo.luma.height), (5000, 1500));
         assert!(Arc::ptr_eq(&photo.source, &photo.original), "a photo that needs no enlarging is held once");
+        assert!(photo.unenlarged.is_none() && photo.luma.unenlarged.is_none());
         let notice = &bench.notice().text;
         assert!(notice.starts_with("Loaded large (5000 × 1500)") && notice.contains("Crop to outline"), "{notice}");
         // What draws it is no larger than a texture may be, and is
@@ -4159,11 +4165,22 @@ mod tests {
         // The black and white view, on show, was made again with it.
         assert_eq!(photo.binarised.as_ref().map(|view| view.texture.size()), Some([5000, 1500]));
         // A small photo is still enlarged, and says so.
-        let small = image::imageops::resize(&render, 110, 110, image::imageops::FilterType::Nearest);
+        let small = resize(render.as_raw(), w, h, 4, 110, 110);
+        let small = image::RgbaImage::from_raw(110, 110, small).expect("the render at a third of its size");
         bench.app.set_photo(&ctx, "small".into(), small);
         let photo = bench.app.photo.as_ref().expect("the photo is loaded");
         assert_eq!((photo.width, photo.height, photo.scale()), (330, 330, 3.0));
         assert!(bench.notice().text.starts_with("Loaded small (330 × 330, enlarged 3 times from 110 × 110"), "{}", bench.notice().text);
+        // Its own pixels are kept beside the enlarged, as loaded and as
+        // luminance, through a change of the adjustments.
+        let own = |bench: &Bench| {
+            let photo = bench.app.photo.as_ref().expect("the photo is loaded");
+            (photo.unenlarged.as_ref().map(|own| own.dimensions()), photo.luma.unenlarged.as_ref().map(|own| (own.width, own.height)))
+        };
+        assert!(photo.unenlarged.as_ref().is_some_and(|own| Arc::ptr_eq(own, &photo.source)), "the photo as loaded, held once");
+        assert_eq!(own(&bench), (Some((110, 110)), Some((110, 110))));
+        bench.act(Action::SetAdjust(Adjust { contrast: 0.3, ..bench.app.doc.adjust }));
+        assert_eq!(own(&bench), (Some((110, 110)), Some((110, 110))));
         bench.step();
         assert!(bench.texts().iter().any(|text| text == "small · 330 × 330 · enlarged from 110 × 110"), "{:?}", bench.texts());
     }
@@ -4250,6 +4267,7 @@ mod tests {
         let photo = bench.app.photo.as_ref().expect("the photo is on show");
         assert_eq!(photo.crop.map(|crop| crop.rect), Some([3020, 620, 140, 140]));
         assert_eq!((photo.width, photo.height, photo.scale()), (280, 280, 2.0));
+        assert_eq!(photo.luma.unenlarged.as_ref().map(|own| (own.width, own.height)), Some((140, 140)), "the part as it was cut");
         assert_eq!(bench.app.doc.corners, square(40.0, 40.0, 200.0));
         assert!(bench.notice().text.contains("enlarged 2 times"), "{}", bench.notice().text);
         bench.act(Action::ShowWholePhoto);
