@@ -1,0 +1,8 @@
+; from: testdata/cv/qrcode/multiple/6_qrcodes.png
+; quick
+SKIP
+STEP FORWARD
+QUESTION
+STEP BACK
+EXTRA
+TWO STEPS FORWARD

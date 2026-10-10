@@ -1,0 +1,3135 @@
+//! The application window: owns the document, applies edits, and lays out
+//! the panels. Panels describe what the user asked for as [`Action`]s, which
+//! are applied after the frame's widgets have been drawn.
+
+mod canvas;
+mod inspector;
+#[cfg(feature = "selftest")]
+mod selftest;
+mod state;
+mod tools_panel;
+
+use std::path::Path;
+use std::sync::Arc;
+
+use eframe::egui;
+use qr_forensics::decode::codewords::{Pin, PinSource, Pins};
+use qr_forensics::decode::padding::{clear_padding_pins, detect_padding, recover_padding};
+use qr_forensics::decode::pipeline::{Attempt, DecodeOptions, analyze, brute_force, brute_force_mirrored, decode};
+use qr_forensics::decode::repair::{quiet_zone, render_rgba, repaired_grid};
+use qr_forensics::decode::sequence::Part;
+use qr_forensics::decode::text::Charset;
+use qr_forensics::imaging::adjust::{Adjust, LENS_MIN_PAIRS, estimate_k1, remap_point};
+use qr_forensics::imaging::photo::normalize_size;
+use qr_forensics::imaging::detect::{
+    Anchor, AnchorKind, Detection, SearchParams, anchor_sites, decodes_as_found, find_symbols_of_families,
+    refine_anchors, settle_loose_corners,
+};
+use qr_forensics::imaging::read::{ReadResult, read_outline};
+use qr_forensics::imaging::refine::{Refinement, refine_corners, refine_corners_holding};
+use qr_forensics::imaging::Luma;
+use qr_forensics::imaging::sample::{Kernel, SampleParams, VersionGuess, classify, sample_modules_with, suggest_versions};
+use qr_forensics::symbol::function_map::{FunctionMap, looks_inverted};
+use qr_forensics::symbol::grid::{Mirror, Module, Symmetry};
+use qr_forensics::symbol::layout::{CwId, SymbolLayout};
+use qr_forensics::symbol::{EcLevel, Family, SymbolVersion};
+use state::*;
+
+/// Pixels per module in exported images.
+const EXPORT_SCALE: usize = 10;
+/// How long a notice that is not an error stays in the status bar.
+const NOTICE_SECONDS: f32 = 12.0;
+
+const UNDO: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z);
+const REDO: egui::KeyboardShortcut =
+    egui::KeyboardShortcut::new(egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT), egui::Key::Z);
+const OPEN: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Transform {
+    RotateCw,
+    Rotate180,
+    Mirror(Mirror),
+    Invert,
+    /// Any turn or reflection of the grid's rectangle.
+    Symmetry(Symmetry),
+    /// A turn or reflection with dark and light swapped as well, as one
+    /// edit, so that one Undo takes both back.
+    SymmetryInverted(Symmetry),
+}
+
+impl Transform {
+    /// The turn or reflection of the grid's rectangle the transform
+    /// makes, if it makes one: what the outline and the anchors must
+    /// follow, since they say where the grid's modules lie in the photo.
+    fn symmetry(self) -> Option<Symmetry> {
+        match self {
+            Transform::RotateCw => Some(Symmetry::RotateCw),
+            Transform::Rotate180 => Some(Symmetry::Rotate180),
+            Transform::Mirror(Mirror::Transpose) => Some(Symmetry::Transpose),
+            Transform::Mirror(Mirror::Horizontal) => Some(Symmetry::FlipHorizontal),
+            Transform::Mirror(Mirror::Vertical) => Some(Symmetry::FlipVertical),
+            Transform::Invert => None,
+            Transform::Symmetry(symmetry) | Transform::SymmetryInverted(symmetry) => Some(symmetry),
+        }
+    }
+}
+
+/// Something the user asked for during a frame.
+pub(crate) enum Action {
+    OpenImage,
+    PasteImage,
+    ClosePhoto,
+    NewBlank,
+    SetVersion(SymbolVersion),
+    /// Read the grid as painted as a symbol of `version`, the same size
+    /// as the current one: a QR Code grid as Model 1, or the reverse.
+    ReinterpretAs(SymbolVersion),
+    Undo,
+    Redo,
+    FillFixed,
+    ClearData,
+    Transform(Transform),
+    Sample { only_unknown: bool },
+    SuggestVersions,
+    ResetCorners,
+    /// Change how the photo is read. The control that asks records the
+    /// undo point first, once per gesture, since a slider drag asks on
+    /// every frame.
+    SetAdjust(Adjust),
+    /// Estimate the lens term from the corners and anchors and apply it,
+    /// moving them with the photo. Only ever at the user's asking.
+    EstimateLens,
+    SetFormat(FormatSel),
+    BruteForce,
+    Pin(CwId, u8),
+    Unpin(CwId),
+    ApplyPadding,
+    ClearPaddingPins,
+    ClearAllPins,
+    SetCharset(Charset),
+    SetBitLevel(bool),
+    SetReliability(bool),
+    /// Find the finder patterns inside the outline and move the corners
+    /// onto the symbol.
+    FindCorners,
+    /// Search the whole photo for symbols of every family, with no
+    /// outline drawn, and list what is found.
+    FindSymbols,
+    /// Adopt one of the symbols found: its version, outline and anchors.
+    UseProposal(usize),
+    ClearProposals,
+    /// Refine the corners and every anchor against the photo.
+    RefineCorners,
+    ClearAnchors,
+    /// Add the current decode to the structured append sequence.
+    AddToSequence,
+    RemoveFromSequence(u8),
+    ClearSequence,
+    /// Save the message's bytes, raw, to a file.
+    SaveBytes,
+    /// Write every corrected module and regenerated function pattern into
+    /// the grid.
+    ApplyCorrections,
+    /// Save the repaired symbol as a PNG.
+    ExportImage,
+    DismissNotice,
+    FitView,
+    Quit,
+}
+
+pub(crate) struct BruteResults {
+    pub attempts: Vec<Attempt>,
+    /// The document has changed since these were computed.
+    pub stale: bool,
+}
+
+/// A search of the whole photo for symbols, running on a thread of its
+/// own: it takes seconds a photo, a few per family, and the window must
+/// keep answering while it runs. The result arrives through the channel.
+struct PendingSearch {
+    /// The photo, at the lens setting, the search was started for.
+    generation: u64,
+    receiver: std::sync::mpsc::Receiver<Vec<Detection>>,
+    /// The photo's Invert setting when the search began.
+    photo_inverted: bool,
+    started: std::time::Instant,
+}
+
+/// A slow step of the alignment running on a thread of its own: finding
+/// the corners takes a second a photo and refining them most of another,
+/// and the window must keep answering meanwhile, as it does during a
+/// search. The result arrives through the channel and is taken into the
+/// document on the UI thread, with the undo point and the notice the step
+/// would have left had it run in the frame. One job runs at a time; a
+/// search may run beside it, since the two touch nothing in common.
+struct PendingJob {
+    kind: JobKind,
+    /// The photo, at the lens setting, the job was started for.
+    generation: u64,
+    /// The document's version when the job began. A result that means
+    /// something only at that version is dropped if the version changed.
+    version: SymbolVersion,
+    receiver: std::sync::mpsc::Receiver<JobResult>,
+    started: std::time::Instant,
+}
+
+/// Which step a job is running, for the status bar and the buttons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JobKind {
+    FindCorners,
+    /// Placing the corners and anchors on a symbol the search found.
+    Adopt,
+    Refine,
+    /// Ranking the versions on the corners.
+    Suggest,
+}
+
+impl JobKind {
+    /// What the step is doing, as the status bar puts it.
+    fn label(self) -> &'static str {
+        match self {
+            JobKind::FindCorners => "Finding the symbol inside the outline",
+            JobKind::Adopt => "Placing the corners on the symbol found",
+            JobKind::Refine => "Refining the corners and anchors",
+            JobKind::Suggest => "Ranking the versions on these corners",
+        }
+    }
+}
+
+/// What a job worked out, to be taken into the document on the UI thread.
+enum JobResult {
+    /// Find in outline: the symbol found inside the outline, made ready to
+    /// adopt, with the family it was found under when that is not the one
+    /// asked about; or nothing.
+    Corners(Option<(Prepared, Option<Family>)>),
+    /// A symbol the search found, made ready to adopt.
+    Adopt(Prepared),
+    /// Refine: `None` when the corners form no usable outline.
+    Refine(Option<Refined>),
+    Suggest(Vec<VersionGuess>),
+}
+
+/// A detection refined against the photo, with everything else that
+/// adopting it needs and takes time to work out.
+struct Prepared {
+    /// The detection, its corners and anchors refined.
+    found: Detection,
+    /// (matching, fixed) at the refined corners.
+    agreement: (usize, usize),
+    /// Every version of the family in use when the job began, ranked on
+    /// the corners found; made when the version found would not be
+    /// adopted outright, so that it can be suggested instead.
+    guesses: Option<(Family, Vec<VersionGuess>)>,
+    /// The photo's Invert setting the detection was made under.
+    searched_inverted: bool,
+    /// What the detection decoded to, where Find in outline read it through
+    /// to text to choose among the placements.
+    read: Option<ReadNote>,
+}
+
+/// What a read of a detection made of it, in brief.
+struct ReadNote {
+    /// The sampling kernel the read that decoded best used.
+    kernel: Kernel,
+    /// The threshold rule it used: each module against its neighbourhood,
+    /// or every module against one split of the symbol.
+    local: bool,
+    /// Blocks verified, of the blocks in the symbol.
+    verified: usize,
+    blocks: usize,
+    trustworthy: bool,
+    /// The grid read as the other QR Code model, which its format word
+    /// named and which decoded.
+    reinterpreted: Option<SymbolVersion>,
+}
+
+/// What Refine worked out: the corners refined, and every anchor moved
+/// onto its pattern, beside the anchors as they were.
+struct Refined {
+    refinement: Refinement,
+    before: Vec<Anchor>,
+    after: Vec<Anchor>,
+}
+
+pub struct App {
+    doc: Document,
+    history: History,
+    photo: Option<Photo>,
+    view: ViewState,
+    derived: Derived,
+    dirty: bool,
+    opts: DecodeOptions,
+    brute: Option<BruteResults>,
+    guesses: Option<Vec<VersionGuess>>,
+    /// The projection for the current outline and anchors.
+    model: Option<Model>,
+    preview: Option<SamplePreview>,
+    /// What the last corner search found, with the corners it left; shown
+    /// on the canvas while the outline stays there.
+    detection: Option<Detection>,
+    /// Symbols a search of the whole photo found, on offer until the list
+    /// is cleared or the photo, or its lens setting, changes.
+    proposals: Option<Proposals>,
+    /// A search of the whole photo still running on its own thread.
+    search: Option<PendingSearch>,
+    /// A step of the alignment still running on its own thread.
+    job: Option<PendingJob>,
+    /// Counts photos loaded and changes of the lens setting, which moves
+    /// every pixel of a photo and so makes another of it, so that a search
+    /// or a job finishing after its photo was replaced or straightened
+    /// anew is told apart from one for the photo on show.
+    photo_generation: u64,
+    /// Last notice for the status bar.
+    message: Option<Notice>,
+    /// The EC level and mask were carried over during a stroke; settle them
+    /// by brute force once it ends.
+    settle_pending: bool,
+    #[cfg(feature = "selftest")]
+    selftest: Option<selftest::SelfTest>,
+}
+
+/// Recompute everything that follows from the document. When the format
+/// bits cannot settle the EC level and mask, brute force chooses them and
+/// its attempts are returned as well; while `settle` is false the previous
+/// choice is carried over instead, which keeps a brush stroke responsive.
+fn derive(
+    doc: &Document,
+    previous: Option<&Derived>,
+    opts: &DecodeOptions,
+    settle: bool,
+) -> (Derived, Option<Vec<Attempt>>) {
+    let func = match previous {
+        Some(old) if old.func.version == doc.version => old.func.clone(),
+        _ => Arc::new(FunctionMap::new(doc.version)),
+    };
+    let analysis = analyze(&doc.grid, &func);
+    let levels = doc.version.ec_levels();
+    let mut attempts = None;
+    let (ec, mask, format_by_brute) = match doc.format {
+        FormatSel::Manual { ec, mask } if levels.contains(&ec) && mask < doc.version.mask_count() => {
+            (ec, mask, false)
+        }
+        _ if analysis.format.is_reliable() => {
+            let best = analysis.format.best().expect("a reliable analysis has a best candidate");
+            (best.fields.ec, best.fields.mask, false)
+        }
+        _ => match previous {
+            Some(old) if !settle && old.format_by_brute && old.func.version == doc.version => {
+                (old.ec, old.mask, true)
+            }
+            _ => {
+                let pins = doc.pins_ec.map(|level| (level, &doc.pins));
+                let tried = brute_force(&doc.grid, &func, pins, opts);
+                let (ec, mask) = tried.first().map_or((levels[0], 0), |a| (a.ec, a.mask));
+                attempts = Some(tried);
+                (ec, mask, true)
+            }
+        },
+    };
+    let layout = match previous {
+        Some(old) if Arc::ptr_eq(&old.layout.func, &func) && old.ec == ec => old.layout.clone(),
+        _ => Arc::new(SymbolLayout::new(func.clone(), ec).expect("EC level is valid for the version")),
+    };
+    // Pins number codewords under one EC level's block structure; under any
+    // other they would land on the wrong codewords.
+    let no_pins = Pins::new();
+    let pins = if doc.pins_ec == Some(ec) { &doc.pins } else { &no_pins };
+    let report = decode(&doc.grid, &layout, mask, pins, opts);
+    let padding = if report.is_complete() { None } else { detect_padding(&layout, &report) };
+    // When nothing decodes and the format bits could not say the grid is
+    // a mirror image, try its mirror images outright, as ZXing and ZBar
+    // retry a failed decode transposed. Only once a stroke has ended: it
+    // is a brute force of its own.
+    let mirror_by_decode = (settle
+        && format_by_brute
+        && !report.is_trustworthy()
+        && !analysis.inverted
+        && analysis.mirrored.is_none()
+        && doc.grid.count(Module::Unknown) < doc.grid.cells().len())
+    .then(|| {
+        let best = brute_force_mirrored(&doc.grid, &func, opts).into_iter().next()?;
+        let better = best.report.blocks_verified() > report.blocks_verified()
+            && (best.report.is_trustworthy() || best.report.blocks_verified() * 2 > best.report.blocks.len());
+        better.then_some(best.mirror).flatten()
+    })
+    .flatten();
+    (Derived { func, analysis, ec, mask, layout, report, padding, format_by_brute, mirror_by_decode }, attempts)
+}
+
+impl App {
+    /// `image` is a photo to open straight away.
+    pub fn new(cc: &eframe::CreationContext<'_>, image: Option<std::path::PathBuf>) -> Self {
+        let mut app = Self::blank();
+        if let Some(path) = image {
+            app.load_path(&cc.egui_ctx, &path);
+        }
+        app
+    }
+
+    /// The app as it starts: a blank grid and no photo.
+    fn blank() -> Self {
+        let doc = Document::blank(SymbolVersion::Qr(2));
+        let opts = DecodeOptions::default();
+        let (derived, _) = derive(&doc, None, &opts, true);
+        Self {
+            doc,
+            history: History::default(),
+            photo: None,
+            view: ViewState::default(),
+            derived,
+            dirty: false,
+            opts,
+            brute: None,
+            guesses: None,
+            model: None,
+            preview: None,
+            detection: None,
+            proposals: None,
+            search: None,
+            job: None,
+            photo_generation: 0,
+            message: None,
+            settle_pending: false,
+            #[cfg(feature = "selftest")]
+            selftest: selftest::SelfTest::from_env(),
+        }
+    }
+
+    /// Bring everything that follows from the document up to it, when
+    /// the document has changed since. Called before anything reads the
+    /// derived values against the document: at the start of a frame,
+    /// again once the results of the worker threads have been taken in,
+    /// which may switch the version, and before each action is applied,
+    /// since an action before it in the same frame may have done so. The
+    /// function map, the layout and the report are then always those of
+    /// the document's version, and nothing indexes a grid of one size by
+    /// the map of another.
+    fn catch_up(&mut self) {
+        if self.dirty || self.derived.func.version != self.doc.version {
+            self.refresh();
+        }
+    }
+
+    fn refresh(&mut self) {
+        let settle = self.view.stroke.is_none();
+        let (derived, attempts) = derive(&self.doc, Some(&self.derived), &self.opts, settle);
+        self.derived = derived;
+        self.settle_pending = !settle && self.derived.format_by_brute;
+        match attempts {
+            Some(attempts) => self.brute = Some(BruteResults { attempts, stale: false }),
+            None => {
+                if let Some(brute) = &mut self.brute {
+                    brute.stale = true;
+                }
+            }
+        }
+        if self.view.selected.is_some_and(|cw| cw >= self.derived.layout.codewords.len()) {
+            self.view.selected = None;
+        }
+        if self.view.highlight_block.is_some_and(|b| b >= self.derived.layout.blocks.len()) {
+            self.view.highlight_block = None;
+        }
+        if self.view.table_block.is_some_and(|b| b >= self.derived.layout.blocks.len()) {
+            self.view.table_block = None;
+        }
+        let (width, height) = (self.derived.func.width, self.derived.func.height);
+        if self.view.hover.is_some_and(|(x, y)| x >= width || y >= height) {
+            self.view.hover = None;
+        }
+        self.dirty = false;
+    }
+
+    fn notify(&mut self, text: impl Into<String>) {
+        self.message = Some(Notice { text: text.into(), is_error: false, at: std::time::Instant::now() });
+    }
+
+    fn fail(&mut self, text: impl Into<String>) {
+        self.message = Some(Notice { text: text.into(), is_error: true, at: std::time::Instant::now() });
+    }
+
+    /// Pins in effect: those made under the current EC level.
+    fn active_pins(&self) -> Pins {
+        if self.doc.pins_ec == Some(self.derived.ec) { self.doc.pins.clone() } else { Pins::new() }
+    }
+
+    /// Record an undo point. A notice about an earlier state is dropped.
+    fn checkpoint(&mut self) {
+        self.history.checkpoint(&self.doc);
+        self.message = None;
+    }
+
+    /// Record an undo point and mark the document changed.
+    fn begin_edit(&mut self) {
+        self.checkpoint();
+        self.dirty = true;
+    }
+
+    /// Set one module, leaving fixed patterns alone when they are locked.
+    fn paint(&mut self, x: i32, y: i32, module: Module) {
+        let func = &self.derived.func;
+        if x < 0 || y < 0 || x as usize >= func.width || y as usize >= func.height {
+            return;
+        }
+        let (x, y) = (x as usize, y as usize);
+        if self.view.lock_fixed && func.expected(x, y).is_some() {
+            return;
+        }
+        if self.doc.grid.get(x, y) != module {
+            self.doc.grid.set(x, y, module);
+            self.dirty = true;
+        }
+    }
+
+    fn set_version(&mut self, version: SymbolVersion) {
+        if version == self.doc.version {
+            return;
+        }
+        self.begin_edit();
+        self.doc = self.doc.blank_like(version);
+        self.view.selected = None;
+        self.view.highlight_block = None;
+        self.view.table_block = None;
+        self.view.edit_view.auto_fit = true;
+        self.brute = None;
+        self.model = None;
+        self.preview = None;
+    }
+
+    /// Keep the modules as painted and read them as a symbol of `version`,
+    /// which must be the same size: the two QR Code models share their
+    /// sizes and fixed patterns, and only the format word and the data
+    /// layout tell them apart. Pins name codewords of the old layout and
+    /// anchors name its alignment patterns, so neither carries over.
+    fn reinterpret_as(&mut self, version: SymbolVersion) {
+        if version == self.doc.version {
+            return;
+        }
+        if (version.width(), version.height()) != (self.doc.version.width(), self.doc.version.height()) {
+            self.fail(format!("A {} {} symbol is not the size of this grid.", version.family().label(), version));
+            return;
+        }
+        self.begin_edit();
+        let grid = self.doc.grid.clone();
+        self.doc = Document { grid, ..self.doc.blank_like(version) };
+        self.view.selected = None;
+        self.view.highlight_block = None;
+        self.view.table_block = None;
+        self.brute = None;
+        self.model = None;
+        self.preview = None;
+        self.notify(format!("Reading the grid as {} version {version}.", version.family().label()));
+    }
+
+    fn set_photo(&mut self, ctx: &egui::Context, name: String, image: image::RgbaImage) {
+        let image = normalize_size(image);
+        let (width, height) = (image.width() as usize, image.height() as usize);
+        let original = image.into_raw();
+        let adjust = Adjust::default();
+        let (display, luma) = adjust.apply(&original, width, height);
+        let texture = ctx.load_texture(
+            "photo",
+            egui::ColorImage::from_rgba_unmultiplied([width, height], &display),
+            egui::TextureOptions::LINEAR,
+        );
+        let photo = Photo { name, width, height, original, adjust, luma: Arc::new(luma), texture, binarised: None };
+        // The outline, the anchors and the adjustments are of the photo
+        // they were placed on: the new photo starts without them, and no
+        // undo or redo brings another photo's back onto it. The symbol,
+        // the grid and its pins, stays as it is, with its own history.
+        self.history.photo_changed(&self.doc);
+        self.doc.corners = photo.default_corners();
+        self.doc.anchors.clear();
+        self.doc.adjust = adjust;
+        let loaded = format!(
+            "Loaded {} ({width} × {height}). Press Search whole photo to look for the symbols in it, or drag the \
+             corners loosely around the symbol and press Find in outline.",
+            photo.name
+        );
+        self.photo = Some(photo);
+        self.view.stage = Stage::Align;
+        self.view.align_view.auto_fit = true;
+        self.view.binarize_auto = true;
+        self.model = None;
+        self.preview = None;
+        self.guesses = None;
+        self.detection = None;
+        self.proposals = None;
+        self.search = None;
+        self.job = None;
+        self.photo_generation += 1;
+        // The photo is searched for symbols only when the user asks: a
+        // search takes seconds, and the outline may as well be drawn by
+        // hand.
+        self.notify(loaded);
+    }
+
+    /// Recompute the photo's luminance and texture after a change to its
+    /// adjustments.
+    fn reapply_adjust(&mut self) {
+        if let Some(photo) = &mut self.photo {
+            let (display, luma) = photo.adjust.apply(&photo.original, photo.width, photo.height);
+            photo.luma = Arc::new(luma);
+            photo.texture.set(
+                egui::ColorImage::from_rgba_unmultiplied([photo.width, photo.height], &display),
+                egui::TextureOptions::LINEAR,
+            );
+            photo.binarised = None;
+        }
+    }
+
+    /// Bring the photo up to the document's adjustments, after a change
+    /// of them or an undo that took one back. A change of the lens term
+    /// among them drops what was found in the photo as it was: see
+    /// [`Self::lens_changed`], whose notice comes back when it has one.
+    fn sync_adjust(&mut self) -> Option<String> {
+        let photo = self.photo.as_mut()?;
+        if photo.adjust == self.doc.adjust {
+            return None;
+        }
+        let lens = photo.adjust.k1 != self.doc.adjust.k1;
+        photo.adjust = self.doc.adjust;
+        self.reapply_adjust();
+        if lens { self.lens_changed() } else { None }
+    }
+
+    /// The lens term has changed, which moves every pixel of the photo:
+    /// whatever was worked out on the photo as it was lies somewhere else
+    /// now. The symbols a search listed are taken off offer, a search or
+    /// a step still under way is abandoned, and the photo counts as a new
+    /// one, so that nothing which finishes later is taken in at the old
+    /// coordinates. Returns what to tell the user, when anything was
+    /// dropped.
+    fn lens_changed(&mut self) -> Option<String> {
+        self.photo_generation += 1;
+        self.detection = None;
+        let mut dropped = Vec::new();
+        if self.proposals.take().is_some() {
+            dropped.push("the symbols found were taken off the list".to_owned());
+        }
+        if self.search.take().is_some() {
+            dropped.push("the search under way was stopped".to_owned());
+        }
+        if let Some(job) = self.job.take() {
+            dropped.push(format!("{} was stopped", job.kind.label().to_lowercase()));
+        }
+        (!dropped.is_empty()).then(|| {
+            format!(
+                "The lens setting changed, which moves every part of the photo, so {}. Run the search or the step \
+                 again.",
+                list_phrase(&dropped)
+            )
+        })
+    }
+
+    /// Set the Invert adjustment; true when it changed. The caller has
+    /// taken the undo point.
+    fn set_photo_invert(&mut self, invert: bool) -> bool {
+        if self.photo.is_none() || self.doc.adjust.invert == invert {
+            return false;
+        }
+        self.doc.adjust.invert = invert;
+        // No lens term changes here, so there is nothing to report.
+        let _ = self.sync_adjust();
+        true
+    }
+
+    fn load_path(&mut self, ctx: &egui::Context, path: &Path) {
+        match qr_forensics::imaging::photo::open(path) {
+            Ok(image) => {
+                let name = path.file_name().map_or_else(|| "image".into(), |n| n.to_string_lossy().into_owned());
+                self.set_photo(ctx, name, image);
+            }
+            Err(error) => self.fail(format!("Could not open {}: {error}", path.display())),
+        }
+    }
+
+    fn paste_image(&mut self, ctx: &egui::Context) {
+        let pasted = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image());
+        match pasted {
+            Ok(data) => {
+                let (w, h) = (data.width as u32, data.height as u32);
+                match image::RgbaImage::from_raw(w, h, data.bytes.into_owned()) {
+                    Some(image) => self.set_photo(ctx, "clipboard image".into(), image),
+                    None => self.fail("The clipboard image has an unexpected layout."),
+                }
+            }
+            Err(error) => self.fail(format!("No image on the clipboard ({error}).")),
+        }
+    }
+
+    /// Refresh the projection and the cached sampling of the photo if
+    /// anything they depend on moved.
+    fn update_preview(&mut self) {
+        // The projection is laid out for the function map in use, which
+        // must be the document's own.
+        self.catch_up();
+        let Some(photo) = &self.photo else {
+            self.model = None;
+            self.preview = None;
+            return;
+        };
+        let func = &self.derived.func;
+        let model_key = ModelKey {
+            version: self.doc.version,
+            size: (func.width, func.height),
+            corners: self.doc.corners,
+            anchors: self.doc.anchors.clone(),
+            use_anchors: self.view.use_anchors,
+        };
+        if !self.model.as_ref().is_some_and(|m| m.key == model_key) {
+            self.model = self.doc.projection(func.width, func.height, self.view.use_anchors).map(|projection| {
+                let lattice = Arc::new(projection.lattice(func.width, func.height));
+                Model { key: model_key.clone(), projection: Arc::new(projection), lattice, width: func.width, height: func.height }
+            });
+        }
+        let key = SampleKey { model: model_key, adjust: photo.adjust, params: self.view.sample };
+        if self.preview.as_ref().is_some_and(|p| p.key == key) {
+            return;
+        }
+        self.preview = self.model.as_ref().map(|model| {
+            let sampled =
+                sample_modules_with(&photo.luma, model.projection.as_ref(), func.width, func.height, self.view.sample.kernel);
+            let classified = classify(&sampled, &self.view.sample);
+            let fixed = func.fixed_agreement(&classified.to_grid(func.width, func.height));
+            SamplePreview { key, classified, fixed }
+        });
+    }
+
+    /// Find the symbol inside the outline, put the corners and anchors on
+    /// it, refine them, and read it through to text, on a thread of its
+    /// own: the decode chooses among the placements, kernels and turns
+    /// the fit alone cannot. The current family is tried first; when its
+    /// read does not decode, the other families are, as a reader tries
+    /// every symbology it knows.
+    fn find_corners(&mut self, ctx: &egui::Context) {
+        if self.job_busy() {
+            return;
+        }
+        let Some(photo) = &self.photo else {
+            self.fail("Load a photo first.");
+            return;
+        };
+        let luma = photo.luma.clone();
+        let searched_inverted = photo.adjust.invert;
+        let (version, corners, params, opts) = (self.doc.version, self.doc.corners, self.view.sample, self.opts);
+        self.start_job(ctx, JobKind::FindCorners, move || {
+            JobResult::Corners(read_inside(&luma, version, corners, &params, &opts, searched_inverted))
+        });
+    }
+
+    /// Estimate the radial lens term from the corners and anchors, and
+    /// apply it, moving the corners and anchors with the photo so that
+    /// they stay on the symbol. Never run of its own accord: the user
+    /// asks, with the corners and anchors placed.
+    fn estimate_lens(&mut self) {
+        let Some(photo) = &self.photo else {
+            self.fail("Load a photo first.");
+            return;
+        };
+        let (width, height) = (photo.width, photo.height);
+        let (w, h) = (self.derived.func.width as f64, self.derived.func.height as f64);
+        let mut pairs: Vec<([f64; 2], [f64; 2])> =
+            [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]].into_iter().zip(self.doc.corners).collect();
+        pairs.extend(self.doc.anchors.iter().map(|a| (a.anchor.at, a.anchor.center)));
+        if pairs.len() < LENS_MIN_PAIRS {
+            self.fail(format!(
+                "Estimating the lens needs the four corners and at least {} anchors on the symbol; press Find in outline \
+                 to place them, or drag the hollow handles onto their patterns.",
+                LENS_MIN_PAIRS - 4
+            ));
+            return;
+        }
+        let from = self.doc.adjust.k1;
+        match estimate_k1(width, height, from, &pairs) {
+            Some(estimate) => {
+                self.checkpoint();
+                self.doc.corners = self.doc.corners.map(|c| remap_point(c, width, height, from, estimate.k1));
+                for anchor in &mut self.doc.anchors {
+                    anchor.anchor.center = remap_point(anchor.anchor.center, width, height, from, estimate.k1);
+                }
+                self.doc.adjust.k1 = estimate.k1;
+                // Whatever else was found in the photo as it was is dropped.
+                let dropped = self.sync_adjust();
+                let mut text = format!(
+                    "Lens set to {:.3}: the corners and anchors lie {:.2} px from a plane, down from {:.2}, and were moved \
+                     with the photo. Press Refine to settle them on it.",
+                    estimate.k1, estimate.rms_after, estimate.rms_before
+                );
+                if let Some(dropped) = dropped {
+                    text.push(' ');
+                    text.push_str(&dropped);
+                }
+                self.notify(text);
+            }
+            None => self.notify(format!(
+                "No lens setting fits the corners and anchors better than the current {from:.3}, so it was left as it is."
+            )),
+        }
+    }
+
+    /// Take in what Find in outline found: adopt it, or say that nothing was.
+    /// `searched` is the family the outline was searched for first.
+    fn finish_find_corners(&mut self, found: Option<(Prepared, Option<Family>)>, searched: Family) {
+        match found {
+            Some((prepared, other_family)) => {
+                let text = self.adopt_prepared(prepared);
+                match other_family {
+                    Some(family) => self.notify(format!(
+                        "What is inside the outline reads as a {} symbol, not a {} one. {text}",
+                        family.label(),
+                        searched.label()
+                    )),
+                    None => self.notify(text),
+                }
+            }
+            None => self.fail(
+                "No finder pattern of any family was found inside the outline. Draw the outline loosely around the \
+                 whole symbol, so that its finder patterns are inside, and try again; or press Search whole \
+                 photo.",
+            ),
+        }
+    }
+
+    /// Place the corners and anchors on a symbol the search found,
+    /// refining them on a thread of its own. `searched_inverted` is the
+    /// Invert setting the search ran under.
+    fn adopt_proposal(&mut self, ctx: &egui::Context, found: Detection, searched_inverted: bool) {
+        if self.job_busy() {
+            return;
+        }
+        let Some(photo) = &self.photo else {
+            self.fail("Load a photo first.");
+            return;
+        };
+        let luma = photo.luma.clone();
+        let (version, params, func) = (self.doc.version, self.view.sample, self.derived.func.clone());
+        self.start_job(ctx, JobKind::Adopt, move || {
+            JobResult::Adopt(prepare_adoption(&luma, &func, version, found, searched_inverted, &params))
+        });
+    }
+
+    /// Refine the corners and every anchor against the photo, on a thread
+    /// of its own.
+    fn refine(&mut self, ctx: &egui::Context) {
+        if self.job_busy() {
+            return;
+        }
+        let Some(photo) = &self.photo else {
+            self.fail("Load a photo first.");
+            return;
+        };
+        let luma = photo.luma.clone();
+        let func = self.derived.func.clone();
+        let (corners, params) = (self.doc.corners, self.view.sample);
+        let anchors: Vec<Anchor> = self.doc.anchors.iter().map(|a| a.anchor).collect();
+        self.start_job(ctx, JobKind::Refine, move || {
+            JobResult::Refine(refine_outline(&luma, &func, corners, anchors, &params))
+        });
+    }
+
+    /// Take in what Refine worked out: the corners move, and every anchor
+    /// that found its pattern moves onto it.
+    fn finish_refine(&mut self, refined: Option<Refined>) {
+        let Some(Refined { refinement: refined, before, after }) = refined else {
+            self.fail("The corners do not form a usable outline.");
+            return;
+        };
+        self.checkpoint();
+        self.doc.corners = refined.corners;
+        let mut moved = 0;
+        for (old, new) in before.iter().zip(&after) {
+            if old.center != new.center {
+                moved += 1;
+                let source = self.doc.anchor_at(old.at).map_or(AnchorSource::Detected, |a| a.source);
+                self.doc.set_anchor(*new, source);
+            }
+        }
+        let (after_count, fixed, before_count) = (refined.after.0, refined.after.1, refined.before.0);
+        let change = if after_count >= before_count { "up from" } else { "down from" };
+        let mut text = if refined.inverted {
+            format!(
+                "Refined the corners: with dark and light swapped the fixed patterns match {after_count} of \
+                 {fixed}, {change} {before_count}."
+            )
+        } else {
+            format!("Refined the corners: fixed patterns match {after_count} of {fixed}, {change} {before_count}.")
+        };
+        if moved > 0 {
+            text.push_str(&format!(" {moved} of {} anchors moved onto their patterns.", after.len()));
+        }
+        if refined.inverted {
+            text.push_str(if self.photo.as_ref().is_some_and(|p| p.adjust.invert) {
+                " Invert photo looks wrong for this photo."
+            } else {
+                " This looks like a light-on-dark symbol: tick Invert photo before sampling."
+            });
+        }
+        self.notify(text);
+    }
+
+    /// Rank every version of the family on the corners, on a thread of
+    /// its own. Nothing to rank against without a photo.
+    fn rank_versions(&mut self, ctx: &egui::Context) {
+        if self.job_busy() {
+            return;
+        }
+        let Some(photo) = &self.photo else { return };
+        let luma = photo.luma.clone();
+        let (corners, family, params) = (self.doc.corners, self.doc.version.family(), self.view.sample);
+        self.start_job(ctx, JobKind::Suggest, move || {
+            JobResult::Suggest(suggest_versions(&luma, corners, family, &params))
+        });
+    }
+
+    /// Whether a job is still running, in which case say so. The buttons
+    /// that start one are disabled meanwhile, so this is only a safeguard.
+    fn job_busy(&mut self) -> bool {
+        let Some(job) = &self.job else { return false };
+        let text = format!("{} is still under way.", job.kind.label());
+        self.notify(text);
+        true
+    }
+
+    /// The step a job is running, if one is.
+    fn running(&self) -> Option<JobKind> {
+        self.job.as_ref().map(|job| job.kind)
+    }
+
+    /// Run `work` on a thread of its own; [`Self::poll_job`] takes its
+    /// result in when it arrives. The caller has checked that no job is
+    /// running.
+    fn start_job(&mut self, ctx: &egui::Context, kind: JobKind, work: impl FnOnce() -> JobResult + Send + 'static) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = work();
+            // The window may have closed meanwhile; nothing to do then.
+            let _ = sender.send(result);
+            ctx.request_repaint();
+        });
+        self.job = Some(PendingJob {
+            kind,
+            generation: self.photo_generation,
+            version: self.doc.version,
+            receiver,
+            started: std::time::Instant::now(),
+        });
+    }
+
+    /// Take in a finished job, if one has finished. A result for a photo
+    /// since replaced is dropped; so is one that means something only at
+    /// the version the job began under, when the version changed
+    /// meanwhile. A detection carries its own version, and adopting it
+    /// reckons with the document as it is now.
+    fn poll_job(&mut self) {
+        let Some(job) = &self.job else { return };
+        let result = match job.receiver.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // The thread ended without a result, which only a panic
+                // in it does: say so, rather than let the step vanish.
+                let text = format!(
+                    "{} stopped on an internal error and changed nothing. That is a fault in this program, worth \
+                     reporting with the photo; the outline, the anchors and the grid are as they were.",
+                    job.kind.label()
+                );
+                self.job = None;
+                self.fail(text);
+                return;
+            }
+        };
+        let job = self.job.take().expect("a job was pending");
+        if job.generation != self.photo_generation || self.photo.is_none() {
+            return;
+        }
+        let version_changed = self.doc.version != job.version;
+        match result {
+            JobResult::Corners(found) => self.finish_find_corners(found, job.version.family()),
+            JobResult::Adopt(prepared) => {
+                let text = self.adopt_prepared(prepared);
+                self.notify(text);
+            }
+            JobResult::Refine(_) if version_changed => self.notify(
+                "The version changed while the corners were being refined, so the result was dropped; press \
+                 Refine again.",
+            ),
+            JobResult::Refine(refined) => self.finish_refine(refined),
+            JobResult::Suggest(_) if version_changed => self.notify(
+                "The version changed while the versions were being ranked, so the ranking was dropped; press \
+                 Suggest version again.",
+            ),
+            JobResult::Suggest(guesses) => self.guesses = Some(guesses),
+        }
+    }
+
+    /// Search the whole photo for symbols of every family and offer what
+    /// is found, as a reader tries every symbology it knows. Only ever at
+    /// the user's asking.
+    fn search_symbols(&mut self, ctx: &egui::Context) {
+        let Some(photo) = &self.photo else {
+            self.fail("Load a photo first.");
+            return;
+        };
+        if self.search.is_some() {
+            self.notify("The photo is still being searched.");
+            return;
+        }
+        let photo_inverted = photo.adjust.invert;
+        let luma = photo.luma.clone();
+        let params = self.view.sample;
+        let search = self.view.search;
+        self.start_search(ctx, photo_inverted, move || find_symbols_of_every_family(&luma, &params, &search));
+    }
+
+    /// Run `work`, a search of the photo, on a thread of its own;
+    /// [`Self::poll_search`] takes in what it finds when it arrives. The
+    /// caller has checked that no search is running.
+    fn start_search(
+        &mut self,
+        ctx: &egui::Context,
+        photo_inverted: bool,
+        work: impl FnOnce() -> Vec<Detection> + Send + 'static,
+    ) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let found = work();
+            // The window may have closed meanwhile; nothing to do then.
+            let _ = sender.send(found);
+            ctx.request_repaint();
+        });
+        self.search = Some(PendingSearch {
+            generation: self.photo_generation,
+            receiver,
+            photo_inverted,
+            started: std::time::Instant::now(),
+        });
+    }
+
+    /// Take in a finished search, if one has finished. A result for a
+    /// photo since replaced is dropped.
+    fn poll_search(&mut self) {
+        let Some(search) = &self.search else { return };
+        let found = match search.receiver.try_recv() {
+            Ok(found) => found,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // The thread ended without a result, which only a panic
+                // in it does: say so, rather than let the search vanish.
+                self.search = None;
+                self.fail(
+                    "The search of the photo for symbols stopped on an internal error and found nothing. That is a \
+                     fault in this program, worth reporting with the photo; draw an outline around the symbol by \
+                     hand and press Find in outline.",
+                );
+                return;
+            }
+        };
+        let search = self.search.take().expect("a search was pending");
+        if search.generation != self.photo_generation || self.photo.is_none() {
+            return;
+        }
+        self.finish_search(found, search.photo_inverted);
+    }
+
+    /// Offer what a search of the whole photo found.
+    fn finish_search(&mut self, found: Vec<Detection>, photo_inverted: bool) {
+        if found.is_empty() {
+            self.proposals = None;
+            self.fail(
+                "No symbol of any family was found in the photo. Drag the corners loosely around the symbol and \
+                 press Find in outline.",
+            );
+            return;
+        }
+        let count = found.len();
+        // A symbol the outline was put on from the list before is still
+        // the one it lies on in the new list.
+        let adopted = self
+            .proposals
+            .as_ref()
+            .and_then(|before| proposal_in_use(before, &self.doc.corners))
+            .and_then(|_| found.iter().position(|f| same_outline(&f.corners, &self.doc.corners)));
+        self.proposals = Some(Proposals { found, photo_inverted, adopted });
+        self.view.stage = Stage::Align;
+        let what = if count == 1 { "Found 1 symbol".to_owned() } else { format!("Found {count} symbols") };
+        let how = "outlined on the photo. Pick one under Alignment, or click its outline, to place the corners on it.";
+        self.notify(format!("{what}, {how}"));
+    }
+
+    /// Take a detection a job refined and made ready as the document's
+    /// outline and anchors, and adopt its version when the symbol's own
+    /// bits or a clean fit vouch for it, or when it is of another family.
+    /// A symbol that read light on dark has the photo inverted for it, as
+    /// a reader retries inverted of its own accord. Returns the notice to
+    /// show.
+    fn adopt_prepared(&mut self, prepared: Prepared) -> String {
+        let Prepared { found, agreement: (matching, fixed), guesses, searched_inverted, read } = prepared;
+        let Some(photo) = &self.photo else { return String::new() };
+        // Whether the version found is adopted is judged against the
+        // document as it is now, which may have changed while the job
+        // ran. The ranking the job made serves when it was made for the
+        // family in use; otherwise, which takes a change of family during
+        // the job, it is made here.
+        let decoded = read.as_ref().is_some_and(|r| r.trustworthy);
+        let adopt = adopts_version(&found, self.doc.version, decoded);
+        let guesses = (found.version != self.doc.version && !adopt).then(|| {
+            let family = self.doc.version.family();
+            match guesses {
+                Some((ranked, guesses)) if ranked == family => guesses,
+                _ => suggest_versions(&photo.luma, found.corners, family, &self.view.sample),
+            }
+        });
+        self.checkpoint();
+        if adopt {
+            self.doc = self.doc.blank_like(found.version);
+            self.view.selected = None;
+            self.view.highlight_block = None;
+            self.view.table_block = None;
+            self.view.edit_view.auto_fit = true;
+            self.brute = None;
+            self.guesses = None;
+            self.model = None;
+            self.preview = None;
+            self.dirty = true;
+        }
+        // The symbol read light on dark against the photo as it was
+        // searched: invert the photo for it, so that the sample preview and
+        // Sample read it the right way round.
+        let want_inverted = searched_inverted ^ found.inverted;
+        let photo_flipped = self.set_photo_invert(want_inverted);
+        self.doc.corners = found.corners;
+        self.doc.anchors = if adopt || found.version == self.doc.version {
+            found.anchors.iter().map(|&anchor| DocAnchor { anchor, source: AnchorSource::Detected }).collect()
+        } else {
+            Vec::new()
+        };
+
+        let plural = |n: usize, what: &str| if n == 1 { format!("1 {what}") } else { format!("{n} {what}s") };
+        let mut parts = vec![plural(found.count(AnchorKind::Finder), "finder pattern")];
+        let alignments = found.count(AnchorKind::Alignment);
+        if alignments > 0 {
+            parts.push(plural(alignments, "alignment pattern"));
+        }
+        if found.count(AnchorKind::FinderSub) > 0 {
+            parts.push("the finder sub-pattern".into());
+        }
+        let timings = found.count(AnchorKind::Timing);
+        if timings > 0 {
+            parts.push(plural(timings, "timing module"));
+        }
+        let edges = found.count(AnchorKind::Edge);
+        if edges > 0 {
+            parts.push(plural(edges, "point along a bowed edge"));
+        }
+        let what = list_phrase(&parts);
+        let polarity = if found.inverted { " with dark and light swapped" } else { "" };
+        let mut text = format!("Found {what}; fixed patterns match {matching} of {fixed}{polarity}.");
+        if let Some(retry) = found.retry {
+            text.push_str(&format!(" Found only with {retry}."));
+        }
+        if found.partial() > 0 {
+            text.push_str(&format!(" {} partly damaged, placed from the undamaged part.", plural(found.partial(), "pattern")));
+        }
+        let inferred = found.anchors.iter().filter(|a| a.inferred).count();
+        if inferred > 0 {
+            text.push_str(&format!(" {} not found and placed between neighbours.", plural(inferred, "alignment pattern")));
+        }
+        if !found.edged_corners.is_empty() {
+            text.push_str(&format!(" {} placed by tracing the symbol's edge.", plural(found.edged_corners.len(), "corner")));
+        }
+        match found.info.named_version {
+            // A word read outright confirms; one that took correcting
+            // only names, as it would beside print that is no symbol.
+            Some(named) if named == found.version => {
+                let what = if found.version.family() == Family::Qr { "version" } else { "format" };
+                let says = if found.version_confirmed() { "confirms" } else { "names" };
+                text.push_str(&format!(" The {what} information {says} the version."));
+            }
+            Some(named) => text.push_str(&format!(
+                " The symbol's own information names version {named}, but its fixed patterns did not fit there."
+            )),
+            None => {}
+        }
+        if adopt {
+            text.push_str(&format!(" Switched to version {}, which the photo fits.", found.version));
+        }
+        if let Some(guesses) = guesses {
+            text.push_str(&format!(
+                " Looks like version {} rather than {}: pick it under Suggest version.",
+                found.version, self.doc.version
+            ));
+            self.guesses = Some(guesses);
+        }
+        if found.turns != 0 {
+            text.push_str(" The outline was turned so that TL is the symbol's own top left.");
+        }
+        if let Some(read) = read {
+            text.push_str(&format!(
+                " Read through: {} of {} blocks verified{}.",
+                read.verified,
+                read.blocks,
+                if read.trustworthy { ", the message decodes" } else { "" }
+            ));
+            if let Some(other) = read.reinterpreted {
+                text.push_str(&format!(" The format bits name {}, and the grid reads as one.", other.family().label()));
+            }
+            // The kernel and threshold rule of a read that decoded are
+            // the ones that read this photo, and Sampling takes them
+            // over. Those of a read that did not are only the best of
+            // attempts that all failed, and say nothing: the settings
+            // stay as the user has them.
+            if read.trustworthy && read.kernel != self.view.sample.kernel {
+                self.view.sample.kernel = read.kernel;
+                text.push_str(&format!(
+                    " Only the {} sampling kernel decoded it, so Sampling now uses that.",
+                    read.kernel.label().to_lowercase()
+                ));
+            }
+            if read.trustworthy && read.local != self.view.sample.local {
+                self.view.sample.local = read.local;
+                text.push_str(if read.local {
+                    " Only the local threshold decoded it, so Sampling now uses that."
+                } else {
+                    " Only one threshold for the whole symbol decoded it, so Sampling now uses that instead of \
+                     the local one."
+                });
+            }
+        }
+        if found.mirrored {
+            text.push_str(if found.mirrored_by_decode {
+                " The photo shows the symbol mirrored, as from the back: its format bits were unreadable, but \
+                 only the mirror image decodes, so the corners were placed in mirror order."
+            } else {
+                " The photo shows the symbol mirrored, as from the back: the corners were placed in mirror order, so \
+                 the grid reads it the right way round."
+            });
+        }
+        if photo_flipped {
+            text.push_str(if want_inverted {
+                " This is a light-on-dark symbol, so Invert photo was turned on."
+            } else {
+                " Invert photo looked wrong for this photo and was turned off."
+            });
+        } else if found.inverted && want_inverted {
+            text.push_str(" This is a light-on-dark symbol, read with Invert photo on.");
+        }
+        self.detection = Some(found);
+        text
+    }
+
+    fn apply(&mut self, ctx: &egui::Context, action: Action) {
+        // An edit made on the canvas this frame, or an action before
+        // this one, may have left the document ahead of what follows
+        // from it.
+        self.catch_up();
+        match action {
+            Action::OpenImage => {
+                let picked = rfd::FileDialog::new()
+                    .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"])
+                    .pick_file();
+                if let Some(path) = picked {
+                    self.load_path(ctx, &path);
+                }
+            }
+            Action::PasteImage => self.paste_image(ctx),
+            Action::ClosePhoto => {
+                self.history.photo_changed(&self.doc);
+                self.photo = None;
+                self.model = None;
+                self.preview = None;
+                self.guesses = None;
+                self.detection = None;
+                self.proposals = None;
+                self.search = None;
+                self.job = None;
+                self.photo_generation += 1;
+                self.view.stage = Stage::Edit;
+            }
+            Action::NewBlank => {
+                self.begin_edit();
+                self.doc = self.doc.blank_like(self.doc.version);
+                self.brute = None;
+            }
+            Action::SetVersion(version) => self.set_version(version),
+            Action::ReinterpretAs(version) => self.reinterpret_as(version),
+            Action::Undo => {
+                if self.history.undo(&mut self.doc) {
+                    self.dirty = true;
+                    self.view.edit_view.auto_fit |= self.doc.version != self.derived.func.version;
+                    if let Some(text) = self.sync_adjust() {
+                        self.notify(text);
+                    }
+                }
+            }
+            Action::Redo => {
+                if self.history.redo(&mut self.doc) {
+                    self.dirty = true;
+                    self.view.edit_view.auto_fit |= self.doc.version != self.derived.func.version;
+                    if let Some(text) = self.sync_adjust() {
+                        self.notify(text);
+                    }
+                }
+            }
+            Action::FillFixed => {
+                self.begin_edit();
+                self.derived.func.fill_fixed(&mut self.doc.grid);
+            }
+            Action::ClearData => {
+                self.begin_edit();
+                self.doc.grid = self.derived.func.blank_grid();
+            }
+            Action::Transform(transform) => {
+                self.begin_edit();
+                let (width, height) = (self.doc.grid.width(), self.doc.grid.height());
+                self.doc.grid = match transform {
+                    Transform::RotateCw => self.doc.grid.rotated_cw(),
+                    Transform::Rotate180 => self.doc.grid.rotated_180(),
+                    Transform::Mirror(mirror) => self.doc.grid.mirrored(mirror),
+                    Transform::Invert => self.doc.grid.inverted(),
+                    Transform::Symmetry(symmetry) => self.doc.grid.symmetric(symmetry),
+                    Transform::SymmetryInverted(symmetry) => self.doc.grid.symmetric(symmetry).inverted(),
+                };
+                let mut notes = Vec::new();
+                // The outline and the anchors say where the grid's
+                // modules lie in the photo, and the modules have just
+                // moved: they move with them, so that the photo under
+                // the grid, and whatever is sampled from it next, is
+                // still the photo of these modules. The corner of the
+                // photo's symbol that was the grid's top left becomes
+                // whichever corner the turn takes it to, and an anchor
+                // names the module its pattern has gone to. One that
+                // lands where the version has no pattern of its kind, as
+                // a finder pattern turned into the corner without one
+                // does, has no handle there and nothing to be refined
+                // against, and goes.
+                if let Some(symmetry) = transform.symmetry() {
+                    self.doc.corners = symmetry.map_corners(self.doc.corners);
+                    let sites = anchor_sites(&self.derived.func);
+                    let before = self.doc.anchors.len();
+                    self.doc.anchors = std::mem::take(&mut self.doc.anchors)
+                        .into_iter()
+                        .filter_map(|mut anchor| {
+                            let at = symmetry.map_point(width, height, anchor.anchor.at);
+                            anchor.anchor.at = at;
+                            // A point traced along the edge is on the
+                            // edge wherever the turn takes it.
+                            let sited = anchor.anchor.kind == AnchorKind::Edge
+                                || sites.iter().any(|site| {
+                                    site.kind == anchor.anchor.kind
+                                        && (site.at[0] - at[0]).abs() < 1e-6
+                                        && (site.at[1] - at[1]).abs() < 1e-6
+                                });
+                            sited.then_some(anchor)
+                        })
+                        .collect();
+                    let dropped = before - self.doc.anchors.len();
+                    if dropped > 0 {
+                        let what = if dropped == 1 { "1 anchor was".to_owned() } else { format!("{dropped} anchors were") };
+                        notes.push(format!(
+                            "The outline and anchors were turned with the grid. {what} removed: the turn left no \
+                             pattern of the same kind underneath."
+                        ));
+                    }
+                }
+                // Pins assert values of codewords whose modules have just
+                // moved or changed colour, so they no longer mean anything.
+                if !self.doc.pins.is_empty() {
+                    let count = self.doc.pins.len();
+                    self.doc.pins.clear();
+                    self.doc.pins_ec = None;
+                    notes.push(format!("Removed {count} pins: they referred to the grid before the transform."));
+                }
+                if !notes.is_empty() {
+                    self.notify(notes.join(" "));
+                }
+            }
+            Action::Sample { only_unknown } => {
+                self.update_preview();
+                if self.preview.is_none() {
+                    self.fail("Load a photo and place the corners first.");
+                    return;
+                }
+                // One undo point takes back the modules and any inversion
+                // of the photo made for them.
+                self.begin_edit();
+                // The fixed patterns reading inverted means a light-on-dark
+                // symbol, or an Invert setting that is wrong for the photo:
+                // either way the photo is inverted before sampling, as a
+                // reader retries inverted of its own accord.
+                let mut flipped = None;
+                if self.view.auto_invert && self.preview.as_ref().is_some_and(|p| looks_inverted(p.fixed)) {
+                    let invert = !self.doc.adjust.invert;
+                    if self.set_photo_invert(invert) {
+                        self.update_preview();
+                        flipped = Some(invert);
+                    }
+                }
+                let Some(preview) = &self.preview else {
+                    self.fail("Load a photo and place the corners first.");
+                    return;
+                };
+                let classified = preview.classified.clone();
+                let inverted = looks_inverted(preview.fixed);
+                let photo_inverted = self.doc.adjust.invert;
+                let func = self.derived.func.clone();
+                // The preview is keyed on the function map's size, so
+                // this cannot differ; were it ever to, the modules read
+                // would be those of another grid, and none is taken.
+                if classified.modules.len() != func.width * func.height {
+                    self.fail("The sample of the photo is not of this grid's size; move a corner and sample again.");
+                    return;
+                }
+                // The fixed patterns as the photo shows them are the one
+                // thing that says whether the outline lies on the symbol
+                // the right way round. Locked, they would be painted as
+                // specified, and a grid sampled a quarter turn out, or
+                // from the back, would look sound and decode to nothing
+                // with no word of why. So they are judged as sampled
+                // first, and when they fit the grid turned or reflected
+                // they are left as sampled: the grid then shows it, and
+                // the Paint section offers the transform that puts it
+                // right, which takes the outline with it.
+                let turned = analyze(&classified.to_grid(func.width, func.height), &func).orientation;
+                let lock_fixed = self.view.lock_fixed && turned.is_none();
+                let mut changed = 0;
+                for y in 0..func.height {
+                    for x in 0..func.width {
+                        let current = self.doc.grid.get(x, y);
+                        if only_unknown && current != Module::Unknown {
+                            continue;
+                        }
+                        let i = y * func.width + x;
+                        match func.expected(x, y) {
+                            Some(dark) if lock_fixed => {
+                                if current != Module::from_dark(dark) {
+                                    self.doc.grid.set(x, y, Module::from_dark(dark));
+                                    changed += 1;
+                                }
+                            }
+                            _ => {
+                                changed += usize::from(classified.modules[i] != current);
+                                // Recorded even when the colour agrees: the
+                                // reliability is new information.
+                                self.doc.grid.set_sampled(x, y, classified.modules[i], classified.reliability[i]);
+                            }
+                        }
+                    }
+                }
+                self.view.stage = Stage::Edit;
+                let mut text = format!("Sampled the photo: {changed} modules changed. Check them against the photo.");
+                match flipped {
+                    Some(true) => text.push_str(
+                        " This is a light-on-dark symbol: its fixed patterns read inverted, so Invert photo was turned \
+                         on first. Untick it to override.",
+                    ),
+                    Some(false) => text.push_str(
+                        " The fixed patterns read inverted with Invert photo on, so it was turned off first. Tick it \
+                         again to override.",
+                    ),
+                    None => {}
+                }
+                if inverted {
+                    text.push_str(if photo_inverted {
+                        " The fixed patterns read inverted: Invert photo looks wrong for this photo. Untick it and \
+                         sample again."
+                    } else {
+                        " The fixed patterns read inverted: this looks like a light-on-dark symbol. Tick Invert photo \
+                         and sample again."
+                    });
+                }
+                if let Some(orientation) = turned {
+                    let (matching, known) = orientation.agreement;
+                    let how = if orientation.inverted { ", with dark and light swapped" } else { "" };
+                    text.push_str(&format!(
+                        " The outline is turned on the symbol: the fixed patterns fit after \"{}\"{how} ({matching} of \
+                         {known} read right).",
+                        orientation.symmetry.label()
+                    ));
+                    text.push_str(if only_unknown {
+                        " Only unknown modules were sampled, so the grid may not show it. Move the corners round by \
+                         hand, or use Sample all and then the button under Paint."
+                    } else if self.view.lock_fixed {
+                        " The fixed patterns were left as sampled, not locked, so that the grid shows it. Use the \
+                         button under Paint to turn the grid and the outline together."
+                    } else {
+                        " Use the button under Paint to turn the grid and the outline together."
+                    });
+                }
+                self.notify(text);
+            }
+            Action::SuggestVersions => self.rank_versions(ctx),
+            Action::ResetCorners => {
+                if let Some(photo) = &self.photo {
+                    let corners = photo.default_corners();
+                    self.checkpoint();
+                    self.doc.corners = corners;
+                    self.doc.anchors.clear();
+                    self.detection = None;
+                }
+            }
+            Action::ClearAnchors => {
+                if !self.doc.anchors.is_empty() {
+                    self.checkpoint();
+                    self.doc.anchors.clear();
+                }
+            }
+            Action::FindCorners => self.find_corners(ctx),
+            Action::FindSymbols => self.search_symbols(ctx),
+            Action::UseProposal(i) => {
+                let proposal = self.proposals.as_ref().and_then(|p| p.found.get(i).map(|f| (f.clone(), p.photo_inverted)));
+                let Some((found, photo_inverted)) = proposal else {
+                    self.fail("That symbol is no longer in the list; press Search whole photo again.");
+                    return;
+                };
+                if let Some(proposals) = &mut self.proposals {
+                    proposals.adopted = Some(i);
+                }
+                self.adopt_proposal(ctx, found, photo_inverted);
+            }
+            Action::ClearProposals => self.proposals = None,
+            Action::RefineCorners => self.refine(ctx),
+            Action::SetAdjust(adjust) => {
+                if self.doc.adjust != adjust {
+                    self.doc.adjust = adjust;
+                    if let Some(text) = self.sync_adjust() {
+                        self.notify(text);
+                    }
+                }
+            }
+            Action::EstimateLens => self.estimate_lens(),
+            Action::SetFormat(format) => {
+                if self.doc.format != format {
+                    self.begin_edit();
+                    self.doc.format = format;
+                }
+            }
+            Action::BruteForce => {
+                let pins = self.active_pins();
+                let attempts = brute_force(
+                    &self.doc.grid,
+                    &self.derived.func,
+                    Some((self.derived.ec, &pins)),
+                    &self.opts,
+                );
+                self.brute = Some(BruteResults { attempts, stale: false });
+            }
+            Action::Pin(cw, value) => {
+                self.begin_edit();
+                if self.doc.pins_ec != Some(self.derived.ec) {
+                    self.doc.pins.clear();
+                    self.doc.pins_ec = Some(self.derived.ec);
+                }
+                self.doc.pins.insert(cw, Pin::full(value, PinSource::Manual));
+            }
+            Action::Unpin(cw) => {
+                self.begin_edit();
+                self.doc.pins.remove(&cw);
+            }
+            Action::ApplyPadding => {
+                let pins = self.active_pins();
+                let recovery =
+                    recover_padding(&self.doc.grid, &self.derived.layout, self.derived.mask, &pins, &self.opts);
+                match recovery {
+                    Some(recovery) => {
+                        self.begin_edit();
+                        self.doc.pins = recovery.pins;
+                        self.doc.pins_ec = Some(self.derived.ec);
+                        let check = if recovery.confirmed {
+                            "segment headers confirm where the data ends"
+                        } else {
+                            "not confirmed by segment headers"
+                        };
+                        let total = self.derived.layout.blocks.len();
+                        let progress = if recovery.solved_after > recovery.solved_before {
+                            format!("{} of {total} blocks solved, up from {}", recovery.solved_after, recovery.solved_before)
+                        } else {
+                            format!("still {} of {total} blocks solved", recovery.solved_after)
+                        };
+                        self.notify(format!("Padding recovery pinned {} codewords: {progress}; {check}.", recovery.added));
+                    }
+                    None => self.fail("No standard padding could be located in this symbol."),
+                }
+            }
+            Action::ClearPaddingPins => {
+                self.begin_edit();
+                clear_padding_pins(&mut self.doc.pins);
+            }
+            Action::ClearAllPins => {
+                self.begin_edit();
+                self.doc.pins.clear();
+            }
+            Action::SetCharset(charset) => {
+                self.opts.charset = charset;
+                self.dirty = true;
+            }
+            Action::SetBitLevel(enabled) => {
+                self.opts.bit_level = enabled;
+                self.dirty = true;
+            }
+            Action::SetReliability(enabled) => {
+                self.opts.reliability = enabled;
+                self.dirty = true;
+            }
+            Action::ApplyCorrections => {
+                let repaired =
+                    repaired_grid(&self.doc.grid, &self.derived.layout, self.derived.mask, &self.derived.report);
+                let changed = repaired.cells().iter().zip(self.doc.grid.cells()).filter(|(a, b)| a != b).count();
+                self.begin_edit();
+                self.doc.grid = repaired;
+                let unsolved = self.derived.report.blocks.len() - self.derived.report.blocks_solved();
+                let rest = if unsolved > 0 {
+                    format!(" The modules of {unsolved} unsolved blocks are as they were.")
+                } else {
+                    String::new()
+                };
+                self.notify(format!("Applied corrections: {changed} modules changed.{rest}"));
+            }
+            Action::ExportImage => {
+                let picked = rfd::FileDialog::new()
+                    .add_filter("PNG image", &["png"])
+                    .set_file_name("repaired.png")
+                    .save_file();
+                let Some(path) = picked else { return };
+                self.export_image(&path);
+            }
+            Action::AddToSequence => {
+                let label = self.photo.as_ref().map_or_else(|| "grid".to_owned(), |p| p.name.clone());
+                match Part::from_report(&self.derived.report, label) {
+                    Some(part) => {
+                        let (index, total) = (part.index, part.total);
+                        let replaced = self.view.sequence.add(part);
+                        let what = if replaced { "replaced" } else { "added" };
+                        self.notify(format!(
+                            "Part {index} of {total} {what} to the sequence; {} of {total} parts collected.",
+                            self.view.sequence.len()
+                        ));
+                    }
+                    None => self.fail("This symbol carries no structured append header."),
+                }
+            }
+            Action::RemoveFromSequence(index) => self.view.sequence.remove(index),
+            Action::ClearSequence => self.view.sequence.clear(),
+            Action::SaveBytes => {
+                let Some(bytes) = self.derived.report.text.raw_bytes() else {
+                    self.fail("Some bytes of the message are unreadable; nothing to save yet.");
+                    return;
+                };
+                let picked = rfd::FileDialog::new().set_file_name("message.bin").save_file();
+                let Some(path) = picked else { return };
+                match std::fs::write(&path, &bytes) {
+                    Ok(()) => self.notify(format!("Saved {} bytes to {}.", bytes.len(), path.display())),
+                    Err(error) => self.fail(format!("Could not save {}: {error}", path.display())),
+                }
+            }
+            Action::DismissNotice => self.message = None,
+            Action::FitView => match self.view.stage {
+                Stage::Align => self.view.align_view.auto_fit = true,
+                Stage::Edit => self.view.edit_view.auto_fit = true,
+            },
+            Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+        }
+    }
+
+    /// Save the grid as error correction leaves it as a PNG at `path`,
+    /// and say what was saved: a symbol whose every block solved is the
+    /// repaired one, which an ordinary reader can scan, and anything
+    /// short of that is said to be.
+    fn export_image(&mut self, path: &Path) {
+        let repaired = repaired_grid(&self.doc.grid, &self.derived.layout, self.derived.mask, &self.derived.report);
+        let (w, h, pixels) = render_rgba(&repaired, EXPORT_SCALE, quiet_zone(self.doc.version));
+        let saved = image::save_buffer(path, &pixels, w as u32, h as u32, image::ExtendedColorType::Rgba8);
+        match saved {
+            Ok(()) => {
+                let unknown = repaired.count(Module::Unknown);
+                let mut note = if unknown > 0 { format!(" {unknown} unknown modules are grey.") } else { String::new() };
+                let (solved, total) = (self.derived.report.blocks_solved(), self.derived.report.blocks.len());
+                if solved < total {
+                    note.push_str(&format!(
+                        " Not every block is solved ({solved} of {total}), and the modules of the rest are as painted: \
+                         this is not yet the repaired symbol, and a reader may well not scan it."
+                    ));
+                }
+                self.notify(format!("Saved {} ({w} × {h}).{note}", path.display()));
+            }
+            Err(error) => self.fail(format!("Could not save {}: {error}", path.display())),
+        }
+    }
+
+    fn shortcuts(&mut self, ui: &egui::Ui, actions: &mut Vec<Action>) {
+        // Redo first: the undo shortcut also matches with Shift held.
+        let (redo, undo, open) = ui.input_mut(|i| {
+            (i.consume_shortcut(&REDO), i.consume_shortcut(&UNDO), i.consume_shortcut(&OPEN))
+        });
+        if redo {
+            actions.push(Action::Redo);
+        } else if undo {
+            actions.push(Action::Undo);
+        }
+        if open {
+            actions.push(Action::OpenImage);
+        }
+        if ui.ctx().egui_wants_keyboard_input() {
+            return;
+        }
+        ui.input(|i| {
+            if i.modifiers.command || i.modifiers.ctrl || i.modifiers.alt {
+                return;
+            }
+            for (key, ink) in
+                [(egui::Key::Num1, Module::Dark), (egui::Key::Num2, Module::Light), (egui::Key::Num3, Module::Unknown)]
+            {
+                if i.key_pressed(key) {
+                    self.view.ink = ink;
+                }
+            }
+            for (key, tool) in [(egui::Key::B, Tool::Brush), (egui::Key::R, Tool::Rect), (egui::Key::I, Tool::Inspect)] {
+                if i.key_pressed(key) {
+                    self.view.tool = tool;
+                }
+            }
+            if i.key_pressed(egui::Key::X) {
+                self.view.ink = self.view.ink.inverted();
+            }
+            if i.key_pressed(egui::Key::F) {
+                actions.push(Action::FitView);
+            }
+            if i.key_pressed(egui::Key::Escape) {
+                self.view.selected = None;
+                self.view.highlight_block = None;
+            }
+        });
+    }
+
+    fn menu_bar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let shortcut = |ui: &egui::Ui, text: &str, shortcut: &egui::KeyboardShortcut| {
+            egui::Button::new(text.to_owned()).shortcut_text(ui.ctx().format_shortcut(shortcut))
+        };
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("File", |ui| {
+                if ui.add(shortcut(ui, "Open Image…", &OPEN)).clicked() {
+                    actions.push(Action::OpenImage);
+                }
+                if ui.button("Paste Image from Clipboard").clicked() {
+                    actions.push(Action::PasteImage);
+                }
+                if ui.add_enabled(self.photo.is_some(), egui::Button::new("Close Image")).clicked() {
+                    actions.push(Action::ClosePhoto);
+                }
+                ui.separator();
+                if ui.button("New Blank Grid").clicked() {
+                    actions.push(Action::NewBlank);
+                }
+                ui.separator();
+                if ui.button("Export Repaired Image…").clicked() {
+                    actions.push(Action::ExportImage);
+                }
+                ui.separator();
+                if ui.button("Quit").clicked() {
+                    actions.push(Action::Quit);
+                }
+            });
+            ui.menu_button("Edit", |ui| {
+                if ui.add_enabled(self.history.can_undo(&self.doc), shortcut(ui, "Undo", &UNDO)).clicked() {
+                    actions.push(Action::Undo);
+                }
+                if ui.add_enabled(self.history.can_redo(&self.doc), shortcut(ui, "Redo", &REDO)).clicked() {
+                    actions.push(Action::Redo);
+                }
+                ui.separator();
+                if ui.button("Fill Fixed Patterns").clicked() {
+                    actions.push(Action::FillFixed);
+                }
+                if ui.button("Clear Everything Else to Unknown").clicked() {
+                    actions.push(Action::ClearData);
+                }
+                if ui.button("Apply Corrections").clicked() {
+                    actions.push(Action::ApplyCorrections);
+                }
+                ui.separator();
+                let square = self.doc.version.family() != Family::Rmqr;
+                if ui.add_enabled(square, egui::Button::new("Rotate 90° Clockwise")).clicked() {
+                    actions.push(Action::Transform(Transform::RotateCw));
+                }
+                if ui.button("Rotate 180°").clicked() {
+                    actions.push(Action::Transform(Transform::Rotate180));
+                }
+                for &mirror in self.doc.version.mirrors() {
+                    if ui.button(mirror.label()).on_hover_text("For a symbol seen from the back").clicked() {
+                        actions.push(Action::Transform(Transform::Mirror(mirror)));
+                    }
+                }
+                if square && ui.button(Symmetry::RotateCcw.label()).clicked() {
+                    actions.push(Action::Transform(Transform::Symmetry(Symmetry::RotateCcw)));
+                }
+                if ui.button("Swap Dark and Light").clicked() {
+                    actions.push(Action::Transform(Transform::Invert));
+                }
+                ui.separator();
+                if ui.add_enabled(!self.doc.pins.is_empty(), egui::Button::new("Remove All Pins")).clicked() {
+                    actions.push(Action::ClearAllPins);
+                }
+            });
+            ui.menu_button("View", |ui| {
+                if ui.button("Fit to Window    F").clicked() {
+                    actions.push(Action::FitView);
+                }
+                ui.checkbox(&mut self.view.grid_lines, "Grid Lines");
+                ui.separator();
+                ui.label("Overlay");
+                for overlay in Overlay::ALL {
+                    ui.radio_value(&mut self.view.overlay, overlay, overlay.label());
+                }
+            });
+        });
+    }
+
+    fn status_bar(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        ui.horizontal(|ui| {
+            // What runs on other threads, with how long it has run; a job
+            // and a search may run side by side.
+            let mut running = Vec::new();
+            if let Some(job) = &self.job {
+                running.push(format!("{}… {:.0} s", job.kind.label(), job.started.elapsed().as_secs_f32()));
+            }
+            if let Some(search) = &self.search {
+                running.push(format!(
+                    "Searching the photo for symbols of every family… {:.0} s",
+                    search.started.elapsed().as_secs_f32()
+                ));
+            }
+            if !running.is_empty() {
+                ui.spinner();
+                ui.label(running.join("  ·  "));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+            } else if let Some((x, y)) = self.view.hover
+                && self.view.stage == Stage::Edit
+            {
+                ui.monospace(canvas::describe_module(&self.derived, &self.doc, x, y));
+            } else {
+                ui.weak("Scroll to pan · pinch or ⌘-scroll to zoom · 1/2/3 ink · B/R/I tool · hold H for the photo");
+            }
+            let Some(notice) = &self.message else { return };
+            // Errors stay until dismissed or the next edit; other notices fade.
+            let age = notice.at.elapsed().as_secs_f32();
+            if !notice.is_error {
+                if age >= NOTICE_SECONDS {
+                    actions.push(Action::DismissNotice);
+                    return;
+                }
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs_f32(NOTICE_SECONDS - age));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("×").on_hover_text("Dismiss").clicked() {
+                    actions.push(Action::DismissNotice);
+                }
+                let color = if notice.is_error { ui.visuals().error_fg_color } else { ui.visuals().text_color() };
+                ui.add(egui::Label::new(egui::RichText::new(&notice.text).color(color)).truncate());
+            });
+        });
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.show(ui);
+    }
+}
+
+impl App {
+    /// One frame: take in what happened since the last, lay out the
+    /// panels, and apply what the user asked for in them.
+    fn show(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let mut actions = Vec::new();
+
+        for file in ui.input(|i| i.raw.dropped_files.clone()) {
+            let path = file.path().to_owned();
+            self.load_path(&ctx, &path);
+        }
+        self.shortcuts(ui, &mut actions);
+        #[cfg(feature = "selftest")]
+        self.selftest_tick(ui, &mut actions);
+        if self.settle_pending && self.view.stroke.is_none() {
+            self.dirty = true;
+        }
+        self.catch_up();
+        self.poll_search();
+        self.poll_job();
+        // A result just taken in may have switched the version: what
+        // follows from the document is brought up to it before anything
+        // is laid out or drawn from the two together.
+        self.catch_up();
+        self.update_preview();
+
+        egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui, &mut actions));
+        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui, &mut actions));
+        egui::Panel::left("tools").default_size(250.0).size_range(210.0..=360.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                tools_panel::show(ui, self, &mut actions);
+            });
+        });
+        egui::Panel::right("inspector").default_size(400.0).size_range(300.0..=640.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                inspector::show(ui, self, &mut actions);
+            });
+        });
+        egui::CentralPanel::default().show(ui, |ui| canvas::show(ui, self, &mut actions));
+
+        for action in actions {
+            self.apply(&ctx, action);
+        }
+        if self.dirty {
+            ctx.request_repaint();
+        }
+    }
+}
+
+/// Short name for an EC level in the context of a version.
+pub(crate) fn ec_name(version: SymbolVersion, ec: EcLevel) -> &'static str {
+    version.ec_label(ec)
+}
+
+/// Share of fixed modules a detection of another family must read right
+/// for Find in outline to take it when the current family finds nothing, and
+/// the share of the outline's area it must fill.
+const OTHER_FAMILY_SCORE: f64 = 0.8;
+const OTHER_FAMILY_FILL: f64 = 0.25;
+
+/// The version a search of a family starts from: a middling one, from
+/// which the detector tries the versions the finder spacing suggests.
+pub(crate) fn family_start(family: Family) -> SymbolVersion {
+    match family {
+        Family::Qr => SymbolVersion::Qr(2),
+        Family::Micro => SymbolVersion::Micro(2),
+        Family::Rmqr => SymbolVersion::Rmqr(11),
+        Family::Model1 => SymbolVersion::Model1(2),
+    }
+}
+
+/// The slow part of Find in outline: the symbol inside the outline read
+/// through to text, as [`read_outline_of_any_family`] reads it, and made
+/// ready to adopt. The family it was found under comes back with it when
+/// that is not the one asked about.
+fn read_inside(
+    luma: &Luma,
+    version: SymbolVersion,
+    corners: [[f64; 2]; 4],
+    params: &SampleParams,
+    opts: &DecodeOptions,
+    searched_inverted: bool,
+) -> Option<(Prepared, Option<Family>)> {
+    let (read, other) = read_outline_of_any_family(luma, version, corners, params, opts)?;
+    let asked = other.map_or(version, family_start);
+    Some((prepared_from_read(luma, asked, read, searched_inverted, params), other))
+}
+
+/// Read the symbol inside an outline drawn loosely around it, as one of
+/// `version`'s family first and, when that read does not decode, as one
+/// of the other families too, as a reader tries every symbology it knows;
+/// the window's Find in outline and the command line's `--outline` both read
+/// an outline this way. The family the read was made under comes back
+/// with it when that is not `version`'s. `None` when no family finds a
+/// symbol there at all.
+///
+/// A read of `version`'s family that decodes is the answer, and nothing
+/// else is tried. Otherwise another family is only taken on good
+/// evidence: a message that decodes, or its own bits naming the version
+/// and a clean fit, over a fair share of the outline. Every finder
+/// pattern of a QR Code passes for a Micro QR symbol of its own, and
+/// reads well as one, but fills only a corner of an outline drawn around
+/// the whole symbol. Of the reads that did not decode, the one asked
+/// about and any other that passed that bar, the one with the most to
+/// show for itself is kept: see [`standing`].
+pub(crate) fn read_outline_of_any_family(
+    luma: &Luma,
+    version: SymbolVersion,
+    corners: [[f64; 2]; 4],
+    params: &SampleParams,
+    opts: &DecodeOptions,
+) -> Option<(ReadResult, Option<Family>)> {
+    let own = read_outline(luma, version, corners, params, opts);
+    if own.as_ref().is_some_and(ReadResult::is_trustworthy) {
+        return own.map(|read| (read, None));
+    }
+    let current = version.family();
+    let mut best: Option<(ReadResult, Option<Family>)> = own.map(|read| (read, None));
+    for family in Family::SEARCHED.into_iter().filter(|&f| f != current) {
+        let Some(read) = read_outline(luma, family_start(family), corners, params, opts) else { continue };
+        let vouched = read.is_trustworthy()
+            || (read.detection.info.named_version == Some(read.detection.version)
+                && read.detection.score() >= OTHER_FAMILY_SCORE);
+        if !vouched || quad_area(&read.detection.corners) < OTHER_FAMILY_FILL * quad_area(&corners) {
+            continue;
+        }
+        if read.is_trustworthy() {
+            return Some((read, Some(family)));
+        }
+        let outranks = |held: &ReadResult| {
+            standing(read.report.blocks_verified(), read.agreement) > standing(held.report.blocks_verified(), held.agreement)
+        };
+        if best.as_ref().is_none_or(|(held, _)| outranks(held)) {
+            best = Some((read, Some(family)));
+        }
+    }
+    best
+}
+
+/// What a read that did not decode has to show for itself, for choosing
+/// between two of them, from the blocks of it that verified and its
+/// (matching, fixed) agreement: whether any block verified, and then how
+/// far its fixed modules read right beyond what chance gives. Chance is
+/// no coin toss here: the placement of a symbol of the wrong family has
+/// been pushed to the best fit the outline allows, and over the test
+/// photographs a QR Code laid on a Micro QR symbol reads as many as seven
+/// in ten of its fixed modules right, though never three in four. So a
+/// fixed module that reads wrong is set against two that read right:
+/// a fit of two in three nets nothing, however many fixed modules the
+/// family has, where a small symbol that fits nets nearly all of its
+/// own, and a larger one that fits, damaged as it may be, more than any
+/// part of it read as a symbol of its own.
+fn standing(blocks_verified: usize, (matching, fixed): (usize, usize)) -> (bool, i64) {
+    (blocks_verified > 0, 3 * matching as i64 - 2 * fixed as i64)
+}
+
+/// What Find in outline read, made ready to adopt: the detection, already
+/// refined, with what it decoded to, and the versions ranked on its
+/// corners when the version found would not be adopted outright. A grid
+/// that decoded only as the other QR Code model is adopted as that
+/// model's symbol, whose anchors are its finders alone.
+fn prepared_from_read(
+    luma: &Luma,
+    version: SymbolVersion,
+    result: ReadResult,
+    searched_inverted: bool,
+    params: &SampleParams,
+) -> Prepared {
+    let trustworthy = result.is_trustworthy();
+    let mut found = result.detection;
+    if let Some(other) = result.reinterpreted
+        && trustworthy
+    {
+        found.version = other;
+        found.anchors.retain(|a| a.kind != AnchorKind::Alignment);
+    }
+    let guesses = (found.version != version && !adopts_version(&found, version, trustworthy))
+        .then(|| (version.family(), suggest_versions(luma, found.corners, version.family(), params)));
+    let read = ReadNote {
+        kernel: result.kernel,
+        local: result.local,
+        verified: result.report.blocks_verified(),
+        blocks: result.report.blocks.len(),
+        trustworthy,
+        reinterpreted: result.reinterpreted,
+    };
+    Prepared { found, agreement: result.agreement, guesses, searched_inverted, read: Some(read) }
+}
+
+/// The slow part of adopting a detection: its corners refined against
+/// the photo with its anchors held, then every anchor against its own
+/// pattern, and the versions ranked on the corners when the version found
+/// would not be adopted outright, so that it can be suggested instead.
+/// `func` is the function map in use, kept when the detection is of its
+/// version, and `version` the document's when the job began.
+fn prepare_adoption(
+    luma: &Luma,
+    func: &Arc<FunctionMap>,
+    version: SymbolVersion,
+    mut found: Detection,
+    searched_inverted: bool,
+    params: &SampleParams,
+) -> Prepared {
+    let func = if func.version == found.version { func.clone() } else { Arc::new(FunctionMap::new(found.version)) };
+    let controls: Vec<_> = found.anchors.iter().map(Anchor::control_point).collect();
+    let refined = refine_corners_holding(luma, &func, found.corners, &controls, &found.held_corners(), params);
+    let agreement = refined.as_ref().map_or(found.agreement, |r| r.after);
+    found.corners = refined.map_or(found.corners, |r| r.corners);
+    found.anchors = refine_anchors(luma, &func, found.corners, &found.anchors, params);
+    let guesses = (found.version != version && !adopts_version(&found, version, false))
+        .then(|| (version.family(), suggest_versions(luma, found.corners, version.family(), params)));
+    Prepared { found, agreement, guesses, searched_inverted, read: None }
+}
+
+/// Whether adopting `found` switches a document at `version` to the
+/// version found: when the symbol's own bits, a clean fit or a message
+/// that `decoded` vouch for it, or when it is of another family, which
+/// the user chose by picking it. Otherwise the version found is only
+/// suggested.
+fn adopts_version(found: &Detection, version: SymbolVersion, decoded: bool) -> bool {
+    found.version != version
+        && (found.version.family() != version.family()
+            || found.info.named_version == Some(found.version)
+            || found.score() > 0.9
+            || decoded)
+}
+
+/// What to add to the offer of a symbol found when taking it would
+/// switch a document at `version` to the symbol's own, which starts the
+/// grid afresh; nothing otherwise.
+fn new_grid_note(found: &Detection, version: SymbolVersion) -> String {
+    if !adopts_version(found, version, false) {
+        return String::new();
+    }
+    format!(" This starts a new {} {} grid (undoable).", found.version.family().label(), found.version)
+}
+
+/// The slow part of Refine: corners nothing holds are settled by the
+/// symbol's edge first, then every corner is refined with the anchors
+/// held, then every anchor against its own pattern. `None` when the
+/// corners form no usable outline.
+fn refine_outline(
+    luma: &Luma,
+    func: &FunctionMap,
+    corners: [[f64; 2]; 4],
+    anchors: Vec<Anchor>,
+    params: &SampleParams,
+) -> Option<Refined> {
+    let settled = settle_loose_corners(luma, func, corners, &anchors, params);
+    let controls: Vec<_> = anchors.iter().map(Anchor::control_point).collect();
+    let refinement = refine_corners(luma, func, settled, &controls, params)?;
+    let after = refine_anchors(luma, func, refinement.corners, &anchors, params);
+    Some(Refined { refinement, before: anchors, after })
+}
+
+/// Items as a sentence lists them: "a", "a and b", "a, b and c".
+fn list_phrase(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// Share of fixed modules a detection that does not decode as found must
+/// read right to count as a credible symbol, inside which a smaller
+/// detection is only a part of it, and whose finder patterns are its own.
+const CREDIBLE_SCORE: f64 = 0.75;
+
+/// What a search of the whole photo finds, over every family, as ZXing's
+/// MultiFormatReader and zxing-cpp's ReadBarcodes try every symbology in
+/// one pass: what decodes as it was found first, then the best fit,
+/// whatever its family, and among equal fits the one whose own bits name
+/// its version, in each family's own order.
+///
+/// Every finder pattern of a QR Code passes for the finder of a Micro QR
+/// or rMQR symbol of its own, so QR Code is searched first, and the
+/// finders of each credible QR Code found are withheld from the searches
+/// after it. For what gets by all the same, a detection whose centre lies
+/// inside a larger, credible one is dropped as a part of it; and two
+/// detections of about the same size and place are the same symbol,
+/// listed once under the better claim.
+pub(crate) fn find_symbols_of_every_family(luma: &Luma, params: &SampleParams, search: &SearchParams) -> Vec<Detection> {
+    let mut all = find_symbols_of_families(luma, &Family::SEARCHED, params, search, &credible);
+    // The decode is asked of each as found, on the photo itself: it says
+    // which of two claims on one place is the symbol, and puts what needs
+    // no work at the head of the list.
+    for found in &mut all {
+        found.decodes = Some(decodes_as_found(luma, found, params));
+    }
+    merge_detections(all)
+}
+
+/// The detections of every family as one list, what decodes first and
+/// then the best fit: parts of a larger, credible detection dropped, and
+/// two detections of one symbol listed once, as
+/// [`find_symbols_of_every_family`] describes.
+fn merge_detections(mut all: Vec<Detection>) -> Vec<Detection> {
+    let quality =
+        |found: &Detection| (found.decodes == Some(true), found.score(), found.info.named_version == Some(found.version));
+    all.sort_by(|a, b| {
+        let (qa, qb) = (quality(a), quality(b));
+        qb.0.cmp(&qa.0).then(qb.1.total_cmp(&qa.1)).then(qb.2.cmp(&qa.2))
+    });
+    let mut merged: Vec<Detection> = Vec::new();
+    for found in all {
+        if merged.iter().any(|taken| part_of(&found, taken) || same_symbol(taken, &found)) {
+            continue;
+        }
+        // A finder pattern often reads better as a Micro QR symbol than
+        // the damaged symbol it belongs to reads as a whole, and so comes
+        // before it: the parts already taken go when their whole arrives.
+        merged.retain(|taken| !part_of(taken, &found));
+        merged.push(found);
+    }
+    merged
+}
+
+/// Whether `small` is a part of `big`: its centre lies inside `big`'s
+/// outline, which is larger and credible.
+fn part_of(small: &Detection, big: &Detection) -> bool {
+    credible(big)
+        && quad_area(&big.corners) > quad_area(&small.corners)
+        && quad_contains(&big.corners, quad_centre(&small.corners))
+}
+
+/// Whether a detection is to be believed a symbol: it decodes as found,
+/// or reads [`CREDIBLE_SCORE`] of its fixed modules right.
+fn credible(found: &Detection) -> bool {
+    found.decodes == Some(true) || found.score() >= CREDIBLE_SCORE
+}
+
+/// Whether two detections outline the same symbol.
+fn same_symbol(a: &Detection, b: &Detection) -> bool {
+    same_outline(&a.corners, &b.corners)
+}
+
+/// Whether two outlines lie on the same symbol: one's centre lies inside
+/// the other, and their areas are within a factor of two.
+fn same_outline(a: &[[f64; 2]; 4], b: &[[f64; 2]; 4]) -> bool {
+    let (area_a, area_b) = (quad_area(a), quad_area(b));
+    if !(area_a > 0.0 && area_b > 0.0) || area_a > 2.0 * area_b || area_b > 2.0 * area_a {
+        return false;
+    }
+    quad_contains(a, quad_centre(b)) || quad_contains(b, quad_centre(a))
+}
+
+/// The symbol found that the outline was put on and still lies on, if
+/// there is one: listed as in use, and not offered again on the canvas.
+fn proposal_in_use(proposals: &Proposals, outline: &[[f64; 2]; 4]) -> Option<usize> {
+    proposals.adopted.filter(|&i| proposals.found.get(i).is_some_and(|found| same_outline(&found.corners, outline)))
+}
+
+fn quad_centre(quad: &[[f64; 2]; 4]) -> [f64; 2] {
+    [quad.iter().map(|p| p[0]).sum::<f64>() / 4.0, quad.iter().map(|p| p[1]).sum::<f64>() / 4.0]
+}
+
+/// Area of a quadrilateral by the shoelace formula.
+fn quad_area(quad: &[[f64; 2]; 4]) -> f64 {
+    let mut twice = 0.0;
+    for i in 0..4 {
+        let (p, q) = (quad[i], quad[(i + 1) % 4]);
+        twice += p[0] * q[1] - q[0] * p[1];
+    }
+    twice.abs() / 2.0
+}
+
+/// Whether a point lies inside a convex quadrilateral: it is on the same
+/// side of every edge.
+fn quad_contains(quad: &[[f64; 2]; 4], point: [f64; 2]) -> bool {
+    let mut sign = 0.0f64;
+    for i in 0..4 {
+        let (p, q) = (quad[i], quad[(i + 1) % 4]);
+        let cross = (q[0] - p[0]) * (point[1] - p[1]) - (q[1] - p[1]) * (point[0] - p[0]);
+        if cross == 0.0 {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if cross.signum() != sign {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use qr_forensics::imaging::detect::InfoEvidence;
+    use qr_forensics::imaging::projection::Project;
+    use qr_forensics::symbol::grid::ModuleGrid;
+
+    use super::*;
+
+    fn square(x: f64, y: f64, side: f64) -> [[f64; 2]; 4] {
+        [[x, y], [x + side, y], [x + side, y + side], [x, y + side]]
+    }
+
+    #[test]
+    fn quad_geometry() {
+        let big = square(0.0, 0.0, 100.0);
+        assert_eq!(quad_area(&big), 10_000.0);
+        assert_eq!(quad_centre(&big), [50.0, 50.0]);
+        assert!(quad_contains(&big, [50.0, 50.0]));
+        assert!(quad_contains(&big, [1.0, 99.0]));
+        assert!(!quad_contains(&big, [101.0, 50.0]));
+        // Corner order the other way round (as a mirrored photo gives it)
+        // still contains its inside.
+        let reversed = [big[0], big[3], big[2], big[1]];
+        assert!(quad_contains(&reversed, [50.0, 50.0]));
+        assert!(!quad_contains(&reversed, [-1.0, 50.0]));
+    }
+
+    /// A photo as the app loads it, for the search helpers.
+    fn load(name: &str) -> Luma {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/photos").join(name);
+        let image = normalize_size(image::open(&path).expect("photo opens").to_rgba8());
+        let (width, height) = (image.width() as usize, image.height() as usize);
+        Adjust::default().apply(image.as_raw(), width, height).1
+    }
+
+    #[test]
+    fn every_family_is_searched_and_the_best_fit_leads() {
+        let params = SampleParams::default();
+        // A QR Code, whose finder patterns each pass for the finder of a
+        // Micro QR or rMQR symbol when those families are searched: they
+        // are the QR Code's, and nothing is made of them, neither inside
+        // it nor hung off its corners over the quiet zone.
+        let found = find_symbols_of_every_family(&load("zxing_qrcode-3_01.png"), &params, &SearchParams::default());
+        let first = found.first().expect("the QR Code is found");
+        assert_eq!(first.version.family(), Family::Qr, "{:?}", found.iter().map(|f| f.version).collect::<Vec<_>>());
+        assert!(first.score() > 0.95);
+        assert_eq!(first.decodes, Some(true));
+        assert_eq!(found.len(), 1, "{:?}", found.iter().map(|f| (f.version, f.score())).collect::<Vec<_>>());
+        // A Micro QR, with QR Code selected as it would be by default.
+        let found = find_symbols_of_every_family(&load("cpp_micro_1.png"), &params, &SearchParams::default());
+        let first = found.first().expect("the Micro QR is found");
+        assert_eq!(first.version, SymbolVersion::Micro(3));
+        assert!(!first.inverted);
+        // A light-on-dark rMQR: found, and known to be inverted.
+        let found = find_symbols_of_every_family(&load("cpp_rmqr_R7x43-H_inverted.png"), &params, &SearchParams::default());
+        let first = found.first().expect("the rMQR is found");
+        assert_eq!(first.version.family(), Family::Rmqr);
+        assert!(first.inverted);
+    }
+
+    #[test]
+    fn detections_of_one_symbol_are_listed_once() {
+        let params = SampleParams::default();
+        let found = find_symbols_of_every_family(&load("cpp_micro_1.png"), &params, &SearchParams::default());
+        for (i, a) in found.iter().enumerate() {
+            for b in &found[i + 1..] {
+                assert!(!same_symbol(a, b), "{} and {} outline the same symbol", a.version, b.version);
+            }
+        }
+    }
+
+    #[test]
+    fn a_part_is_not_listed_with_its_whole_whichever_fits_better() {
+        let scored = |version, corners, agreement| Detection { agreement, ..detection(version, corners) };
+        // A finder pattern read as a Micro QR symbol, fitting a little
+        // better than the QR Code it is a corner of, and another Micro QR
+        // symbol beside them.
+        let whole = scored(SymbolVersion::Qr(2), square(0.0, 0.0, 250.0), (93, 100));
+        let part = scored(SymbolVersion::Micro(3), square(0.0, 0.0, 110.0), (94, 100));
+        let beside = scored(SymbolVersion::Micro(3), square(400.0, 0.0, 110.0), (90, 100));
+        assert!(part_of(&part, &whole) && !part_of(&beside, &whole));
+        for found in [vec![part.clone(), whole.clone(), beside.clone()], vec![beside.clone(), whole.clone(), part.clone()]] {
+            let merged = merge_detections(found);
+            assert_eq!(merged.iter().map(|d| d.version).collect::<Vec<_>>(), [SymbolVersion::Qr(2), SymbolVersion::Micro(3)]);
+            assert_eq!(merged[1].corners, beside.corners);
+        }
+        // The same the other way about, the whole fitting better.
+        let better = scored(SymbolVersion::Qr(2), square(0.0, 0.0, 250.0), (99, 100));
+        assert_eq!(merge_detections(vec![part.clone(), better]).len(), 1);
+        // A whole that fits too poorly to be believed takes no parts with it.
+        let poor = scored(SymbolVersion::Qr(2), square(0.0, 0.0, 250.0), (50, 100));
+        assert_eq!(merge_detections(vec![part, poor]).len(), 2);
+    }
+
+    #[test]
+    fn what_decodes_as_found_leads_whatever_fits_better() {
+        let claim = |version, corners, agreement, decodes| Detection { agreement, decodes: Some(decodes), ..detection(version, corners) };
+        // Two claims on one place: the one that decodes is the symbol,
+        // though the other's fixed patterns fit better. A symbol
+        // elsewhere that fits best of all and does not decode comes after.
+        let decoded = claim(SymbolVersion::Qr(2), square(0.0, 0.0, 250.0), (85, 100), true);
+        let fitted = claim(SymbolVersion::Qr(3), square(5.0, 5.0, 250.0), (95, 100), false);
+        let elsewhere = claim(SymbolVersion::Micro(3), square(400.0, 0.0, 110.0), (99, 100), false);
+        let merged = merge_detections(vec![fitted, elsewhere, decoded]);
+        assert_eq!(merged.iter().map(|d| d.version).collect::<Vec<_>>(), [SymbolVersion::Qr(2), SymbolVersion::Micro(3)]);
+        // A whole that decodes is believed at a fit that would not be
+        // otherwise, and takes its parts with it.
+        let poor = claim(SymbolVersion::Qr(2), square(0.0, 0.0, 250.0), (70, 100), true);
+        let part = claim(SymbolVersion::Micro(3), square(0.0, 0.0, 110.0), (94, 100), false);
+        assert!(!part_of(&part, &Detection { decodes: Some(false), ..poor.clone() }));
+        assert_eq!(merge_detections(vec![part, poor]).len(), 1);
+    }
+
+    #[test]
+    fn a_read_that_did_not_decode_is_ranked_by_what_it_has_to_show() {
+        // A QR Code laid on a Micro QR symbol, as `cpp_micro_9.webp` reads
+        // when asked about as one: seven in ten of its many fixed modules
+        // right, which is more modules than the Micro QR symbol has, and
+        // nothing to set against the Micro QR symbol's own clean fit.
+        assert!(standing(0, (78, 78)) > standing(0, (144, 203)));
+        // A finder pattern of a damaged QR Code fits well as a Micro QR
+        // symbol, and has less to show than the whole it is a corner of.
+        assert!(standing(0, (195, 230)) > standing(0, (77, 82)));
+        // A block that verified outweighs any fit.
+        assert!(standing(1, (150, 230)) > standing(0, (85, 85)));
+    }
+
+    #[test]
+    fn an_outline_is_read_as_another_family_when_its_own_does_not_decode() {
+        // A Micro QR symbol inside the outline, asked about as a QR Code:
+        // a QR Code fits it at the level of chance and decodes nothing.
+        let (params, opts) = (SampleParams::default(), DecodeOptions::default());
+        let luma = load("cpp_micro_1.png");
+        let outline = [[210.3, 27.8], [423.2, 28.0], [423.2, 240.7], [210.3, 240.9]];
+        let (read, other) = read_outline_of_any_family(&luma, SymbolVersion::Qr(2), outline, &params, &opts).expect("a symbol");
+        assert_eq!(other, Some(Family::Micro));
+        assert!(read.is_trustworthy());
+        assert_eq!(read.text(), "Wikipedia");
+        // Asked about as what it is, it is read as that, and no other
+        // family comes into it.
+        let (read, other) = read_outline_of_any_family(&luma, SymbolVersion::Micro(2), outline, &params, &opts).expect("a symbol");
+        assert_eq!(other, None);
+        assert_eq!(read.text(), "Wikipedia");
+    }
+
+    #[test]
+    fn an_anchor_replaced_keeps_its_place() {
+        let mut doc = Document::blank(SymbolVersion::Qr(2));
+        let traced = |x: f64, px: f64| anchor(AnchorKind::Edge, [x, 0.0], [px, 0.0]);
+        for x in [5.0, 9.0, 14.0] {
+            doc.set_anchor(traced(x, x), AnchorSource::Detected);
+        }
+        doc.set_anchor(traced(5.0, 99.0), AnchorSource::Manual);
+        assert_eq!(doc.anchors.iter().map(|a| a.anchor.at[0]).collect::<Vec<_>>(), [5.0, 9.0, 14.0]);
+        assert_eq!((doc.anchors[0].anchor.center, doc.anchors[0].source), ([99.0, 0.0], AnchorSource::Manual));
+    }
+
+    #[test]
+    fn a_checkpoint_for_a_change_that_never_came_costs_nothing() {
+        let mut history = History::default();
+        let mut doc = Document::blank(SymbolVersion::Qr(2));
+        let blank = doc.clone();
+        history.checkpoint(&doc);
+        doc.grid.set(10, 10, Module::Dark);
+        let painted = doc.clone();
+        assert!(history.undo(&mut doc) && doc == blank);
+        // A press that paints nothing, on a module already that colour or
+        // beside the grid: the checkpoint is taken, and nothing follows.
+        history.checkpoint(&doc);
+        assert!(history.can_redo(&doc));
+        assert!(!history.can_undo(&doc), "the press left no step to undo");
+        assert!(history.redo(&mut doc) && doc == painted);
+        assert!(history.undo(&mut doc) && doc == blank);
+        assert!(!history.undo(&mut doc));
+        // A press that does paint leaves the undone state behind.
+        history.checkpoint(&doc);
+        doc.grid.set(11, 11, Module::Light);
+        assert!(!history.can_redo(&doc));
+        assert!(!history.redo(&mut doc));
+        assert!(history.undo(&mut doc) && doc == blank);
+    }
+
+    fn anchor(kind: AnchorKind, at: [f64; 2], center: [f64; 2]) -> Anchor {
+        Anchor { kind, at, center, partial: false, inferred: false }
+    }
+
+    /// An anchor on the finder pattern at the top left.
+    fn finder_anchor(center: [f64; 2]) -> Anchor {
+        anchor(AnchorKind::Finder, [3.5, 3.5], center)
+    }
+
+    #[test]
+    fn undo_on_another_photo_brings_back_the_symbol_and_not_the_outline() {
+        let mut history = History::default();
+        let mut doc = Document::blank(SymbolVersion::Qr(2));
+        // On the first photo: an outline, an anchor and a lens term, and
+        // then a module painted.
+        doc.corners = square(10.0, 10.0, 100.0);
+        doc.set_anchor(finder_anchor([24.0, 24.0]), AnchorSource::Detected);
+        doc.adjust.k1 = 0.05;
+        history.checkpoint(&doc);
+        doc.grid.set(10, 10, Module::Dark);
+        // The second photo, as loading it leaves the document.
+        history.photo_changed(&doc);
+        doc.corners = square(50.0, 50.0, 300.0);
+        doc.anchors.clear();
+        doc.adjust = Adjust::default();
+        let on_second = doc.clone();
+        assert!(history.undo(&mut doc));
+        assert_eq!(doc.grid.get(10, 10), Module::Unknown, "the module painted is taken back");
+        assert_eq!(doc.corners, on_second.corners, "the outline is still the second photo's");
+        assert!(doc.anchors.is_empty() && doc.adjust == Adjust::default());
+        assert!(history.redo(&mut doc) && doc == on_second);
+        // Loading a photo is no step of its own: once the symbol is as it
+        // was, there is nothing further to undo.
+        assert!(history.undo(&mut doc));
+        assert!(!history.can_undo(&doc) && !history.undo(&mut doc));
+    }
+
+    #[test]
+    fn an_export_of_an_unsolved_symbol_says_so() {
+        let mut app = App::blank();
+        let path = std::env::temp_dir().join(format!("qr-forensics-export-test-{}.png", std::process::id()));
+        app.export_image(&path);
+        let _ = std::fs::remove_file(&path);
+        let notice = &app.message.as_ref().expect("a notice").text;
+        assert!(notice.starts_with("Saved "), "{notice}");
+        assert!(notice.contains("Not every block is solved (0 of 1)"), "{notice}");
+    }
+
+    // The tests from here on show the window, frame by frame, to an egui
+    // context with no display behind it, as egui's own tests run a UI:
+    // the frame's order of work, and what a click lands on, are the
+    // things under test.
+
+    /// Corners of the symbol in the photo [`Bench::new`] loads.
+    const STRAIGHT: [[f64; 2]; 4] = [[40.0, 40.0], [290.0, 40.0], [290.0, 290.0], [40.0, 290.0]];
+
+    /// A version 2 QR Code grid with every module painted: the fixed
+    /// patterns, and data that is no message.
+    fn painted_grid() -> ModuleGrid {
+        let func = FunctionMap::new(SymbolVersion::Qr(2));
+        let mut grid = func.blank_grid();
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        for y in 0..func.height {
+            for x in 0..func.width {
+                if func.expected(x, y).is_none() {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    grid.set(x, y, Module::from_dark(seed & 1 == 1));
+                }
+            }
+        }
+        grid
+    }
+
+    /// A detection of `version` at `corners`, with a fit good enough to
+    /// be adopted, as a job hands one back.
+    fn detection(version: SymbolVersion, corners: [[f64; 2]; 4]) -> Detection {
+        Detection {
+            corners,
+            version,
+            inverted: false,
+            mirrored: false,
+            mirrored_by_decode: false,
+            turns: 0,
+            anchors: Vec::new(),
+            agreement: (100, 100),
+            info: InfoEvidence::default(),
+            edged_corners: Vec::new(),
+            measured_corners: Vec::new(),
+            retry: None,
+            decodes: None,
+        }
+    }
+
+    fn prepared(found: Detection) -> Prepared {
+        Prepared { agreement: found.agreement, found, guesses: None, searched_inverted: false, read: None }
+    }
+
+    /// End a worker thread without a result, as a panic in it does, but
+    /// without the panic hook's message in the test's output.
+    fn die<T>() -> T {
+        std::panic::resume_unwind(Box::new("a worker dying, for the test"))
+    }
+
+    struct Bench {
+        ctx: egui::Context,
+        app: App,
+        /// The window's size, in points.
+        size: egui::Vec2,
+        time: f64,
+        /// What the last frame painted.
+        shapes: Vec<egui::epaint::ClippedShape>,
+    }
+
+    impl Bench {
+        /// A fresh app with a render of [`painted_grid`] as its photo,
+        /// ten pixels a module with its quiet zone, in the Align stage.
+        /// Loading searches nothing, so no symbol is on offer.
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            let mut app = App::blank();
+            let (w, h, pixels) = render_rgba(&painted_grid(), 10, 4);
+            let image = image::RgbaImage::from_raw(w as u32, h as u32, pixels).expect("a render is an image");
+            app.set_photo(&ctx, "render".into(), image);
+            let mut bench = Self { ctx, app, size: egui::vec2(1440.0, 900.0), time: 0.0, shapes: Vec::new() };
+            bench.settle();
+            bench
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            };
+            self.time += 1.0 / 60.0;
+            let app = &mut self.app;
+            let mut output = self.ctx.run_ui(input, |ui| app.show(ui));
+            output.textures_delta.clear();
+            self.shapes = output.shapes;
+        }
+
+        fn step(&mut self) {
+            self.frame(Vec::new());
+        }
+
+        /// Frames until no search and no job is under way, and one more.
+        fn settle(&mut self) {
+            let started = std::time::Instant::now();
+            loop {
+                self.step();
+                if self.app.search.is_none() && self.app.job.is_none() {
+                    break;
+                }
+                assert!(started.elapsed().as_secs() < 120, "a worker did not finish");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            self.step();
+        }
+
+        /// Apply an action as the end of a frame applies it.
+        fn act(&mut self, action: Action) {
+            let ctx = self.ctx.clone();
+            self.app.apply(&ctx, action);
+        }
+
+        fn button(&mut self, pos: egui::Pos2, button: egui::PointerButton, pressed: bool) {
+            self.frame(vec![egui::Event::PointerButton { pos, button, pressed, modifiers: egui::Modifiers::NONE }]);
+        }
+
+        fn click(&mut self, pos: egui::Pos2, button: egui::PointerButton) {
+            self.frame(vec![egui::Event::PointerMoved(pos)]);
+            self.step();
+            self.button(pos, button, true);
+            self.button(pos, button, false);
+            self.step();
+        }
+
+        /// Turn the wheel by `points`, negative to bring what is below
+        /// into view, and let the scroll run its course.
+        fn wheel(&mut self, points: f32) {
+            self.frame(vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, points),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            for _ in 0..30 {
+                self.step();
+            }
+        }
+
+        /// Where a point of the photo is on the canvas, by way of an
+        /// anchor's handle, which is drawn where its anchor is.
+        fn locate(&mut self) -> impl Fn([f64; 2]) -> egui::Pos2 + use<> {
+            let saved = self.app.doc.anchors.clone();
+            self.app.doc.anchors = vec![DocAnchor { anchor: finder_anchor([75.0, 75.0]), source: AnchorSource::Detected }];
+            self.step();
+            self.step();
+            let handles = self.handles(5.5);
+            assert_eq!(handles.len(), 1, "{handles:?}");
+            self.app.doc.anchors = saved;
+            self.step();
+            let (origin, scale) = (handles[0], self.app.view.align_view.scale);
+            move |px| origin + egui::vec2(px[0] as f32 - 75.0, px[1] as f32 - 75.0) * scale
+        }
+
+        /// Centres of the filled circles of `radius` the last frame
+        /// painted: the handles of anchors set are such, at 5.5 or, for
+        /// timing modules and edge points, at 4.
+        fn handles(&self, radius: f32) -> Vec<egui::Pos2> {
+            fn walk(shape: &egui::Shape, radius: f32, out: &mut Vec<egui::Pos2>) {
+                match shape {
+                    egui::Shape::Circle(circle) if circle.radius == radius && circle.fill != egui::Color32::TRANSPARENT => {
+                        out.push(circle.center);
+                    }
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, radius, out)),
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            self.shapes.iter().for_each(|clipped| walk(&clipped.shape, radius, &mut out));
+            out
+        }
+
+        /// Every colour the meshes the last frame painted have a vertex
+        /// of: the photo is one, in white, and the overlays on it others.
+        fn mesh_colours(&self) -> Vec<egui::Color32> {
+            fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+                match shape {
+                    egui::Shape::Mesh(mesh) => {
+                        for vertex in &mesh.vertices {
+                            if !out.contains(&vertex.color) {
+                                out.push(vertex.color);
+                            }
+                        }
+                    }
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, out)),
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            self.shapes.iter().for_each(|clipped| walk(&clipped.shape, &mut out));
+            out
+        }
+
+        /// Every piece of text the last frame painted.
+        fn texts(&self) -> Vec<String> {
+            fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+                match shape {
+                    egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, out)),
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            self.shapes.iter().for_each(|clipped| walk(&clipped.shape, &mut out));
+            out
+        }
+
+        fn notice(&self) -> &Notice {
+            self.app.message.as_ref().expect("a notice")
+        }
+
+        /// The document, what follows from it, and what is cached for
+        /// the photo are all of `version`.
+        fn assert_all_of(&self, version: SymbolVersion) {
+            let app = &self.app;
+            let (width, height) = (version.width(), version.height());
+            assert_eq!(app.doc.version, version);
+            assert_eq!(app.derived.func.version, version);
+            assert_eq!((app.doc.grid.width(), app.doc.grid.height()), (width, height));
+            assert_eq!(app.model.as_ref().map(|m| (m.width, m.height)), Some((width, height)));
+            assert_eq!(app.preview.as_ref().map(|p| p.classified.modules.len()), Some(width * height));
+        }
+    }
+
+    #[test]
+    fn a_version_adopted_from_a_job_is_the_one_drawn_and_sampled() {
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        // A larger symbol than the grid in use, taken in while the Align
+        // stage shows. Sampling then read the old version's preview by
+        // the new version's indices, and ran off its end.
+        let found = detection(SymbolVersion::Qr(6), STRAIGHT);
+        bench.app.start_job(&ctx, JobKind::Adopt, move || JobResult::Adopt(prepared(found)));
+        bench.settle();
+        bench.assert_all_of(SymbolVersion::Qr(6));
+        bench.act(Action::Sample { only_unknown: false });
+        bench.step();
+        bench.assert_all_of(SymbolVersion::Qr(6));
+        // A smaller one, taken in while the Edit stage shows the larger
+        // grid, which drew the new grid by the old version's map.
+        bench.app.view.stage = Stage::Edit;
+        bench.step();
+        let found = detection(SymbolVersion::Micro(2), STRAIGHT);
+        bench.app.start_job(&ctx, JobKind::Adopt, move || JobResult::Adopt(prepared(found)));
+        bench.settle();
+        bench.assert_all_of(SymbolVersion::Micro(2));
+    }
+
+    #[test]
+    fn an_action_in_the_frame_of_a_version_change_works_on_the_new_version() {
+        let mut bench = Bench::new();
+        // No frame comes between the two: the function map in hand when
+        // the second is applied was made for the version before.
+        bench.act(Action::SetVersion(SymbolVersion::Qr(5)));
+        bench.act(Action::ClearData);
+        assert_eq!((bench.app.doc.grid.width(), bench.app.doc.grid.height()), (37, 37));
+        bench.act(Action::SetVersion(SymbolVersion::Micro(1)));
+        bench.act(Action::FillFixed);
+        assert_eq!((bench.app.doc.grid.width(), bench.app.doc.grid.height()), (11, 11));
+        bench.act(Action::Undo);
+        bench.act(Action::Sample { only_unknown: false });
+        bench.step();
+        bench.assert_all_of(SymbolVersion::Qr(5));
+    }
+
+    #[test]
+    fn only_a_read_that_decoded_sets_the_sampling() {
+        let mut bench = Bench::new();
+        let before = bench.app.view.sample;
+        assert_ne!(before.kernel, Kernel::Centre);
+        let read = |trustworthy: bool| {
+            let (kernel, local, verified) = (Kernel::Centre, !before.local, usize::from(trustworthy));
+            let note = ReadNote { kernel, local, verified, blocks: 1, trustworthy, reinterpreted: None };
+            Prepared { read: Some(note), ..prepared(detection(SymbolVersion::Qr(2), STRAIGHT)) }
+        };
+        // The best of the attempts at a read that decoded nothing says
+        // nothing about how this photo wants sampling.
+        let text = bench.app.adopt_prepared(read(false));
+        assert!(bench.app.view.sample == before);
+        assert!(!text.contains("decoded it"), "{text}");
+        let text = bench.app.adopt_prepared(read(true));
+        assert_eq!((bench.app.view.sample.kernel, bench.app.view.sample.local), (Kernel::Centre, !before.local));
+        assert!(text.contains("sampling kernel decoded it"), "{text}");
+    }
+
+    #[test]
+    fn dragging_a_traced_edge_point_moves_that_point_alone() {
+        let mut bench = Bench::new();
+        bench.app.doc.corners = STRAIGHT;
+        // Three points traced along the top edge, as the detection of a
+        // bowed symbol leaves them: they stand on no site of the version,
+        // and are known among the handles only by where they are.
+        for x in [6.3, 12.1, 18.4] {
+            let anchor = anchor(AnchorKind::Edge, [x, 0.0], [40.0 + 10.0 * x, 36.0]);
+            bench.app.doc.anchors.push(DocAnchor { anchor, source: AnchorSource::Detected });
+        }
+        bench.step();
+        bench.step();
+        let handles = bench.handles(4.0);
+        assert_eq!(handles.len(), 3, "{handles:?}");
+        let mut pointer = handles.into_iter().min_by(|a, b| a.x.total_cmp(&b.x)).expect("three handles");
+        bench.frame(vec![egui::Event::PointerMoved(pointer)]);
+        bench.step();
+        bench.button(pointer, egui::PointerButton::Primary, true);
+        for _ in 0..6 {
+            pointer.y -= 10.0;
+            bench.frame(vec![egui::Event::PointerMoved(pointer)]);
+        }
+        bench.button(pointer, egui::PointerButton::Primary, false);
+        bench.step();
+        let heights: Vec<f64> = bench.app.doc.anchors.iter().map(|a| a.anchor.center[1]).collect();
+        let dragged = 40.0 / f64::from(bench.app.view.align_view.scale);
+        assert!(heights[0] < 36.0 - dragged, "the point under the pointer went with it: {heights:?}");
+        assert_eq!(heights[1..], [36.0, 36.0], "and the others stayed");
+        assert_eq!(bench.app.doc.anchors.iter().map(|a| a.anchor.at[0]).collect::<Vec<_>>(), [6.3, 12.1, 18.4]);
+    }
+
+    #[test]
+    fn a_handle_inside_a_symbol_found_takes_its_own_clicks() {
+        let mut bench = Bench::new();
+        bench.app.doc.corners = STRAIGHT;
+        // A symbol found that the outline happens to lie on, and has not
+        // been put on from the list.
+        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: None });
+        bench.app.doc.set_anchor(finder_anchor([75.0, 75.0]), AnchorSource::Detected);
+        bench.step();
+        bench.step();
+        let handles = bench.handles(5.5);
+        assert_eq!(handles.len(), 1, "{handles:?}");
+        // A click on the handle is not a click on the symbol found
+        // beneath it, which would adopt it again over what was placed.
+        bench.click(handles[0], egui::PointerButton::Primary);
+        assert_eq!(bench.app.running(), None);
+        // A right-click drops the anchor.
+        bench.click(handles[0], egui::PointerButton::Secondary);
+        assert!(bench.app.doc.anchors.is_empty());
+        // Clear of the handles, in the middle of the symbol, ninety photo
+        // pixels right of the anchor and below it, the symbol found is
+        // there to be clicked.
+        let middle = handles[0] + egui::vec2(90.0, 90.0) * bench.app.view.align_view.scale;
+        bench.click(middle, egui::PointerButton::Primary);
+        assert_eq!(bench.app.running(), Some(JobKind::Adopt));
+        bench.settle();
+    }
+
+    /// An outline off in a corner of the photo, on no symbol found.
+    const ASIDE: [[f64; 2]; 4] = [[4.0, 4.0], [24.0, 4.0], [24.0, 24.0], [4.0, 24.0]];
+
+    #[test]
+    fn a_symbol_found_is_clicked_inside_its_outline_and_the_better_of_two_where_they_overlap() {
+        let mut bench = Bench::new();
+        bench.app.doc.corners = ASIDE;
+        // A square standing on its corner, whose box takes in the whole
+        // symbol and whose outline leaves the symbol's corners out; and
+        // after it in the list, a claim on the symbol's lower right
+        // quarter, which the two share about (200, 200).
+        let diamond = [[165.0, 40.0], [290.0, 165.0], [165.0, 290.0], [40.0, 165.0]];
+        let found = vec![detection(SymbolVersion::Qr(2), diamond), detection(SymbolVersion::Micro(3), square(170.0, 170.0, 140.0))];
+        bench.app.proposals = Some(Proposals { found, photo_inverted: false, adopted: None });
+        let at = bench.locate();
+        // Inside the box about the first and outside its outline, there
+        // is nothing to click.
+        bench.click(at([60.0, 60.0]), egui::PointerButton::Primary);
+        assert_eq!(bench.app.running(), None);
+        // Where the two overlap, the click is the first one's.
+        bench.click(at([200.0, 200.0]), egui::PointerButton::Primary);
+        assert_eq!(bench.app.running(), Some(JobKind::Adopt));
+        assert_eq!(bench.app.proposals.as_ref().and_then(|p| p.adopted), Some(0));
+        bench.settle();
+        // Inside the second alone, it is the second's.
+        bench.app.doc.corners = ASIDE;
+        bench.step();
+        bench.click(at([300.0, 300.0]), egui::PointerButton::Primary);
+        assert_eq!(bench.app.running(), Some(JobKind::Adopt));
+        assert_eq!(bench.app.proposals.as_ref().and_then(|p| p.adopted), Some(1));
+        bench.settle();
+    }
+
+    #[test]
+    fn the_symbol_the_outline_was_put_on_is_not_offered_again_on_the_canvas() {
+        let mut bench = Bench::new();
+        bench.app.doc.corners = STRAIGHT;
+        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: Some(0) });
+        let at = bench.locate();
+        // A click inside the symbol, clear of the handles, is not a click
+        // on the symbol found: it would put the outline back as found,
+        // over whatever was placed by hand since.
+        bench.click(at([165.0, 165.0]), egui::PointerButton::Primary);
+        assert_eq!(bench.app.running(), None);
+        assert_eq!(proposal_in_use(bench.app.proposals.as_ref().expect("the list"), &bench.app.doc.corners), Some(0));
+        // Once the outline is somewhere else, by hand or by an undo, the
+        // symbol found is on offer again.
+        bench.app.doc.corners = ASIDE;
+        bench.step();
+        assert_eq!(proposal_in_use(bench.app.proposals.as_ref().expect("the list"), &bench.app.doc.corners), None);
+        bench.click(at([165.0, 165.0]), egui::PointerButton::Primary);
+        assert_eq!(bench.app.running(), Some(JobKind::Adopt));
+        bench.settle();
+        // A search run again lists the symbol the outline lies on as the
+        // one in use still.
+        let again = vec![detection(SymbolVersion::Micro(3), square(170.0, 170.0, 140.0)), detection(SymbolVersion::Qr(2), STRAIGHT)];
+        bench.app.finish_search(again, false);
+        assert_eq!(bench.app.proposals.as_ref().and_then(|p| p.adopted), Some(1));
+    }
+
+    #[test]
+    fn a_corner_under_the_pointer_is_shown_enlarged_and_h_shows_the_bare_photo() {
+        let mut bench = Bench::new();
+        bench.app.doc.corners = STRAIGHT;
+        bench.app.doc.set_anchor(finder_anchor([75.0, 75.0]), AnchorSource::Detected);
+        let at = bench.locate();
+        bench.app.doc.set_anchor(finder_anchor([75.0, 75.0]), AnchorSource::Detected);
+        bench.step();
+        assert_eq!(bench.handles(5.5).len(), 1);
+        assert!(bench.texts().iter().any(|text| text == "TL"));
+        assert!(!bench.texts().iter().any(|text| text.starts_with("TL at")));
+        // The pointer on the top-left corner's handle: the photo about
+        // the corner is shown enlarged, beside the handle and not under
+        // the pointer.
+        let corner = at(STRAIGHT[0]);
+        bench.frame(vec![egui::Event::PointerMoved(corner)]);
+        bench.step();
+        bench.step();
+        assert!(bench.texts().iter().any(|text| text.starts_with("TL at 40.0, 40.0")), "{:?}", bench.texts());
+        let loupe = bench.ctx.memory(|memory| memory.area_rect(egui::Id::new("loupe"))).expect("the loupe is a window");
+        assert!(!loupe.contains(corner), "{loupe:?} is under the pointer at {corner:?}");
+        // With H held, the photo is shown with nothing over it: no
+        // handles, no labels and no loupe.
+        let key = |pressed| egui::Event::Key { key: egui::Key::H, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE };
+        bench.frame(vec![key(true)]);
+        bench.step();
+        assert!(bench.handles(5.5).is_empty());
+        assert!(!bench.texts().iter().any(|text| text.starts_with("TL")), "{:?}", bench.texts());
+        bench.frame(vec![key(false)]);
+        bench.step();
+        assert_eq!(bench.handles(5.5).len(), 1);
+    }
+
+    #[test]
+    fn the_sample_preview_shows_each_module_in_the_colour_it_would_be_painted() {
+        let mut bench = Bench::new();
+        bench.app.doc.corners = STRAIGHT;
+        bench.app.view.show_anchors = false;
+        bench.step();
+        let (black, red, green) = (egui::Color32::BLACK, egui::Color32::from_rgb(235, 60, 60), egui::Color32::from_rgb(40, 190, 90));
+        assert!(!bench.mesh_colours().contains(&black), "nothing black is drawn over the photo to start with");
+        // Dark is a black dot and light a white one, as the grid paints
+        // them: not red and green, which read as wrong and right and which
+        // many cannot tell apart.
+        bench.app.view.align_overlay = AlignOverlay::SamplePreview;
+        bench.step();
+        let colours = bench.mesh_colours();
+        assert!(colours.contains(&black) && colours.contains(&egui::Color32::WHITE));
+        assert!(!colours.contains(&red) && !colours.contains(&green));
+    }
+
+    #[test]
+    fn a_list_takes_the_wheel_only_once_the_pointer_is_moved_onto_it() {
+        let mut wheel = WheelLatch::default();
+        let list = egui::Rect::from_min_size(egui::pos2(100.0, 300.0), egui::vec2(200.0, 100.0));
+        // The pointer at rest above the list.
+        let rest = egui::pos2(150.0, 250.0);
+        wheel.follow(Some(rest));
+        wheel.place(InnerList::Codewords, list);
+        wheel.follow(Some(rest));
+        assert!(!wheel.owns(InnerList::Codewords));
+        // The inspector scrolls, and the list slides under the pointer:
+        // the wheel is not the list's, however long the pointer rests
+        // there, and a jog of the mouse as its wheel turns is no move.
+        let list = list.translate(egui::vec2(0.0, -80.0));
+        for jog in [0.0, 0.0, 3.0] {
+            wheel.place(InnerList::Codewords, list);
+            wheel.follow(Some(rest + egui::vec2(jog, 0.0)));
+            assert!(!wheel.owns(InnerList::Codewords));
+        }
+        // Moved, within the list: the wheel is the list's, and stays so
+        // while the pointer rests.
+        wheel.place(InnerList::Codewords, list);
+        wheel.follow(Some(rest + egui::vec2(20.0, 0.0)));
+        assert!(wheel.owns(InnerList::Codewords) && !wheel.owns(InnerList::Blocks));
+        wheel.place(InnerList::Codewords, list);
+        wheel.follow(Some(rest + egui::vec2(20.0, 0.0)));
+        assert!(wheel.owns(InnerList::Codewords));
+        // Moved off it, or onto where a list was before its section was
+        // closed: the wheel is the inspector's.
+        wheel.follow(Some(rest + egui::vec2(40.0, 0.0)));
+        assert!(!wheel.owns(InnerList::Codewords));
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_inspector_past_a_list_that_slides_under_the_pointer() {
+        let mut bench = Bench::new();
+        // A window short enough that the inspector has far to scroll.
+        bench.size = egui::vec2(1440.0, 600.0);
+        for _ in 0..3 {
+            bench.step();
+        }
+        let list = |bench: &Bench| bench.app.view.wheel.placed(InnerList::Codewords).expect("the codeword table is laid out");
+        // The pointer at rest a little above the codeword table, and a
+        // turn of the wheel that brings the table up under it.
+        let before = list(&bench);
+        let pointer = egui::pos2(before.center().x, before.top() - 14.0);
+        bench.frame(vec![egui::Event::PointerMoved(pointer)]);
+        bench.step();
+        bench.wheel(-40.0);
+        let under = list(&bench);
+        assert!(under.top() < before.top() - 20.0, "the inspector scrolled: {before:?} to {under:?}");
+        assert!(under.contains(pointer), "and the table is under the pointer now: {under:?}");
+        // The next turn is the inspector's still, not the table's.
+        bench.wheel(-40.0);
+        let past = list(&bench);
+        assert!(past.top() < under.top() - 20.0, "the inspector scrolled on: {under:?} to {past:?}");
+        // Moved onto the table, the pointer gives it the wheel: the table
+        // scrolls, and the inspector stays where it is.
+        let pointer = egui::pos2(past.center().x + 20.0, past.center().y);
+        bench.frame(vec![egui::Event::PointerMoved(pointer)]);
+        bench.step();
+        assert!(bench.app.view.wheel.owns(InnerList::Codewords));
+        bench.wheel(-40.0);
+        assert_eq!(list(&bench).top(), past.top());
+    }
+
+    #[test]
+    fn a_lens_term_between_the_sliders_steps_is_left_as_it_is() {
+        let mut bench = Bench::new();
+        // What Estimate sets: a term to the thousandth, where the slider
+        // steps by five of them. The corners and anchors have been moved
+        // for exactly this term.
+        bench.app.doc.adjust.k1 = -0.062;
+        let _ = bench.app.sync_adjust();
+        for _ in 0..3 {
+            bench.step();
+        }
+        assert_eq!(bench.app.doc.adjust.k1, -0.062);
+        assert_eq!(bench.app.photo.as_ref().map(|p| p.adjust.k1), Some(-0.062));
+        assert!(!bench.app.history.can_undo(&bench.app.doc), "nothing changed, and nothing was recorded");
+    }
+
+    #[test]
+    fn a_new_photo_starts_without_the_last_photos_outline_and_anchors() {
+        let mut bench = Bench::new();
+        bench.app.checkpoint();
+        bench.app.doc.corners = STRAIGHT;
+        bench.app.doc.set_anchor(finder_anchor([75.0, 75.0]), AnchorSource::Detected);
+        bench.app.doc.grid.set(10, 10, Module::Dark);
+        let ctx = bench.ctx.clone();
+        bench.app.set_photo(&ctx, "another".into(), image::RgbaImage::from_pixel(400, 300, image::Rgba([255; 4])));
+        assert!(bench.app.doc.anchors.is_empty());
+        let outline = bench.app.doc.corners;
+        assert_eq!(Some(outline), bench.app.photo.as_ref().map(Photo::default_corners));
+        // Undo takes the painted module back, and leaves the new photo
+        // its own outline.
+        bench.act(Action::Undo);
+        assert_eq!(bench.app.doc.grid.get(10, 10), Module::Unknown);
+        assert_eq!(bench.app.doc.corners, outline);
+        assert!(bench.app.doc.anchors.is_empty());
+        bench.settle();
+    }
+
+    #[test]
+    fn a_change_of_lens_drops_what_was_found_in_the_photo_as_it_was() {
+        fn slowly<T>(result: T) -> T {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            result
+        }
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        bench.app.doc.corners = STRAIGHT;
+        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: None });
+        // A search and a step that are still under way when the lens
+        // changes, and would move the outline were they taken in.
+        let elsewhere = || detection(SymbolVersion::Qr(2), square(0.0, 0.0, 10.0));
+        bench.app.start_search(&ctx, false, move || slowly(vec![elsewhere()]));
+        bench.app.start_job(&ctx, JobKind::Adopt, move || slowly(JobResult::Adopt(prepared(elsewhere()))));
+        bench.app.history.checkpoint(&bench.app.doc);
+        let adjust = Adjust { k1: -0.05, ..bench.app.doc.adjust };
+        bench.act(Action::SetAdjust(adjust));
+        assert!(bench.app.proposals.is_none() && bench.app.search.is_none() && bench.app.job.is_none());
+        assert!(bench.notice().text.starts_with("The lens setting changed"), "{}", bench.notice().text);
+        // What the abandoned threads hand back is not taken in.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        bench.settle();
+        assert_eq!(bench.app.doc.corners, STRAIGHT);
+        assert!(bench.app.proposals.is_none());
+        bench.act(Action::UseProposal(0));
+        assert_eq!(bench.app.running(), None);
+        // Undo takes the lens back, and with it whatever was found since.
+        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: None });
+        bench.act(Action::Undo);
+        assert_eq!(bench.app.doc.adjust.k1, 0.0);
+        assert!(bench.app.proposals.is_none());
+    }
+
+    #[test]
+    fn a_grid_sampled_a_quarter_turn_out_shows_it_and_turns_with_its_outline() {
+        let mut bench = Bench::new();
+        // The outline with its top-left handle on the symbol's top-right
+        // corner, and the fixed patterns locked, as they are to start
+        // with: painted as specified, they would hide the turn.
+        let [tl, tr, br, bl] = STRAIGHT;
+        bench.app.doc.corners = [tr, br, bl, tl];
+        assert!(bench.app.view.lock_fixed);
+        bench.step();
+        bench.act(Action::Sample { only_unknown: false });
+        bench.step();
+        let turned = bench.app.derived.analysis.orientation.expect("the fixed patterns, left as sampled, show the turn");
+        assert!(bench.notice().text.contains("outline is turned on the symbol"), "{}", bench.notice().text);
+        // Two anchors on the grid as it lies: on the finder pattern at
+        // its top left, and on a module of its timing pattern.
+        let projection = bench.app.model.as_ref().expect("the outline is usable").projection.clone();
+        let sites = anchor_sites(&bench.app.derived.func);
+        let timing = sites.into_iter().find(|site| site.kind == AnchorKind::Timing).expect("a timing site").at;
+        let finder_px = projection.apply(3.5, 3.5);
+        let timing_px = projection.apply(timing[0], timing[1]);
+        bench.app.doc.set_anchor(finder_anchor(finder_px), AnchorSource::Detected);
+        bench.app.doc.set_anchor(anchor(AnchorKind::Timing, timing, timing_px), AnchorSource::Detected);
+        // The transform the Paint section offers turns the grid, and the
+        // outline and the anchors with it.
+        bench.act(Action::Transform(Transform::Symmetry(turned.symmetry)));
+        bench.step();
+        assert!(bench.app.doc.grid.cells() == painted_grid().cells(), "the grid now reads as the symbol");
+        assert!(bench.app.derived.analysis.orientation.is_none());
+        assert_eq!(bench.app.doc.corners, STRAIGHT);
+        // The finder pattern's anchor went with its pattern to the corner
+        // the turn took it to, where the version has a finder pattern;
+        // the timing module landed on no timing pattern, and went.
+        let anchors: Vec<Anchor> = bench.app.doc.anchors.iter().map(|a| a.anchor).collect();
+        assert_eq!(anchors, [Anchor { at: turned.symmetry.map_point(25, 25, [3.5, 3.5]), ..finder_anchor(finder_px) }]);
+        assert!(bench.notice().text.contains("1 anchor was removed"), "{}", bench.notice().text);
+        // What is sampled next is the photo of these modules.
+        for y in 9..15 {
+            for x in 9..15 {
+                bench.app.doc.grid.set(x, y, Module::Unknown);
+            }
+        }
+        bench.act(Action::Sample { only_unknown: true });
+        assert!(bench.app.doc.grid.cells() == painted_grid().cells());
+    }
+
+    #[test]
+    fn a_worker_that_dies_is_reported() {
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        bench.app.start_job(&ctx, JobKind::Refine, die);
+        bench.settle();
+        let notice = bench.notice();
+        assert!(notice.is_error, "{}", notice.text);
+        assert!(notice.text.starts_with("Refining the corners and anchors stopped on an internal error"), "{}", notice.text);
+        bench.app.start_search(&ctx, false, die);
+        bench.settle();
+        let notice = bench.notice();
+        assert!(notice.is_error, "{}", notice.text);
+        assert!(notice.text.starts_with("The search of the photo for symbols stopped on an internal error"), "{}", notice.text);
+    }
+
+    #[test]
+    fn a_photo_is_searched_for_symbols_only_when_asked() {
+        let mut bench = Bench::new();
+        // Loading the photo searched nothing: the notice says it is
+        // loaded, and how to go on.
+        assert!(bench.app.search.is_none() && bench.app.proposals.is_none());
+        let notice = bench.notice();
+        assert!(!notice.is_error && notice.text.starts_with("Loaded render"), "{}", notice.text);
+        assert!(notice.text.contains("Search whole photo"), "{}", notice.text);
+        // Search whole photo is what searches it.
+        bench.act(Action::FindSymbols);
+        assert!(bench.app.search.is_some());
+        bench.settle();
+        let proposals = bench.app.proposals.as_ref().expect("the symbol is found");
+        assert_eq!(proposals.found.first().map(|found| found.version), Some(SymbolVersion::Qr(2)));
+    }
+}

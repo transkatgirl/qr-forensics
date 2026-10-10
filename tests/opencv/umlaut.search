@@ -1,0 +1,4 @@
+; from: testdata/cv/qrcode/umlaut.png
+; quick
+; messages: as this reader reads them
+SPC<CR><LF>0200<CR><LF>1<CR><LF>CH043000523022244901H<CR><LF>S<CR><LF>Emil Frey Betriebs AG<CR><LF>Bahnhofstrasse 17<CR><LF><CR><LF>5745<CR><LF>Safenwil<CR><LF>CH<CR><LF><CR><LF><CR><LF><CR><LF><CR><LF><CR><LF><CR><LF><CR><LF>3228.50<CR><LF>CHF<CR><LF>S<CR><LF>Sixt rent a Car AG <CR><LF>Müllheimstrasse 195<CR><LF><CR><LF>4057<CR><LF>Basel<CR><LF>CH<CR><LF>QRR<CR><LF>267274035810104830009639430<CR><LF>Kdnr 963943, 03581-0104830<CR><LF>EPD

@@ -1,0 +1,682 @@
+//! What the app keeps between frames.
+
+use std::sync::Arc;
+
+use eframe::egui;
+use qr_forensics::decode::codewords::Pins;
+use qr_forensics::decode::padding::PadCandidate;
+use qr_forensics::decode::pipeline::{DecodeReport, GridAnalysis};
+use qr_forensics::decode::sequence::Sequence;
+use qr_forensics::imaging::Luma;
+use qr_forensics::imaging::adjust::Adjust;
+use qr_forensics::imaging::binarize::BinarizeParams;
+use qr_forensics::imaging::detect::{Anchor, Detection};
+use qr_forensics::imaging::projection::{ControlPoint, Projection};
+use qr_forensics::imaging::detect::SearchParams;
+use qr_forensics::imaging::sample::{Classified, SampleParams};
+use qr_forensics::symbol::function_map::FunctionMap;
+use qr_forensics::symbol::grid::{Mirror, Module, ModuleGrid};
+use qr_forensics::symbol::layout::{CwId, SymbolLayout};
+use qr_forensics::symbol::{EcLevel, SymbolVersion};
+
+/// Where an anchor's photo position came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnchorSource {
+    /// Found in the photo by the corner search.
+    Detected,
+    /// Placed by hand.
+    Manual,
+}
+
+/// A fixed pattern whose place in the photo is known, by detection or by
+/// hand, and which the projection passes through.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DocAnchor {
+    pub anchor: Anchor,
+    pub source: AnchorSource,
+}
+
+impl DocAnchor {
+    pub fn control_point(&self) -> ControlPoint {
+        self.anchor.control_point()
+    }
+}
+
+/// Symbols a search of the whole photo found, on offer until the list is
+/// cleared, the photo changes, or its lens setting does, which moves the
+/// photo under them.
+pub struct Proposals {
+    pub found: Vec<Detection>,
+    /// The photo's Invert setting when the search ran. A detection's
+    /// `inverted` says how the symbol read against the photo as it was
+    /// then, so adopting it later, after the setting has changed, must
+    /// reckon from here.
+    pub photo_inverted: bool,
+    /// The one of them last picked to put the outline on. While the
+    /// outline still lies on it, it is not offered again on the canvas,
+    /// where a click meant for the grid would put the outline back as
+    /// found, over whatever was placed by hand since.
+    pub adopted: Option<usize>,
+}
+
+/// How the EC level and mask are chosen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormatSel {
+    /// Whatever the format bits match best.
+    Auto,
+    Manual { ec: EcLevel, mask: u8 },
+}
+
+/// Everything undo and redo restore.
+#[derive(Clone, PartialEq)]
+pub struct Document {
+    pub version: SymbolVersion,
+    pub grid: ModuleGrid,
+    pub pins: Pins,
+    /// The EC level the pins were made under; codeword numbering depends on it.
+    pub pins_ec: Option<EcLevel>,
+    pub format: FormatSel,
+    /// Symbol outline on the photo: top-left, top-right, bottom-right,
+    /// bottom-left, in photo pixels. Kept here so that moving a corner is
+    /// undoable; meaningless while no photo is loaded.
+    pub corners: [[f64; 2]; 4],
+    /// Fixed patterns pinned to their places in the photo, which bend the
+    /// projection between the corners. Their module coordinates belong to
+    /// `version`.
+    pub anchors: Vec<DocAnchor>,
+    /// How the photo is read: kept here so that a change of adjustments
+    /// is undoable. The photo's own copy says what its luminance and
+    /// texture were last built under; meaningless while no photo is
+    /// loaded.
+    pub adjust: Adjust,
+}
+
+impl Document {
+    pub fn blank(version: SymbolVersion) -> Self {
+        Self {
+            version,
+            grid: FunctionMap::new(version).blank_grid(),
+            pins: Pins::new(),
+            pins_ec: None,
+            format: FormatSel::Auto,
+            corners: [[0.0; 2]; 4],
+            anchors: Vec::new(),
+            adjust: Adjust::default(),
+        }
+    }
+
+    /// A fresh grid at `version` that keeps the photo outline and
+    /// adjustments. Anchors name modules of the old version and do not
+    /// carry over.
+    pub fn blank_like(&self, version: SymbolVersion) -> Self {
+        Self { corners: self.corners, adjust: self.adjust, ..Self::blank(version) }
+    }
+
+    /// The anchors as control points of the projection.
+    pub fn control_points(&self) -> Vec<ControlPoint> {
+        self.anchors.iter().map(DocAnchor::control_point).collect()
+    }
+
+    /// The anchor at a site, if one is set.
+    pub fn anchor_at(&self, at: [f64; 2]) -> Option<&DocAnchor> {
+        self.anchors.iter().find(|a| (a.anchor.at[0] - at[0]).abs() < 1e-6 && (a.anchor.at[1] - at[1]).abs() < 1e-6)
+    }
+
+    /// Set or replace the anchor at a site. One replaced keeps its place
+    /// among the others, so that nothing which goes by their order, as
+    /// the handles of the Align stage are drawn, sees it move.
+    pub fn set_anchor(&mut self, anchor: Anchor, source: AnchorSource) {
+        let at = anchor.at;
+        let set = DocAnchor { anchor, source };
+        match self.anchors.iter().position(|a| (a.anchor.at[0] - at[0]).abs() < 1e-6 && (a.anchor.at[1] - at[1]).abs() < 1e-6) {
+            Some(i) => self.anchors[i] = set,
+            None => self.anchors.push(set),
+        }
+    }
+
+    pub fn remove_anchor(&mut self, at: [f64; 2]) {
+        self.anchors.retain(|a| !((a.anchor.at[0] - at[0]).abs() < 1e-6 && (a.anchor.at[1] - at[1]).abs() < 1e-6));
+    }
+
+    /// Whether the two hold the same symbol, whatever photo each lies on:
+    /// the version, the modules, the pins and the format.
+    fn same_symbol_as(&self, other: &Document) -> bool {
+        self.version == other.version
+            && self.grid == other.grid
+            && self.pins == other.pins
+            && self.pins_ec == other.pins_ec
+            && self.format == other.format
+    }
+
+    /// This document's symbol laid on the photo `other` lies on: with
+    /// `other`'s outline and adjustments, and its anchors where they name
+    /// modules of the same version.
+    fn on_photo_of(self, other: &Document) -> Document {
+        let anchors = if self.version == other.version { other.anchors.clone() } else { Vec::new() };
+        Document { corners: other.corners, anchors, adjust: other.adjust, ..self }
+    }
+
+    /// Module coordinates to photo pixels: the corner homography bent
+    /// through the anchors, or the homography alone when `use_anchors` is
+    /// off or there are none.
+    pub fn projection(&self, width: usize, height: usize, use_anchors: bool) -> Option<Projection> {
+        let controls = if use_anchors { self.control_points() } else { Vec::new() };
+        Projection::new(width, height, self.corners, &controls)
+    }
+}
+
+/// Everything the projection depends on.
+#[derive(Clone, PartialEq)]
+pub struct ModelKey {
+    pub version: SymbolVersion,
+    /// Width and height of the function map the projection was laid out
+    /// for. They follow from the version, and are kept beside it so that
+    /// a projection made for a grid of another size can never pass for
+    /// the one wanted, whatever the version says.
+    pub size: (usize, usize),
+    pub corners: [[f64; 2]; 4],
+    pub anchors: Vec<DocAnchor>,
+    pub use_anchors: bool,
+}
+
+/// The projection for the current outline, with the photo position of
+/// every module corner worked out once, for drawing and sampling.
+pub struct Model {
+    pub key: ModelKey,
+    pub projection: Arc<Projection>,
+    /// `(width + 1) * (height + 1)` points, row-major.
+    pub lattice: Arc<Vec<[f64; 2]>>,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl Model {
+    /// Photo position of module corner (`x`, `y`), 0..=width, 0..=height.
+    pub fn corner(&self, x: usize, y: usize) -> [f64; 2] {
+        self.lattice[y * (self.width + 1) + x]
+    }
+}
+
+/// One undo point: the document, and which photo it lay on.
+struct Snapshot {
+    doc: Document,
+    photo: u64,
+}
+
+impl Snapshot {
+    /// Whether going back to this point would change `doc`, which lies
+    /// on photo `photo`. A point taken on another photo brings back the
+    /// symbol alone, so it changes nothing unless the symbol differs.
+    fn changes(&self, doc: &Document, photo: u64) -> bool {
+        if self.photo == photo { self.doc != *doc } else { !self.doc.same_symbol_as(doc) }
+    }
+
+    /// The document this point brings back in place of `doc`, which lies
+    /// on photo `photo`: all of it when it was taken on that photo, and
+    /// otherwise its symbol on `doc`'s photo. An outline, anchors and
+    /// lens setting are of the photo they were placed on, and mean
+    /// nothing on another.
+    fn onto(self, doc: &Document, photo: u64) -> Document {
+        if self.photo == photo { self.doc } else { self.doc.on_photo_of(doc) }
+    }
+}
+
+#[derive(Default)]
+pub struct History {
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    /// Counts the photos the document has lain on: see [`Snapshot`].
+    photo: u64,
+    /// A checkpoint has been taken, and whether the change it was taken
+    /// for then happened has not been looked at yet.
+    open: bool,
+}
+
+impl History {
+    const LIMIT: usize = 200;
+
+    /// Record the state before a change. Whether the change then happens
+    /// is seen at the next call, of this or of undo or redo: a press that
+    /// turns out to change nothing, on a module already that colour or
+    /// beside the grid, costs neither the states that could be redone nor
+    /// a step of undo.
+    pub fn checkpoint(&mut self, doc: &Document) {
+        self.close(doc);
+        if self.undo.last().is_none_or(|last| last.photo != self.photo || last.doc != *doc) {
+            self.undo.push(Snapshot { doc: doc.clone(), photo: self.photo });
+            if self.undo.len() > Self::LIMIT {
+                self.undo.remove(0);
+            }
+        }
+        self.open = true;
+    }
+
+    /// Reckon with the last checkpoint: when the document has changed
+    /// since it was taken, the states undone before it are a road not
+    /// taken, and can no longer be redone.
+    fn close(&mut self, doc: &Document) {
+        if std::mem::take(&mut self.open) && self.changed_since_checkpoint(doc) {
+            self.redo.clear();
+        }
+    }
+
+    fn changed_since_checkpoint(&self, doc: &Document) -> bool {
+        self.undo.last().is_some_and(|last| last.doc != *doc)
+    }
+
+    /// The document is about to be laid on another photo, or on none.
+    /// Undo and redo from here on bring back the symbol of an earlier
+    /// state, not the outline, anchors and adjustments it had on the
+    /// photo it was on.
+    pub fn photo_changed(&mut self, doc: &Document) {
+        self.close(doc);
+        self.photo += 1;
+    }
+
+    pub fn can_undo(&self, doc: &Document) -> bool {
+        self.undo.iter().rev().any(|point| point.changes(doc, self.photo))
+    }
+
+    pub fn can_redo(&self, doc: &Document) -> bool {
+        !(self.open && self.changed_since_checkpoint(doc)) && self.redo.iter().rev().any(|point| point.changes(doc, self.photo))
+    }
+
+    pub fn undo(&mut self, doc: &mut Document) -> bool {
+        self.close(doc);
+        // A checkpoint taken for a change that never happened is skipped.
+        while let Some(previous) = self.undo.pop() {
+            if previous.changes(doc, self.photo) {
+                let restored = previous.onto(doc, self.photo);
+                self.redo.push(Snapshot { doc: std::mem::replace(doc, restored), photo: self.photo });
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn redo(&mut self, doc: &mut Document) -> bool {
+        self.close(doc);
+        while let Some(next) = self.redo.pop() {
+            if next.changes(doc, self.photo) {
+                let restored = next.onto(doc, self.photo);
+                let current = std::mem::replace(doc, restored);
+                if self.undo.last().is_none_or(|last| last.photo != self.photo || last.doc != current) {
+                    self.undo.push(Snapshot { doc: current, photo: self.photo });
+                }
+                return true;
+            }
+        }
+        false
+    }
+}
+
+pub struct Photo {
+    pub name: String,
+    pub width: usize,
+    pub height: usize,
+    /// RGBA as loaded, after any downscaling.
+    pub original: Vec<u8>,
+    pub adjust: Adjust,
+    /// What sampling reads: the adjusted image as luminance. Shared, so
+    /// that a search or a job on its own thread starts without copying
+    /// the photo; a change of adjustments makes a new one.
+    pub luma: Arc<Luma>,
+    pub texture: egui::TextureHandle,
+    /// The binarised view, built when first shown and kept until the
+    /// luminance or the settings change.
+    pub binarised: Option<Binarised>,
+}
+
+/// The adaptive threshold of the photo as a texture, with what it was
+/// made from. It holds the luminance it was built from, so that a new one
+/// cannot take the old one's address and pass for it.
+pub struct Binarised {
+    pub source: Arc<Luma>,
+    pub params: BinarizeParams,
+    pub texture: egui::TextureHandle,
+}
+
+impl Binarised {
+    /// Whether this is the threshold of `luma` under `params`.
+    pub fn is_for(&self, luma: &Arc<Luma>, params: &BinarizeParams) -> bool {
+        Arc::ptr_eq(&self.source, luma) && self.params == *params
+    }
+}
+
+impl Photo {
+    /// A square outline in the middle of the photo, to start from.
+    pub fn default_corners(&self) -> [[f64; 2]; 4] {
+        let (w, h) = (self.width as f64, self.height as f64);
+        let side = 0.7 * w.min(h);
+        let (x0, y0) = ((w - side) / 2.0, (h - side) / 2.0);
+        [[x0, y0], [x0 + side, y0], [x0 + side, y0 + side], [x0, y0 + side]]
+    }
+}
+
+/// Result of sampling the photo with the current corners and settings.
+pub struct SamplePreview {
+    pub key: SampleKey,
+    pub classified: Classified,
+    /// (matching, known) against the version's fixed patterns.
+    pub fixed: (usize, usize),
+}
+
+/// Everything the sample preview depends on.
+#[derive(Clone, PartialEq)]
+pub struct SampleKey {
+    pub model: ModelKey,
+    pub adjust: Adjust,
+    pub params: SampleParams,
+}
+
+/// Values computed from the document, refreshed whenever it changes.
+pub struct Derived {
+    pub func: Arc<FunctionMap>,
+    pub analysis: GridAnalysis,
+    /// The EC level and mask in effect.
+    pub ec: EcLevel,
+    pub mask: u8,
+    pub layout: Arc<SymbolLayout>,
+    pub report: DecodeReport,
+    pub padding: Option<PadCandidate>,
+    /// The EC level and mask came from brute force because the format bits
+    /// could not settle them.
+    pub format_by_brute: bool,
+    /// Nothing decoded as painted, but the grid's mirror image did: the
+    /// symbol was seen from the back and its format bits could not say so.
+    pub mirror_by_decode: Option<Mirror>,
+}
+
+/// A line for the status bar.
+pub struct Notice {
+    pub text: String,
+    pub is_error: bool,
+    pub at: std::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// Photo coordinates: place the corners.
+    Align,
+    /// Module coordinates: paint and inspect.
+    Edit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tool {
+    Brush,
+    Rect,
+    Inspect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Overlay {
+    None,
+    Roles,
+    Blocks,
+    Corrections,
+    /// How far each sampled module was from its threshold.
+    Reliability,
+}
+
+impl Overlay {
+    pub const ALL: [Overlay; 5] =
+        [Overlay::None, Overlay::Roles, Overlay::Blocks, Overlay::Corrections, Overlay::Reliability];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Overlay::None => "None",
+            Overlay::Roles => "Module roles",
+            Overlay::Blocks => "RS blocks",
+            Overlay::Corrections => "Corrections",
+            Overlay::Reliability => "Reliability",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlignOverlay {
+    FixedPatterns,
+    SamplePreview,
+    LinesOnly,
+    /// The photo thresholded as a finder scan sees it, under the lines.
+    Binarised,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layers {
+    Both,
+    Photo,
+    Grid,
+}
+
+/// How the decoded message is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResultMode {
+    /// Decoded text, with unreadable characters marked.
+    Text,
+    /// Text with control characters spelt out.
+    Escaped,
+    /// The message's bytes in hexadecimal.
+    Hex,
+    /// Text with ECI designators written in.
+    Eci,
+    /// GS1 element strings, each application identifier in parentheses.
+    Gs1,
+}
+
+impl ResultMode {
+    pub const ALL: [ResultMode; 5] =
+        [ResultMode::Text, ResultMode::Escaped, ResultMode::Hex, ResultMode::Eci, ResultMode::Gs1];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ResultMode::Text => "Text",
+            ResultMode::Escaped => "Escaped",
+            ResultMode::Hex => "Hex",
+            ResultMode::Eci => "ECI",
+            ResultMode::Gs1 => "GS1",
+        }
+    }
+}
+
+/// Pan and zoom of one canvas stage.
+#[derive(Clone, Copy, Debug)]
+pub struct PanZoom {
+    /// World point shown at the centre of the canvas.
+    pub center: egui::Vec2,
+    /// Screen points per world unit.
+    pub scale: f32,
+    /// Keep the content fitted to the canvas, following window resizes,
+    /// until the user pans or zooms.
+    pub auto_fit: bool,
+}
+
+impl Default for PanZoom {
+    fn default() -> Self {
+        Self { center: egui::Vec2::ZERO, scale: 1.0, auto_fit: true }
+    }
+}
+
+impl PanZoom {
+    pub fn to_screen(self, canvas: egui::Rect, world: egui::Vec2) -> egui::Pos2 {
+        canvas.center() + (world - self.center) * self.scale
+    }
+
+    pub fn to_world(self, canvas: egui::Rect, screen: egui::Pos2) -> egui::Vec2 {
+        self.center + (screen - canvas.center()) / self.scale
+    }
+
+    pub fn fit(&mut self, canvas: egui::Rect, world: egui::Rect) {
+        let scale = (canvas.width() / world.width()).min(canvas.height() / world.height()) * 0.92;
+        if scale.is_finite() && scale > 0.0 {
+            self.scale = scale;
+            self.center = world.center().to_vec2();
+        }
+    }
+
+    /// Zoom by `factor`, keeping the world point under `anchor` in place.
+    pub fn zoom_about(&mut self, canvas: egui::Rect, anchor: egui::Pos2, factor: f32) {
+        let before = self.to_world(canvas, anchor);
+        self.scale = (self.scale * factor).clamp(0.01, 400.0);
+        self.center += before - self.to_world(canvas, anchor);
+    }
+}
+
+/// The lists that scroll inside the inspector, which scrolls itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InnerList {
+    ResultText,
+    Blocks,
+    Codewords,
+    SequenceText,
+}
+
+/// Which of the inspector's lists the wheel belongs to, if any. A list
+/// takes the wheel once the pointer has been moved onto it. One that
+/// slides under a pointer at rest, as the inspector scrolls, does not:
+/// it would stop the inspector there, with every turn of the wheel going
+/// to the list until its end, and the rest of the inspector out of reach.
+#[derive(Default)]
+pub struct WheelLatch {
+    /// Where each list lay on the last frame, by [`InnerList`]'s order.
+    rects: [Option<egui::Rect>; 4],
+    owner: Option<InnerList>,
+    /// Where the pointer was when `owner` was last settled.
+    settled_at: Option<egui::Pos2>,
+}
+
+impl WheelLatch {
+    /// How far the pointer must move, in points, to count as moved: more
+    /// than turning a mouse's wheel jogs it.
+    const MOVED: f32 = 6.0;
+
+    /// Take in where the pointer is, at the start of a frame, before the
+    /// lists are laid out again: one that is not, its section closed, is
+    /// no longer anywhere.
+    pub fn follow(&mut self, pointer: Option<egui::Pos2>) {
+        let rects = std::mem::take(&mut self.rects);
+        let Some(pointer) = pointer else { return };
+        if self.settled_at.is_some_and(|at| at.distance(pointer) <= Self::MOVED) {
+            return;
+        }
+        self.settled_at = Some(pointer);
+        self.owner = [InnerList::ResultText, InnerList::Blocks, InnerList::Codewords, InnerList::SequenceText]
+            .into_iter()
+            .find(|&list| rects[list as usize].is_some_and(|rect| rect.contains(pointer)));
+    }
+
+    /// Whether `list` has the wheel.
+    pub fn owns(&self, list: InnerList) -> bool {
+        self.owner == Some(list)
+    }
+
+    /// Record where `list` was laid out this frame.
+    pub fn place(&mut self, list: InnerList, rect: egui::Rect) {
+        self.rects[list as usize] = Some(rect);
+    }
+
+    /// Where `list` was laid out this frame, if it was.
+    #[cfg(test)]
+    pub fn placed(&self, list: InnerList) -> Option<egui::Rect> {
+        self.rects[list as usize]
+    }
+}
+
+/// A brush stroke or rectangle drag in progress.
+#[derive(Clone, Copy, Debug)]
+pub struct Stroke {
+    pub ink: Module,
+    pub start: (i32, i32),
+    pub last: (i32, i32),
+}
+
+pub struct ViewState {
+    pub stage: Stage,
+    pub tool: Tool,
+    pub ink: Module,
+    pub overlay: Overlay,
+    pub align_overlay: AlignOverlay,
+    pub layers: Layers,
+    pub photo_opacity: f32,
+    pub grid_opacity: f32,
+    pub grid_lines: bool,
+    /// Keep fixed patterns at their specified colours.
+    pub lock_fixed: bool,
+    pub align_view: PanZoom,
+    pub edit_view: PanZoom,
+    pub selected: Option<CwId>,
+    /// Scroll the codeword table to the selection on the next frame.
+    pub reveal_selected: bool,
+    /// Block whose unresolved codewords are outlined on the canvas.
+    pub highlight_block: Option<usize>,
+    pub hover: Option<(usize, usize)>,
+    pub active_corner: usize,
+    pub sample: SampleParams,
+    /// How Search whole photo searches the photo.
+    pub search: SearchParams,
+    pub stroke: Option<Stroke>,
+    /// Codeword table filter: a block index, or everything.
+    pub table_block: Option<usize>,
+    pub pin_text: String,
+    /// Bend the projection through the anchors.
+    pub use_anchors: bool,
+    /// When the fixed patterns read inverted at sampling time, invert the
+    /// photo before writing the grid, as a reader retries inverted of its
+    /// own accord.
+    pub auto_invert: bool,
+    /// Draw anchor handles in the Align stage.
+    pub show_anchors: bool,
+    pub result_mode: ResultMode,
+    /// Parts of a structured append message collected so far.
+    pub sequence: Sequence,
+    /// Settings of the binarised view: the scan's own rule for the
+    /// outline while `binarize_auto` holds, and whatever was set since.
+    pub binarize: BinarizeParams,
+    /// The binarised view follows the outline, as the scan does.
+    pub binarize_auto: bool,
+    /// The pointer press on a photo adjustment control under way has
+    /// taken its undo point: a slider drag changes the value every frame
+    /// and must make one step of undo, not one a frame.
+    pub adjust_gesture: bool,
+    /// Which of the inspector's lists the wheel scrolls.
+    pub wheel: WheelLatch,
+}
+
+impl Default for ViewState {
+    fn default() -> Self {
+        Self {
+            stage: Stage::Edit,
+            tool: Tool::Brush,
+            ink: Module::Dark,
+            overlay: Overlay::None,
+            align_overlay: AlignOverlay::FixedPatterns,
+            layers: Layers::Both,
+            photo_opacity: 1.0,
+            grid_opacity: 0.6,
+            grid_lines: true,
+            lock_fixed: true,
+            align_view: PanZoom::default(),
+            edit_view: PanZoom::default(),
+            selected: None,
+            reveal_selected: false,
+            highlight_block: None,
+            hover: None,
+            active_corner: 0,
+            sample: SampleParams::default(),
+            search: SearchParams::default(),
+            stroke: None,
+            table_block: None,
+            pin_text: String::new(),
+            use_anchors: true,
+            auto_invert: true,
+            show_anchors: true,
+            result_mode: ResultMode::Text,
+            sequence: Sequence::default(),
+            binarize: BinarizeParams::default(),
+            binarize_auto: true,
+            adjust_gesture: false,
+            wheel: WheelLatch::default(),
+        }
+    }
+}

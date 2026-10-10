@@ -1,0 +1,7 @@
+; family: qr
+; status: pass
+; rotations: 0 90 180 270
+-61 -61
+415 -61
+415 415
+-61 415

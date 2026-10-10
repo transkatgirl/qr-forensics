@@ -1,0 +1,26 @@
+[package]
+name = "qr-forensics"
+version = "0.1.0"
+edition = "2024"
+description = "Manual decoder for QR codes too damaged for a camera-based reader"
+
+[dependencies]
+eframe = "0.36"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff"] }
+rfd = "0.17"
+arboard = { version = "3", features = ["image-data"] }
+encoding_rs = "0.8"
+
+[features]
+# Development aid: scripted UI run that saves screenshots. See src/app/selftest.rs.
+selftest = []
+
+[dev-dependencies]
+qrcode-generator = { version = "6.1", default-features = false, features = ["qr", "micro-qr", "rmqr", "kanji"] }
+rxing = { version = "0.9", default-features = false, features = ["decoders", "qrcode", "encoding_rs"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

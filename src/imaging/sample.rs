@@ -1,0 +1,1190 @@
+//! Reading module colours off a photo through a projection.
+
+use super::Luma;
+use super::homography::Homography;
+use super::projection::Project;
+use crate::symbol::function_map::{FunctionMap, looks_inverted};
+use crate::symbol::grid::{CERTAIN, Module, ModuleGrid};
+use crate::symbol::{Family, Pos, SymbolVersion};
+
+/// Points sampled per module along each axis, spread over the middle of the
+/// module so neighbours and edge blur stay out of the average.
+pub const POINTS: usize = 5;
+pub const INNER_FRACTION: f64 = 0.6;
+
+/// How a module's luminance is read: averaged over the middle of the
+/// module; taken at its centre alone, which is how ZXing and zxing-cpp
+/// read the binarised image; or the median of five points about the
+/// centre, which is how BoofCV reads the grey one, by a majority of the
+/// five. The average is steadiest against noise; the centre alone reads
+/// a smeared print or a symbol drawn as dots, where the average takes in
+/// the neighbours or the paper between the dots; the vote outvotes a
+/// speck or a scratch narrower than half the module, which pulls the
+/// average and may fall on the centre.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Kernel {
+    Area,
+    Centre,
+    #[default]
+    Vote,
+}
+
+impl Kernel {
+    pub const ALL: [Kernel; 3] = [Kernel::Area, Kernel::Centre, Kernel::Vote];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Kernel::Area => "Area average",
+            Kernel::Centre => "Module centre",
+            Kernel::Vote => "Centre vote",
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Kernel::Area => {
+                "The mean over the middle of each module, which averages noise and specks away"
+            }
+            Kernel::Centre => {
+                "The luminance at the centre of each module alone, as ZXing reads it: for smeared prints and \
+                 symbols drawn as dots, where the average takes in the neighbours"
+            }
+            Kernel::Vote => {
+                "The median of five points about the centre of each module, as BoofCV reads one: a majority vote, \
+                 which a speck or a scratch narrower than half the module cannot swing"
+            }
+        }
+    }
+
+    /// The other kernel, to retry a read with: the vote falls back on
+    /// the average, which it refines.
+    pub fn other(self) -> Kernel {
+        match self {
+            Kernel::Area => Kernel::Centre,
+            Kernel::Centre => Kernel::Area,
+            Kernel::Vote => Kernel::Area,
+        }
+    }
+
+    /// This kernel, then the others, in the order a read tries them.
+    pub fn retries(self) -> impl Iterator<Item = Kernel> {
+        std::iter::once(self).chain(Kernel::ALL.into_iter().filter(move |&k| k != self))
+    }
+
+    /// The luminance of the module at column `mx`, row `my`, read as this
+    /// kernel reads one; `None` where the module lies off the image.
+    pub fn sample(self, image: &Luma, map: &impl Project, mx: usize, my: usize) -> Option<f32> {
+        match self {
+            Kernel::Area => sample_module_inner(image, map, mx, my, INNER_FRACTION, POINTS),
+            Kernel::Centre => sample_module_inner(image, map, mx, my, INNER_FRACTION, 1),
+            Kernel::Vote => sample_module_vote(image, map, mx, my),
+        }
+    }
+}
+
+/// Mean luminance of each module; `None` where the module lies off the image.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Sampled {
+    pub width: usize,
+    pub height: usize,
+    pub luma: Vec<Option<f32>>,
+}
+
+/// Mean luminance over the middle `inner` of the module at column `mx`,
+/// row `my`, from `points` × `points` samples; `None` when it lies mostly
+/// off the image, since that is not evidence of anything. The map's local
+/// correction is taken once, at the module's centre.
+pub fn sample_module_inner(
+    image: &Luma,
+    map: &impl Project,
+    mx: usize,
+    my: usize,
+    inner: f64,
+    points: usize,
+) -> Option<f32> {
+    let [dx, dy] = map.displacement(mx as f64 + 0.5, my as f64 + 0.5);
+    let (mut sum, mut count) = (0.0f32, 0u32);
+    for sy in 0..points {
+        for sx in 0..points {
+            let offset = |s: usize| (1.0 - inner) / 2.0 + inner * (s as f64 + 0.5) / points as f64;
+            let [px, py] = map.base(mx as f64 + offset(sx), my as f64 + offset(sy));
+            if let Some(value) = image.sample(px + dx, py + dy) {
+                sum += value;
+                count += 1;
+            }
+        }
+    }
+    (count as usize * 2 > points * points).then(|| sum / count as f32)
+}
+
+/// Mean luminance of the module at column `mx`, row `my`, keeping clear of
+/// its edges.
+pub fn sample_module(image: &Luma, map: &impl Project, mx: usize, my: usize) -> Option<f32> {
+    sample_module_inner(image, map, mx, my, INNER_FRACTION, POINTS)
+}
+
+/// How far from the centre of a module the vote's four outer points lie,
+/// in modules, as BoofCV places them.
+pub const VOTE_OFFSET: f64 = 0.2;
+
+/// The median luminance of five points about the centre of the module at
+/// column `mx`, row `my`: the centre and [`VOTE_OFFSET`] to each side of
+/// it. Against a threshold the median falls as the majority of the five
+/// do, which is how BoofCV votes them. `None` when fewer than three lie
+/// on the image.
+pub fn sample_module_vote(image: &Luma, map: &impl Project, mx: usize, my: usize) -> Option<f32> {
+    let (cx, cy) = (mx as f64 + 0.5, my as f64 + 0.5);
+    let [dx, dy] = map.displacement(cx, cy);
+    let offsets = [
+        [0.0, 0.0],
+        [-VOTE_OFFSET, 0.0],
+        [VOTE_OFFSET, 0.0],
+        [0.0, -VOTE_OFFSET],
+        [0.0, VOTE_OFFSET],
+    ];
+    let mut values: Vec<f32> = offsets
+        .iter()
+        .filter_map(|[ox, oy]| {
+            let [px, py] = map.base(cx + ox, cy + oy);
+            image.sample(px + dx, py + dy)
+        })
+        .collect();
+    if values.len() < 3 {
+        return None;
+    }
+    values.sort_by(f32::total_cmp);
+    let n = values.len();
+    Some(if n % 2 == 1 {
+        values[n / 2]
+    } else {
+        (values[n / 2 - 1] + values[n / 2]) / 2.0
+    })
+}
+
+/// Below this many pixels a module, the modules are sharpened against
+/// their neighbours before they are read, and the more the smaller.
+pub const SHARPEN_BELOW_PX: f64 = 4.0;
+/// Most of the difference between a module and the mean of its four
+/// neighbours that is added back, for a module vanishingly small.
+const SHARPEN_GAIN: f32 = 0.8;
+
+/// Sample a `width` × `height` module grid through `map` with the area
+/// kernel. Where a module is only a few pixels across, the lens has
+/// blurred each into its neighbours, and a lone dark module among light
+/// ones reads as grey: the modules are then sharpened against their
+/// neighbours, a little of what the blur took being put back, as an
+/// unsharp mask does to a photo.
+pub fn sample_modules(image: &Luma, map: &impl Project, width: usize, height: usize) -> Sampled {
+    sample_modules_with(image, map, width, height, Kernel::Area)
+}
+
+/// [`sample_modules`] with the kernel given. Whatever the module size, a
+/// reading whose luminances separate poorly into dark and light, as a
+/// photo blurred by the lens or by movement reads, is sharpened too, as
+/// [`Sampled::sharpened_for_separation`] does it.
+pub fn sample_modules_with(
+    image: &Luma,
+    map: &impl Project,
+    width: usize,
+    height: usize,
+    kernel: Kernel,
+) -> Sampled {
+    let luma = (0..height)
+        .flat_map(|my| (0..width).map(move |mx| (mx, my)))
+        .map(|(mx, my)| kernel.sample(image, map, mx, my))
+        .collect();
+    let sampled = Sampled {
+        width,
+        height,
+        luma,
+    };
+    let (cx, cy) = (width as f64 / 2.0, height as f64 / 2.0);
+    let step = |dx: f64, dy: f64| {
+        let [ax, ay] = map.base(cx, cy);
+        let [bx, by] = map.base(cx + dx, cy + dy);
+        ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt()
+    };
+    let module_px = (step(1.0, 0.0) + step(0.0, 1.0)) / 2.0;
+    let sampled = if module_px < SHARPEN_BELOW_PX {
+        sampled.sharpened(SHARPEN_GAIN * (1.0 - module_px / SHARPEN_BELOW_PX) as f32)
+    } else {
+        sampled
+    };
+    sampled.sharpened_for_separation()
+}
+
+/// Below this separability of a reading's luminances, a sharpened reading
+/// is tried: the modules of a blurred photo read grey where a dark one
+/// has light neighbours, at any size, where the size rule above sharpens
+/// only the smallest.
+const SHARPEN_FOR_SEPARABILITY: f32 = POOR_SEPARABILITY;
+/// How much better a sharpened reading must separate to be kept over the
+/// reading as it is.
+const SHARPEN_SEPARATION_GAIN: f32 = 0.1;
+/// The gains tried for a poorly separated reading, the larger the
+/// strength the size rule gives a module vanishingly small.
+const SHARPEN_TRIAL_GAINS: [f32; 2] = [0.4, SHARPEN_GAIN];
+
+impl Sampled {
+    /// How clearly the luminances read fall into two groups, as
+    /// [`separability`] measures it.
+    pub fn separability(&self) -> f32 {
+        separability(self.luma.iter().flatten().copied())
+    }
+
+    /// The reading sharpened against its neighbours when its luminances
+    /// separate poorly into dark and light, as a blurred photo reads at
+    /// any module size: a gentle and a strong sharpening are tried and
+    /// the reading that separates best is kept, when it separates clearly
+    /// better than the reading as it is. A reading that already separates
+    /// well, or that no sharpening helps, is returned as it is: a grid
+    /// that straddles module boundaries reads grey too, and sharpening
+    /// does not place it.
+    pub fn sharpened_for_separation(self) -> Self {
+        let before = self.separability();
+        if before >= SHARPEN_FOR_SEPARABILITY {
+            return self;
+        }
+        let mut best: Option<(f32, Sampled)> = None;
+        for &gain in &SHARPEN_TRIAL_GAINS {
+            let trial = self.sharpened(gain);
+            let after = trial.separability();
+            if after >= before + SHARPEN_SEPARATION_GAIN
+                && best.as_ref().is_none_or(|(b, _)| after > *b)
+            {
+                best = Some((after, trial));
+            }
+        }
+        match best {
+            Some((_, trial)) => trial,
+            None => self,
+        }
+    }
+
+    /// Each module moved away from the mean of its known four-neighbours
+    /// by `gain` times their difference.
+    pub fn sharpened(&self, gain: f32) -> Self {
+        let (w, h) = (self.width, self.height);
+        let at = |x: i64, y: i64| {
+            (x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h)
+                .then(|| self.luma[y as usize * w + x as usize])
+                .flatten()
+        };
+        let luma = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x as i64, y as i64)))
+            .map(|(x, y)| {
+                let value = at(x, y)?;
+                let around: Vec<f32> = [at(x - 1, y), at(x + 1, y), at(x, y - 1), at(x, y + 1)]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                if around.is_empty() {
+                    return Some(value);
+                }
+                let mean = around.iter().sum::<f32>() / around.len() as f32;
+                Some(value + gain * (value - mean))
+            })
+            .collect();
+        Self {
+            width: w,
+            height: h,
+            luma,
+        }
+    }
+}
+
+/// Sample only the given modules, over the middle `inner` of each, from
+/// `points` × `points` samples.
+pub fn sample_positions(
+    image: &Luma,
+    map: &impl Project,
+    positions: &[Pos],
+    inner: f64,
+    points: usize,
+) -> Vec<Option<f32>> {
+    positions
+        .iter()
+        .map(|p| sample_module_inner(image, map, p.x as usize, p.y as usize, inner, points))
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SampleParams {
+    /// Luminance below which a module is dark. `None` picks it automatically.
+    /// Ignored in local mode.
+    pub threshold: Option<f32>,
+    /// Modules whose distance from the threshold is below this fraction of
+    /// the local contrast (half the spread between dark and light) become
+    /// unknown rather than guessed.
+    pub band: f32,
+    /// Threshold each module against its own neighbourhood instead of the
+    /// whole symbol. Follows shadows, glare and stains; the default, as in
+    /// ZXing.
+    pub local: bool,
+    /// Neighbourhood half-width in modules for local mode.
+    pub local_radius: usize,
+    /// When the whole symbol is read against one threshold, found
+    /// automatically, let it lie as a surface across the symbol rather
+    /// than level: see [`ThresholdSurface`]. Ignored in local mode, and
+    /// when a threshold is given.
+    pub surface: bool,
+    /// How each module's luminance is read.
+    pub kernel: Kernel,
+}
+
+impl Default for SampleParams {
+    fn default() -> Self {
+        Self {
+            threshold: None,
+            band: 0.12,
+            local: true,
+            local_radius: 5,
+            surface: false,
+            kernel: Kernel::Vote,
+        }
+    }
+}
+
+/// Least spread between the darkest and lightest modules of a
+/// neighbourhood for it to hold any information, as a share of the
+/// symbol's own contrast, the gap between the means of its dark and its
+/// light modules. Below it the modules all look alike, as under an opaque
+/// stain or in glare, and calling them dark or light would be guessing.
+/// ZXing's HybridBinarizer draws the line at 24 of 255 whatever the
+/// photo, and so loses an underexposed photo whole, whose symbol spans
+/// less than that from ink to paper; BoofCV's block Otsu has no such
+/// floor. A share of the symbol's contrast falls where ZXing's line does
+/// on a well exposed photo and far lower on a dark one.
+pub const FLAT_SHARE: f32 = 0.15;
+/// The spread below which a neighbourhood is flat whatever the symbol's
+/// contrast: the noise of the sensor alone spreads a flat patch by about
+/// this much.
+pub const NOISE_RANGE: f32 = 0.02;
+/// Fewest readable modules in a neighbourhood for local statistics.
+const MIN_LOCAL_COUNT: usize = 6;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Classified {
+    pub modules: Vec<Module>,
+    /// How far each module is from its threshold as a share of the local
+    /// contrast, on a scale of 0..=254; zero where the module could not be
+    /// sampled or its neighbourhood had no contrast.
+    pub reliability: Vec<u8>,
+    /// The global threshold, automatic or as given.
+    pub threshold: f32,
+    /// How clearly the module luminances fall into two groups: how empty
+    /// the valley between the two peaks of their histogram is, 0 to 1. A
+    /// well placed outline on a readable symbol scores high; an outline off
+    /// the symbol, which averages neighbouring modules into greys, or a
+    /// washed-out photo, scores low. ZXing's global binarizer refuses an
+    /// image whose two peaks are not apart for the same reason.
+    pub separability: f32,
+    /// Modules left unknown because nothing around them had contrast.
+    pub flat: usize,
+}
+
+impl Classified {
+    pub fn to_grid(&self, width: usize, height: usize) -> ModuleGrid {
+        let mut grid = ModuleGrid::new(width, height);
+        for (i, (&module, &reliability)) in self.modules.iter().zip(&self.reliability).enumerate() {
+            grid.set_sampled(i % width, i / width, module, reliability);
+        }
+        grid
+    }
+
+    /// The luminances do not separate into two groups; the outline is
+    /// probably off the symbol, or the photo too washed out to read.
+    pub fn is_poorly_separated(&self) -> bool {
+        self.separability < POOR_SEPARABILITY
+    }
+}
+
+/// Below this the two groups are not believable: the valley between them
+/// holds half as many modules as the smaller peak.
+pub const POOR_SEPARABILITY: f32 = 0.5;
+
+/// How clearly the values split in two: one when nothing lies in the
+/// middle of the gap between the dark and light groups, zero when as many
+/// values lie there as make up the smaller group. Module means from a
+/// well placed grid cluster at two levels; a grid that straddles module
+/// boundaries averages dark with light and fills the middle.
+pub fn separability(values: impl Iterator<Item = f32>) -> f32 {
+    let values: Vec<f32> = values.collect();
+    if values.len() < 4 {
+        return 0.0;
+    }
+    let (threshold, means, _) = otsu_split(values.iter().copied());
+    let band = 0.35 * (means[1] - means[0]).max(1e-3);
+    let low = values.iter().filter(|&&v| v < threshold).count();
+    let high = values.len() - low;
+    let middle = values
+        .iter()
+        .filter(|&&v| (v - threshold).abs() < band)
+        .count();
+    let smaller = low.min(high).max(1);
+    (1.0 - middle as f32 / smaller as f32).clamp(0.0, 1.0)
+}
+
+/// Reliability for a relative margin from the threshold.
+fn quantize(margin: f32) -> u8 {
+    (margin.clamp(0.0, 1.0) * (CERTAIN - 1) as f32).round() as u8
+}
+
+/// Otsu's split of `values`, with how well it separates them: the
+/// threshold, the means of the two groups, and the share of variance that
+/// lies between the groups. Returns a half-grey split with zero
+/// separability when there is nothing to separate.
+pub fn otsu_split(values: impl Iterator<Item = f32>) -> (f32, [f32; 2], f32) {
+    const BINS: usize = 256;
+    let mut histogram = [0u32; BINS];
+    let mut total = 0u32;
+    for value in values {
+        histogram[((value.clamp(0.0, 1.0) * (BINS - 1) as f32).round()) as usize] += 1;
+        total += 1;
+    }
+    if total == 0 {
+        return (0.5, [0.25, 0.75], 0.0);
+    }
+    let sum_all: f64 = histogram
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| i as f64 * n as f64)
+        .sum();
+    let sum_sq: f64 = histogram
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| (i * i) as f64 * n as f64)
+        .sum();
+    let mean_all = sum_all / total as f64;
+    let variance_all = sum_sq / total as f64 - mean_all * mean_all;
+    let (mut weight_low, mut sum_low) = (0.0f64, 0.0f64);
+    let (mut best, mut best_variance, mut best_means) = (None, 0.0f64, [0.0f64, 0.0f64]);
+    // Several adjacent splits tie when the two groups are well apart; take
+    // the middle of the tied range so the threshold sits between the groups.
+    let mut tie_end = 0;
+    for (i, &n) in histogram.iter().enumerate() {
+        weight_low += n as f64;
+        sum_low += i as f64 * n as f64;
+        let weight_high = total as f64 - weight_low;
+        if weight_low == 0.0 || weight_high == 0.0 {
+            continue;
+        }
+        let (mean_low, mean_high) = (sum_low / weight_low, (sum_all - sum_low) / weight_high);
+        let mean_gap = mean_low - mean_high;
+        let variance = weight_low * weight_high * mean_gap * mean_gap;
+        if variance > best_variance * (1.0 + 1e-12) {
+            best_variance = variance;
+            best = Some(i);
+            best_means = [mean_low, mean_high];
+            tie_end = i;
+        } else if best.is_some() && variance >= best_variance * (1.0 - 1e-12) {
+            tie_end = i;
+        }
+    }
+    match best {
+        Some(start) => {
+            let threshold = ((start + tie_end) as f32 / 2.0 + 0.5) / (BINS - 1) as f32;
+            let means = best_means.map(|m| (m / (BINS - 1) as f64) as f32);
+            // Between-group variance as Otsu defines it, over the total.
+            let between = best_variance / (total as f64 * total as f64);
+            let separability = if variance_all > 0.0 {
+                (between / variance_all).clamp(0.0, 1.0) as f32
+            } else {
+                0.0
+            };
+            (threshold, means, separability)
+        }
+        None => (0.5, [0.25, 0.75], 0.0),
+    }
+}
+
+/// Otsu's threshold: the split that best separates the values into two
+/// groups. Returns 0.5 when there is nothing to separate.
+pub fn otsu(values: impl Iterator<Item = f32>) -> f32 {
+    otsu_split(values).0
+}
+
+/// How far `values` reach from their first to their ninety-ninth
+/// percentile, by a histogram of 256 bins: the spread of a photo from ink
+/// to paper, with the few pixels beyond either left out. Zero for no
+/// values. What a contrast floor is a share of, so that an underexposed
+/// photo, which spans a tenth of the scale, is held to a tenth of the
+/// floor a well exposed one is.
+pub fn robust_spread(values: impl Iterator<Item = f32>) -> f32 {
+    const BINS: usize = 256;
+    let mut histogram = [0u32; BINS];
+    let mut total = 0u32;
+    for value in values {
+        histogram[((value.clamp(0.0, 1.0) * (BINS - 1) as f32).round()) as usize] += 1;
+        total += 1;
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    let percentile = |share: f64| {
+        let want = (share * f64::from(total)).ceil().max(1.0) as u32;
+        let mut seen = 0u32;
+        for (i, &n) in histogram.iter().enumerate() {
+            seen += n;
+            if seen >= want {
+                return i as f32 / (BINS - 1) as f32;
+            }
+        }
+        1.0
+    };
+    (percentile(0.99) - percentile(0.01)).max(0.0)
+}
+
+/// Means of the values on either side of `threshold`; the group means of
+/// the split when a threshold was given rather than found.
+fn means_about(values: impl Iterator<Item = f32>, threshold: f32) -> [f32; 2] {
+    let (mut sum, mut count) = ([0.0f64; 2], [0u32; 2]);
+    for value in values {
+        let side = usize::from(value >= threshold);
+        sum[side] += value as f64;
+        count[side] += 1;
+    }
+    let mean = |side: usize, fallback: f32| {
+        if count[side] > 0 {
+            (sum[side] / count[side] as f64) as f32
+        } else {
+            fallback
+        }
+    };
+    [mean(0, threshold - 0.25), mean(1, threshold + 0.25)]
+}
+
+/// Low and high ends of a neighbourhood's luminance: the tenth and
+/// ninetieth percentiles, so that a stray module does not set the range.
+fn robust_range(values: &mut [f32]) -> (f32, f32) {
+    let n = values.len();
+    let lo = n / 10;
+    let hi = n - 1 - n / 10;
+    let (_, low, _) = values.select_nth_unstable_by(lo, f32::total_cmp);
+    let low = *low;
+    let (_, high, _) = values.select_nth_unstable_by(hi, f32::total_cmp);
+    (low, *high)
+}
+
+/// Modules on a side of the window at each corner of the symbol that a
+/// [`ThresholdSurface`] takes its corner threshold from: a finder pattern
+/// with its separator and the format bits beside it, which hold dark and
+/// light in fair measure whatever the data.
+const SURFACE_WINDOW: usize = 9;
+
+/// A threshold that lies as a smooth surface across the symbol: the
+/// thresholds of its four corners, interpolated bilinearly between them,
+/// as BoofCV reads a QR Code (`bitIntensityToBitValue`), which takes
+/// three of the four from its position patterns and the fourth from the
+/// data in the corner that has none. A shadow that falls across the
+/// symbol, or light that fails toward one side, moves every module's
+/// luminance by an amount that changes slowly from corner to corner, and
+/// the surface follows it. One level threshold cannot; and the
+/// neighbourhood rule, which can, follows every stain and smudge as
+/// well, and reads the modules of an evenly blurred symbol against
+/// neighbours as grey as themselves.
+///
+/// Each corner's threshold is the midpoint between the darkest and
+/// lightest modules of a window [`SURFACE_WINDOW`] modules on a side in
+/// that corner, and stands at the middle of its window; a corner with
+/// too few modules read, or none that differ, takes the level threshold
+/// of the whole symbol. The contrast the unsure band is a share of is
+/// interpolated with it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThresholdSurface {
+    /// Where the corner windows stand, in modules: left and right
+    /// columns, top and bottom rows.
+    columns: [f32; 2],
+    rows: [f32; 2],
+    /// (threshold, half the contrast) at the top-left, top-right,
+    /// bottom-left and bottom-right.
+    corners: [(f32, f32); 4],
+}
+
+impl ThresholdSurface {
+    /// The surface over `sampled`, with `level` the threshold and
+    /// contrast of the symbol as a whole, for a corner that has none of
+    /// its own, and `flat_range` the least spread of luminance that is
+    /// any contrast at all.
+    pub fn new(sampled: &Sampled, level: (f32, f32), flat_range: f32) -> Self {
+        let (w, h) = (sampled.width, sampled.height);
+        let (ww, wh) = (SURFACE_WINDOW.min(w), SURFACE_WINDOW.min(h));
+        let corner = |x0: usize, y0: usize| {
+            let mut values: Vec<f32> = (y0..y0 + wh)
+                .flat_map(|y| (x0..x0 + ww).map(move |x| (x, y)))
+                .filter_map(|(x, y)| sampled.luma[y * w + x])
+                .collect();
+            if values.len() < MIN_LOCAL_COUNT {
+                return level;
+            }
+            let (low, high) = robust_range(&mut values);
+            if high - low < flat_range { level } else { ((low + high) / 2.0, (high - low) / 2.0) }
+        };
+        let (x1, y1) = (w - ww, h - wh);
+        Self {
+            columns: [(ww as f32 - 1.0) / 2.0, x1 as f32 + (ww as f32 - 1.0) / 2.0],
+            rows: [(wh as f32 - 1.0) / 2.0, y1 as f32 + (wh as f32 - 1.0) / 2.0],
+            corners: [corner(0, 0), corner(x1, 0), corner(0, y1), corner(x1, y1)],
+        }
+    }
+
+    /// The threshold, and half the contrast, at the module in column `x`
+    /// and row `y`: interpolated between the corners, and carried on at
+    /// the same slope beyond the middles of their windows.
+    pub fn at(&self, x: usize, y: usize) -> (f32, f32) {
+        let share = |v: usize, [a, b]: [f32; 2]| if b > a { (v as f32 - a) / (b - a) } else { 0.5 };
+        let (u, v) = (share(x, self.columns), share(y, self.rows));
+        let mix = |pick: fn(&(f32, f32)) -> f32| {
+            let [tl, tr, bl, br] = self.corners.each_ref().map(pick);
+            (1.0 - v) * ((1.0 - u) * tl + u * tr) + v * ((1.0 - u) * bl + u * br)
+        };
+        // Carried beyond its corners the contrast may run out; a tenth of
+        // the least of them is as low as it is let fall.
+        let least = self.corners.iter().map(|c| c.1).fold(f32::INFINITY, f32::min);
+        (mix(|c| c.0), mix(|c| c.1).max(0.1 * least).max(1e-3))
+    }
+}
+
+pub fn classify(sampled: &Sampled, params: &SampleParams) -> Classified {
+    let (auto_threshold, _, _) = otsu_split(sampled.luma.iter().flatten().copied());
+    let separability = separability(sampled.luma.iter().flatten().copied());
+    let global = params.threshold.unwrap_or(auto_threshold);
+    let global_means = means_about(sampled.luma.iter().flatten().copied(), global);
+    let global_half = ((global_means[1] - global_means[0]) / 2.0).max(1e-3);
+    let flat_range = (FLAT_SHARE * (global_means[1] - global_means[0])).max(NOISE_RANGE);
+    let (w, h) = (sampled.width, sampled.height);
+    let surface = (params.surface && !params.local && params.threshold.is_none() && w > 0 && h > 0)
+        .then(|| ThresholdSurface::new(sampled, (global, global_half), flat_range));
+
+    let mut modules = Vec::with_capacity(w * h);
+    let mut reliability = Vec::with_capacity(w * h);
+    let mut flat = 0;
+    let mut neighbourhood: Vec<f32> = Vec::new();
+    for i in 0..w * h {
+        let Some(value) = sampled.luma[i] else {
+            modules.push(Module::Unknown);
+            reliability.push(0);
+            continue;
+        };
+        let (threshold, half) = if params.local {
+            let (x, y) = (i % w, i / w);
+            let r = params.local_radius;
+            neighbourhood.clear();
+            for ny in y.saturating_sub(r)..(y + r + 1).min(h) {
+                for nx in x.saturating_sub(r)..(x + r + 1).min(w) {
+                    if let Some(v) = sampled.luma[ny * w + nx] {
+                        neighbourhood.push(v);
+                    }
+                }
+            }
+            if neighbourhood.len() < MIN_LOCAL_COUNT {
+                (global, global_half)
+            } else {
+                let (low, high) = robust_range(&mut neighbourhood);
+                if high - low < flat_range {
+                    // Nothing around here has contrast: no evidence either way.
+                    modules.push(Module::Unknown);
+                    reliability.push(0);
+                    flat += 1;
+                    continue;
+                }
+                // The midpoint rather than the mean, so a neighbourhood with
+                // more of one colour does not pull the threshold towards it.
+                ((low + high) / 2.0, (high - low) / 2.0)
+            }
+        } else if let Some(surface) = &surface {
+            surface.at(i % w, i / w)
+        } else {
+            (global, global_half)
+        };
+        let margin = (value - threshold).abs() / half;
+        modules.push(if margin < params.band {
+            Module::Unknown
+        } else {
+            Module::from_dark(value < threshold)
+        });
+        reliability.push(quantize(margin));
+    }
+    Classified {
+        modules,
+        reliability,
+        threshold: global,
+        separability,
+        flat,
+    }
+}
+
+/// How well a photo fits one version's fixed patterns.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VersionGuess {
+    pub version: SymbolVersion,
+    /// Fixed modules that came out the right colour, or, when `inverted`,
+    /// the right colour with dark and light swapped.
+    pub matching: usize,
+    /// Fixed modules in the version.
+    pub fixed: usize,
+    /// The fixed patterns read inverted at this version: the photo shows
+    /// a light symbol on a dark background.
+    pub inverted: bool,
+}
+
+impl VersionGuess {
+    pub fn score(&self) -> f32 {
+        self.matching as f32 / self.fixed.max(1) as f32
+    }
+}
+
+/// Try every version of a family on the same four corners and rank them by
+/// how many fixed-pattern modules land on the right colour. A version whose
+/// fixed patterns read decidedly inverted is scored with dark and light
+/// swapped and marked as such, so a light-on-dark symbol still ranks its
+/// true version first.
+pub fn suggest_versions(
+    image: &Luma,
+    corners: [[f64; 2]; 4],
+    family: Family,
+    params: &SampleParams,
+) -> Vec<VersionGuess> {
+    let mut guesses: Vec<VersionGuess> = family
+        .versions()
+        .into_iter()
+        .filter_map(|version| {
+            let func = FunctionMap::new(version);
+            let h = Homography::rect_to_quad(func.width as f64, func.height as f64, corners)?;
+            let sampled = sample_modules(image, &h, func.width, func.height);
+            let grid = classify(&sampled, params).to_grid(func.width, func.height);
+            let (matching, known) = func.fixed_agreement(&grid);
+            let inverted = looks_inverted((matching, known));
+            let matching = if inverted { known - matching } else { matching };
+            let fixed = (0..func.height)
+                .flat_map(|y| (0..func.width).map(move |x| (x, y)))
+                .filter(|&(x, y)| func.expected(x, y).is_some())
+                .count();
+            Some(VersionGuess {
+                version,
+                matching,
+                fixed,
+                inverted,
+            })
+        })
+        .collect();
+    guesses.sort_by(|a, b| b.score().total_cmp(&a.score()));
+    guesses
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn otsu_splits_between_groups() {
+        let values = [0.1f32, 0.12, 0.09, 0.11, 0.8, 0.82, 0.79, 0.85, 0.81];
+        let (t, means, eta) = otsu_split(values.iter().copied());
+        assert!((0.3..0.6).contains(&t), "{t}");
+        assert!(
+            (means[0] - 0.105).abs() < 0.01 && (means[1] - 0.814).abs() < 0.01,
+            "{means:?}"
+        );
+        assert!(eta > 0.95, "{eta}");
+        assert_eq!(otsu(std::iter::empty()), 0.5);
+        assert_eq!(otsu([0.4f32; 5].into_iter()), 0.5);
+        // Two clean groups leave the valley between them empty; one blob
+        // of noise has no valley at all, and neither has a grid that
+        // straddles module boundaries and averages dark with light.
+        assert!(separability(values.iter().copied()) > 0.99);
+        let noise: Vec<f32> = (0..200)
+            .map(|i| 0.4 + 0.2 * ((i * 7919) % 101) as f32 / 101.0)
+            .collect();
+        assert!(
+            separability(noise.iter().copied()) < POOR_SEPARABILITY,
+            "{}",
+            separability(noise.iter().copied())
+        );
+        let straddled: Vec<f32> = (0..350)
+            .map(|i| [0.1, 0.23, 0.37, 0.5, 0.63, 0.77, 0.9][(i * 3) % 7])
+            .collect();
+        assert!(
+            separability(straddled.iter().copied()) < POOR_SEPARABILITY,
+            "{}",
+            separability(straddled.iter().copied())
+        );
+        assert_eq!(separability(std::iter::empty()), 0.0);
+    }
+
+    #[test]
+    fn band_marks_uncertain_modules() {
+        let sampled = Sampled {
+            width: 5,
+            height: 1,
+            luma: vec![Some(0.1), Some(0.47), Some(0.9), None, Some(0.55)],
+        };
+        let global = SampleParams {
+            threshold: Some(0.5),
+            band: 0.2,
+            local: false,
+            ..Default::default()
+        };
+        let out = classify(&sampled, &global);
+        assert_eq!(
+            out.modules,
+            [
+                Module::Dark,
+                Module::Unknown,
+                Module::Light,
+                Module::Unknown,
+                Module::Light
+            ]
+        );
+        // Groups mean 0.285 and 0.725: a margin of 0.03 is about a seventh
+        // of the half-contrast of 0.22, a margin of 0.05 about a quarter.
+        assert_eq!(out.reliability[0], 254);
+        assert!(
+            (30..40).contains(&out.reliability[1]),
+            "{:?}",
+            out.reliability
+        );
+        assert_eq!(out.reliability[2], 254);
+        assert_eq!(out.reliability[3], 0);
+        assert!(
+            (52..64).contains(&out.reliability[4]),
+            "{:?}",
+            out.reliability
+        );
+        let grid = out.to_grid(5, 1);
+        assert!(grid.has_reliability());
+        assert_eq!(grid.reliability(0, 0), 254);
+        assert_eq!(grid.reliability(3, 0), 0);
+        let strict = classify(
+            &sampled,
+            &SampleParams {
+                band: 0.0,
+                ..global
+            },
+        );
+        assert_eq!(strict.modules[1], Module::Dark);
+        assert_eq!(strict.modules[4], Module::Light);
+    }
+
+    #[test]
+    fn local_threshold_follows_lighting_and_refuses_flat_regions() {
+        // A 9×9 symbol-like grid, checkerboard, lit twice as bright on the
+        // right; a 3×3 patch in the middle washed out to one grey.
+        let (w, h) = (9, 9);
+        let mut luma = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                let dark = (x + y) % 2 == 0;
+                let light = 0.4 + 0.6 * x as f32 / (w - 1) as f32;
+                let value = if dark { 0.1 * light } else { 0.9 * light };
+                luma.push(Some(if (3..6).contains(&x) && (3..6).contains(&y) {
+                    0.5
+                } else {
+                    value
+                }));
+            }
+        }
+        let sampled = Sampled {
+            width: w,
+            height: h,
+            luma,
+        };
+        let params = SampleParams {
+            local: true,
+            local_radius: 1,
+            ..Default::default()
+        };
+        let out = classify(&sampled, &params);
+        for y in 0..h {
+            for x in 0..w {
+                let want = if (3..6).contains(&x) && (3..6).contains(&y) {
+                    // Inside the wash-out the modules all read the same
+                    // grey, which is no evidence; the ring around it still
+                    // has neighbours with contrast and reads right.
+                    None
+                } else {
+                    Some((x + y) % 2 == 0)
+                };
+                let got = out.modules[y * w + x];
+                match want {
+                    None => assert!(matches!(
+                        got,
+                        Module::Unknown | Module::Dark | Module::Light
+                    )),
+                    Some(dark) => assert_eq!(got, Module::from_dark(dark), "({x},{y})"),
+                }
+            }
+        }
+        // The washed-out centre itself is unknown and its margin zero, as a
+        // flat neighbourhood. The exact count depends on how far the flat
+        // patch dominates each neighbourhood; the centre module always is.
+        assert_eq!(out.modules[4 * w + 4], Module::Unknown);
+        assert_eq!(out.reliability[4 * w + 4], 0);
+        assert!(out.flat >= 1, "{}", out.flat);
+        // Reliability is relative to the local contrast, so a module in the
+        // dim left half is about as sure as one in the bright right half.
+        let (left, right) = (out.reliability[w + 1], out.reliability[w + 7]);
+        assert!(left > 230 && right > 230, "{left} {right}");
+        assert!(left.abs_diff(right) < 12, "{left} {right}");
+    }
+
+    #[test]
+    fn a_threshold_surface_follows_a_gradient_across_the_symbol() {
+        // A 25×25 grid of modules, checkered, in grey ink, under light
+        // that falls off to a seventh from the left edge to the right:
+        // paper at the dark end reads darker than ink at the light end,
+        // and no one threshold tells them apart.
+        let (w, h) = (25, 25);
+        let dark = |x: usize, y: usize| (x + y).is_multiple_of(2);
+        let light = |x: usize, y: usize| 1.0 - 0.85 * (4 * x + y) as f32 / (4 * (w - 1) + h - 1) as f32;
+        let luma: Vec<Option<f32>> = (0..w * h)
+            .map(|i| (i % w, i / w))
+            .map(|(x, y)| Some(light(x, y) * if dark(x, y) { 0.35 } else { 0.9 }))
+            .collect();
+        let sampled = Sampled {
+            width: w,
+            height: h,
+            luma,
+        };
+        let wrong = |params: &SampleParams| {
+            let out = classify(&sampled, params);
+            (0..w * h)
+                .filter(|&i| out.modules[i] != Module::from_dark(dark(i % w, i / w)))
+                .count()
+        };
+        let level = SampleParams {
+            local: false,
+            ..Default::default()
+        };
+        assert!(wrong(&level) > 50, "{}", wrong(&level));
+        // The surface is asked for: nothing reads against one otherwise.
+        assert!(!SampleParams::default().surface);
+        let surface = SampleParams {
+            surface: true,
+            ..level
+        };
+        assert_eq!(wrong(&surface), 0);
+        // The contrast goes with the threshold: a module at the dark end
+        // is read nearly as surely as one at the light end, where under
+        // one contrast for the whole symbol it would be all but unsure.
+        let out = classify(&sampled, &surface);
+        let (first, last) = (out.reliability[w + 1], out.reliability[(h - 2) * w + w - 2]);
+        assert!(first > 150 && last > 150, "{first} {last}");
+        // A threshold given, or the neighbourhood rule, is as it was.
+        let given = SampleParams {
+            threshold: Some(0.3),
+            ..surface
+        };
+        let plain = SampleParams {
+            threshold: Some(0.3),
+            ..level
+        };
+        assert_eq!(classify(&sampled, &given), classify(&sampled, &plain));
+        let local = SampleParams {
+            local: true,
+            ..surface
+        };
+        assert_eq!(
+            classify(&sampled, &local),
+            classify(&sampled, &SampleParams::default())
+        );
+        // A corner with nothing read in it takes the symbol's own level.
+        let mut holed = sampled.clone();
+        for y in 0..SURFACE_WINDOW {
+            for x in 0..SURFACE_WINDOW {
+                holed.luma[y * w + x] = None;
+            }
+        }
+        let out = classify(&holed, &surface);
+        assert_eq!(out.modules[0], Module::Unknown);
+        assert_ne!(out.modules[h * w - 1], Module::Unknown);
+        // A symbol no bigger than the window has one for every corner.
+        let small = Sampled {
+            width: 7,
+            height: 5,
+            luma: (0..35).map(|i| Some(if i % 2 == 0 { 0.1 } else { 0.9 })).collect(),
+        };
+        let out = classify(&small, &surface);
+        assert!((0..35).all(|i| out.modules[i] == Module::from_dark(i % 2 == 0)));
+    }
+
+    #[test]
+    fn local_midpoint_is_not_pulled_by_the_majority_colour() {
+        // Seven dark modules at 0.1 and two light ones at 0.9 in a row of
+        // nine, plus one at 0.45 that a mean of the row would call light.
+        let luma: Vec<Option<f32>> = [0.1, 0.1, 0.1, 0.1, 0.45, 0.1, 0.1, 0.9, 0.9, 0.1]
+            .iter()
+            .map(|&v| Some(v))
+            .collect();
+        let sampled = Sampled {
+            width: 10,
+            height: 1,
+            luma,
+        };
+        let out = classify(
+            &sampled,
+            &SampleParams {
+                local: true,
+                local_radius: 9,
+                band: 0.0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(out.modules[4], Module::Dark);
+    }
+
+    #[test]
+    fn sampling_reads_module_centres() {
+        // 4×2 modules, 10 px each, with a one-pixel dark border bleeding in
+        // from the left neighbour of every light module.
+        let (mw, mh, px) = (4, 2, 10);
+        let pattern = [true, false, false, true, false, true, true, false];
+        let mut data = vec![1.0f32; mw * px * mh * px];
+        for y in 0..mh * px {
+            for x in 0..mw * px {
+                if pattern[(y / px) * mw + x / px] {
+                    data[y * mw * px + x] = 0.0;
+                }
+            }
+        }
+        let image = Luma::new(mw * px, mh * px, data);
+        let h = Homography::rect_to_quad(
+            mw as f64,
+            mh as f64,
+            [[0.0, 0.0], [40.0, 0.0], [40.0, 20.0], [0.0, 20.0]],
+        )
+        .unwrap();
+        let sampled = sample_modules(&image, &h, mw, mh);
+        for (value, dark) in sampled.luma.iter().zip(pattern) {
+            assert_eq!(value.unwrap(), if dark { 0.0 } else { 1.0 });
+        }
+        let some = sample_positions(
+            &image,
+            &h,
+            &[Pos::new(3, 1), Pos::new(0, 0)],
+            INNER_FRACTION,
+            POINTS,
+        );
+        assert_eq!(some, [Some(1.0), Some(0.0)]);
+        // Sampled densely over its whole area, a light module's dark
+        // neighbours bleed into the average without changing its colour.
+        let whole = sample_positions(&image, &h, &[Pos::new(1, 0)], 1.0, 20);
+        assert!(
+            whole[0].unwrap() < 1.0 && whole[0].unwrap() > 0.5,
+            "{whole:?}"
+        );
+        // Shifted half off the image, the outer column has no evidence.
+        let shifted = Homography::rect_to_quad(
+            mw as f64,
+            mh as f64,
+            [[-8.0, 0.0], [32.0, 0.0], [32.0, 20.0], [-8.0, 20.0]],
+        )
+        .unwrap();
+        let sampled = sample_modules(&image, &shifted, mw, mh);
+        assert_eq!(sampled.luma[0], None);
+        assert!(sampled.luma[1].is_some());
+        // The centre kernel reads one point, the module's middle: a dot
+        // of ink there is read whole where the area average dilutes it.
+        let mut dotted = vec![1.0f32; mw * px * mh * px];
+        for y in 4..6 {
+            for x in 14..16 {
+                dotted[y * mw * px + x] = 0.0;
+            }
+        }
+        let dots = Luma::new(mw * px, mh * px, dotted);
+        let centre = sample_modules_with(&dots, &h, mw, mh, Kernel::Centre);
+        let area = sample_modules_with(&dots, &h, mw, mh, Kernel::Area);
+        assert_eq!(centre.luma[1], Some(0.0));
+        assert!(area.luma[1].unwrap() > 0.5, "{:?}", area.luma[1]);
+        // The vote reads the centre and four points a fifth of a module
+        // out: the dot of two pixels covers the centre alone, and is
+        // outvoted; a speck of a pixel beside the centre of a light module
+        // is outvoted too, where the centre kernel reads it whole.
+        let vote = sample_modules_with(&dots, &h, mw, mh, Kernel::Vote);
+        assert_eq!(vote.luma[1], Some(1.0));
+        let mut specked = vec![1.0f32; mw * px * mh * px];
+        specked[4 * mw * px + 15] = 0.0;
+        let speck = Luma::new(mw * px, mh * px, specked);
+        assert!(sample_modules_with(&speck, &h, mw, mh, Kernel::Centre).luma[1].unwrap() < 1.0);
+        assert_eq!(
+            sample_modules_with(&speck, &h, mw, mh, Kernel::Vote).luma[1],
+            Some(1.0)
+        );
+        assert_eq!(Kernel::Area.other(), Kernel::Centre);
+        assert_eq!(Kernel::Vote.other(), Kernel::Area);
+        assert_eq!(
+            Kernel::Centre.retries().collect::<Vec<_>>(),
+            [Kernel::Centre, Kernel::Area, Kernel::Vote]
+        );
+        assert_eq!(SampleParams::default().kernel, Kernel::Vote);
+        assert_eq!(Kernel::default(), Kernel::Vote);
+    }
+
+    #[test]
+    fn a_poorly_separated_reading_is_sharpened_and_a_clean_one_left_alone() {
+        // A random pattern of modules, blurred so that each reads half its
+        // own colour and half the mean of its four neighbours: a dark
+        // module among light ones reads as grey as a light one among dark,
+        // and the luminances fill the middle. Sharpened against the
+        // neighbours they separate again. The clean pattern is returned
+        // as it is.
+        let (w, h) = (15, 15);
+        let mut seed = 2_463_534_242u32;
+        let truth: Vec<bool> = (0..w * h)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed & 1 == 1
+            })
+            .collect();
+        let level = |dark: bool| if dark { 0.1f32 } else { 0.9 };
+        let clean = Sampled {
+            width: w,
+            height: h,
+            luma: truth.iter().map(|&d| Some(level(d))).collect(),
+        };
+        assert!(clean.separability() > 0.99);
+        assert_eq!(clean.clone().sharpened_for_separation(), clean);
+        let at = |x: i64, y: i64| {
+            (x >= 0 && y >= 0 && x < w as i64 && y < h as i64)
+                .then(|| level(truth[y as usize * w + x as usize]))
+        };
+        // Each module reads about half its own colour and half the mean of
+        // its four neighbours: a dark module among light ones reads as grey
+        // as a light one among dark, the luminances fill the middle, and
+        // ten modules fall on the wrong side of the split.
+        let blurred: Vec<Option<f32>> = (0..w * h)
+            .map(|i| {
+                let (x, y) = ((i % w) as i64, (i / w) as i64);
+                let around: Vec<f32> = [at(x - 1, y), at(x + 1, y), at(x, y - 1), at(x, y + 1)]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                let mean = around.iter().sum::<f32>() / around.len() as f32;
+                Some(0.48 * level(truth[i]) + 0.52 * mean)
+            })
+            .collect();
+        let smeared = Sampled {
+            width: w,
+            height: h,
+            luma: blurred,
+        };
+        let wrong = |s: &Sampled| {
+            s.luma
+                .iter()
+                .zip(&truth)
+                .filter(|(v, d)| (v.unwrap() < 0.5) != **d)
+                .count()
+        };
+        let before = smeared.separability();
+        assert!(before < SHARPEN_FOR_SEPARABILITY, "{before}");
+        assert!(wrong(&smeared) > 0);
+        let sharpened = smeared.clone().sharpened_for_separation();
+        let after = sharpened.separability();
+        assert!(
+            after >= before + SHARPEN_SEPARATION_GAIN,
+            "{before} -> {after}"
+        );
+        assert_eq!(wrong(&sharpened), 0, "{} wrong before", wrong(&smeared));
+    }
+}

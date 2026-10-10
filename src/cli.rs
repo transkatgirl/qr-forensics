@@ -1,0 +1,667 @@
+//! A headless reader: `qr-forensics decode [options] <image>...`
+//! reads every image given as the window reads one, searching the whole
+//! photo for symbols of every family as Search whole photo does or
+//! taking an outline from the command line as Find in outline does, and
+//! prints what it finds, one symbol a line. ZXing,
+//! zxing-cpp and OpenCV each ship such a tool; this one runs the pipeline
+//! the window runs, so a batch of photos can be read, and a result
+//! reproduced, without a display.
+//!
+//! ```text
+//! qr-forensics decode [--family qr|micro|rmqr|model1]
+//!                     [--outline x,y,x,y,x,y,x,y] [--hex | --escaped]
+//!                     [--charset name] [--corners] [--details] [--grid]
+//!                     [--partial] [--surface] [--full-search] <image>...
+//! ```
+//!
+//! An option that takes a value takes the next argument, or what follows
+//! an equals sign, as `--outline=1,2,3,4,5,6,7,8`.
+//!
+//! `--corners` adds to each line where the symbol lies: its four corners
+//! in the pixels `--outline` takes, top-left first as the symbol has
+//! them, so that a symbol a search found can be read again through its
+//! own outline, and a batch checked for where its symbols were, as
+//! OpenCV's `decodeMulti` hands back each symbol's points beside its
+//! text and BoofCV each symbol's bounds. `--grid` prints the modules as
+//! read below the line, a row to a line and each indented by two
+//! spaces, `#` for dark, `.` for light and `?` for a module that could
+//! not be read, as OpenCV hands back the straightened symbol; a
+//! light-on-dark symbol's grid is dark where the symbol prints dark.
+//!
+//! `--details` adds what the decode settled on the way to the message:
+//! the error correction level and mask, the character set the bytes were
+//! read in, the symbology identifier, and the symbol's place in a
+//! structured append sequence when it has one, as OpenCV's detector
+//! hands back each symbol's ECI and BoofCV its level, mask and encoding.
+//! `--charset` names the character set to read byte data in when the
+//! symbol declares none, where it is otherwise guessed: `utf-8`,
+//! `iso-8859-1`, `windows-1252`, `shift_jis`, `gb18030`, `big5`, `euc-kr`,
+//! any other name the ECI table has, or an ECI assignment number.
+//! `--partial` prints the symbols that did not decode beside those that
+//! did, where they are otherwise printed only when none did: BoofCV
+//! returns its failures beside its detections for the same reason, that
+//! a damaged symbol among sound ones is still a symbol.
+//!
+//! `--surface` reads every symbol against one threshold that lies as a
+//! smooth surface across it, the window's Threshold surface, where each
+//! module is otherwise judged against its neighbourhood first: for a
+//! shadow or a fall-off of light across an evenly printed symbol. The
+//! neighbourhood rule is still tried when the surface does not decode.
+//!
+//! `--full-search` searches a photo at its full size from the start,
+//! where the search otherwise looks at a copy no larger than a thousand
+//! pixels on its longer side first and finds what it shows again at full
+//! size, which on a large photo is many times faster.
+//!
+//! The outline is drawn top-left first and clockwise, in the pixels of
+//! the photo at the size the app works at, and upright as its EXIF
+//! orientation has it: photos over 4096 pixels on their longer side are
+//! shrunk to it, and photos under 256 on their shorter side enlarged by
+//! a whole factor. What is inside it is read as
+//! the window's Find in outline reads it: as a QR Code first and, when that
+//! does not decode, as a Micro QR or rMQR symbol too, on the evidence
+//! Find in outline asks of another family, the best of the reads being
+//! kept. `--family` names the one family to look for, with an outline or
+//! without one, and then nothing else is tried. Without an outline the
+//! whole photo is searched, and every symbol that reads is printed; when
+//! none does, the partial reads are printed instead, since the search
+//! offers what might be a symbol as readily as what is one. Each line
+//! names the image, the family and version, whether the symbol was light
+//! on dark or mirrored, how the read stands, with `--details` what it
+//! settled, with `--corners` where it lies, and the message: as text,
+//! with `--escaped` the control characters spelt out, or with `--hex` the
+//! message's bytes. A read stands as `read` when every block is confirmed
+//! and the message parses; `unconfirmed` when every block solved and the
+//! message parses but a block has nothing left over to confirm it, as
+//! one solved at the very limit of its error correction has not;
+//! `malformed` when every block is confirmed and the message does not
+//! parse to its end; and `partial` otherwise, with the blocks that
+//! solved.
+//!
+//! Symbols that carry a structured append header are parts of one
+//! message, and after the symbols of an image a line gives each message
+//! its parts make up, in order, with the parts found and whether the
+//! parity the headers claim is the parity of the bytes, as OpenCV's
+//! `decodeMulti` joins the parts it finds in one image, unchecked.
+//!
+//! The exit status is 0 when every image gave a trustworthy read, 1 when
+//! one did not, and 2 for a bad command line or an image that would not
+//! load. When standard output is closed, as `| head` closes it, the run
+//! stops there without complaint, with the status of the images read so
+//! far.
+
+use std::ffi::OsString;
+use std::io::Write;
+use std::path::Path;
+
+use qr_forensics::decode::pipeline::DecodeOptions;
+use qr_forensics::decode::sequence::{ParityCheck, Part, Sequence};
+use qr_forensics::decode::text::Charset;
+use qr_forensics::imaging::Luma;
+use qr_forensics::imaging::adjust::Adjust;
+use qr_forensics::imaging::detect::{SearchParams, find_symbols_with};
+use qr_forensics::imaging::photo::{self, normalize_size};
+use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline};
+use qr_forensics::imaging::sample::SampleParams;
+use qr_forensics::symbol::{Family, SymbolVersion};
+
+const USAGE: &str = "usage: qr-forensics decode [--family qr|micro|rmqr|model1] [--outline x,y,x,y,x,y,x,y] \
+                     [--hex | --escaped] [--charset name] [--corners] [--details] [--grid] [--partial] \
+                     [--surface] [--full-search] <image>...";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Show {
+    Text,
+    Hex,
+    Escaped,
+}
+
+struct Options {
+    family: Option<Family>,
+    outline: Option<[[f64; 2]; 4]>,
+    show: Show,
+    /// The character set byte data is read in when the symbol declares
+    /// none.
+    charset: Charset,
+    /// Print where each symbol lies.
+    corners: bool,
+    /// Print what each decode settled: level, mask and character set.
+    details: bool,
+    /// Print the modules as read below each line.
+    grid: bool,
+    /// Print the symbols that did not decode beside those that did.
+    partial: bool,
+    /// Read each symbol against a threshold surface first.
+    surface: bool,
+    search: SearchParams,
+    images: Vec<OsString>,
+}
+
+/// The character set a name on the command line means: a name as the app
+/// lists them, whatever its case and with or without its hyphens, or an
+/// ECI assignment number.
+fn charset_named(name: &str) -> Option<Charset> {
+    let plain = |text: &str| text.chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_ascii_lowercase();
+    let wanted = plain(name);
+    Charset::ALL
+        .into_iter()
+        .find(|c| plain(c.label()) == wanted)
+        .or_else(|| name.parse().ok().map(Charset::Eci).filter(|c| c.label() != "unsupported"))
+}
+
+fn parse(args: &[OsString]) -> Result<Options, String> {
+    let mut options = Options {
+        family: None,
+        outline: None,
+        show: Show::Text,
+        charset: Charset::Auto,
+        corners: false,
+        details: false,
+        grid: false,
+        partial: false,
+        surface: false,
+        search: SearchParams::default(),
+        images: Vec::new(),
+    };
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let text = arg.to_string_lossy();
+        // `--name=value` is `--name value`.
+        let (name, inline) = match text.split_once('=') {
+            Some((name, value)) if name.starts_with("--") => (name, Some(value)),
+            _ => (text.as_ref(), None),
+        };
+        let mut value = |what: &str| -> Result<String, String> {
+            match inline {
+                Some(value) => Ok(value.to_owned()),
+                None => args.next().map(|a| a.to_string_lossy().into_owned()).ok_or_else(|| format!("{name} needs {what}")),
+            }
+        };
+        let flag = || if inline.is_some() { Err(format!("{name} takes no value")) } else { Ok(()) };
+        match name {
+            "--family" => {
+                let value = value("a value")?;
+                options.family = Some(match value.as_str() {
+                    "qr" => Family::Qr,
+                    "micro" => Family::Micro,
+                    "rmqr" => Family::Rmqr,
+                    "model1" => Family::Model1,
+                    other => return Err(format!("unknown family {other:?}")),
+                });
+            }
+            "--outline" => {
+                let value = value("eight numbers")?;
+                let numbers: Vec<f64> = value.split(',').map(|v| v.trim().parse::<f64>().map_err(|e| format!("outline {value:?}: {e}"))).collect::<Result<_, _>>()?;
+                let [x0, y0, x1, y1, x2, y2, x3, y3] = numbers[..] else {
+                    return Err(format!("an outline is eight numbers, not {}", numbers.len()));
+                };
+                options.outline = Some([[x0, y0], [x1, y1], [x2, y2], [x3, y3]]);
+            }
+            "--hex" => {
+                flag()?;
+                options.show = Show::Hex;
+            }
+            "--escaped" => {
+                flag()?;
+                options.show = Show::Escaped;
+            }
+            "--charset" => {
+                let value = value("a character set")?;
+                options.charset = charset_named(&value).ok_or_else(|| format!("unknown character set {value:?}"))?;
+            }
+            "--corners" => {
+                flag()?;
+                options.corners = true;
+            }
+            "--details" => {
+                flag()?;
+                options.details = true;
+            }
+            "--grid" => {
+                flag()?;
+                options.grid = true;
+            }
+            "--partial" => {
+                flag()?;
+                options.partial = true;
+            }
+            "--surface" => {
+                flag()?;
+                options.surface = true;
+            }
+            "--full-search" => {
+                flag()?;
+                options.search.coarse_to_fine = false;
+            }
+            "--help" | "-h" => return Err(String::new()),
+            other if other.starts_with("--") => return Err(format!("unknown option {other}")),
+            _ => options.images.push(arg.clone()),
+        }
+    }
+    if options.images.is_empty() {
+        return Err("no image given".to_owned());
+    }
+    Ok(options)
+}
+
+/// A photo as the app loads it: the file's pixels at the working size, as
+/// luminance, with the default tone adjustments.
+fn load(path: &Path) -> Result<Luma, String> {
+    let image = normalize_size(photo::open(path).map_err(|e| e.to_string())?);
+    let (width, height) = (image.width() as usize, image.height() as usize);
+    Ok(Adjust::default().apply(image.as_raw(), width, height).1)
+}
+
+/// The version a search of `family` starts from, as the window starts.
+fn start_version(family: Family) -> SymbolVersion {
+    match family {
+        Family::Qr => SymbolVersion::Qr(2),
+        Family::Micro => SymbolVersion::Micro(2),
+        Family::Rmqr => SymbolVersion::Rmqr(11),
+        Family::Model1 => SymbolVersion::Model1(2),
+    }
+}
+
+/// How a read stands, as the module describes: `read`, or what keeps it
+/// from being one.
+fn standing(result: &ReadResult) -> String {
+    let report = &result.report;
+    let blocks = report.blocks.len();
+    if result.is_trustworthy() {
+        "read".to_owned()
+    } else if report.is_complete() && report.score.stream_valid {
+        format!("unconfirmed, {} of {blocks} blocks confirmed", report.blocks_verified())
+    } else if report.score.all_verified {
+        format!("malformed, {blocks} of {blocks} blocks solved")
+    } else {
+        format!("partial, {} of {blocks} blocks solved", report.blocks_solved())
+    }
+}
+
+/// What a decode settled on the way to the message, as `--details`
+/// prints it: the level and mask, the character set byte data was read
+/// in, the symbology identifier, and the place in a structured append
+/// sequence.
+fn details(result: &ReadResult) -> String {
+    let (version, report) = (result.version(), &result.report);
+    let mut parts = vec![format!("EC {}", version.ec_label(report.ec))];
+    if version.mask_count() > 1 {
+        parts.push(format!("mask {}", report.mask));
+    }
+    parts.extend(report.text.encoding.clone());
+    parts.extend(report.text.symbology.clone());
+    if let Some(part) = Part::from_report(report, String::new()) {
+        parts.push(format!("part {} of {}", part.index, part.total));
+    }
+    parts.join(", ")
+}
+
+/// One symbol's line: the image, what was found, how the read stands,
+/// what it settled when `details` is asked, where it lies when `corners`
+/// is, and the message.
+fn describe(path: &Path, result: &ReadResult, options: &Options) -> String {
+    let version = result.version();
+    let mut what = format!("{} {}", version.family().label(), version);
+    if result.detection.inverted {
+        what.push_str(", light on dark");
+    }
+    if result.detection.mirrored {
+        what.push_str(", mirrored");
+    }
+    let message = match options.show {
+        Show::Text => result.text(),
+        Show::Hex => result.report.text.hex(),
+        Show::Escaped => result.report.text.escaped(),
+    };
+    let mut line = format!("{}: {what}: {}", path.display(), standing(result));
+    if options.details {
+        line.push_str(&format!(": {}", details(result)));
+    }
+    if options.corners {
+        let at: Vec<String> = result.detection.corners.iter().flat_map(|c| [c[0], c[1]]).map(|v| format!("{v:.1}")).collect();
+        line.push_str(&format!(": at {}", at.join(",")));
+    }
+    format!("{line}: {message}")
+}
+
+/// The messages the parts make up, one sequence for each count and
+/// parity the parts' headers claim, as ZBar groups them: parts of two
+/// messages photographed together are not parts of one.
+fn sequences(parts: Vec<Part>) -> Vec<Sequence> {
+    let mut all: Vec<Sequence> = Vec::new();
+    for part in parts {
+        let header = (part.total, part.parity);
+        match all.iter_mut().find(|s| s.header() == Some(header)) {
+            Some(sequence) => {
+                sequence.add(part);
+            }
+            None => {
+                let mut sequence = Sequence::default();
+                sequence.add(part);
+                all.push(sequence);
+            }
+        }
+    }
+    all
+}
+
+/// A sequence's line: the image, the parts found, what the parity says,
+/// and the parts' messages in order, with each missing part marked.
+fn describe_sequence(path: &Path, sequence: &Sequence, show: Show) -> String {
+    let total = sequence.header().map_or(0, |h| h.0);
+    let found = format!("structured append, {} of {total} parts", sequence.len());
+    let parity = match sequence.check() {
+        ParityCheck::Complete { computed, claimed } if computed == claimed => ", parity verified".to_owned(),
+        ParityCheck::Complete { computed, claimed } => format!(", parity {computed:02X} where the parts claim {claimed:02X}"),
+        ParityCheck::Unreadable => ", parity unreadable".to_owned(),
+        ParityCheck::Inconsistent => ", parts disagree".to_owned(),
+        ParityCheck::Empty | ParityCheck::Incomplete { .. } => String::new(),
+    };
+    let message = match show {
+        Show::Text => sequence.assembled().plain(),
+        Show::Hex => sequence.hex(),
+        Show::Escaped => sequence.assembled().escaped(),
+    };
+    format!("{}: {found}{parity}: {message}", path.display())
+}
+
+/// The modules of a grid as `--grid` prints them: a row to a line,
+/// indented, `#` dark, `.` light and `?` unknown.
+fn grid_lines(result: &ReadResult) -> Vec<String> {
+    result
+        .grid
+        .to_text()
+        .lines()
+        .map(|row| format!("  {}", row.chars().map(|c| match c { '1' => '#', '0' => '.', other => other }).collect::<String>()))
+        .collect()
+}
+
+/// Run the reader over the arguments after `decode`; the exit status.
+pub fn run(args: &[OsString]) -> i32 {
+    run_to(args, &mut std::io::stdout().lock())
+}
+
+/// [`run`], printing what is read to `out`. When `out` takes no more, as
+/// a pipe whose reader has gone does not, the run stops quietly with the
+/// status so far: `println!` would panic there, and there is no one left
+/// to read the rest.
+fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
+    let options = match parse(args) {
+        Ok(options) => options,
+        Err(message) => {
+            if !message.is_empty() {
+                eprintln!("{message}");
+            }
+            eprintln!("{USAGE}");
+            return 2;
+        }
+    };
+    let params = if options.surface {
+        SampleParams { local: false, surface: true, ..SampleParams::default() }
+    } else {
+        SampleParams::default()
+    };
+    let opts = DecodeOptions { charset: options.charset, ..DecodeOptions::default() };
+    let mut status = 0;
+    for image in &options.images {
+        let path = Path::new(image);
+        let luma = match load(path) {
+            Ok(luma) => luma,
+            Err(message) => {
+                eprintln!("{}: {message}", path.display());
+                status = status.max(2);
+                continue;
+            }
+        };
+        let results: Vec<ReadResult> = match options.outline {
+            // A family named is the one family the outline is read as;
+            // with none named it is read as Find in outline reads one, as a
+            // QR Code and then as the other families.
+            Some(outline) => match options.family {
+                Some(family) => read_outline(&luma, start_version(family), outline, &params, &opts).into_iter().collect(),
+                None => crate::app::read_outline_of_any_family(&luma, start_version(Family::Qr), outline, &params, &opts)
+                    .into_iter()
+                    .map(|(read, _)| read)
+                    .collect(),
+            },
+            None => {
+                let found = match options.family {
+                    Some(family) => find_symbols_with(&luma, family, &params, &options.search),
+                    None => crate::app::find_symbols_of_every_family(&luma, &params, &options.search),
+                };
+                found.into_iter().filter_map(|detection| read_detection(&luma, detection, &params, &opts)).collect()
+            }
+        };
+        if results.is_empty() {
+            status = status.max(1);
+            if writeln!(out, "{}: no symbol found", path.display()).is_err() {
+                return status;
+            }
+            continue;
+        }
+        let any_read = results.iter().any(ReadResult::is_trustworthy);
+        if !any_read {
+            status = status.max(1);
+        }
+        for result in results.iter().filter(|r| r.is_trustworthy() || !any_read || options.partial) {
+            if writeln!(out, "{}", describe(path, result, &options)).is_err() {
+                return status;
+            }
+            if options.grid {
+                for line in grid_lines(result) {
+                    if writeln!(out, "{line}").is_err() {
+                        return status;
+                    }
+                }
+            }
+        }
+        // The parts of a message spread over several symbols, joined: of
+        // the reads that are to be believed, whose headers are.
+        let parts = results.iter().filter(|r| r.is_trustworthy()).filter_map(|r| Part::from_report(&r.report, String::new()));
+        for sequence in sequences(parts.collect()) {
+            if writeln!(out, "{}", describe_sequence(path, &sequence, options.show)).is_err() {
+                return status;
+            }
+        }
+    }
+    status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arguments_are_parsed() {
+        let args: Vec<OsString> = ["--family", "rmqr", "--outline", "1,2, 3,4,5,6,7,8", "--hex", "a.png", "b.jpg"].iter().map(OsString::from).collect();
+        let options = parse(&args).unwrap();
+        assert_eq!(options.family, Some(Family::Rmqr));
+        assert_eq!(options.outline, Some([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]));
+        assert_eq!(options.show, Show::Hex);
+        assert!(options.search.coarse_to_fine);
+        assert_eq!(options.images, [OsString::from("a.png"), OsString::from("b.jpg")]);
+        assert!(!options.corners && !options.grid);
+        let full: Vec<OsString> = ["--full-search", "a.png"].iter().map(OsString::from).collect();
+        assert!(!parse(&full).unwrap().search.coarse_to_fine);
+        // A value after an equals sign, and flags that take none.
+        let joined: Vec<OsString> =
+            ["--family=micro", "--outline=1,2,3,4,5,6,7,8", "--corners", "--grid", "a.png"].iter().map(OsString::from).collect();
+        let options = parse(&joined).unwrap();
+        assert_eq!(options.family, Some(Family::Micro));
+        assert_eq!(options.outline, Some([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]));
+        assert!(options.corners && options.grid);
+        assert_eq!((options.charset, options.details, options.partial, options.surface), (Charset::Auto, false, false, false));
+        let more: Vec<OsString> =
+            ["--charset", "Shift_JIS", "--details", "--partial", "--surface", "a.png"].iter().map(OsString::from).collect();
+        let options = parse(&more).unwrap();
+        assert_eq!((options.charset, options.details, options.partial, options.surface), (Charset::ShiftJis, true, true, true));
+        assert!(parse(&[OsString::from("--charset=klingon"), OsString::from("a.png")]).is_err());
+        assert!(parse(&[OsString::from("--details=yes"), OsString::from("a.png")]).is_err());
+        assert!(parse(&[OsString::from("--hex=1"), OsString::from("a.png")]).is_err());
+        assert!(parse(&[OsString::from("--family")]).is_err());
+        assert!(parse(&[OsString::from("--outline"), OsString::from("1,2,3"), OsString::from("a.png")]).is_err());
+        assert!(parse(&[OsString::from("--what"), OsString::from("a.png")]).is_err());
+        assert!(parse(&[]).is_err());
+        assert_eq!(run(&[OsString::from("--help")]), 2);
+        assert_eq!(run(&[OsString::from("/nowhere/at/all.png")]), 2);
+    }
+
+    #[test]
+    fn character_sets_are_named_loosely() {
+        // As the app lists them, in any case, with or without hyphens.
+        assert_eq!(charset_named("UTF-8"), Some(Charset::Utf8));
+        assert_eq!(charset_named("utf8"), Some(Charset::Utf8));
+        assert_eq!(charset_named("shift-jis"), Some(Charset::ShiftJis));
+        assert_eq!(charset_named("EUC_KR"), Some(Charset::EucKr));
+        assert_eq!(charset_named("auto"), Some(Charset::Auto));
+        // Any set the ECI table names, by its name or its number.
+        for charset in Charset::ALL {
+            assert_eq!(charset_named(charset.label()).map(Charset::label), Some(charset.label()));
+        }
+        assert_eq!(charset_named("17").map(Charset::label), Some(Charset::Eci(17).label()));
+        assert_eq!(charset_named("klingon"), None);
+        assert_eq!(charset_named("14"), None, "an assignment the table leaves empty");
+    }
+
+    /// A part of a structured append message as a decode would make it.
+    fn part(index: u8, total: u8, parity: u8, text: &str) -> Part {
+        use qr_forensics::decode::bitstream::Certainty;
+        use qr_forensics::decode::text::{TextReport, TextSpan};
+        let report = TextReport {
+            spans: vec![TextSpan { text: text.to_owned(), certainty: Certainty::Verified }],
+            parity: Some(text.bytes().fold(0, |a, b| a ^ b)),
+            bytes: text.bytes().map(Some).collect(),
+            ..TextReport::default()
+        };
+        Part { index, total, parity, label: String::new(), text: report }
+    }
+
+    #[test]
+    fn the_parts_of_a_message_are_joined_in_order() {
+        let message = "The quick brown fox jumps over the lazy dog";
+        let parity = message.bytes().fold(0, |a, b| a ^ b);
+        let path = Path::new("sheet.png");
+        // Found out of order, with a part of some other message among
+        // them: each message is joined of its own parts.
+        let found = vec![
+            part(3, 3, parity, &message[30..]),
+            part(1, 2, 0x55, "another "),
+            part(1, 3, parity, &message[..15]),
+            part(2, 3, parity, &message[15..30]),
+        ];
+        let joined = sequences(found);
+        assert_eq!(joined.len(), 2);
+        assert_eq!(
+            describe_sequence(path, &joined[0], Show::Text),
+            format!("sheet.png: structured append, 3 of 3 parts, parity verified: {message}")
+        );
+        assert_eq!(
+            describe_sequence(path, &joined[1], Show::Text),
+            "sheet.png: structured append, 1 of 2 parts: another [part 2 missing]"
+        );
+        // Every part in and a byte of one misread: the parity says so.
+        let wrong = sequences(vec![part(1, 2, parity, &message[..20]), part(2, 2, parity, &message[20..].replace('z', "s"))]);
+        let line = describe_sequence(path, &wrong[0], Show::Text);
+        assert!(line.starts_with(&format!("sheet.png: structured append, 2 of 2 parts, parity {:02X} where the parts claim {parity:02X}: ", parity ^ b'z' ^ b's')), "{line}");
+    }
+
+    #[test]
+    fn details_say_what_the_decode_settled() {
+        let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/photos/cpp_micro_M3-Mixed.png").into_os_string();
+        let mut out = Vec::new();
+        assert_eq!(run_to(&[OsString::from("--details"), OsString::from("--corners"), image], &mut out), 0);
+        let text = String::from_utf8(out).unwrap();
+        let (fields, _) = fields_and_grid(&text);
+        assert_eq!(fields.len(), 6, "{text}");
+        assert_eq!(&fields[1..3], ["Micro QR M3", "read"]);
+        // The level and the mask, and no character set: the symbol holds
+        // no byte data.
+        let settled: Vec<&str> = fields[3].split(", ").collect();
+        assert!(settled.len() >= 2 && settled[0].starts_with("EC ") && settled[1].starts_with("mask "), "{fields:?}");
+        assert!(fields[4].starts_with("at "));
+        assert_eq!(fields[5], "1234 ABCD");
+    }
+
+    /// A pipe whose reader has gone.
+    struct Closed;
+
+    impl Write for Closed {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The fields of a line, split at the separators, and the lines of
+    /// the grid printed below it.
+    fn fields_and_grid(text: &str) -> (Vec<String>, Vec<String>) {
+        let mut lines = text.lines();
+        let fields = lines.next().unwrap().split(": ").map(str::to_owned).collect();
+        let grid = lines.take_while(|l| l.starts_with("  ")).map(|l| l.trim().to_owned()).collect();
+        (fields, grid)
+    }
+
+    #[test]
+    fn a_symbol_found_reads_again_through_its_corners() {
+        // A search prints where it found the symbol, and the corners
+        // printed, given back as the outline, read the same symbol: as
+        // the symbol is, and mirrored, when the corners run the other
+        // way round the photo.
+        let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/photos/cpp_micro_M3-Mixed.png");
+        let mirrored = std::env::temp_dir().join(format!("qr-forensics-mirrored-{}.png", std::process::id()));
+        image::open(&image).unwrap().fliph().save(&mirrored).unwrap();
+        for (path, expect_mirrored) in [(image, false), (mirrored.clone(), true)] {
+            let mut out = Vec::new();
+            let args = [OsString::from("--corners"), OsString::from("--grid"), path.clone().into_os_string()];
+            assert_eq!(run_to(&args, &mut out), 0);
+            let text = String::from_utf8(out).unwrap();
+            let (fields, grid) = fields_and_grid(&text);
+            assert_eq!(fields.len(), 5, "{text}");
+            assert_eq!(fields[1], if expect_mirrored { "Micro QR M3, mirrored" } else { "Micro QR M3" });
+            assert_eq!(fields[2], "read");
+            assert_eq!(fields[4], "1234 ABCD");
+            let at = fields[3].strip_prefix("at ").unwrap();
+            assert_eq!(at.split(',').count(), 8, "{at}");
+            // Fifteen rows of fifteen modules, every one read.
+            assert_eq!(grid.len(), 15, "{text}");
+            assert!(grid.iter().all(|row| row.len() == 15 && row.chars().all(|c| c == '#' || c == '.')), "{grid:?}");
+            let again = [OsString::from(format!("--outline={at}")), path.into_os_string()];
+            let mut out = Vec::new();
+            assert_eq!(run_to(&again, &mut out), 0);
+            let (fields, _) = fields_and_grid(&String::from_utf8(out).unwrap());
+            assert_eq!(&fields[2..], ["read", "1234 ABCD"], "{fields:?}");
+        }
+        let _ = std::fs::remove_file(mirrored);
+    }
+
+    #[test]
+    fn a_symbol_the_search_places_badly_is_read_again_as_an_outline() {
+        // The search of this photo of a crumpled sheet finds its symbol,
+        // and the one placement it keeps solves nothing; the outline of
+        // that placement, drawn a little wide and read as a hand-drawn
+        // one is, with every placement the detector offers, reads.
+        let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/blackbox/cpp_qrcode-4_wrinkle1-05x.webp");
+        let expected = std::fs::read_to_string(image.with_extension("txt")).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(run_to(&[OsString::from("--family=qr"), image.into_os_string()], &mut out), 0);
+        let text = String::from_utf8(out).unwrap();
+        let (fields, _) = fields_and_grid(&text);
+        assert_eq!(&fields[1..], ["QR Code 3", "read", expected.trim_end()], "{text}");
+    }
+
+    #[test]
+    fn a_closed_output_ends_the_run_quietly() {
+        let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/photos/cpp_micro_M3-Mixed.png").into_os_string();
+        let args = [image, OsString::from("/nowhere/at/all.png")];
+        let mut out = Vec::new();
+        assert_eq!(run_to(&args, &mut out), 2, "the second image does not load");
+        assert!(String::from_utf8_lossy(&out).ends_with("Micro QR M3: read: 1234 ABCD\n"));
+        // The first image reads and its line cannot be written: the run
+        // ends there, with that image's status, and the second is never
+        // come to.
+        assert_eq!(run_to(&args, &mut Closed), 0);
+    }
+}

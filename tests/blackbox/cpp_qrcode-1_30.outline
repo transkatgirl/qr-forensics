@@ -1,0 +1,7 @@
+; family: qr
+; status: pass
+; rotations: 0 90 180 270
+49 49
+301 49
+301 301
+49 301

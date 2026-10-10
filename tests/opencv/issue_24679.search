@@ -1,0 +1,6 @@
+; from: testdata/cv/qrcode/issue_24679.png
+; messages: as this reader reads them
+BottomLeft-bateau-1
+BottomRight-bateau-1
+TopRight-bateau-1
+TopLeft-bateau-1

@@ -1,0 +1,773 @@
+//! Corner refinement: nudge the four corners of the outline to where the
+//! version's fixed patterns read best.
+//!
+//! The score is the contrast across every boundary between two fixed
+//! modules of opposite colour: luminance a little way into the light side
+//! minus luminance the same distance into the dark side, measured at a few
+//! points along the boundary and at a few distances from it. Uneven
+//! lighting changes both sides alike and cancels, and a boundary placed a
+//! fraction of a pixel off the real edge loses contrast at once, so the
+//! score has a sharp peak at the true outline. Coordinate descent then
+//! finds it down to a twentieth of a pixel. Besides moving one corner at a
+//! time it tries joint moves of all four, since on a long thin symbol a
+//! slightly turned outline is a local maximum that no single corner can
+//! leave.
+//!
+//! The boundaries are combined with a trimmed mean: the fifth of them that
+//! read worst are left out. A finder pattern with a corner torn off, or an
+//! alignment pattern under a stain, keeps most of its boundaries, and
+//! those place it as well as ever, where a plain mean would be dragged
+//! towards the damage. ZBar fits its finder edges with RANSAC for the same
+//! reason.
+//!
+//! A light-on-dark symbol reverses the contrast across every boundary, so
+//! the search is run for both polarities and the outline with the stronger
+//! contrast wins; the result says which polarity that was.
+//!
+//! When anchors are known, the outline is a [`Projection`] through them
+//! rather than a plain homography, and the corners are refined with the
+//! anchors held fixed.
+//!
+//! The same scorer serves the coarse alignment in [`super::detect`], there
+//! applied to one finder or alignment pattern at a time through a
+//! [`Template`] of that patch alone.
+
+use std::sync::Arc;
+
+use super::Luma;
+use super::homography::Homography;
+use super::projection::{ControlPoint, Project, Projection, Spline};
+use super::sample::{INNER_FRACTION, POINTS, SampleParams, otsu, sample_positions};
+use crate::symbol::Pos;
+use crate::symbol::function_map::FunctionMap;
+
+/// How far the refinement may move a corner a finder pattern's own fit
+/// placed, in modules.
+const HELD_TRAVEL: f64 = 0.05;
+/// Smallest move tried, in photo pixels.
+const MIN_STEP: f64 = 0.05;
+/// Passes over the corners at one step size before it is halved.
+const MAX_PASSES: usize = 20;
+/// Distances from a boundary, in photo pixels, at which contrast is taken.
+/// Several, so that a blurrier edge still gives a peak at the right place.
+const SCALES: [f64; 3] = [0.5, 1.0, 2.0];
+/// A further distance as a share of the module: an over-exposed photo
+/// moves every boundary a fraction of a module into the dark, and a pair
+/// this far apart still straddles the moved boundary.
+const MODULE_SCALE_FRACTION: f64 = 0.3;
+/// No further across a boundary than this fraction of a module, so the
+/// sample stays inside the neighbouring module.
+const MAX_SCALE_FRACTION: f64 = 0.4;
+/// Part of a boundary's length that is sampled, keeping clear of the module
+/// corners where diagonal neighbours intrude.
+const ALONG_FRACTION: f64 = 0.7;
+/// Share of the boundaries, those reading worst, left out of the score.
+pub const TRIM_FRACTION: f64 = 0.2;
+/// How far each corner (top-left, top-right, bottom-right, bottom-left)
+/// moves in one trial, as multiples of the step along one axis: each corner
+/// alone, then the four patterns that together span every joint move of
+/// the outline: a shift, a turn, and a squeeze across each diagonal pair.
+pub(crate) const MOVES: [[f64; 4]; 8] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+    [1.0, 1.0, 1.0, 1.0],
+    [1.0, -1.0, -1.0, 1.0],
+    [1.0, 1.0, -1.0, -1.0],
+    [1.0, -1.0, 1.0, -1.0],
+];
+/// The joint shift alone: for a patch too small to pin down its own shape.
+pub(crate) const SHIFT: [[f64; 4]; 1] = [[1.0, 1.0, 1.0, 1.0]];
+
+/// The fixed modules of a rectangular patch of a symbol, in the patch's own
+/// module coordinates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Template {
+    pub width: usize,
+    pub height: usize,
+    /// Colour of each module, row-major: `Some(true)` is dark and `None`
+    /// means the module's colour is not fixed.
+    pub expected: Vec<Option<bool>>,
+}
+
+impl Template {
+    /// Every fixed module of a version.
+    pub fn whole(func: &FunctionMap) -> Self {
+        Self::window(func, 0, 0, func.width, func.height)
+    }
+
+    /// The fixed modules inside a rectangle of the symbol, whose top-left
+    /// module is (`x0`, `y0`). Modules outside the symbol are not fixed.
+    pub fn window(func: &FunctionMap, x0: i64, y0: i64, width: usize, height: usize) -> Self {
+        let expected = (0..height)
+            .flat_map(|dy| (0..width).map(move |dx| (dx, dy)))
+            .map(|(dx, dy)| {
+                let (x, y) = (x0 + dx as i64, y0 + dy as i64);
+                let inside = x >= 0 && y >= 0 && (x as usize) < func.width && (y as usize) < func.height;
+                inside.then(|| func.expected(x as usize, y as usize)).flatten()
+            })
+            .collect();
+        Self { width, height, expected }
+    }
+
+    /// Every fixed module of a version and the first module of quiet zone
+    /// around it, which must be light: two modules wider and higher than
+    /// the symbol, whose top-left module is at (1, 1).
+    pub fn with_quiet_zone(func: &FunctionMap) -> Self {
+        let mut template = Self::window(func, -1, -1, func.width + 2, func.height + 2);
+        for y in 0..template.height {
+            for x in 0..template.width {
+                if x == 0 || y == 0 || x + 1 == template.width || y + 1 == template.height {
+                    template.expected[y * template.width + x] = Some(false);
+                }
+            }
+        }
+        template
+    }
+
+    /// A finder pattern with the ring of light modules around it: the
+    /// separator on its inner sides and the quiet zone on the outer ones.
+    /// Nine modules square, the finder's centre at (4.5, 4.5).
+    pub fn finder_with_ring() -> Self {
+        let expected = (0..9usize)
+            .flat_map(|y| (0..9usize).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let ring = x.abs_diff(4).max(y.abs_diff(4));
+                Some(ring == 3 || ring <= 1)
+            })
+            .collect();
+        Self { width: 9, height: 9, expected }
+    }
+
+    /// A finder pattern alone, seven modules square.
+    pub fn finder_core() -> Self {
+        let expected = (0..7usize)
+            .flat_map(|y| (0..7usize).map(move |x| (x, y)))
+            .map(|(x, y)| Some(x.abs_diff(3).max(y.abs_diff(3)) != 2))
+            .collect();
+        Self { width: 7, height: 7, expected }
+    }
+
+    /// The template with one quarter (as [`Scorer::agreement_quarters`]
+    /// numbers them) left unfixed: for a pattern torn there.
+    pub fn without_quarter(&self, quarter: usize) -> Self {
+        let mut out = self.clone();
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let q = usize::from(2 * x + 1 >= self.width) + 2 * usize::from(2 * y + 1 >= self.height);
+                if q == quarter {
+                    out.expected[y * self.width + x] = None;
+                }
+            }
+        }
+        out
+    }
+
+    pub fn expected(&self, x: usize, y: usize) -> Option<bool> {
+        self.expected[y * self.width + x]
+    }
+
+    /// How many modules are fixed.
+    pub fn fixed(&self) -> usize {
+        self.expected.iter().flatten().count()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Refinement {
+    pub corners: [[f64; 2]; 4],
+    /// (matching, fixed) modules at the corners given, read the way the
+    /// sampler reads them. When `inverted`, matching means the inverse of
+    /// the specified colour.
+    pub before: (usize, usize),
+    /// The same after refinement.
+    pub after: (usize, usize),
+    pub evaluations: usize,
+    /// The outline was found with dark and light swapped: the photo shows
+    /// a light symbol on a dark background.
+    pub inverted: bool,
+}
+
+/// A boundary between two fixed modules of opposite colours.
+struct Edge {
+    /// Centre of the boundary, in module units.
+    at: [f64; 2],
+    /// Unit step from the dark side to the light side.
+    across: [f64; 2],
+    /// Unit step along the boundary.
+    along: [f64; 2],
+}
+
+/// A map shifted in module space: for scoring a template whose origin is
+/// not the symbol's.
+pub struct Shifted<'a, P: Project> {
+    pub map: &'a P,
+    /// Added to template coordinates to get the map's coordinates.
+    pub dx: f64,
+    pub dy: f64,
+}
+
+impl<P: Project> Project for Shifted<'_, P> {
+    fn base(&self, x: f64, y: f64) -> [f64; 2] {
+        self.map.base(x + self.dx, y + self.dy)
+    }
+
+    fn displacement(&self, x: f64, y: f64) -> [f64; 2] {
+        self.map.displacement(x + self.dx, y + self.dy)
+    }
+}
+
+/// Scores placements of one template against the photo.
+pub(crate) struct Scorer<'a> {
+    image: &'a Luma,
+    width: f64,
+    height: f64,
+    edges: Vec<Edge>,
+    scales: Vec<f64>,
+    /// Sample pairs along each boundary.
+    along: usize,
+    positions: Vec<Pos>,
+    expected_dark: Vec<bool>,
+    threshold: Option<f32>,
+    module_px: f64,
+    /// Spline weights at each boundary's centre, for projections that
+    /// share one spline: the displacement there is then a weighted sum of
+    /// the projection's residuals.
+    edge_weights: Option<Vec<Vec<f64>>>,
+    /// How far, in modules, every boundary is expected to have moved into
+    /// the dark: the bleed of an over-exposed photo. Negative for light
+    /// bled into by dark.
+    bloom: f64,
+}
+
+impl<'a> Scorer<'a> {
+    /// A scorer for `template` placed at `corners`, which set the scale of
+    /// the sampling. `threshold` fixes the dark/light split used by
+    /// [`Scorer::agreement`]; without it the split is found per call.
+    pub(crate) fn new(image: &'a Luma, template: &Template, corners: [[f64; 2]; 4], threshold: Option<f32>) -> Self {
+        let mut positions = Vec::new();
+        let mut expected_dark = Vec::new();
+        let mut edges = Vec::new();
+        for y in 0..template.height {
+            for x in 0..template.width {
+                let Some(dark) = template.expected(x, y) else { continue };
+                positions.push(Pos::new(x, y));
+                expected_dark.push(dark);
+                let sign = if dark { 1.0 } else { -1.0 };
+                if x + 1 < template.width && template.expected(x + 1, y) == Some(!dark) {
+                    edges.push(Edge {
+                        at: [x as f64 + 1.0, y as f64 + 0.5],
+                        across: [sign, 0.0],
+                        along: [0.0, 1.0],
+                    });
+                }
+                if y + 1 < template.height && template.expected(x, y + 1) == Some(!dark) {
+                    edges.push(Edge {
+                        at: [x as f64 + 0.5, y as f64 + 1.0],
+                        across: [0.0, sign],
+                        along: [1.0, 0.0],
+                    });
+                }
+            }
+        }
+        let width = template.width as f64;
+        let height = template.height as f64;
+        let module_px = module_pixels(corners, width, height);
+        let mut scales: Vec<f64> = SCALES.iter().copied().filter(|&s| s <= MAX_SCALE_FRACTION * module_px).collect();
+        let wide = MODULE_SCALE_FRACTION * module_px;
+        if scales.last().is_none_or(|&s| s < wide) {
+            scales.push(wide.max(MIN_STEP));
+        }
+        Scorer {
+            image,
+            width,
+            height,
+            edges,
+            scales,
+            // About two sample pairs per pixel of boundary.
+            along: ((2.0 * module_px).round() as usize).clamp(2, 16),
+            positions,
+            expected_dark,
+            threshold,
+            module_px,
+            edge_weights: None,
+            bloom: 0.0,
+        }
+    }
+
+    /// Expect every boundary `bloom` modules into the dark side of where
+    /// the template has it.
+    pub(crate) fn with_bloom(mut self, bloom: f64) -> Self {
+        self.bloom = bloom;
+        self
+    }
+
+    /// Take at most `max` sample pairs along each boundary: faster, for
+    /// searches that only need to tell a good placement from a bad one.
+    pub(crate) fn with_along(mut self, max: usize) -> Self {
+        self.along = self.along.min(max.max(1));
+        self
+    }
+
+    /// Keep at most `max` boundaries, every n-th in raster order, for a
+    /// template with far more than a descent needs to place the corners.
+    pub(crate) fn with_max_edges(mut self, max: usize) -> Self {
+        let max = max.max(1);
+        if self.edges.len() > max {
+            let stride = self.edges.len().div_ceil(max);
+            self.edges = std::mem::take(&mut self.edges).into_iter().step_by(stride).collect();
+            if let Some(weights) = &mut self.edge_weights {
+                *weights = std::mem::take(weights).into_iter().step_by(stride).collect();
+            }
+        }
+        self
+    }
+
+    /// Precompute the spline's weights at every boundary, for scoring
+    /// projections that share `spline`. Only right for a template in the
+    /// symbol's own coordinates.
+    pub(crate) fn with_spline(mut self, spline: Option<&Spline>) -> Self {
+        self.edge_weights = spline.map(|s| self.edges.iter().map(|e| s.weights(e.at)).collect());
+        self
+    }
+
+    /// Size of a module in photo pixels at the corners given to [`Scorer::new`].
+    pub(crate) fn module_px(&self) -> f64 {
+        self.module_px
+    }
+
+    /// Fixed modules in the template.
+    pub(crate) fn fixed(&self) -> usize {
+        self.positions.len()
+    }
+
+    /// Trimmed mean contrast across the boundaries of the template placed
+    /// through `map`, times `sign`, where -1 looks for a light-on-dark
+    /// symbol; `None` for a degenerate placement.
+    pub(crate) fn contrast_with(&self, map: &impl Project, sign: f64) -> Option<f64> {
+        self.contrast_edges(sign, |e, edge| {
+            let _ = e;
+            map.displacement(edge.at[0], edge.at[1])
+        }, |x, y| map.base(x, y))
+    }
+
+    /// The same for a projection sharing the spline given to
+    /// [`Scorer::with_spline`], which avoids re-evaluating the spline.
+    pub(crate) fn contrast_projection(&self, map: &Projection, sign: f64) -> Option<f64> {
+        match &self.edge_weights {
+            Some(weights) if map.spline().is_some_and(|s| s.len() == weights.first().map_or(0, Vec::len)) => {
+                self.contrast_edges(sign, |e, _| map.displacement_from_weights(&weights[e]), |x, y| map.base(x, y))
+            }
+            _ => self.contrast_with(map, sign),
+        }
+    }
+
+    fn contrast_edges(
+        &self,
+        sign: f64,
+        displacement: impl Fn(usize, &Edge) -> [f64; 2],
+        base: impl Fn(f64, f64) -> [f64; 2],
+    ) -> Option<f64> {
+        let mut per_edge: Vec<f64> = Vec::with_capacity(self.edges.len());
+        for (e, edge) in self.edges.iter().enumerate() {
+            let [dx, dy] = displacement(e, edge);
+            let (mut total, mut count) = (0.0f64, 0usize);
+            for k in 0..self.along {
+                let t = ALONG_FRACTION * ((k as f64 + 0.5) / self.along as f64 - 0.5);
+                let (mx, my) = (
+                    edge.at[0] + edge.along[0] * t - edge.across[0] * self.bloom,
+                    edge.at[1] + edge.along[1] * t - edge.across[1] * self.bloom,
+                );
+                let p = base(mx, my);
+                // The across direction in photo pixels, from a short step.
+                let q = base(mx + 0.01 * edge.across[0], my + 0.01 * edge.across[1]);
+                let (ax, ay) = (q[0] - p[0], q[1] - p[1]);
+                let length = (ax * ax + ay * ay).sqrt();
+                if length == 0.0 || !length.is_finite() {
+                    return None;
+                }
+                let (ux, uy) = (ax / length, ay / length);
+                let (px, py) = (p[0] + dx, p[1] + dy);
+                for &scale in &self.scales {
+                    let light = self.image.sample(px + ux * scale, py + uy * scale);
+                    let dark = self.image.sample(px - ux * scale, py - uy * scale);
+                    total += match (light, dark) {
+                        (Some(light), Some(dark)) => sign * (light - dark) as f64,
+                        // Off the image counts as wrong by the widest margin,
+                        // whichever polarity is sought: the penalty must not
+                        // turn into a reward when the sign is reversed, or a
+                        // light-on-dark search is drawn off the edge of the
+                        // photo, where everything reads as it pleases.
+                        _ => -1.0,
+                    };
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                per_edge.push(total / count as f64);
+            }
+        }
+        trimmed_mean(&mut per_edge)
+    }
+
+    /// Mean contrast across the boundaries for the template placed at
+    /// `corners`; `None` for degenerate corners.
+    pub(crate) fn contrast(&self, corners: [[f64; 2]; 4]) -> Option<f64> {
+        self.contrast_signed(corners, 1.0)
+    }
+
+    /// The same times `sign`, where -1 looks for a light-on-dark symbol.
+    /// The sign goes in with the samples: negating the contrast of a
+    /// dark-on-light reading afterwards would turn its penalty for
+    /// sampling off the image into a reward, and trim away the edges that
+    /// match best instead of those that match worst.
+    pub(crate) fn contrast_signed(&self, corners: [[f64; 2]; 4], sign: f64) -> Option<f64> {
+        let h = Homography::rect_to_quad(self.width, self.height, corners)?;
+        self.contrast_with(&h, sign)
+    }
+
+    /// Fixed modules that come out the right colour when sampled the way
+    /// the reader samples them, or the inverse colour when `inverted`.
+    pub(crate) fn agreement(&self, corners: [[f64; 2]; 4], inverted: bool) -> Option<usize> {
+        let h = Homography::rect_to_quad(self.width, self.height, corners)?;
+        self.agreement_known(&h, inverted).map(|(matching, _)| matching)
+    }
+
+    /// The same, with the number of fixed modules the photo covers at all,
+    /// for a template placed through `map`.
+    pub(crate) fn agreement_known(&self, map: &impl Project, inverted: bool) -> Option<(usize, usize)> {
+        let luma = sample_positions(self.image, map, &self.positions, INNER_FRACTION, POINTS);
+        let threshold = self.threshold.unwrap_or_else(|| otsu(luma.iter().flatten().copied()));
+        let known = luma.iter().flatten().count();
+        let matching = luma
+            .iter()
+            .zip(&self.expected_dark)
+            .filter(|(value, dark)| value.is_some_and(|v| (v < threshold) == (**dark != inverted)))
+            .count();
+        Some((matching, known))
+    }
+
+    /// (matching, known) in each quarter of the template, top-left,
+    /// top-right, bottom-left, bottom-right. A pattern with one quarter
+    /// torn away still reads right in the other three; one that is not
+    /// there at all reads wrong everywhere.
+    pub(crate) fn agreement_quarters(&self, corners: [[f64; 2]; 4], inverted: bool) -> Option<[(usize, usize); 4]> {
+        self.agreement_quarters_at(corners, inverted, None)
+    }
+
+    /// The same against a threshold of the caller's choosing, when there
+    /// is a better one than the split of the template's own samples.
+    pub(crate) fn agreement_quarters_at(
+        &self,
+        corners: [[f64; 2]; 4],
+        inverted: bool,
+        threshold: Option<f32>,
+    ) -> Option<[(usize, usize); 4]> {
+        let h = Homography::rect_to_quad(self.width, self.height, corners)?;
+        let luma = sample_positions(self.image, &h, &self.positions, INNER_FRACTION, POINTS);
+        let threshold = threshold.or(self.threshold).unwrap_or_else(|| otsu(luma.iter().flatten().copied()));
+        let mut out = [(0usize, 0usize); 4];
+        for ((value, dark), pos) in luma.iter().zip(&self.expected_dark).zip(&self.positions) {
+            let Some(v) = value else { continue };
+            let quarter = usize::from(2.0 * (pos.x as f64 + 0.5) >= self.width)
+                + 2 * usize::from(2.0 * (pos.y as f64 + 0.5) >= self.height);
+            out[quarter].1 += 1;
+            out[quarter].0 += usize::from((*v < threshold) == (*dark != inverted));
+        }
+        Some(out)
+    }
+
+    /// Coordinate descent from `corners` on `sign` times the contrast,
+    /// where -1 looks for the outline of a light-on-dark symbol, trying the
+    /// given `moves` at `step` photo pixels first and halving from there.
+    /// Returns the corners reached and the score there.
+    pub(crate) fn descend(
+        &self,
+        corners: [[f64; 2]; 4],
+        sign: f64,
+        moves: &[[f64; 4]],
+        step: f64,
+        evaluations: &mut usize,
+    ) -> Option<([[f64; 2]; 4], f64)> {
+        self.descend_by(corners, moves, step, evaluations, |trial| {
+            let h = Homography::rect_to_quad(self.width, self.height, trial)?;
+            self.contrast_with(&h, sign)
+        })
+    }
+
+    /// Coordinate descent on any score of the corners.
+    pub(crate) fn descend_by(
+        &self,
+        corners: [[f64; 2]; 4],
+        moves: &[[f64; 4]],
+        step: f64,
+        evaluations: &mut usize,
+        score: impl Fn([[f64; 2]; 4]) -> Option<f64>,
+    ) -> Option<([[f64; 2]; 4], f64)> {
+        descend_by(corners, moves, step, evaluations, score)
+    }
+
+    /// The template's size in modules.
+    pub(crate) fn template_width(&self) -> f64 {
+        self.width
+    }
+
+    pub(crate) fn template_height(&self) -> f64 {
+        self.height
+    }
+}
+
+/// Coordinate descent from `corners` on `score`, trying the given `moves`
+/// at `step` photo pixels first and halving from there, down to a
+/// twentieth of a pixel. Returns the corners reached and the score there;
+/// `None` when the start cannot be scored.
+///
+/// Each pass takes the first move that improves the score, so where a
+/// descent ends up depends a little on the order the axes and directions
+/// are swept in: a photo turned a quarter swaps the axes, and the same
+/// start can then lead to another peak a fraction of a module off.
+/// Sweeping in both orders, alternately or keeping the better of two
+/// descents, was tried and found to settle on wrong peaks of the contrast
+/// as often as it avoided them, so the sweep is left as it is, and a read
+/// that fails is tried again with the photo turned instead, which
+/// [`super::read`] does.
+pub(crate) fn descend_by(
+    corners: [[f64; 2]; 4],
+    moves: &[[f64; 4]],
+    step: f64,
+    evaluations: &mut usize,
+    score: impl Fn([[f64; 2]; 4]) -> Option<f64>,
+) -> Option<([[f64; 2]; 4], f64)> {
+    let mut best = score(corners)?;
+    *evaluations += 1;
+    let mut current = corners;
+    let mut step = step.max(MIN_STEP);
+    while step >= MIN_STEP {
+        for _ in 0..MAX_PASSES {
+            let mut improved = false;
+            for &pattern in moves {
+                for axis in 0..2 {
+                    for direction in [1.0, -1.0] {
+                        let mut trial = current;
+                        for (corner, weight) in trial.iter_mut().zip(pattern) {
+                            corner[axis] += direction * weight * step;
+                        }
+                        *evaluations += 1;
+                        if let Some(value) = score(trial)
+                            && value > best
+                        {
+                            best = value;
+                            current = trial;
+                            improved = true;
+                        }
+                    }
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+        step /= 2.0;
+    }
+    Some((current, best))
+}
+
+/// Mean of the values with the lowest [`TRIM_FRACTION`] of them left out.
+/// Reorders `values`. `None` when there are none.
+pub(crate) fn trimmed_mean(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let drop = ((values.len() as f64 * TRIM_FRACTION).floor() as usize).min(values.len() - 1);
+    // A partition about the last value dropped, not a sort: the mean of
+    // the kept values does not care for their order, and this runs in the
+    // innermost loop of every placement scored.
+    if drop > 0 {
+        values.select_nth_unstable_by(drop, f64::total_cmp);
+    }
+    let kept = &values[drop..];
+    Some(kept.iter().sum::<f64>() / kept.len() as f64)
+}
+
+/// Size of a module in photo pixels along the outline's shortest side.
+fn module_pixels(corners: [[f64; 2]; 4], width: f64, height: f64) -> f64 {
+    let distance = |a: [f64; 2], b: [f64; 2]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt();
+    (distance(corners[0], corners[1]).min(distance(corners[3], corners[2])) / width)
+        .min(distance(corners[0], corners[3]).min(distance(corners[1], corners[2])) / height)
+}
+
+/// (matching fixed modules, mean boundary contrast) for an outline, as the
+/// refinement sees it. `None` when the corners do not form a usable outline.
+pub fn alignment_score(
+    image: &Luma,
+    func: &FunctionMap,
+    corners: [[f64; 2]; 4],
+    params: &SampleParams,
+) -> Option<(usize, f64)> {
+    let scorer = Scorer::new(image, &Template::whole(func), corners, fixed_threshold(params));
+    Some((scorer.agreement(corners, false)?, scorer.contrast(corners)?))
+}
+
+/// The threshold the sampler would apply to every module alike. A fixed
+/// global threshold is honoured; local thresholds are not meaningful over
+/// fixed modules alone.
+pub(crate) fn fixed_threshold(params: &SampleParams) -> Option<f32> {
+    params.threshold.filter(|_| !params.local)
+}
+
+/// The projections of one symbol's outline that share a set of anchors:
+/// the spline is solved once and each placement of the corners reuses it.
+pub struct Warp {
+    width: usize,
+    height: usize,
+    anchors: Vec<ControlPoint>,
+    spline: Option<Arc<Spline>>,
+}
+
+impl Warp {
+    pub fn new(width: usize, height: usize, anchors: &[ControlPoint]) -> Self {
+        // Build once to learn which sites the spline keeps, in which order.
+        let probe = Projection::new(width, height, [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], anchors);
+        let spline = probe.and_then(|p| p.spline().cloned()).map(Arc::new);
+        Self { width, height, anchors: anchors.to_vec(), spline }
+    }
+
+    pub fn spline(&self) -> Option<&Spline> {
+        self.spline.as_deref()
+    }
+
+    /// The projection for one placement of the corners.
+    pub fn place(&self, corners: [[f64; 2]; 4]) -> Option<Projection> {
+        Projection::new(self.width, self.height, corners, &self.anchors)
+    }
+}
+
+/// Move the corners to maximise how well the version's fixed patterns read,
+/// at whichever polarity the photo turns out to have, with `anchors` held
+/// fixed, and then settle any corner the fixed patterns cannot place by
+/// the symbol's edge or its data modules. `None` when the corners given
+/// do not form a usable outline.
+pub fn refine_corners(
+    image: &Luma,
+    func: &FunctionMap,
+    corners: [[f64; 2]; 4],
+    anchors: &[ControlPoint],
+    params: &SampleParams,
+) -> Option<Refinement> {
+    refine_corners_holding(image, func, corners, anchors, &[], params)
+}
+
+/// [`refine_corners`] with the corners in `held` kept where they are:
+/// those a finder pattern's own fit has placed, which no descent of the
+/// whole outline's contrast places better, and which on curled paper it
+/// places worse.
+pub fn refine_corners_holding(
+    image: &Luma,
+    func: &FunctionMap,
+    corners: [[f64; 2]; 4],
+    anchors: &[ControlPoint],
+    held: &[usize],
+    params: &SampleParams,
+) -> Option<Refinement> {
+    let warp = Warp::new(func.width, func.height, anchors);
+    let scorer = Scorer::new(image, &Template::whole(func), corners, fixed_threshold(params)).with_spline(warp.spline());
+    let fixed = scorer.fixed();
+    let mut evaluations = 0;
+    // Start at half a module: a corner further off than that is misplaced,
+    // not merely imprecise, and the search could settle a whole module away.
+    let step = scorer.module_px() * 0.5;
+    let (warp_ref, scorer_ref) = (&warp, &scorer);
+    let score = |sign: f64| {
+        move |trial: [[f64; 2]; 4]| {
+            let map = warp_ref.place(trial)?;
+            scorer_ref.contrast_projection(&map, sign)
+        }
+    };
+    // A corner that no fixed pattern is near is moved by the contrast only
+    // through the perspective of the whole outline, which is to say by
+    // noise: on a blurred photo it wandered two modules off and dragged
+    // the corners beside it along. Such a corner is held where it was
+    // given through the descent, and placed once the others are settled
+    // as the detector first placed it: by the symbol's edge where there
+    // is a quiet zone to trace it against, and otherwise by how crisply
+    // the data modules of its quarter read dark or light rather than grey.
+    let anchored: Vec<[f64; 2]> = anchors.iter().map(|a| a.at).collect();
+    let loose = super::detect::loose_corners(func, &anchored);
+    // A corner whose only fixed patterns the anchors hold is likewise
+    // beyond the contrast's reach, and keeps its place.
+    let pinned = super::detect::corners_held_by_controls(func, anchors);
+    let still: Vec<usize> = loose.iter().chain(&pinned).copied().collect();
+    let moves = holding(&still);
+    let normal = scorer.descend_by(corners, &moves, step, &mut evaluations, score(1.0))?;
+    let flipped = scorer.descend_by(corners, &moves, step, &mut evaluations, score(-1.0))?;
+    let (inverted, (mut current, _)) = if flipped.1 > normal.1 { (true, flipped) } else { (false, normal) };
+    // A corner a finder pattern's own fit placed is let move only the
+    // last fraction of a pixel, which the whole outline's contrast does
+    // place better on a flat photo: on curled paper the contrast would
+    // walk it off the finder to where a plane reads every pattern best.
+    for &i in held {
+        if distance(current[i], corners[i]) > HELD_TRAVEL * scorer.module_px() {
+            current[i] = corners[i];
+        }
+    }
+    // The descent is believed only while it reads at least as many fixed
+    // modules right as where it started: a peak of boundary contrast that
+    // reads fewer is a wrong peak, as blur makes them, and the corners
+    // given are kept instead, as quirc keeps a move of its perspective
+    // only when the count of cells it reads right improves.
+    let before = scorer.agreement_known(&warp.place(corners)?, inverted)?.0;
+    if scorer.agreement_known(&warp.place(current)?, inverted)?.0 < before {
+        current = corners;
+    }
+    let sign = if inverted { -1.0 } else { 1.0 };
+    let current = super::detect::settle_loose_corners_with(image, func, current, &anchored, sign, params);
+    let after = scorer.agreement_known(&warp.place(current)?, inverted)?.0;
+    Some(Refinement { corners: current, before: (before, fixed), after: (after, fixed), evaluations, inverted })
+}
+
+fn distance(a: [f64; 2], b: [f64; 2]) -> f64 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
+}
+
+/// The corner moves with the corners in `held` kept still: their part in
+/// every pattern zeroed, and patterns that then move nothing dropped.
+fn holding(held: &[usize]) -> Vec<[f64; 4]> {
+    let mut moves: Vec<[f64; 4]> = MOVES
+        .iter()
+        .map(|pattern| {
+            let mut pattern = *pattern;
+            for &i in held {
+                pattern[i] = 0.0;
+            }
+            pattern
+        })
+        .filter(|pattern| pattern.iter().any(|&v| v != 0.0))
+        .collect();
+    moves.dedup();
+    moves
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trimmed_mean_drops_the_worst_fifth() {
+        let mut values = vec![0.5, 0.6, 0.55, 0.58, -0.9];
+        assert!((trimmed_mean(&mut values).unwrap() - 0.5575).abs() < 1e-9);
+        let mut one = vec![0.3];
+        assert_eq!(trimmed_mean(&mut one), Some(0.3));
+        assert_eq!(trimmed_mean(&mut []), None);
+        // Fewer than five values: nothing is dropped.
+        let mut four = vec![1.0, 2.0, 3.0, -4.0];
+        assert_eq!(trimmed_mean(&mut four), Some(0.5));
+    }
+
+    #[test]
+    fn shifted_maps_offset_their_input() {
+        let h = Homography::from_matrix([2.0, 0.0, 10.0, 0.0, 2.0, 20.0, 0.0, 0.0, 1.0]).unwrap();
+        let shifted = Shifted { map: &h, dx: -1.0, dy: -1.0 };
+        assert_eq!(shifted.apply(1.0, 1.0), h.apply(0.0, 0.0));
+    }
+}
