@@ -8,14 +8,15 @@ use qr_forensics::decode::codewords::Pins;
 use qr_forensics::decode::pipeline::{BlockOutcome, DecodeOptions, SolveMethod, analyze, decode};
 use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::adjust::Filter;
-use qr_forensics::imaging::detect::{AnchorKind, detect_outline, find_symbols, find_symbols_fine, refine_anchors};
-use qr_forensics::imaging::read::{drop_contradicted_anchors, read_outline};
+use qr_forensics::imaging::detect::{AnchorKind, Retry, detect_outline, find_symbols, find_symbols_fine, refine_anchors};
+use qr_forensics::imaging::enhance::{Enhance, Sharpen};
+use qr_forensics::imaging::read::{drop_contradicted_anchors, read_detection, read_outline};
 use qr_forensics::imaging::refine::Template;
 use qr_forensics::symbol::function_map::{FunctionMap, Role};
 use qr_forensics::imaging::homography::Homography;
 use qr_forensics::imaging::projection::{ControlPoint, Projection};
 use qr_forensics::imaging::refine::{refine_corners, refine_corners_holding};
-use qr_forensics::imaging::sample::{SampleParams, classify, sample_modules, suggest_versions};
+use qr_forensics::imaging::sample::{SampleParams, classify, sample_modules, sample_modules_as, suggest_versions};
 use qr_forensics::symbol::grid::{CERTAIN, Module, ModuleGrid};
 use qr_forensics::symbol::{EcLevel, Family, SymbolVersion};
 use qrcode_generator::Segment;
@@ -1225,6 +1226,105 @@ fn a_symbol_a_pixel_a_module_is_found_by_enlarging() {
     assert!(all[0].retry.is_some() || all[0].anchors.is_empty(), "{:?}", all[0]);
     let error = corner_error(all[0].corners, quad);
     assert!(error < 1.0, "found corners {error:.2} px off");
+}
+
+/// `image` out of focus: blurred by a Gaussian `sigma` pixels wide.
+fn defocus(image: &Luma, sigma: f64) -> Luma {
+    let reach = (3.0 * sigma).ceil() as i64;
+    let raw: Vec<f64> = (-reach..=reach).map(|k| (-0.5 * (k as f64 / sigma).powi(2)).exp()).collect();
+    let total: f64 = raw.iter().sum();
+    let (w, h) = (image.width as i64, image.height as i64);
+    let pass = |from: &[f32], across: bool| -> Vec<f32> {
+        (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                let at = |k: i64| {
+                    let (nx, ny) = if across { ((x + k).clamp(0, w - 1), y) } else { (x, (y + k).clamp(0, h - 1)) };
+                    f64::from(from[(ny * w + nx) as usize])
+                };
+                ((-reach..=reach).zip(&raw).map(|(k, weight)| weight * at(k)).sum::<f64>() / total) as f32
+            })
+            .collect()
+    };
+    Luma::new(image.width, image.height, pass(&pass(&image.data, true), false))
+}
+
+/// How many modules of `read` differ from `truth`'s, unknown ones
+/// counted with the wrong.
+fn misread(read: &ModuleGrid, truth: &ModuleGrid) -> usize {
+    let (wrong, unknown) = tally(read, truth);
+    wrong + unknown
+}
+
+#[test]
+fn a_symbol_out_of_focus_reads_through_the_photo_sharpened() {
+    // A version 5 symbol three pixels a module, a little turned, out of
+    // focus by seven tenths of a module: its finder patterns' rings have
+    // run into their stones, and a dark module among light ones is grey.
+    // As the photo lies it does not decode; the read is made again
+    // through the photo enlarged and sharpened, and says so.
+    let (version, ec) = (SymbolVersion::Qr(5), EcLevel::M);
+    let grid = symbol(version, ec);
+    let truth = decode_plain(&grid, &layout(version, ec), 0).text.plain();
+    let quad = turned_quad([200.0, 180.0], 3.0 * version.width() as f64, 7.0);
+    let image = defocus(&render(&grid, quad, (400, 360), |_, _, v| v), 2.1);
+    let (params, opts) = (SampleParams::default(), DecodeOptions::default());
+    let read = read_outline(&image, SymbolVersion::Qr(2), bounding_box(quad, 0.2), &params, &opts).expect("found");
+    assert!(read.is_trustworthy(), "{:?} of {} blocks", read.report.blocks_verified(), read.report.blocks.len());
+    assert_eq!(read.text(), truth);
+    assert_eq!(read.version(), version);
+    assert!(read.enhance.sharpen != Sharpen::Off && read.enhance.enlarge > 1, "read through {:?}", read.enhance);
+    assert_eq!(read.detection.retry, Some(Retry::Enhanced(read.enhance)));
+    // The placement is in the photo's own pixels.
+    let error = corner_error(read.detection.corners, quad);
+    assert!(error < 1.5, "corners {error:.2} px off");
+    // Sampled through the same copy, with the kernel and threshold rule
+    // of the read, the placement gives the read's grid again: what the
+    // window's Sampling does once it has taken the read's settings over.
+    // Sampled off the photo as it lies, the same placement reads more
+    // than twice as many modules wrong or not at all.
+    let sample = |enhance: Enhance| {
+        let how = SampleParams { kernel: read.kernel, local: read.local, enhance, ..params };
+        let map = read.detection.projection().expect("the placement maps");
+        classify(&sample_modules_as(&image, &map, grid.width(), grid.height(), &how), &how).to_grid(grid.width(), grid.height())
+    };
+    let (again, plain) = (sample(read.enhance), sample(Enhance::NONE));
+    let differing = (0..grid.width() * grid.height()).filter(|i| again.get(i % grid.width(), i / grid.width()) != read.grid.get(i % grid.width(), i / grid.width())).count();
+    assert!(differing <= 2, "{differing} modules read otherwise the second time");
+    assert!(misread(&plain, &grid) > 2 * misread(&again, &grid).max(10), "{} as it lies, {} sharpened", misread(&plain, &grid), misread(&again, &grid));
+    // Asked for from the start, the same copy is what is read first.
+    let asked = SampleParams { enhance: read.enhance, ..params };
+    let direct = read_outline(&image, SymbolVersion::Qr(2), bounding_box(quad, 0.2), &asked, &opts).expect("found");
+    assert!(direct.is_trustworthy() && direct.enhance == read.enhance && direct.text() == truth);
+    // And a search of the whole photo finds the symbol and reads it.
+    let found = find_symbols(&image, Family::Qr, &params);
+    assert_eq!(found.len(), 1, "{found:?}");
+    let read = read_detection(&image, found[0].clone(), &params, &opts).expect("read where it was found");
+    assert!(read.is_trustworthy() && read.text() == truth, "{:?}", read.report.text.plain());
+    assert!(corner_error(read.detection.corners, quad) < 1.5);
+}
+
+#[test]
+fn small_modules_a_lens_has_run_together_read_enlarged() {
+    // A version 3 symbol a pixel and a quarter a module, blurred by
+    // seven tenths of a pixel, as a lens and a sensor leave a symbol far
+    // from the camera: read through the photo enlarged four times and
+    // sharpened, with its corners placed in the photo's own pixels to
+    // about a module.
+    let (version, ec) = (SymbolVersion::Qr(3), EcLevel::M);
+    let grid = symbol(version, ec);
+    let truth = decode_plain(&grid, &layout(version, ec), 0).text.plain();
+    let side = 1.25 * version.width() as f64;
+    let quad = [[150.3, 120.6], [150.3 + side, 120.6], [150.3 + side, 120.6 + side], [150.3, 120.6 + side]];
+    let image = defocus(&render(&grid, quad, (360, 300), |_, _, v| v), 0.7);
+    let (params, opts) = (SampleParams::default(), DecodeOptions::default());
+    let read = read_outline(&image, SymbolVersion::Qr(2), bounding_box(quad, 0.25), &params, &opts).expect("found");
+    assert!(read.is_trustworthy(), "{:?} of {} blocks", read.report.blocks_verified(), read.report.blocks.len());
+    assert_eq!((read.text(), read.version()), (truth, version));
+    assert_eq!(read.enhance.enlarge, 4, "read through {:?}", read.enhance);
+    assert!(read.enhance.sharpen != Sharpen::Off);
+    let error = corner_error(read.detection.corners, quad);
+    assert!(error < 1.5, "corners {error:.2} px off");
 }
 
 #[test]

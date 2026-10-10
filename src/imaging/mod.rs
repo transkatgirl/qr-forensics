@@ -4,6 +4,7 @@
 pub mod adjust;
 pub mod binarize;
 pub mod detect;
+pub mod enhance;
 pub mod homography;
 pub mod photo;
 pub mod projection;
@@ -22,11 +23,11 @@ pub struct Luma {
     pub width: usize,
     pub height: usize,
     pub data: Vec<f32>,
-    /// The image at its own size, when this is a small photo enlarged
-    /// for the pipeline ([`photo::enlarged`]): a whole number of times
-    /// smaller each way. The enlargement smooths every edge and rounds
-    /// every corner, and a symbol rendered pixel for pixel is read off
-    /// the pixels it had ([`pure`]), which are these.
+    /// The image at its own size, when this is a photo enlarged for the
+    /// pipeline ([`adjust::Enlarge`]): a whole number of times smaller
+    /// each way. The enlargement smooths every edge and rounds every
+    /// corner, and a symbol rendered pixel for pixel is read off the
+    /// pixels it had ([`pure`]), which are these.
     pub unenlarged: Option<Arc<Luma>>,
 }
 
@@ -72,6 +73,18 @@ impl Luma {
     /// Kernel Sharp 2013: see [`resize`].
     pub fn resized(&self, width: usize, height: usize) -> Luma {
         Luma::new(width, height, resize::resize(&self.data, self.width, self.height, 1, width, height))
+    }
+
+    /// The image as opaque grey pixels, four bytes to each: what a
+    /// photo shown in grey is drawn from, so that what is shown is what
+    /// is read.
+    pub fn to_rgba(&self) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity(self.data.len() * 4);
+        for &value in &self.data {
+            let grey = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+            rgba.extend_from_slice(&[grey, grey, grey, 255]);
+        }
+        rgba
     }
 
     /// The image turned clockwise by `quarters` quarter turns, pixel for
@@ -138,6 +151,7 @@ mod tests {
         assert_eq!(once.data, vec![5.0, 3.0, 1.0, 6.0, 4.0, 2.0]);
         assert_eq!(image.rotated_cw(4), image);
         assert_eq!(once.rotated_cw(3), image);
+        assert_eq!(Luma::new(3, 1, vec![0.0, 0.5, 1.2]).to_rgba(), [0, 0, 0, 255, 128, 128, 128, 255, 255, 255, 255, 255]);
         // An enlarged image turns with the image it was enlarged from.
         let small = Luma::new(1, 2, vec![0.25, 0.75]);
         let large = Luma { unenlarged: Some(Arc::new(small.clone())), ..Luma::new(2, 4, vec![0.5; 8]) };

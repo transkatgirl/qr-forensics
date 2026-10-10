@@ -1,6 +1,7 @@
 //! Reading module colours off a photo through a projection.
 
 use super::Luma;
+use super::enhance::{Enhance, Enhanced};
 use super::homography::Homography;
 use super::projection::Project;
 use crate::symbol::function_map::{FunctionMap, looks_inverted};
@@ -213,6 +214,25 @@ pub fn sample_modules_with(
     sampled.sharpened_for_separation()
 }
 
+/// [`sample_modules_with`] off the photo as `params` ask for it: with
+/// their kernel, and, where they ask for the photo enlarged or
+/// sharpened ([`SampleParams::enhance`]), off a copy of it so made about
+/// the symbol, through the same map. A symbol a read found only through
+/// such a copy reads the same again here, and an outline placed by hand
+/// round modules too small or too blurred to read as they lie may be
+/// read through one. The photo is read as it is when no copy can be
+/// made.
+pub fn sample_modules_as(image: &Luma, map: &impl Project, width: usize, height: usize, params: &SampleParams) -> Sampled {
+    if !params.enhance.is_none() {
+        let (w, h) = (width as f64, height as f64);
+        let outline = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]].map(|[x, y]| map.apply(x, y));
+        if let Some(view) = Enhanced::around(image, outline, params.enhance) {
+            return sample_modules_with(&view.luma, &view.through(map), width, height, params.kernel);
+        }
+    }
+    sample_modules_with(image, map, width, height, params.kernel)
+}
+
 /// Below this separability of a reading's luminances, a sharpened reading
 /// is tried: the modules of a blurred photo read grey where a dark one
 /// has light neighbours, at any size, where the size rule above sharpens
@@ -330,6 +350,11 @@ pub struct SampleParams {
     pub surface: bool,
     /// How each module's luminance is read.
     pub kernel: Kernel,
+    /// What is done to the photo about the symbol before it is looked
+    /// for and read there: enlarged, sharpened, or neither. A read that
+    /// does not decode tries the others of itself
+    /// ([`super::read::read_outline`]).
+    pub enhance: Enhance,
 }
 
 impl Default for SampleParams {
@@ -341,6 +366,7 @@ impl Default for SampleParams {
             local_radius: 5,
             surface: false,
             kernel: Kernel::Vote,
+            enhance: Enhance::NONE,
         }
     }
 }

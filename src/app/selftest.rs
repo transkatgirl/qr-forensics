@@ -23,6 +23,11 @@
 //! opacity <grid> <photo>      blend of the Both view, each 0 to 1
 //! overlay none|roles|blocks|corrections|reliability
 //! sample                      sample every module from the photo
+//! enlarge <n>                 the photo's Enlarge: n times its own size,
+//!                             0.25, 0.5 or a whole number, as far as its
+//!                             size allows; the outline goes with it
+//! sharpen <amount>            the photo's Sharpen, from 0 to 1
+//! grey on|off                 show the photo in greyscale, or in colour
 //! invert photo|grid           toggle the photo's inversion, or swap dark
 //!                             and light in the grid
 //! unknown x0 y0 x1 y1         paint a rectangle of modules unknown
@@ -57,7 +62,7 @@
 use std::path::PathBuf;
 
 use eframe::egui;
-use qr_forensics::imaging::adjust::Adjust;
+use qr_forensics::imaging::adjust::{Adjust, Enlarge};
 use qr_forensics::symbol::grid::Module;
 use qr_forensics::symbol::tables::Mode;
 use qr_forensics::symbol::{EcLevel, SymbolVersion};
@@ -187,6 +192,18 @@ impl App {
                 let format = if word(0) == "svg" { ExportFormat::Svg } else { ExportFormat::Png };
                 self.export_image(&test.dir.join(word(1)), format);
             }
+            "enlarge" => {
+                assert!(self.photo.is_some(), "selftest: enlarge needs a photo");
+                let enlarge = Enlarge::parse(word(0)).unwrap_or_else(|| panic!("selftest: bad size in `{step}`"));
+                self.checkpoint();
+                actions.push(Action::SetAdjust(Adjust { enlarge, ..self.doc.adjust }));
+            }
+            "sharpen" => {
+                assert!(self.photo.is_some(), "selftest: sharpen needs a photo");
+                self.checkpoint();
+                actions.push(Action::SetAdjust(Adjust { sharpen: (number(0) as f32).clamp(0.0, 1.0), ..self.doc.adjust }));
+            }
+            "grey" => self.view.greyscale = word(0) == "on",
             "refine" => actions.push(Action::RefineCorners),
             "apply" => actions.push(Action::ApplyCorrections),
             "stage" => self.view.stage = if word(0) == "align" { Stage::Align } else { Stage::Edit },

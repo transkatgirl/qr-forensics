@@ -20,8 +20,8 @@ use qr_forensics::decode::pipeline::{Attempt, DecodeOptions, analyze, brute_forc
 use qr_forensics::decode::repair::{quiet_zone, render_rgba, render_svg, repaired_grid};
 use qr_forensics::decode::sequence::Part;
 use qr_forensics::decode::text::Charset;
-use qr_forensics::imaging::adjust::{Adjust, LENS_MIN_PAIRS, estimate_k1, remap_point, undistort};
-use qr_forensics::imaging::photo::{crop_box, enlarged, flatten_alpha};
+use qr_forensics::imaging::adjust::{Adjust, Enlarge, LENS_MIN_PAIRS, estimate_k1, remap_point, undistort};
+use qr_forensics::imaging::photo::{crop_box, flatten_alpha};
 use qr_forensics::imaging::resize::resize;
 use qr_forensics::imaging::detect::{
     Anchor, AnchorKind, Detection, SEARCH_SIDE, SearchParams, anchor_sites, decodes_as_found, find_symbols_of_families,
@@ -30,6 +30,7 @@ use qr_forensics::imaging::detect::{
 use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline};
 use qr_forensics::imaging::refine::{Refinement, refine_corners, refine_corners_holding};
 use qr_forensics::imaging::Luma;
+use qr_forensics::imaging::enhance::Enhance;
 use qr_forensics::imaging::sample::{Kernel, SampleParams, VersionGuess, classify, sample_modules_with, suggest_versions};
 use qr_forensics::symbol::function_map::{FunctionMap, looks_inverted};
 use qr_forensics::symbol::grid::{Mirror, Module, Symmetry};
@@ -298,6 +299,9 @@ struct ReadNote {
     /// The threshold rule it used: each module against its neighbourhood,
     /// or every module against one split of the symbol.
     local: bool,
+    /// What it read the photo through: a copy of it about the symbol,
+    /// enlarged and sharpened, or the photo as it is.
+    enhance: Enhance,
     /// Blocks verified, of the blocks in the symbol.
     verified: usize,
     blocks: usize,
@@ -601,7 +605,9 @@ impl App {
         // they were placed on: the new photo starts without them, and no
         // undo or redo brings another photo's back onto it. The symbol,
         // the grid and its pins, stays as it is, with its own history.
-        self.show_photo(ctx, name, Arc::new(image), None, Adjust::default());
+        // A small photo starts enlarged, so that its modules can be seen.
+        let adjust = Adjust::for_photo(image.width(), image.height());
+        self.show_photo(ctx, name, Arc::new(image), None, adjust);
         let Some(photo) = &self.photo else { return };
         self.doc.corners = photo.default_corners();
         self.doc.anchors.clear();
@@ -609,7 +615,7 @@ impl App {
         let mut loaded = format!("Loaded {} ({width} × {height}", photo.name);
         if photo.scale() > 1.0 {
             loaded.push_str(&format!(
-                ", enlarged {:.0} times from {} × {} so that its modules can be seen",
+                ", enlarged {:.0} times from {} × {} so that its modules can be seen: Enlarge, under Photo, sets how far",
                 photo.scale(),
                 photo.source.width(),
                 photo.source.height()
@@ -633,19 +639,27 @@ impl App {
     }
 
     /// Put a photo as loaded, or the part `crop` of it, on show under
-    /// `adjust`: its working copy, luminance and texture made, and
-    /// whatever was found or under way on the photo shown before
-    /// dropped. Where the outline and anchors go is the caller's to say.
+    /// `adjust`, enlarged no further than its size allows: its
+    /// luminance and texture made, and whatever was found or under way
+    /// on the photo shown before dropped. Where the outline and anchors
+    /// go is the caller's to say.
     fn show_photo(&mut self, ctx: &egui::Context, name: String, source: Arc<image::RgbaImage>, crop: Option<Crop>, adjust: Adjust) {
-        let (original, unenlarged) = working_copy(&source, crop);
-        let (width, height) = (original.width() as usize, original.height() as usize);
-        let (display, luma) = adjust.apply_photo(&original, unenlarged.as_deref());
+        let original = part_on_show(&source, crop);
+        let (own_width, own_height) = original.dimensions();
+        let adjust = Adjust { enlarge: adjust.enlarge.within(own_width, own_height), ..adjust };
+        let (display, luma) = adjust.apply(original.as_raw(), own_width as usize, own_height as usize);
+        let (width, height) = (luma.width, luma.height);
+        let greyscale = self.view.greyscale;
+        let display = if greyscale { luma.to_rgba() } else { display };
         self.texture_limit = ctx.input(|i| i.max_texture_side);
         let texture = ctx.load_texture("photo", texture_image(display, width, height, self.texture_limit), egui::TextureOptions::LINEAR);
         self.history.photo_changed(&self.doc);
         self.doc.adjust = adjust;
-        self.photo =
-            Some(Photo { name, width, height, source, crop, original, unenlarged, adjust, luma: Arc::new(luma), texture, binarised: None });
+        let enlargements = Enlarge::steps_for(own_width, own_height);
+        let mut photo =
+            Photo { name, width, height, source, crop, original, adjust, enlargements, luma: Arc::new(luma), texture, greyscale, binarised: None };
+        photo.offer(adjust.enlarge);
+        self.photo = Some(photo);
         self.view.stage = Stage::Align;
         self.view.align_view.auto_fit = true;
         self.view.binarize_auto = true;
@@ -664,14 +678,20 @@ impl App {
     /// in it. A lens term in force is of the whole photo, about its
     /// centre, and means nothing of a part: the part is cut from the
     /// photo straightened by it, and takes 0 for its own, and the whole
-    /// photo takes the term back. Returns how many times the part now on
-    /// show was enlarged, one for a part that needed none of it; `None`
-    /// with no photo.
-    fn reframe(&mut self, ctx: &egui::Context, rect: Option<[u32; 4]>) -> Option<f64> {
-        let old = self.photo.as_ref()?;
+    /// photo takes the term back. The enlargement is of the pixels as
+    /// loaded, and a part keeps it whatever its size, as it keeps the
+    /// other adjustments: the symbol is as large after the cut as it
+    /// was before it, and Enlarge is the user's to set. The whole photo
+    /// takes back the enlargement it had, which a part may since have
+    /// been taken past what the whole of a large photo is enlarged to
+    /// unasked. False with no photo.
+    fn reframe(&mut self, ctx: &egui::Context, rect: Option<[u32; 4]>) -> bool {
+        let Some(old) = self.photo.as_ref() else { return false };
         let lens = old.crop.map_or(self.doc.adjust.k1, |crop| crop.k1);
-        let crop = rect.map(|rect| Crop { rect, k1: lens });
-        let adjust = Adjust { k1: if crop.is_some() { 0.0 } else { lens }, ..self.doc.adjust };
+        let whole = old.crop.map_or(self.doc.adjust.enlarge, |crop| crop.enlarge);
+        let crop = rect.map(|rect| Crop { rect, k1: lens, enlarge: whole });
+        let enlarge = if crop.is_some() { self.doc.adjust.enlarge } else { whole };
+        let adjust = Adjust { k1: if crop.is_some() { 0.0 } else { lens }, enlarge, ..self.doc.adjust };
         let corners = self.doc.corners.map(|c| old.to_source(c));
         let mut anchors = self.doc.anchors.clone();
         for anchor in &mut anchors {
@@ -679,20 +699,21 @@ impl App {
         }
         let (name, source) = (old.name.clone(), old.source.clone());
         self.show_photo(ctx, name, source, crop, adjust);
-        let new = self.photo.as_ref()?;
+        let Some(new) = self.photo.as_ref() else { return false };
         self.doc.corners = corners.map(|c| new.to_working(c));
         for anchor in &mut anchors {
             anchor.anchor.center = new.to_working(anchor.anchor.center);
         }
         self.doc.anchors = anchors;
-        Some(new.scale())
+        true
     }
 
     /// Cut the photo down to the outline, with room about it. A search of
     /// the whole photo looks at a copy no larger than [`SEARCH_SIDE`],
     /// and then sees that part at its own size; every change of the
-    /// adjustments works on that part alone; and a part too small for
-    /// its modules to be seen is enlarged as a small photo is.
+    /// adjustments works on that part alone. The part is enlarged, or
+    /// reduced, as the photo was: a small one is not enlarged for being
+    /// small, as a small photo is when it is loaded.
     fn crop_to_outline(&mut self, ctx: &egui::Context) {
         let Some(photo) = &self.photo else {
             self.fail("Load a photo first.");
@@ -708,10 +729,13 @@ impl App {
             return;
         };
         let lens = photo.crop.is_none() && self.doc.adjust.k1 != 0.0;
-        let Some(enlarged) = self.reframe(ctx, Some(rect)) else { return };
+        if !self.reframe(ctx, Some(rect)) {
+            return;
+        }
         let mut text = format!("Cropped to the outline: {} × {} pixels of the photo as loaded", rect[2], rect[3]);
-        if enlarged > 1.0 {
-            text.push_str(&format!(", enlarged {enlarged:.0} times so that the modules can be seen"));
+        let enlarge = self.doc.adjust.enlarge;
+        if enlarge != Enlarge::NONE {
+            text.push_str(&format!(", at {enlarge} as the photo was"));
         }
         text.push_str(". What was found in the photo was dropped with the rest of it: search, or Find in outline, again.");
         if lens {
@@ -725,7 +749,7 @@ impl App {
         if self.photo.as_ref().is_none_or(|photo| photo.crop.is_none()) {
             return;
         }
-        if self.reframe(ctx, None).is_some()
+        if self.reframe(ctx, None)
             && let Some(photo) = &self.photo
         {
             self.notify(format!(
@@ -736,29 +760,138 @@ impl App {
     }
 
     /// Recompute the photo's luminance and texture after a change to its
-    /// adjustments.
+    /// adjustments, at the size its enlargement now makes of it.
     fn reapply_adjust(&mut self) {
         if let Some(photo) = &mut self.photo {
-            let (display, luma) = photo.adjust.apply_photo(&photo.original, photo.unenlarged.as_deref());
+            let (own_width, own_height) = photo.original.dimensions();
+            let (display, luma) = photo.adjust.apply(photo.original.as_raw(), own_width as usize, own_height as usize);
+            (photo.width, photo.height) = (luma.width, luma.height);
+            photo.greyscale = self.view.greyscale;
+            let display = if photo.greyscale { luma.to_rgba() } else { display };
             photo.luma = Arc::new(luma);
             photo.texture.set(texture_image(display, photo.width, photo.height, self.texture_limit), egui::TextureOptions::LINEAR);
             photo.binarised = None;
+            photo.offer(photo.adjust.enlarge);
         }
     }
 
+    /// Draw the photo again as the view asks for it, in grey or in its
+    /// colours. What is read off it is as it was.
+    fn redraw_photo(&mut self) {
+        let Some(photo) = &mut self.photo else { return };
+        photo.greyscale = self.view.greyscale;
+        let display = if photo.greyscale {
+            photo.luma.to_rgba()
+        } else {
+            let (own_width, own_height) = photo.original.dimensions();
+            photo.adjust.apply(photo.original.as_raw(), own_width as usize, own_height as usize).0
+        };
+        photo.texture.set(texture_image(display, photo.width, photo.height, self.texture_limit), egui::TextureOptions::LINEAR);
+    }
+
+    /// Change how the photo is read, and bring the photo up to it. An
+    /// enlargement moves every point of the photo with it, and the
+    /// outline and the anchors go with the points they were on. The
+    /// caller has taken the undo point. Returns what to tell the user,
+    /// when what was found or under way in the photo as it was had to
+    /// be dropped.
+    fn set_adjust(&mut self, mut adjust: Adjust) -> Option<String> {
+        if let Some(photo) = &self.photo {
+            let (own_width, own_height) = photo.original.dimensions();
+            adjust.enlarge = adjust.enlarge.within(own_width, own_height);
+            let (width, height) = adjust.enlarge.size(own_width as usize, own_height as usize);
+            let scale = [width as f64 / photo.width as f64, height as f64 / photo.height as f64];
+            if scale != [1.0, 1.0] {
+                self.doc.corners = self.doc.corners.map(|c| [c[0] * scale[0], c[1] * scale[1]]);
+                for anchor in &mut self.doc.anchors {
+                    let center = anchor.anchor.center;
+                    anchor.anchor.center = [center[0] * scale[0], center[1] * scale[1]];
+                }
+            }
+        }
+        self.doc.adjust = adjust;
+        self.sync_adjust()
+    }
+
     /// Bring the photo up to the document's adjustments, after a change
-    /// of them or an undo that took one back. A change of the lens term
-    /// among them drops what was found in the photo as it was: see
-    /// [`Self::lens_changed`], whose notice comes back when it has one.
+    /// of them or an undo that took one back. A change of the
+    /// enlargement among them carries what was found in the photo to
+    /// where it lies at its new size, and a change of the lens term
+    /// drops it: see [`Self::photo_resized`] and [`Self::lens_changed`],
+    /// whose notices come back when they have any.
     fn sync_adjust(&mut self) -> Option<String> {
         let photo = self.photo.as_mut()?;
         if photo.adjust == self.doc.adjust {
             return None;
         }
         let lens = photo.adjust.k1 != self.doc.adjust.k1;
+        let before = (photo.width, photo.height);
         photo.adjust = self.doc.adjust;
         self.reapply_adjust();
-        if lens { self.lens_changed() } else { None }
+        let resized = self.photo.as_ref().is_some_and(|photo| (photo.width, photo.height) != before);
+        let resized = if resized { self.photo_resized(before) } else { None };
+        let lens = if lens { self.lens_changed() } else { None };
+        match (resized, lens) {
+            (Some(resized), Some(lens)) => Some(format!("{resized} {lens}")),
+            (resized, lens) => resized.or(lens),
+        }
+    }
+
+    /// The photo is worked on at another size than the `width` by
+    /// `height` it was: every point of it lies elsewhere in its new
+    /// pixels, by the change of size and no more. So what was found in
+    /// it is carried to where it lies now, with the view of it, where a
+    /// change of lens leaves nothing to carry; the outline and the
+    /// anchors, which are the document's, have gone there already. A
+    /// search or a step still under way is of the photo as it was, and
+    /// is abandoned, the photo counting as a new one. Returns what to
+    /// tell the user, when anything was.
+    fn photo_resized(&mut self, (width, height): (usize, usize)) -> Option<String> {
+        let photo = self.photo.as_ref()?;
+        let scale = [photo.width as f64 / width as f64, photo.height as f64 / height as f64];
+        let carry = |found: &mut Detection| {
+            found.corners = found.corners.map(|c| [c[0] * scale[0], c[1] * scale[1]]);
+            for anchor in &mut found.anchors {
+                anchor.center = [anchor.center[0] * scale[0], anchor.center[1] * scale[1]];
+            }
+        };
+        if let Some(found) = &mut self.detection {
+            carry(found);
+        }
+        if let Some(proposals) = &mut self.proposals {
+            proposals.found.iter_mut().for_each(carry);
+            if let Some(reads) = &mut proposals.reads {
+                reads.results.iter_mut().flatten().for_each(|read| carry(&mut read.detection));
+            }
+        }
+        // The photo stays where it was on the canvas, and as large.
+        let view = &mut self.view.align_view;
+        view.center = egui::vec2(view.center.x * scale[0] as f32, view.center.y * scale[1] as f32);
+        view.scale /= ((scale[0] + scale[1]) / 2.0) as f32;
+        // The binarised view's region and radius were in the old pixels.
+        self.view.binarize_auto = true;
+        self.photo_generation += 1;
+        let dropped = self.abandon_work();
+        (!dropped.is_empty()).then(|| {
+            format!(
+                "The photo changed size, so {}. Run the search or the step again: the outline and what was found went \
+                 with the photo.",
+                list_phrase(&dropped)
+            )
+        })
+    }
+
+    /// Abandon a search or a step still under way, which is of the photo
+    /// as it was: what each was, for telling the user.
+    fn abandon_work(&mut self) -> Vec<String> {
+        let mut dropped = Vec::new();
+        if self.search.take().is_some() {
+            dropped.push("the search under way was stopped".to_owned());
+        }
+        if let Some(job) = self.job.take() {
+            dropped.push(format!("{} was stopped", job.kind.label().to_lowercase()));
+        }
+        dropped
     }
 
     /// The lens term has changed, which moves every pixel of the photo:
@@ -775,12 +908,7 @@ impl App {
         if self.proposals.take().is_some() {
             dropped.push("the symbols found were taken off the list".to_owned());
         }
-        if self.search.take().is_some() {
-            dropped.push("the search under way was stopped".to_owned());
-        }
-        if let Some(job) = self.job.take() {
-            dropped.push(format!("{} was stopped", job.kind.label().to_lowercase()));
-        }
+        dropped.extend(self.abandon_work());
         (!dropped.is_empty()).then(|| {
             format!(
                 "The lens setting changed, which moves every part of the photo, so {}. Run the search or the step \
@@ -788,6 +916,56 @@ impl App {
                 list_phrase(&dropped)
             )
         })
+    }
+
+    /// Set the photo's Enlarge and Sharpen to what a read decoded
+    /// through: a copy of the photo about the symbol, enlarged so many
+    /// times again from `base`, the photo's enlargement when the read
+    /// was made, and sharpened ([`qr_forensics::imaging::enhance`]).
+    /// The whole photo so adjusted shows what the copy showed, and
+    /// Sample reads the symbol as the read did. The outline, the anchors
+    /// and whatever was found go with the photo to its new size. A
+    /// large photo is not enlarged for it, which would make it many
+    /// times the pixels to hold with no one having asked: that is left
+    /// to the user, and said. Returns what to tell the user; `None` for
+    /// a read of the photo as it is, or when the photo is so adjusted
+    /// already. The caller has taken the undo point.
+    fn adjust_as_read(&mut self, enhance: Enhance, base: Enlarge) -> Option<String> {
+        if enhance.is_none() {
+            return None;
+        }
+        let photo = self.photo.as_ref()?;
+        let (own_width, own_height) = photo.original.dimensions();
+        let before = self.doc.adjust;
+        let wanted = base.by(enhance.enlarge);
+        // Left as it is, too small, where the photo is too large to be
+        // enlarged unasked.
+        let left = before.enlarge < wanted && !wanted.fits_unasked(own_width, own_height);
+        let adjust = Adjust {
+            enlarge: if left { before.enlarge } else { before.enlarge.max(wanted) },
+            sharpen: before.sharpen.max(enhance.sharpen.amount()),
+            ..before
+        };
+        let set = match (adjust.enlarge != before.enlarge, adjust.sharpen != before.sharpen) {
+            (true, true) => format!("Enlarge was set to {} and Sharpen to {:.2}", adjust.enlarge, adjust.sharpen),
+            (true, false) => format!("Enlarge was set to {}", adjust.enlarge),
+            (false, true) => format!("Sharpen was set to {:.2}", adjust.sharpen),
+            (false, false) if !left => return None,
+            (false, false) => String::new(),
+        };
+        let mut text = format!("It decoded only with the photo {enhance}");
+        text.push_str(&if set.is_empty() { ".".to_owned() } else { format!(", so under Photo {set}, and Sample reads it that way.") });
+        if left {
+            text.push_str(&format!(
+                " A photo this large is not enlarged to {wanted} unasked: set Enlarge to that by hand, which takes time and \
+                 memory, or crop to the outline and find the symbol again, to sample it so.",
+            ));
+        }
+        if let Some(dropped) = self.set_adjust(adjust) {
+            text.push(' ');
+            text.push_str(&dropped);
+        }
+        Some(text)
     }
 
     /// Set the Invert adjustment; true when it changed. The caller has
@@ -1324,7 +1502,8 @@ impl App {
             }
         }
         let total = reads.len();
-        proposals.reads = Some(FoundReads { results: reads, photo_inverted });
+        let enlarge = self.photo.as_ref().map_or(Enlarge::NONE, |photo| photo.adjust.enlarge);
+        proposals.reads = Some(FoundReads { results: reads, photo_inverted, enlarge });
         let mut text = format!("Read {decoded} of {total} symbols found through to a message; they are listed under Symbols read.");
         if decoded < total {
             text.push_str(" Load one that did not decode to work on its grid.");
@@ -1347,9 +1526,9 @@ impl App {
         }
         let picked = self.proposals.as_ref().and_then(|proposals| {
             let reads = proposals.reads.as_ref()?;
-            Some((reads.results.get(i)?.clone()?, reads.photo_inverted))
+            Some((reads.results.get(i)?.clone()?, reads.photo_inverted, reads.enlarge))
         });
-        let (Some((read, read_inverted)), true) = (picked, self.photo.is_some()) else {
+        let (Some((read, read_inverted, read_enlarge)), true) = (picked, self.photo.is_some()) else {
             self.fail("That symbol has no read to load; press Read all again.");
             return;
         };
@@ -1378,28 +1557,37 @@ impl App {
         self.set_photo_invert(read_inverted ^ found.inverted);
         self.doc.corners = found.corners;
         self.doc.anchors = found.anchors.iter().map(|&anchor| DocAnchor { anchor, source: AnchorSource::Detected }).collect();
-        // What read this symbol is what Sample would have to use to read
-        // it the same again.
-        if decoded {
-            self.view.sample.kernel = read.kernel;
-            self.view.sample.local = read.local;
-        }
         if let Some(proposals) = &mut self.proposals {
             proposals.adopted = Some(i);
         }
         self.detection = Some(found);
+        // What read this symbol is what Sample would have to use to read
+        // it the same again: the kernel and the threshold rule, and the
+        // photo enlarged and sharpened as the copy of it was that the
+        // read was made through.
+        let mut through = None;
+        if decoded {
+            self.view.sample.kernel = read.kernel;
+            self.view.sample.local = read.local;
+            through = self.adjust_as_read(read.enhance, read_enlarge);
+        }
         self.view.stage = Stage::Edit;
         let how = match (decoded, padding_pinned) {
             (true, true) => "it decodes with its padding pinned, and the pins are in place".to_owned(),
             (true, false) => "it decodes".to_owned(),
             (false, _) => format!("{verified} of {blocks} blocks verified"),
         };
-        self.notify(format!(
+        let mut text = format!(
             "Loaded symbol {} as it was read, {} {version}: {how}. The outline and anchors are on it and the grid holds \
              its modules as sampled (undoable).",
             i + 1,
             version.family().label()
-        ));
+        );
+        if let Some(through) = through {
+            text.push(' ');
+            text.push_str(&through);
+        }
+        self.notify(text);
     }
 
     /// Take a detection a job refined and made ready as the document's
@@ -1417,6 +1605,9 @@ impl App {
         // family in use; otherwise, which takes a change of family during
         // the job, it is made here.
         let decoded = read.as_ref().is_some_and(|r| r.trustworthy);
+        // What a read that decoded was made through, of the photo as it
+        // is enlarged now.
+        let through = read.as_ref().filter(|read| read.trustworthy).map(|read| (read.enhance, photo.adjust.enlarge));
         let adopt = adopts_version(&found, self.doc.version, decoded);
         let guesses = (found.version != self.doc.version && !adopt).then(|| {
             let family = self.doc.version.family();
@@ -1567,6 +1758,17 @@ impl App {
             text.push_str(" This is a light-on-dark symbol, read with Invert photo on.");
         }
         self.detection = Some(found);
+        // And so with the photo it was read through: a symbol that
+        // decoded only through a copy of the photo enlarged or sharpened
+        // has the photo so adjusted, and samples the same way. Last,
+        // since the outline, the anchors and the detection, placed
+        // above, go with the photo to its new size.
+        if let Some((enhance, base)) = through
+            && let Some(note) = self.adjust_as_read(enhance, base)
+        {
+            text.push(' ');
+            text.push_str(&note);
+        }
         text
     }
 
@@ -1864,11 +2066,10 @@ impl App {
             }
             Action::RefineCorners => self.refine(ctx),
             Action::SetAdjust(adjust) => {
-                if self.doc.adjust != adjust {
-                    self.doc.adjust = adjust;
-                    if let Some(text) = self.sync_adjust() {
-                        self.notify(text);
-                    }
+                if self.doc.adjust != adjust
+                    && let Some(text) = self.set_adjust(adjust)
+                {
+                    self.notify(text);
                 }
             }
             Action::EstimateLens => self.estimate_lens(),
@@ -2377,6 +2578,10 @@ impl App {
         for action in actions {
             self.apply(&ctx, action);
         }
+        // The photo in grey or in its colours, as the view now asks.
+        if self.photo.as_ref().is_some_and(|photo| photo.greyscale != self.view.greyscale) {
+            self.redraw_photo();
+        }
         if self.dirty {
             ctx.request_repaint();
         }
@@ -2548,6 +2753,7 @@ fn prepared_from_read(
     let read = ReadNote {
         kernel: result.kernel,
         local: result.local,
+        enhance: result.enhance,
         verified: result.report.blocks_verified(),
         blocks: result.report.blocks.len(),
         trustworthy,
@@ -2676,33 +2882,20 @@ fn listed(luma: &Luma, mut all: Vec<Detection>, params: &SampleParams) -> Vec<De
     merge_detections(all)
 }
 
-/// The pixels a photo is worked on at: those of the photo as loaded, or
-/// of the part `crop` of it, enlarged when they are too few for modules
-/// to be seen and otherwise as they are. They are the photo's own,
-/// shared, when the whole of it is on show and needed no enlarging.
-/// With them, when they are an enlargement, the pixels at their own
-/// size.
-fn working_copy(source: &Arc<image::RgbaImage>, crop: Option<Crop>) -> (Arc<image::RgbaImage>, Option<Arc<image::RgbaImage>>) {
-    let Some(crop) = crop else {
-        return match enlarged(source) {
-            Some(larger) => (Arc::new(larger), Some(source.clone())),
-            None => (source.clone(), None),
-        };
-    };
+/// The pixels the adjustments are made to: those of the photo as
+/// loaded, shared, or of the part `crop` of it, cut from the photo
+/// straightened by the lens term the crop was made under.
+fn part_on_show(source: &Arc<image::RgbaImage>, crop: Option<Crop>) -> Arc<image::RgbaImage> {
+    let Some(crop) = crop else { return source.clone() };
     let [x, y, w, h] = crop.rect;
-    let cut = if crop.k1 == 0.0 {
-        image::imageops::crop_imm(&**source, x, y, w, h).to_image()
-    } else {
-        // The outline the crop was made to lay on the photo straightened.
-        let (width, height) = source.dimensions();
-        let straightened = undistort(source.as_raw(), width as usize, height as usize, crop.k1);
-        let straightened = image::RgbaImage::from_raw(width, height, straightened).expect("straightening keeps the photo's size");
-        image::imageops::crop_imm(&straightened, x, y, w, h).to_image()
-    };
-    match enlarged(&cut) {
-        Some(larger) => (Arc::new(larger), Some(Arc::new(cut))),
-        None => (Arc::new(cut), None),
+    if crop.k1 == 0.0 {
+        return Arc::new(image::imageops::crop_imm(&**source, x, y, w, h).to_image());
     }
+    // The outline the crop was made to lay on the photo straightened.
+    let (width, height) = source.dimensions();
+    let straightened = undistort(source.as_raw(), width as usize, height as usize, crop.k1);
+    let straightened = image::RgbaImage::from_raw(width, height, straightened).expect("straightening keeps the photo's size");
+    Arc::new(image::imageops::crop_imm(&straightened, x, y, w, h).to_image())
 }
 
 /// Pixels as a texture holds them: as they are when they fit within
@@ -2838,6 +3031,7 @@ fn quad_contains(quad: &[[f64; 2]; 4], point: [f64; 2]) -> bool {
 #[cfg(test)]
 mod tests {
     use qr_forensics::imaging::detect::InfoEvidence;
+    use qr_forensics::imaging::enhance::Sharpen;
     use qr_forensics::imaging::projection::Project;
     use qr_forensics::symbol::grid::ModuleGrid;
 
@@ -2865,7 +3059,7 @@ mod tests {
     /// A photo as the app loads it, for the search helpers.
     fn load(name: &str) -> Luma {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/photos").join(name);
-        qr_forensics::imaging::photo::luma(image::open(&path).expect("photo opens").to_rgba8(), &Adjust::default())
+        qr_forensics::imaging::photo::luma_as_loaded(image::open(&path).expect("photo opens").to_rgba8())
     }
 
     #[test]
@@ -3140,6 +3334,8 @@ mod tests {
         time: f64,
         /// What the last frame painted.
         shapes: Vec<egui::epaint::ClippedShape>,
+        /// What each texture was last set to, whole.
+        textures: std::collections::HashMap<egui::TextureId, Arc<egui::ColorImage>>,
     }
 
     impl Bench {
@@ -3152,7 +3348,8 @@ mod tests {
             let (w, h, pixels) = render_rgba(&painted_grid(), 10, 4);
             let image = image::RgbaImage::from_raw(w as u32, h as u32, pixels).expect("a render is an image");
             app.set_photo(&ctx, "render".into(), image);
-            let mut bench = Self { ctx, app, size: egui::vec2(1440.0, 900.0), texture_side: None, time: 0.0, shapes: Vec::new() };
+            let mut bench =
+                Self { ctx, app, size: egui::vec2(1440.0, 900.0), texture_side: None, time: 0.0, shapes: Vec::new(), textures: Default::default() };
             bench.settle();
             bench
         }
@@ -3168,6 +3365,12 @@ mod tests {
             self.time += 1.0 / 60.0;
             let app = &mut self.app;
             let mut output = self.ctx.run_ui(input, |ui| app.show(ui));
+            for (id, deltas) in output.textures_delta.set.drain() {
+                for delta in deltas.into_iter().filter(|delta| delta.pos.is_none()) {
+                    let egui::ImageData::Color(image) = delta.image;
+                    self.textures.insert(id, image);
+                }
+            }
             output.textures_delta.clear();
             self.shapes = output.shapes;
         }
@@ -3294,6 +3497,51 @@ mod tests {
             self.app.message.as_ref().expect("a notice")
         }
 
+        /// The photo as its texture last had it: the red, green and
+        /// blue of each pixel.
+        fn drawn(&self) -> Vec<[u8; 3]> {
+            let id = self.app.photo.as_ref().expect("a photo is on show").texture.id();
+            self.textures.get(&id).expect("the photo's texture was set").pixels.iter().map(|c| [c.r(), c.g(), c.b()]).collect()
+        }
+
+        /// The middle of where the last frame painted `text`, which it
+        /// painted once.
+        fn text_at(&self, text: &str) -> egui::Pos2 {
+            fn walk(shape: &egui::Shape, text: &str, out: &mut Vec<egui::Pos2>) {
+                match shape {
+                    egui::Shape::Text(shape) if shape.galley.text() == text => out.push(shape.visual_bounding_rect().center()),
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, text, out)),
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            self.shapes.iter().for_each(|clipped| walk(&clipped.shape, text, &mut out));
+            assert_eq!(out.len(), 1, "{text:?} was painted at {out:?}");
+            out[0]
+        }
+
+        /// The rail of the slider on the row labelled `label`, as the
+        /// last frame painted it: a flat bar beside the label.
+        fn rail_beside(&self, label: &str) -> egui::Rect {
+            fn walk(shape: &egui::Shape, at: egui::Pos2, out: &mut Vec<egui::Rect>) {
+                match shape {
+                    egui::Shape::Rect(bar) => {
+                        let rect = bar.rect;
+                        if (rect.center().y - at.y).abs() < 6.0 && rect.left() > at.x && rect.width() > 60.0 && rect.height() < 12.0 {
+                            out.push(rect);
+                        }
+                    }
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, at, out)),
+                    _ => {}
+                }
+            }
+            let at = self.text_at(label);
+            let mut out = Vec::new();
+            self.shapes.iter().for_each(|clipped| walk(&clipped.shape, at, &mut out));
+            assert_eq!(out.len(), 1, "the rails beside {label:?}: {out:?}");
+            out[0]
+        }
+
         /// The document, what follows from it, and what is cached for
         /// the photo are all of `version`.
         fn assert_all_of(&self, version: SymbolVersion) {
@@ -3348,24 +3596,376 @@ mod tests {
         bench.assert_all_of(SymbolVersion::Qr(5));
     }
 
+    /// The bench's render with its ink in red, so that a photo shown in
+    /// its colours can be told from one shown in grey.
+    fn red_render() -> image::RgbaImage {
+        let (w, h, pixels) = render_rgba(&painted_grid(), 10, 4);
+        let mut image = image::RgbaImage::from_raw(w as u32, h as u32, pixels).expect("a render is an image");
+        for pixel in image.pixels_mut().filter(|pixel| pixel[0] < 128) {
+            pixel.0 = [200, 30, 40, 255];
+        }
+        image
+    }
+
+    #[test]
+    fn enlarging_the_photo_takes_the_outline_and_what_was_found_with_it() {
+        fn slowly<T>(result: T) -> T {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            result
+        }
+        let twice = |points: [[f64; 2]; 4]| points.map(|[x, y]| [2.0 * x, 2.0 * y]);
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        bench.app.doc.corners = STRAIGHT;
+        bench.app.doc.set_anchor(finder_anchor([75.0, 75.0]), AnchorSource::Manual);
+        bench.app.detection = Some(detection(SymbolVersion::Qr(2), STRAIGHT));
+        bench.app.proposals =
+            Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: Some(0), reads: None });
+        bench.step();
+        // The render is large enough to start at its own size, with the
+        // steps its size allows on offer.
+        let photo = bench.app.photo.as_ref().expect("the bench has a photo");
+        assert_eq!((photo.width, photo.height, photo.adjust.enlarge), (330, 330, Enlarge::NONE));
+        assert_eq!(photo.enlargements.iter().map(Enlarge::to_string).collect::<Vec<_>>(), ["0.25×", "0.5×", "1×", "2×", "4×", "8×"]);
+        assert!(bench.texts().iter().any(|text| text == "1×"), "{:?}", bench.texts());
+        // The view left where the user put it, to see that it follows.
+        bench.app.view.align_view.auto_fit = false;
+        let on_screen = bench.locate()([75.0, 75.0]);
+        // Twice the size: the photo, its luminance and its texture, with
+        // the pixels it had kept beside the luminance.
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { enlarge: Enlarge::times(2), ..bench.app.doc.adjust }));
+        bench.step();
+        let photo = bench.app.photo.as_ref().expect("the bench has a photo");
+        assert_eq!((photo.width, photo.height, photo.scale()), (660, 660, 2.0));
+        assert_eq!((photo.luma.width, photo.luma.height), (660, 660));
+        assert_eq!(photo.luma.unenlarged.as_ref().map(|own| (own.width, own.height)), Some((330, 330)));
+        assert_eq!(photo.texture.size(), [660, 660]);
+        assert!(Arc::ptr_eq(&photo.source, &photo.original), "the photo as loaded is what is enlarged");
+        // The outline, the anchor, and what was found went with it, and
+        // the symbol reads there as it did.
+        assert_eq!(bench.app.doc.corners, twice(STRAIGHT));
+        assert_eq!(bench.app.doc.anchors[0].anchor.center, [150.0, 150.0]);
+        assert_eq!(bench.app.detection.as_ref().map(|found| found.corners), Some(twice(STRAIGHT)));
+        let proposals = bench.app.proposals.as_ref().expect("the symbols found stay on offer");
+        assert_eq!(proposals.found[0].corners, twice(STRAIGHT));
+        assert_eq!(proposal_in_use(proposals, &bench.app.doc.corners), Some(0));
+        let (matching, fixed) = bench.app.preview.as_ref().expect("the outline makes a grid").fixed;
+        assert_eq!(matching, fixed);
+        assert!(bench.notice().text.starts_with("Loaded render"), "nothing was under way, so nothing to say: {}", bench.notice().text);
+        let texts = bench.texts();
+        assert!(texts.iter().any(|text| text == "render · 660 × 660 · enlarged from 330 × 330"), "{texts:?}");
+        assert!(texts.iter().any(|text| text == "2×"), "{texts:?}");
+        // And the canvas shows the same part of the photo, as large.
+        let moved = bench.locate()([150.0, 150.0]);
+        assert!(moved.distance(on_screen) < 0.5, "{on_screen:?} to {moved:?}");
+        // Undo takes the size back, and the outline and what was found
+        // with it.
+        bench.act(Action::Undo);
+        bench.step();
+        let photo = bench.app.photo.as_ref().expect("the bench has a photo");
+        assert_eq!((photo.width, photo.height, photo.luma.unenlarged.is_none()), (330, 330, true));
+        assert_eq!(bench.app.doc.corners, STRAIGHT);
+        assert_eq!(bench.app.detection.as_ref().map(|found| found.corners), Some(STRAIGHT));
+        assert!(bench.locate()([75.0, 75.0]).distance(on_screen) < 0.5);
+        // Reduced, it keeps nothing beside it, and says so.
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { enlarge: Enlarge::HALF, ..bench.app.doc.adjust }));
+        bench.step();
+        let photo = bench.app.photo.as_ref().expect("the bench has a photo");
+        assert_eq!((photo.width, photo.height, photo.scale(), photo.luma.unenlarged.is_none()), (165, 165, 0.5, true));
+        assert_eq!(bench.app.doc.corners, STRAIGHT.map(|[x, y]| [x / 2.0, y / 2.0]));
+        let (matching, fixed) = bench.app.preview.as_ref().expect("the outline makes a grid").fixed;
+        assert_eq!(matching, fixed, "five pixels a module still read");
+        assert!(bench.texts().iter().any(|text| text == "render · 165 × 165 · reduced from 330 × 330"), "{:?}", bench.texts());
+        // More than the photo's size allows is held to what it does.
+        bench.act(Action::SetAdjust(Adjust { enlarge: Enlarge::times(64), ..bench.app.doc.adjust }));
+        assert_eq!(bench.app.doc.adjust.enlarge, Enlarge::times(12));
+        bench.act(Action::Undo);
+        assert_eq!(bench.app.photo.as_ref().map(|photo| (photo.width, photo.adjust.enlarge)), Some((330, Enlarge::NONE)));
+        // A search and a step under way are of the photo as it was: they
+        // are abandoned, and what they hand back is not taken in. What
+        // was found before stays, carried to the new size.
+        let elsewhere = || detection(SymbolVersion::Qr(2), square(0.0, 0.0, 10.0));
+        bench.app.start_search(&ctx, false, None, move || slowly(vec![elsewhere()]));
+        bench.app.start_job(&ctx, JobKind::Adopt, move || slowly(JobResult::Adopt(prepared(elsewhere()))));
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { enlarge: Enlarge::times(2), ..bench.app.doc.adjust }));
+        assert!(bench.app.search.is_none() && bench.app.job.is_none());
+        assert!(bench.notice().text.starts_with("The photo changed size, so the search under way was stopped and"), "{}", bench.notice().text);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        bench.settle();
+        assert_eq!(bench.app.doc.corners, twice(STRAIGHT));
+        let carried = bench.app.proposals.as_ref().map(|proposals| proposals.found[0].corners).expect("the symbols found stay on offer");
+        for (corner, on_symbol) in carried.iter().zip(twice(STRAIGHT)) {
+            assert!((corner[0] - on_symbol[0]).hypot(corner[1] - on_symbol[1]) < 1e-9, "{carried:?}");
+        }
+    }
+
+    #[test]
+    fn the_enlarge_slider_goes_from_step_to_step_of_those_on_offer() {
+        let mut bench = Bench::new();
+        bench.app.doc.corners = STRAIGHT;
+        bench.step();
+        bench.step();
+        // Enlarge and Sharpen are adjustments of the photo, each one
+        // slider under Photo, and Sampling has neither.
+        for label in ["Enlarge", "Sharpen"] {
+            bench.text_at(label);
+        }
+        // A press at the far end of the rail is the largest step on
+        // offer, eight times the photo's size, and one near its start
+        // the least, a quarter of it: one step of undo each.
+        let rail = bench.rail_beside("Enlarge");
+        bench.click(egui::pos2(rail.left() + 3.0, rail.center().y), egui::PointerButton::Primary);
+        let photo = bench.app.photo.as_ref().expect("the bench has a photo");
+        assert_eq!((bench.app.doc.adjust.enlarge, photo.width, photo.height), (Enlarge::QUARTER, 83, 83));
+        assert!(bench.texts().iter().any(|text| text == "0.25×"), "{:?}", bench.texts());
+        let scale = 83.0 / 330.0;
+        let reduced = STRAIGHT.map(|[x, y]| [x * scale, y * scale]);
+        assert_eq!(bench.app.doc.corners, reduced);
+        // The fourth of the six, by where the rail has it: the handle
+        // runs the rail's length less its own width, seven points in
+        // from either end.
+        let rail = bench.rail_beside("Enlarge");
+        let fourth = rail.left() + 7.0 + (rail.width() - 14.0) * 3.0 / 5.0;
+        bench.click(egui::pos2(fourth, rail.center().y), egui::PointerButton::Primary);
+        assert_eq!(bench.app.doc.adjust.enlarge, Enlarge::times(2));
+        assert_eq!(bench.app.photo.as_ref().map(|photo| (photo.width, photo.height)), Some((660, 660)));
+        bench.act(Action::Undo);
+        assert_eq!((bench.app.doc.adjust.enlarge, bench.app.doc.corners), (Enlarge::QUARTER, reduced));
+        bench.act(Action::Undo);
+        assert_eq!((bench.app.doc.adjust.enlarge, bench.app.doc.corners), (Enlarge::NONE, STRAIGHT));
+        assert!(!bench.app.history.can_undo(&bench.app.doc));
+        // Reset goes back to what the photo started with: for a small
+        // one, the enlargement it was given.
+        let ctx = bench.ctx.clone();
+        let small = image::imageops::crop_imm(&red_render(), 0, 0, 110, 110).to_image();
+        bench.app.set_photo(&ctx, "small".into(), small);
+        bench.step();
+        bench.step();
+        let photo = bench.app.photo.as_ref().expect("the photo is loaded");
+        assert_eq!(photo.enlargements.iter().map(Enlarge::to_string).collect::<Vec<_>>(), ["0.5×", "1×", "2×", "3×", "4×", "8×", "16×", "32×"]);
+        assert_eq!((photo.adjust, bench.app.doc.adjust), (Adjust::for_photo(110, 110), Adjust::for_photo(110, 110)));
+        assert!(bench.texts().iter().any(|text| text == "3×"), "{:?}", bench.texts());
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { enlarge: Enlarge::NONE, sharpen: 0.4, ..bench.app.doc.adjust }));
+        bench.step();
+        bench.step();
+        assert_eq!(bench.app.photo.as_ref().map(|photo| photo.width), Some(110));
+        let reset = bench.text_at("Reset adjustments");
+        bench.click(reset, egui::PointerButton::Primary);
+        assert_eq!(bench.app.doc.adjust, Adjust::for_photo(110, 110));
+        assert_eq!(bench.app.photo.as_ref().map(|photo| photo.width), Some(330));
+    }
+
+    #[test]
+    fn the_photo_is_sharpened_whole_and_in_its_colours() {
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        bench.app.set_photo(&ctx, "red".into(), red_render());
+        bench.app.doc.corners = STRAIGHT;
+        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: None, reads: None });
+        bench.step();
+        // Ink in the middle of the first finder's stone, and paper in
+        // the quiet zone.
+        let (ink, paper) = (75 * 330 + 75, 20 * 330 + 20);
+        let plain = bench.drawn();
+        assert_eq!((plain[ink], plain[paper]), ([200, 30, 40], [255; 3]));
+        let before = bench.app.photo.as_ref().map(|photo| photo.luma.clone()).expect("the photo is loaded");
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { sharpen: 0.5, ..bench.app.doc.adjust }));
+        bench.step();
+        // The photo is the size it was, and still in its colours: flat
+        // ink and flat paper as they were, and the ink darker along its
+        // edges, where the mask steepens them.
+        let photo = bench.app.photo.as_ref().expect("the photo is loaded");
+        assert_eq!((photo.width, photo.height, photo.adjust.sharpen), (330, 330, 0.5));
+        let sharp = bench.drawn();
+        assert_eq!((sharp[ink], sharp[paper]), ([200, 30, 40], [255; 3]));
+        let edge = 75 * 330 + 60;
+        assert_eq!(plain[edge], [200, 30, 40]);
+        assert!(sharp[edge][0] < 190 && sharp[edge][1] < 30 && sharp[edge][0] > sharp[edge][1] + 100, "{:?}", sharp[edge]);
+        // What is read is the luminance of what is shown.
+        assert!(!Arc::ptr_eq(&photo.luma, &before));
+        let shown = |[r, g, b]: [u8; 3]| (0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b)) / 255.0;
+        assert!(sharp.iter().zip(&photo.luma.data).all(|(&pixel, &luma)| (shown(pixel) - luma).abs() < 1e-4));
+        // Nothing moved: what was found stays, and the symbol reads.
+        assert!(bench.app.proposals.is_some() && bench.notice().text.starts_with("Loaded red"), "{}", bench.notice().text);
+        let (matching, fixed) = bench.app.preview.as_ref().expect("the outline makes a grid").fixed;
+        assert_eq!(matching, fixed);
+        bench.act(Action::Undo);
+        bench.step();
+        assert_eq!(bench.drawn(), plain);
+    }
+
+    #[test]
+    fn the_photo_is_shown_in_grey_when_asked_and_read_the_same() {
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        bench.app.set_photo(&ctx, "red".into(), red_render());
+        bench.app.doc.corners = STRAIGHT;
+        bench.step();
+        bench.step();
+        let (ink, paper) = (75 * 330 + 75, 20 * 330 + 20);
+        // In its colours to begin with.
+        assert!(!bench.app.view.greyscale);
+        assert_eq!((bench.drawn()[ink], bench.drawn()[paper]), ([200, 30, 40], [255; 3]));
+        let read = bench.app.photo.as_ref().map(|photo| photo.luma.clone()).expect("the photo is loaded");
+        let grey = |luma: &Luma| luma.data.iter().map(|&v| [(v * 255.0).round() as u8; 3]).collect::<Vec<_>>();
+        // The checkbox under Photo shows it as the luminance that is
+        // read, which is the same luminance as before.
+        let checkbox = bench.text_at("Show in greyscale");
+        bench.click(checkbox, egui::PointerButton::Primary);
+        assert!(bench.app.view.greyscale);
+        let photo = bench.app.photo.as_ref().expect("the photo is loaded");
+        assert!(photo.greyscale && Arc::ptr_eq(&photo.luma, &read), "only what is shown changed");
+        assert_eq!(bench.drawn(), grey(&read));
+        assert_eq!(bench.drawn()[ink], [82; 3]);
+        assert!(!bench.app.history.can_undo(&bench.app.doc), "a way of looking, not an edit");
+        // It stays in grey through a change of the adjustments, an undo
+        // of it, and another photo.
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { enlarge: Enlarge::times(2), sharpen: 0.5, ..bench.app.doc.adjust }));
+        bench.step();
+        let photo = bench.app.photo.as_ref().expect("the photo is loaded");
+        assert_eq!((photo.texture.size(), bench.drawn()), ([660, 660], grey(&photo.luma)));
+        bench.act(Action::Undo);
+        bench.step();
+        assert_eq!(bench.drawn(), grey(&read));
+        bench.app.set_photo(&ctx, "red again".into(), red_render());
+        bench.step();
+        assert_eq!(bench.drawn(), grey(&read));
+        // Unticked, the colours are back, and what is read is as it was.
+        bench.step();
+        bench.click(bench.text_at("Show in greyscale"), egui::PointerButton::Primary);
+        assert!(!bench.app.view.greyscale);
+        assert_eq!((bench.drawn()[ink], bench.drawn()[paper]), ([200, 30, 40], [255; 3]));
+        assert_eq!(bench.app.photo.as_ref().map(|photo| photo.luma.data.clone()), Some(read.data.clone()));
+    }
+
     #[test]
     fn only_a_read_that_decoded_sets_the_sampling() {
         let mut bench = Bench::new();
         let before = bench.app.view.sample;
         assert_ne!(before.kernel, Kernel::Centre);
-        let read = |trustworthy: bool| {
+        let read = |trustworthy: bool, enhance: Enhance| {
             let (kernel, local, verified) = (Kernel::Centre, !before.local, usize::from(trustworthy));
-            let note = ReadNote { kernel, local, verified, blocks: 1, trustworthy, padding_pinned: false, reinterpreted: None };
+            let note = ReadNote { kernel, local, enhance, verified, blocks: 1, trustworthy, padding_pinned: false, reinterpreted: None };
             Prepared { read: Some(note), ..prepared(detection(SymbolVersion::Qr(2), STRAIGHT)) }
         };
+        let copy = Enhance { enlarge: 2, sharpen: Sharpen::Light };
         // The best of the attempts at a read that decoded nothing says
-        // nothing about how this photo wants sampling.
-        let text = bench.app.adopt_prepared(read(false));
+        // nothing about how this photo wants sampling, or adjusting.
+        let text = bench.app.adopt_prepared(read(false, copy));
         assert!(bench.app.view.sample == before);
+        assert_eq!(bench.app.doc.adjust, Adjust::default());
         assert!(!text.contains("decoded it"), "{text}");
-        let text = bench.app.adopt_prepared(read(true));
+        let text = bench.app.adopt_prepared(read(true, Enhance::NONE));
         assert_eq!((bench.app.view.sample.kernel, bench.app.view.sample.local), (Kernel::Centre, !before.local));
         assert!(text.contains("sampling kernel decoded it"), "{text}");
+        assert_eq!(bench.app.doc.adjust, Adjust::default(), "read off the photo as it is");
+        assert!(!text.contains("only with the photo"), "{text}");
+        // A read made through a copy of the photo about the symbol,
+        // enlarged and sharpened, has the whole photo so adjusted: the
+        // outline and the detection go with it to its new size, and
+        // Sampling reads it there as ever, through no copy of its own.
+        let text = bench.app.adopt_prepared(read(true, copy));
+        assert!(text.contains("It decoded only with the photo enlarged 2 times and sharpened lightly, so under Photo Enlarge was set to 2× and Sharpen to 0.50"), "{text}");
+        assert_eq!(bench.app.doc.adjust, Adjust { enlarge: Enlarge::times(2), sharpen: 0.5, ..Adjust::default() });
+        let photo = bench.app.photo.as_ref().expect("the bench has a photo");
+        assert_eq!((photo.width, photo.height, photo.adjust), (660, 660, bench.app.doc.adjust));
+        let doubled = STRAIGHT.map(|[x, y]| [2.0 * x, 2.0 * y]);
+        assert_eq!(bench.app.doc.corners, doubled);
+        assert_eq!(bench.app.detection.as_ref().map(|found| found.corners), Some(doubled));
+        assert_eq!(bench.app.view.sample.enhance, Enhance::NONE);
+        bench.step();
+        let (matching, fixed) = bench.app.preview.as_ref().expect("the outline makes a grid").fixed;
+        assert_eq!(matching, fixed);
+        // One undo takes the adoption back, the photo's size with it.
+        bench.act(Action::Undo);
+        assert_eq!((bench.app.doc.adjust, bench.app.doc.corners), (Adjust::default(), STRAIGHT));
+        assert_eq!(bench.app.photo.as_ref().map(|photo| photo.width), Some(330));
+        // A copy enlarged by a number of times that is no step of the
+        // slider's is offered as one from then on.
+        let text = bench.app.adopt_prepared(read(true, Enhance { enlarge: 3, sharpen: Sharpen::Off }));
+        assert!(text.contains("only with the photo enlarged 3 times, so under Photo Enlarge was set to 3×, and Sample reads it that way."), "{text}");
+        let photo = bench.app.photo.as_ref().expect("the bench has a photo");
+        assert_eq!((photo.width, photo.adjust.sharpen), (990, 0.0));
+        assert_eq!(photo.enlargements.iter().map(Enlarge::to_string).collect::<Vec<_>>(), ["0.25×", "0.5×", "1×", "2×", "3×", "4×", "8×"]);
+        bench.step();
+        bench.step();
+        assert!(bench.texts().iter().any(|text| text == "3×"), "{:?}", bench.texts());
+        // So adjusted already, a read through the same copy of the photo
+        // as it was has nothing to add.
+        assert_eq!(bench.app.adjust_as_read(Enhance { enlarge: 3, sharpen: Sharpen::Off }, Enlarge::NONE), None);
+        // A photo too large to be enlarged so far without its being
+        // asked for is sharpened, and says what to do about the rest:
+        // the slider offers it.
+        let ctx = bench.ctx.clone();
+        bench.app.set_photo(&ctx, "wide".into(), image::RgbaImage::from_pixel(1500, 300, image::Rgba([255; 4])));
+        let text = bench.app.adopt_prepared(read(true, Enhance { enlarge: 4, sharpen: Sharpen::Strong }));
+        assert!(text.contains("so under Photo Sharpen was set to 1.00, and Sample reads it that way. A photo this large is not enlarged to 4× unasked"), "{text}");
+        assert_eq!(bench.app.doc.adjust, Adjust { sharpen: 1.0, ..Adjust::default() });
+        assert_eq!(bench.app.doc.corners, STRAIGHT);
+        let photo = bench.app.photo.as_ref().expect("the photo is loaded");
+        assert_eq!(photo.enlargements.iter().map(Enlarge::to_string).collect::<Vec<_>>(), ["0.25×", "0.5×", "1×", "2×", "4×"]);
+        // Set so by hand, the photo is as the read had it, and the same
+        // read has nothing more to ask.
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { enlarge: Enlarge::times(4), ..bench.app.doc.adjust }));
+        assert_eq!(bench.app.photo.as_ref().map(|photo| (photo.width, photo.height)), Some((6000, 1200)));
+        assert_eq!(bench.app.doc.corners, STRAIGHT.map(|[x, y]| [4.0 * x, 4.0 * y]));
+        assert_eq!(bench.app.adjust_as_read(Enhance { enlarge: 4, sharpen: Sharpen::Strong }, Enlarge::NONE), None);
+    }
+
+    #[test]
+    fn a_symbol_read_only_through_a_sharpened_copy_samples_the_same_once_the_photo_is_so_adjusted() {
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        // A version 3 symbol three pixels a module in a photo out of
+        // focus by seven tenths of a module: grey where a dark module
+        // has light neighbours, and its finders' rings run into their
+        // stones.
+        let message = "https://example.com/out-of-focus";
+        let (w, h, pixels) = render_rgba(&symbol_of(message), 3, 4);
+        let render = image::RgbaImage::from_raw(w as u32, h as u32, pixels).expect("a render is an image");
+        let mut photo = image::RgbaImage::from_pixel(400, 360, image::Rgba([255; 4]));
+        image::imageops::replace(&mut photo, &render, 150, 120);
+        bench.app.set_photo(&ctx, "blurred".into(), image::imageops::blur(&photo, 2.1));
+        bench.app.doc.corners = square(145.0, 115.0, 121.0);
+        // Find in outline reads it through a copy of the photo sharpened
+        // and enlarged, and the photo is adjusted to match.
+        bench.act(Action::FindCorners);
+        bench.settle();
+        let notice = bench.notice().text.clone();
+        assert!(notice.contains("the message decodes once its padding is pinned") && notice.contains("It decoded only with the photo"), "{notice}");
+        let adjust = bench.app.doc.adjust;
+        assert!(adjust.sharpen >= 0.5 && adjust.enlarge > Enlarge::NONE, "{adjust:?}");
+        let photo = bench.app.photo.as_ref().expect("the photo is loaded");
+        assert_eq!((photo.width, photo.height), adjust.enlarge.size(400, 360));
+        assert_eq!(bench.app.doc.version, SymbolVersion::Qr(3));
+        // Sample then reads off the photo so adjusted what the read read
+        // through its copy: the message, once the padding is pinned as
+        // the read pinned it.
+        bench.act(Action::Sample { only_unknown: false });
+        bench.step();
+        bench.act(Action::ApplyPadding);
+        bench.step();
+        assert!(bench.app.derived.report.is_trustworthy(), "{}: {:?}", bench.notice().text, bench.app.derived.report.text.plain());
+        assert_eq!(bench.app.derived.report.text.plain(), message);
+        // The same outline on the photo as it was, neither enlarged nor
+        // sharpened, does not come to the message that way.
+        let (outline, enlarge) = (bench.app.doc.corners, adjust.enlarge.factor());
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust::default()));
+        assert_eq!(bench.app.doc.corners.map(|c| c.map(f64::round)), outline.map(|c| c.map(|v| (v / enlarge).round())));
+        bench.act(Action::ClearAllPins);
+        bench.act(Action::Sample { only_unknown: false });
+        bench.step();
+        bench.act(Action::ApplyPadding);
+        bench.step();
+        assert!(!bench.app.derived.report.is_trustworthy());
     }
 
     #[test]
@@ -4123,8 +4723,10 @@ mod tests {
         let photo = bench.app.photo.as_ref().expect("the photo is loaded");
         assert_eq!((photo.width, photo.height, photo.scale()), (5000, 1500, 1.0));
         assert_eq!((photo.luma.width, photo.luma.height), (5000, 1500));
-        assert!(Arc::ptr_eq(&photo.source, &photo.original), "a photo that needs no enlarging is held once");
-        assert!(photo.unenlarged.is_none() && photo.luma.unenlarged.is_none());
+        assert!(Arc::ptr_eq(&photo.source, &photo.original), "the photo as loaded is held once");
+        assert!(photo.adjust.enlarge == Enlarge::NONE && photo.luma.unenlarged.is_none());
+        let on_offer = photo.enlargements.iter().map(Enlarge::to_string).collect::<Vec<_>>();
+        assert_eq!(on_offer, ["0.25×", "0.5×", "1×", "2×", "4×"], "enlarged four times at the most, when that is asked for");
         let notice = &bench.notice().text;
         assert!(notice.starts_with("Loaded large (5000 × 1500)") && notice.contains("Crop to outline"), "{notice}");
         // What draws it is no larger than a texture may be, and is
@@ -4164,23 +4766,24 @@ mod tests {
         assert_eq!(photo.texture.size(), [5000, 1500]);
         // The black and white view, on show, was made again with it.
         assert_eq!(photo.binarised.as_ref().map(|view| view.texture.size()), Some([5000, 1500]));
-        // A small photo is still enlarged, and says so.
+        // A small photo starts enlarged, and says so.
         let small = resize(render.as_raw(), w, h, 4, 110, 110);
         let small = image::RgbaImage::from_raw(110, 110, small).expect("the render at a third of its size");
         bench.app.set_photo(&ctx, "small".into(), small);
         let photo = bench.app.photo.as_ref().expect("the photo is loaded");
         assert_eq!((photo.width, photo.height, photo.scale()), (330, 330, 3.0));
+        assert_eq!((photo.adjust.enlarge, bench.app.doc.adjust.enlarge), (Enlarge::times(3), Enlarge::times(3)));
         assert!(bench.notice().text.starts_with("Loaded small (330 × 330, enlarged 3 times from 110 × 110"), "{}", bench.notice().text);
         // Its own pixels are kept beside the enlarged, as loaded and as
         // luminance, through a change of the adjustments.
         let own = |bench: &Bench| {
             let photo = bench.app.photo.as_ref().expect("the photo is loaded");
-            (photo.unenlarged.as_ref().map(|own| own.dimensions()), photo.luma.unenlarged.as_ref().map(|own| (own.width, own.height)))
+            (photo.original.dimensions(), photo.luma.unenlarged.as_ref().map(|own| (own.width, own.height)))
         };
-        assert!(photo.unenlarged.as_ref().is_some_and(|own| Arc::ptr_eq(own, &photo.source)), "the photo as loaded, held once");
-        assert_eq!(own(&bench), (Some((110, 110)), Some((110, 110))));
+        assert!(Arc::ptr_eq(&photo.original, &photo.source), "the photo as loaded, held once");
+        assert_eq!(own(&bench), ((110, 110), Some((110, 110))));
         bench.act(Action::SetAdjust(Adjust { contrast: 0.3, ..bench.app.doc.adjust }));
-        assert_eq!(own(&bench), (Some((110, 110)), Some((110, 110))));
+        assert_eq!(own(&bench), ((110, 110), Some((110, 110))));
         bench.step();
         assert!(bench.texts().iter().any(|text| text == "small · 330 × 330 · enlarged from 110 × 110"), "{:?}", bench.texts());
     }
@@ -4223,7 +4826,7 @@ mod tests {
         // Cut a fifth of the outline's size about it, and small enough
         // now to be drawn pixel for pixel.
         let photo = bench.app.photo.as_ref().expect("the photo is on show");
-        assert_eq!(photo.crop.map(|crop| (crop.rect, crop.k1)), Some(([2990, 590, 350, 350], 0.0)));
+        assert_eq!(photo.crop, Some(Crop { rect: [2990, 590, 350, 350], k1: 0.0, enlarge: Enlarge::NONE }));
         assert_eq!((photo.width, photo.height, photo.scale()), (350, 350, 1.0));
         assert_eq!(photo.texture.size(), [350, 350]);
         assert!(bench.notice().text.starts_with("Cropped to the outline: 350 × 350 pixels of the photo as loaded. What was found"), "{}", bench.notice().text);
@@ -4258,20 +4861,95 @@ mod tests {
         bench.act(Action::ShowWholePhoto);
         assert_eq!(bench.app.doc.adjust.k1, -0.05);
         assert!(bench.app.photo.as_ref().is_some_and(|photo| photo.crop.is_none() && photo.adjust.k1 == -0.05));
-        // A part too small for its modules to be seen is enlarged, as a
-        // small photo is, and the outline with it.
+        // A part keeps the enlargement the photo has, whatever its size:
+        // its own size here, though a photo as small would start
+        // enlarged were it loaded. Enlarge is the user's to set.
         bench.app.history.checkpoint(&bench.app.doc);
         bench.act(Action::SetAdjust(Adjust { k1: 0.0, ..bench.app.doc.adjust }));
         bench.app.doc.corners = square(3040.0, 640.0, 100.0);
         bench.act(Action::CropToOutline);
         let photo = bench.app.photo.as_ref().expect("the photo is on show");
-        assert_eq!(photo.crop.map(|crop| crop.rect), Some([3020, 620, 140, 140]));
-        assert_eq!((photo.width, photo.height, photo.scale()), (280, 280, 2.0));
-        assert_eq!(photo.luma.unenlarged.as_ref().map(|own| (own.width, own.height)), Some((140, 140)), "the part as it was cut");
-        assert_eq!(bench.app.doc.corners, square(40.0, 40.0, 200.0));
-        assert!(bench.notice().text.contains("enlarged 2 times"), "{}", bench.notice().text);
+        assert_eq!(photo.crop, Some(Crop { rect: [3020, 620, 140, 140], k1: 0.0, enlarge: Enlarge::NONE }));
+        assert_eq!((photo.width, photo.height, photo.scale(), photo.luma.unenlarged.is_none()), (140, 140, 1.0, true));
+        assert_eq!((photo.adjust.enlarge, bench.app.doc.adjust.enlarge), (Enlarge::NONE, Enlarge::NONE));
+        assert_eq!(photo.enlargements.iter().map(Enlarge::to_string).collect::<Vec<_>>(), ["0.25×", "0.5×", "1×", "2×", "4×", "8×", "16×"]);
+        assert_eq!(bench.app.doc.corners, square(20.0, 20.0, 100.0));
+        assert!(bench.notice().text.starts_with("Cropped to the outline: 140 × 140 pixels of the photo as loaded. What was found"), "{}", bench.notice().text);
+        // Enlarged by hand, a part of that part is as much enlarged, and
+        // the whole photo takes back the size it had.
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { enlarge: Enlarge::times(4), ..bench.app.doc.adjust }));
+        assert_eq!(bench.app.photo.as_ref().map(|photo| (photo.width, photo.height)), Some((560, 560)));
+        assert_eq!(bench.app.doc.corners, square(80.0, 80.0, 400.0));
+        bench.app.doc.corners = square(120.0, 120.0, 320.0);
+        bench.act(Action::CropToOutline);
+        let photo = bench.app.photo.as_ref().expect("the photo is on show");
+        assert_eq!(photo.crop, Some(Crop { rect: [3034, 634, 112, 112], k1: 0.0, enlarge: Enlarge::NONE }));
+        assert_eq!((photo.width, photo.height, photo.adjust.enlarge), (448, 448, Enlarge::times(4)));
+        assert_eq!(bench.app.doc.corners, square(64.0, 64.0, 320.0));
+        assert!(bench.notice().text.contains("112 × 112 pixels of the photo as loaded, at 4× as the photo was."), "{}", bench.notice().text);
         bench.act(Action::ShowWholePhoto);
-        assert_eq!(bench.app.doc.corners, square(3040.0, 640.0, 100.0));
+        let photo = bench.app.photo.as_ref().expect("the photo is on show");
+        assert_eq!((photo.width, photo.height, photo.adjust.enlarge, bench.app.doc.adjust.enlarge), (5000, 1500, Enlarge::NONE, Enlarge::NONE));
+        assert_eq!(bench.app.doc.corners, square(3050.0, 650.0, 80.0));
+        // A photo reduced is cropped from its pixels as loaded all the
+        // same, by where the outline lies on them, and the part keeps
+        // the reduction, as it keeps the other adjustments.
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { enlarge: Enlarge::HALF, contrast: 0.25, ..bench.app.doc.adjust }));
+        assert_eq!(bench.app.photo.as_ref().map(|photo| (photo.width, photo.height)), Some((2500, 750)));
+        assert_eq!(bench.app.doc.corners, square(1525.0, 325.0, 40.0));
+        bench.app.doc.corners = square(1500.0, 300.0, 400.0);
+        bench.act(Action::CropToOutline);
+        bench.step();
+        let photo = bench.app.photo.as_ref().expect("the photo is on show");
+        assert_eq!(photo.crop, Some(Crop { rect: [2840, 440, 1120, 1060], k1: 0.0, enlarge: Enlarge::HALF }));
+        assert_eq!((photo.width, photo.height, photo.scale()), (560, 530, 0.5));
+        assert_eq!(bench.app.doc.adjust, Adjust { enlarge: Enlarge::HALF, contrast: 0.25, ..Adjust::default() });
+        assert_eq!(bench.app.doc.corners, square(80.0, 80.0, 400.0));
+        assert!(bench.notice().text.contains("1120 × 1060 pixels of the photo as loaded, at 0.5× as the photo was."), "{}", bench.notice().text);
+        assert!(bench.texts().iter().any(|text| text == "large · 560 × 530 · cropped from 5000 × 1500"), "{:?}", bench.texts());
+        assert!(bench.texts().iter().any(|text| text == "0.5×"), "the slider shows it: {:?}", bench.texts());
+        // The symbol in it reads as it did, at five pixels a module.
+        bench.app.doc.corners = square(100.0, 100.0, 125.0);
+        bench.step();
+        let (matching, fixed) = bench.app.preview.as_ref().expect("the outline makes a grid").fixed;
+        assert_eq!(matching, fixed);
+        // A smaller part of it is reduced as much.
+        bench.act(Action::CropToOutline);
+        let photo = bench.app.photo.as_ref().expect("the photo is on show");
+        assert_eq!(photo.crop, Some(Crop { rect: [2990, 590, 350, 350], k1: 0.0, enlarge: Enlarge::HALF }));
+        assert_eq!((photo.width, photo.height, photo.adjust.enlarge), (175, 175, Enlarge::HALF));
+        assert_eq!(bench.app.doc.corners, square(25.0, 25.0, 125.0));
+        assert!(bench.notice().text.contains("350 × 350 pixels of the photo as loaded, at 0.5× as the photo was."), "{}", bench.notice().text);
+        // And so is a part so small that the slider would not offer the
+        // reduction for it: it is offered what it has, and keeps it
+        // through a change of another adjustment.
+        bench.app.doc.corners = square(45.0, 45.0, 20.0);
+        bench.act(Action::CropToOutline);
+        bench.step();
+        let photo = bench.app.photo.as_ref().expect("the photo is on show");
+        assert_eq!(photo.crop, Some(Crop { rect: [3072, 672, 56, 56], k1: 0.0, enlarge: Enlarge::HALF }));
+        assert_eq!((photo.width, photo.height, photo.adjust.enlarge), (28, 28, Enlarge::HALF));
+        assert_eq!(bench.app.doc.corners, square(4.0, 4.0, 20.0));
+        assert_eq!(photo.enlargements.iter().map(Enlarge::to_string).collect::<Vec<_>>(), ["0.5×", "1×", "2×", "4×", "5×", "8×", "16×", "32×", "64×"]);
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { contrast: 0.1, ..bench.app.doc.adjust }));
+        bench.step();
+        let photo = bench.app.photo.as_ref().expect("the photo is on show");
+        assert_eq!((photo.width, photo.height, bench.app.doc.adjust.enlarge), (28, 28, Enlarge::HALF));
+        // Reset, cropped, goes to what a photo of the part's size starts
+        // with, and the whole photo takes its reduction back.
+        bench.step();
+        bench.click(bench.text_at("Reset adjustments"), egui::PointerButton::Primary);
+        assert_eq!(bench.app.doc.adjust, Adjust::for_photo(56, 56));
+        assert_eq!(bench.app.photo.as_ref().map(|photo| (photo.width, photo.adjust.enlarge)), Some((280, Enlarge::times(5))));
+        bench.act(Action::ShowWholePhoto);
+        let photo = bench.app.photo.as_ref().expect("the photo is on show");
+        assert_eq!((photo.width, photo.height, photo.adjust.enlarge, photo.crop), (2500, 750, Enlarge::HALF, None));
+        assert_eq!(bench.app.doc.corners, square(1540.0, 340.0, 20.0));
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust::default()));
         // An outline that takes in the whole photo leaves nothing to
         // crop to, and one off the photo nothing to cut.
         bench.app.doc.corners = [[0.0, 0.0], [5000.0, 0.0], [5000.0, 1500.0], [0.0, 1500.0]];

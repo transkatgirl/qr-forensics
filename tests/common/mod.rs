@@ -7,7 +7,6 @@ use qr_forensics::decode::bitstream::SegmentContent;
 use qr_forensics::decode::codewords::Pins;
 use qr_forensics::decode::pipeline::{DecodeOptions, DecodeReport, decode};
 use qr_forensics::imaging::Luma;
-use qr_forensics::imaging::adjust::Adjust;
 use qr_forensics::imaging::detect::Detection;
 use qr_forensics::imaging::read::read_outline;
 use qr_forensics::imaging::sample::SampleParams;
@@ -195,7 +194,7 @@ pub fn load_photo(path: &std::path::Path) -> Result<Luma, String> {
     let image = image::open(path)
         .map_err(|e| format!("{}: {e}", path.display()))?
         .to_rgba8();
-    Ok(qr_forensics::imaging::photo::luma(image, &Adjust::default()))
+    Ok(qr_forensics::imaging::photo::luma_as_loaded(image))
 }
 
 /// What the photo pipeline made of one outline.

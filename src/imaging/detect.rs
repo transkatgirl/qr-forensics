@@ -103,7 +103,13 @@
 //! shadow or a glare narrower than the neighbourhood is judged against
 //! its own light rather than the paper beyond it, as OpenCV's ArUco-based
 //! QR detector thresholds at several window sizes and keeps what any of
-//! them finds.
+//! them finds. The scan itself reads the outline against the mean of a
+//! window a few pixels about each pixel as well, from the start
+//! ([`super::binarize::window_dark`]): a finder pattern blurred by half
+//! a module keeps its rings only against what lies right beside them.
+//! And three rungs sharpen the photo, at its size and enlarged
+//! ([`super::enhance`]), for a symbol so far out of focus that no
+//! threshold tells its finders' rings from their stones.
 //!
 //! The fit of the fixed patterns ranks the placements, but it is not the
 //! last word. [`detect_candidates`] keeps the best few, across the
@@ -165,12 +171,13 @@ use std::sync::{Arc, OnceLock};
 
 use super::Luma;
 use super::adjust::Filter;
-use super::binarize::BlockMean;
+use super::binarize::{BlockMean, WINDOW_BIAS, WINDOW_RADII, window_dark};
+use super::enhance::{Enhance, Enhanced, MAX_VIEW_SIDE, Sharpen};
 use super::homography::{Homography, Model};
 use super::projection::{ControlPoint, Project, Projection};
 use super::refine::{MOVES, SHIFT, Scorer, Template, descend_by, fixed_threshold};
 use super::sample::{
-    INNER_FRACTION, NOISE_RANGE, POINTS, SampleParams, classify, otsu, otsu_split, robust_spread, sample_modules,
+    INNER_FRACTION, Kernel, NOISE_RANGE, POINTS, SampleParams, classify, otsu, otsu_split, robust_spread, sample_modules_as,
     sample_positions,
 };
 use crate::decode::bch;
@@ -525,8 +532,6 @@ const PROPOSAL_SIZE_MAX: f64 = 2.0;
 /// scan looks for modules of a pixel and a half or more.
 const TARGET_MODULE_PX: f64 = 3.0;
 const MAX_UPSCALE: u8 = 4;
-/// Longest side a transformed copy of the photo may have.
-const MAX_VIEW_SIDE: usize = 4096;
 /// The neighbourhood the ladder narrows the local threshold to, as a
 /// half-width in pixels: two of the threshold's blocks, so that a shadow
 /// or a glare forty pixels across is judged within itself, while a
@@ -655,17 +660,28 @@ pub enum Retry {
     /// three, thirteen and twenty-three pixels and merges what any size
     /// finds.
     Thresholded { radius: u8 },
+    /// Sharpened, and enlarged or not, as [`super::enhance`] makes a
+    /// copy of the photo: a symbol blurred by half a module and more
+    /// has finder patterns whose rings have run into their stones, and
+    /// no threshold reads them apart again; an unsharp mask does, as
+    /// wechat_qrcode reads a small crop a second time through a network
+    /// that enlarges and sharpens it.
+    Enhanced(Enhance),
 }
 
 impl Retry {
     /// The ladder, cheapest step first: a smaller copy costs less than a
     /// filtered one, and that less than a larger one. The narrowed
-    /// threshold costs a pass over the photo as it is, between the two.
-    pub const LADDER: [Retry; 7] = [
+    /// threshold costs a pass over the photo as it is, between the two,
+    /// and so does the photo sharpened at its size.
+    pub const LADDER: [Retry; 10] = [
         Retry::Downscaled { factor: 2 },
         Retry::Thresholded { radius: NARROW_RADIUS },
+        Retry::Enhanced(Enhance { enlarge: 1, sharpen: Sharpen::Light }),
+        Retry::Enhanced(Enhance { enlarge: 1, sharpen: Sharpen::Strong }),
         Retry::Closed { radius: 1 },
         Retry::Upscaled { factor: 2 },
+        Retry::Enhanced(Enhance { enlarge: 2, sharpen: Sharpen::Light }),
         Retry::Downscaled { factor: 3 },
         Retry::Closed { radius: 2 },
         Retry::Upscaled { factor: 3 },
@@ -680,6 +696,7 @@ impl fmt::Display for Retry {
             Retry::Upscaled { factor } => write!(f, "the photo enlarged {factor} times"),
             Retry::Turned { quarters } => write!(f, "the photo turned {}°", 90 * u16::from(quarters % 4)),
             Retry::Thresholded { radius } => write!(f, "the threshold narrowed to {radius} px about each pixel"),
+            Retry::Enhanced(enhance) => write!(f, "the photo {enhance}"),
         }
     }
 }
@@ -919,6 +936,35 @@ pub fn detect_candidates(
     region: [[f64; 2]; 4],
     params: &SampleParams,
 ) -> Vec<Detection> {
+    detect_candidates_by(image, version, region, params, Climb::All)
+}
+
+/// How much of the retry ladder a detection climbs when the photo as it
+/// is shows no symbol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Climb {
+    /// Every rung.
+    All,
+    /// Every rung but the sharpened ones: a read that does not decode
+    /// goes through the photo sharpened itself, the whole of it from the
+    /// scan to the decode ([`super::read::read_outline`]), and the
+    /// placements those rungs would hand it, to be read in the photo as
+    /// it lies, it would only make again.
+    Unsharpened,
+    /// None: the pixels given are themselves a copy made for the look,
+    /// enlarged and sharpened, and a copy of the copy shows little the
+    /// copy does not, at several times the cost.
+    Nothing,
+}
+
+/// [`detect_candidates`], climbing as much of the ladder as `climb` says.
+pub(crate) fn detect_candidates_by(
+    image: &Luma,
+    version: SymbolVersion,
+    region: [[f64; 2]; 4],
+    params: &SampleParams,
+    climb: Climb,
+) -> Vec<Detection> {
     // A symbol rendered pixel for pixel is read off its pixels, exactly,
     // before any fitting.
     if let Some(found) = detect_pure(image, version.family(), region, params) {
@@ -939,6 +985,11 @@ pub fn detect_candidates(
         let found = Retry::LADDER
             .into_iter()
             .filter(|step| !matches!(step, Retry::Upscaled { factor } if *factor <= enlarge))
+            .filter(|step| match climb {
+                Climb::All => true,
+                Climb::Unsharpened => !matches!(step, Retry::Enhanced(_)),
+                Climb::Nothing => false,
+            })
             .take_while(|_| !work::cancelled())
             .map(|step| detect_candidates_through(image, version, region, params, step))
             .find(|found| !found.is_empty())
@@ -1398,10 +1449,19 @@ fn trial_decode(image: &Luma, func: &Arc<FunctionMap>, found: &Detection, params
 
 /// The symbol sampled once through a detection's corners and anchors,
 /// with nothing refined, dark for dark whichever way the photo has it.
-/// `None` when the outline cannot be sampled.
+/// `None` when the outline cannot be sampled. A symbol found only in
+/// the photo sharpened or enlarged is sampled through that copy, where
+/// its modules read as the search saw them, and any other off the
+/// pixels given as they are, whatever `params` ask of a read: a
+/// detection still being made in a copy of the photo is placed in that
+/// copy's pixels, which are what it was found in.
 fn grid_as_found(image: &Luma, func: &FunctionMap, found: &Detection, params: &SampleParams) -> Option<ModuleGrid> {
     let map = found.projection()?;
-    let sampled = sample_modules(image, &map, func.width, func.height);
+    let enhance = match found.retry {
+        Some(Retry::Enhanced(enhance)) => enhance,
+        _ => Enhance::NONE,
+    };
+    let sampled = sample_modules_as(image, &map, func.width, func.height, &SampleParams { kernel: Kernel::Area, enhance, ..*params });
     let grid = classify(&sampled, params).to_grid(func.width, func.height);
     Some(if found.inverted { grid.inverted() } else { grid })
 }
@@ -1767,6 +1827,12 @@ impl View {
                 }
                 (Luma::new(w, h, crop()).resized(vw, vh), 1.0 / f as f64)
             }
+            // Sharpened and enlarged from the pixels the photo had, and
+            // begun where a whole one of those begins.
+            Retry::Enhanced(enhance) => {
+                let view = Enhanced::window(image, [x0, y0, x1, y1], enhance)?;
+                return Some(Self { luma: view.luma, origin: view.origin, scale: 1.0 / view.factor, local_radius: None });
+            }
             // A turn is not a view of a window: the whole photo is turned
             // and read in full by `read`, which brings the result back.
             Retry::Turned { .. } => return None,
@@ -2126,10 +2192,26 @@ fn scan(
 }
 
 /// Finder candidates, strongest first. Rows and columns are each scanned
-/// twice, against one threshold for the whole outline and against a
-/// threshold that follows the local lighting, and the hits of all four
-/// scans are pooled. Modules larger than `max_module` rectified pixels
-/// are not looked for.
+/// against one threshold for the whole outline, against a threshold that
+/// follows the local lighting, and against the mean of a window a few
+/// pixels about each pixel at each of [`WINDOW_RADII`], and the hits of
+/// every scan are pooled. Modules larger than `max_module` rectified
+/// pixels are not looked for.
+///
+/// The windows were a rung of the ladder alone, the neighbourhood
+/// narrowed once every other look had come to nothing, and a scan that
+/// found anything at all never reached it: over symbols blurred by half
+/// to six tenths of a module, which read every one when their true
+/// placement was handed to the reader, the scan made no whole candidate
+/// at a true finder, and often enough a pattern in the blurred data
+/// passed for one and stood a symbol of the wrong size on it, which
+/// ended the search. With the windows scanned from the start, a search
+/// read 97 of 144 photographs of symbols so blurred, or of a pixel or
+/// so a module, where it had read 83.
+///
+/// Candidates come whole ones first and then those of which only half
+/// cross-checked, and within each the two thresholds' before the
+/// windows', each strongest first.
 ///
 /// Candidates rank by the share of the lines across their centre run that
 /// voted for them, not by the count of votes: a vote is one line, so the
@@ -2138,6 +2220,46 @@ fn scan(
 /// ZXing likewise asks only for a quorum of two rows and then judges the
 /// candidates by their geometry.
 fn scan_for_finders(rect: &Rectified, threshold: Option<f32>, max_module: f64) -> Vec<Candidate> {
+    let mut clusters = scan_thresholds(rect, threshold, max_module);
+    // The windows' hits are gathered apart, and stand only where the
+    // two thresholds made no whole candidate: pooled into one gathering
+    // they shifted the centre and the module of a candidate those two
+    // had already made, by the little the windows read it differently,
+    // and a symbol on curled paper that had read outright was then
+    // placed a few pixels off at its far corner and read only with its
+    // padding pinned.
+    let mut windowed = scan_windows(rect, max_module);
+    windowed.retain(|c| {
+        let near = |o: &Candidate| o.inverted == c.inverted && distance([o.x, o.y], [c.x, c.y]) < c.module_mean().max(o.module_mean());
+        !clusters.iter().any(|o| !o.half && near(o))
+    });
+    // The centre run is three modules across, so that many lines could
+    // vote, along each axis.
+    let rate = |c: &Candidate| c.votes as f64 / (3.0 * (c.module[0] + c.module[1])).max(1.0);
+    let strongest_first = |a: &Candidate, b: &Candidate| {
+        a.half.cmp(&b.half).then(rate(b).total_cmp(&rate(a))).then((b.module[0] + b.module[1]).total_cmp(&(a.module[0] + a.module[1])))
+    };
+    clusters.sort_by(strongest_first);
+    windowed.sort_by(strongest_first);
+    // Whole candidates before half ones, and among each the two
+    // thresholds' before the windows': what the scan made before the
+    // windows were added keeps its place in the count of candidates
+    // refined.
+    let (whole, half): (Vec<Candidate>, Vec<Candidate>) = clusters.into_iter().partition(|c| !c.half);
+    let (windowed_whole, windowed_half): (Vec<Candidate>, Vec<Candidate>) = windowed.into_iter().partition(|c| !c.half);
+    whole.into_iter().chain(windowed_whole).chain(half).chain(windowed_half).collect()
+}
+
+/// Whether enough lines agreed on a candidate for it to be worth
+/// fitting a template to.
+fn quorate(c: &Candidate) -> bool {
+    c.votes >= if c.half { MIN_VOTES_HALF } else { MIN_VOTES }
+}
+
+/// The candidates of the scans against one threshold for the whole
+/// outline and against the threshold that follows the local lighting,
+/// rows and columns each, pooled, in no order.
+fn scan_thresholds(rect: &Rectified, threshold: Option<f32>, max_module: f64) -> Vec<Candidate> {
     let global = threshold.unwrap_or_else(|| otsu(rect.data.iter().copied().filter(|v| v.is_finite())));
     let (w, h) = (rect.frame.width, rect.frame.height);
     let mut clusters = Vec::new();
@@ -2148,13 +2270,34 @@ fn scan_for_finders(rect: &Rectified, threshold: Option<f32>, max_module: f64) -
     let local_dark = |x: i64, y: i64| local.dark(rect, x, y);
     scan(w, h, &local_dark, MIN_MODULE, max_module, &mut clusters, false);
     scan(h, w, &|x, y| local_dark(y, x), MIN_MODULE, max_module, &mut clusters, true);
-    clusters.retain(|c| c.votes >= if c.half { MIN_VOTES_HALF } else { MIN_VOTES });
-    // The centre run is three modules across, so that many lines could
-    // vote, along each axis.
-    let rate = |c: &Candidate| c.votes as f64 / (3.0 * (c.module[0] + c.module[1])).max(1.0);
-    clusters.sort_by(|a, b| {
-        a.half.cmp(&b.half).then(rate(b).total_cmp(&rate(a))).then((b.module[0] + b.module[1]).total_cmp(&(a.module[0] + a.module[1])))
-    });
+    clusters.retain(quorate);
+    clusters
+}
+
+/// The candidates of the scans against the mean of a window a few
+/// pixels about each pixel, at each width narrower than the
+/// neighbourhood the local threshold has, pooled, in no order: a finder
+/// blurred until its rings are ripples reads as rings only against what
+/// lies right beside them. See [`super::binarize`].
+fn scan_windows(rect: &Rectified, max_module: f64) -> Vec<Candidate> {
+    let (w, h) = (rect.frame.width, rect.frame.height);
+    let mut clusters = Vec::new();
+    let bias = WINDOW_BIAS * rect.spread;
+    for radius in WINDOW_RADII.into_iter().filter(|&radius| radius as f64 <= rect.local_radius) {
+        let mask = window_dark(&rect.data, w, h, radius, bias);
+        let window = |x: i64, y: i64| {
+            if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+                return None;
+            }
+            match mask[y as usize * w + x as usize] {
+                2 => None,
+                kind => Some(kind == 1),
+            }
+        };
+        scan(w, h, &window, MIN_MODULE, max_module, &mut clusters, false);
+        scan(h, w, &|x, y| window(y, x), MIN_MODULE, max_module, &mut clusters, true);
+    }
+    clusters.retain(quorate);
     clusters
 }
 
@@ -7320,8 +7463,11 @@ mod tests {
         // into the lit paper, whose brightness pulls the mean above the
         // shadowed paper, and the run reads dark along the row and the
         // column alike, so no line through the centre reads 1:1:3:1:1 and
-        // the scan proposes nothing; narrowed to sixteen pixels, the
-        // neighbourhood lies within the shadow and the finder reads.
+        // the two thresholds propose nothing; narrowed to sixteen pixels,
+        // the neighbourhood lies within the shadow and the finder reads.
+        // The windows, the widest of them thirty-two pixels either side,
+        // read it in the image as it is, and the scan has it from the
+        // start.
         let finder = draw_turned(SymbolVersion::Micro(1), [128.0, 128.0], 8.0, 0.0, (300, 300));
         let image = lit(&finder, |x, y| if x >= 64 && y >= 64 { 0.4 } else { 1.0 });
         let region = [[0.0, 0.0], [300.0, 0.0], [300.0, 300.0], [0.0, 300.0]];
@@ -7332,10 +7478,12 @@ mod tests {
         // is 3.5 modules in from its top-left corner, 2 from its centre.
         let centre = rect.to_rectified([128.0 - 2.0 * 8.0, 128.0 - 2.0 * 8.0]);
         let near = |c: &Candidate| distance([c.x, c.y], centre) < 8.0 && !c.inverted;
-        let wide = scan_for_finders(&rect, None, max_module);
+        let wide = scan_thresholds(&rect, None, max_module);
         assert!(!wide.iter().any(near), "{wide:?}");
+        let windowed = scan_for_finders(&rect, None, max_module);
+        assert!(windowed.iter().any(|c| near(c) && !c.half), "{windowed:?}");
         let narrowed = rect.narrowed(Some(f64::from(NARROW_RADIUS)));
-        let found = scan_for_finders(&narrowed, None, max_module);
+        let found = scan_thresholds(&narrowed, None, max_module);
         assert!(found.iter().any(|c| near(c) && !c.half), "{found:?}");
     }
 
@@ -7421,19 +7569,22 @@ mod tests {
     }
 
     #[test]
-    fn the_ladder_narrows_the_threshold_for_a_symbol_in_a_shadow() {
+    fn a_symbol_in_a_shadow_is_found_in_the_photo_as_it_is() {
         // The same shadow over a whole Micro QR symbol, whose one finder is
         // all the scan has to go on, in an outline drawn loosely round
-        // the lit paper and the shadow both: the photo as it is and
-        // shrunk by half show no finder, and the rung that narrows the
-        // threshold does.
+        // the lit paper and the shadow both. The two thresholds show no
+        // finder there, and the symbol was found only on the rung of the
+        // ladder that narrows the neighbourhood; the windows show it in
+        // the photo as it is, with no rung climbed.
         let version = SymbolVersion::Micro(2);
         let symbol = draw_grid(&micro_m2(), [200.0, 200.0], 8.0, 0.0, (400, 400));
         let image = lit(&symbol, |x, y| if x >= 120 && y >= 120 { 0.4 } else { 1.0 });
         let region = [[0.0, 0.0], [400.0, 0.0], [400.0, 400.0], [0.0, 400.0]];
-        assert!(detect_candidates_in(&image, version, region, &SampleParams::default(), true, None, MAX_RECTIFIED).is_empty());
-        let found = detect_outline(&image, version, region, &SampleParams::default()).expect("found through the ladder");
-        assert_eq!(found.retry, Some(Retry::Thresholded { radius: NARROW_RADIUS }), "{found:?}");
+        let rect = Rectified::new(&image, region).unwrap();
+        let wide = scan_thresholds(&rect, None, 400.0 * max_module_fraction(Family::Micro));
+        assert!(!wide.iter().any(|c| !c.half && !c.inverted && distance(rect.frame.to_image.apply(c.x, c.y), [176.0, 176.0]) < 8.0), "{wide:?}");
+        let found = detect_outline(&image, version, region, &SampleParams::default()).expect("found as it is");
+        assert_eq!(found.retry, None, "{found:?}");
         assert_eq!(found.version, version);
         let truth = [[148.0, 148.0], [252.0, 148.0], [252.0, 252.0], [148.0, 252.0]];
         for (c, t) in found.corners.iter().zip(truth) {
@@ -7492,7 +7643,7 @@ mod tests {
                 let dark = mx < func.width && my < func.height && func.expected(mx, my) == Some(true);
                 image::Rgba(if dark { [0, 0, 0, 255] } else { [255, 255, 255, 255] })
             });
-            let image = crate::imaging::photo::luma(render.clone(), &crate::imaging::adjust::Adjust::default());
+            let image = crate::imaging::photo::luma_as_loaded(render.clone());
             let own = image.unenlarged.as_ref().unwrap_or_else(|| panic!("{version} at {px} px is enlarged"));
             assert_eq!((own.width, own.height), (render.width() as usize, render.height() as usize));
             let times = image.width / own.width;

@@ -22,6 +22,16 @@
 //!
 //! The values are resized as they are stored, as the rest of the
 //! pipeline weighs them, and not in linear light.
+//!
+//! Each row of the result is made of the source alone, so a large
+//! result is made a band of rows at a time on the cores to spare
+//! ([`crate::work`]), and comes out as it would have on one: a photo
+//! enlarged four times is sixteen times its pixels, made on every
+//! change of its adjustments.
+
+use std::sync::Mutex;
+
+use crate::work;
 
 /// Magic Kernel Sharp 2013 at `x` pixels from its centre.
 pub fn mks2013(x: f64) -> f64 {
@@ -40,8 +50,13 @@ pub fn mks2013(x: f64) -> f64 {
 /// How far the kernel reaches either side of its centre.
 const REACH: f64 = 2.5;
 
+/// Values of the result made as one piece of an image spread over the
+/// cores: a megapixel of one channel or so. A smaller result is made
+/// whole, where it was asked for.
+const SPREAD: usize = 1 << 20;
+
 /// What a pixel holds in each of its channels.
-pub trait Sample: Copy {
+pub trait Sample: Copy + Send + Sync {
     fn to_f32(self) -> f32;
     /// The value kept within what the channel holds: beside a sharp edge
     /// the kernel's negative lobes carry it past black or white.
@@ -124,37 +139,57 @@ impl Taps {
 /// Kernel Sharp 2013. Every channel is resized alike, so a photo with
 /// transparency is flattened first ([`super::photo::flatten_alpha`]).
 pub fn resize<T: Sample>(data: &[T], width: usize, height: usize, channels: usize, to_width: usize, to_height: usize) -> Vec<T> {
+    resize_into(data, width, height, channels, to_width, to_height)
+}
+
+/// [`resize`] of samples of one kind into samples of another, each
+/// result held to what its own kind holds: values that run past black
+/// and white, as a sharpened image's do, resized into the bytes of a
+/// photo, with no image of the result's size held in between.
+pub fn resize_into<I: Sample, O: Sample>(data: &[I], width: usize, height: usize, channels: usize, to_width: usize, to_height: usize) -> Vec<O> {
     assert_eq!(data.len(), width * height * channels);
     assert!((1..=4).contains(&channels), "one to four channels a pixel");
     assert!(width > 0 && height > 0 && to_width > 0 && to_height > 0, "neither image may be empty");
     let (across, down) = (Taps::new(width, to_width), Taps::new(height, to_height));
-    let stride = width * channels;
-    let mut out = Vec::with_capacity(to_width * to_height * channels);
-    let mut row = vec![0.0f32; stride];
-    for y in 0..to_height {
-        // The source rows this row draws on, weighed into one row as wide
-        // as the source...
-        row.fill(0.0);
-        let (first, weights) = down.of(y);
-        for (k, &weight) in weights.iter().enumerate() {
-            let source = &data[(first + k) * stride..(first + k + 1) * stride];
-            for (sum, &value) in row.iter_mut().zip(source) {
-                *sum += weight * value.to_f32();
-            }
-        }
-        // ...and that row resized across.
-        for x in 0..to_width {
-            let (first, weights) = across.of(x);
-            let mut sums = [0.0f32; 4];
+    let (stride, to_stride) = (width * channels, to_width * channels);
+    let mut out = vec![O::from_f32(0.0); to_stride * to_height];
+    // Bands of whole rows, each with the row it begins at: every band
+    // is its own part of the result, written where it lies.
+    let rows = (SPREAD / to_stride).max(1);
+    let bands: Vec<Mutex<(usize, &mut [O])>> =
+        out.chunks_mut(rows * to_stride).enumerate().map(|(band, values)| Mutex::new((band * rows, values))).collect();
+    work::map(&bands, |band| {
+        let mut band = band.lock().expect("a band is made once, by one worker");
+        let (top, values) = &mut *band;
+        let mut row = vec![0.0f32; stride];
+        for (y, result) in (*top..).zip(values.chunks_exact_mut(to_stride)) {
+            // The source rows this row draws on, weighed into one row as
+            // wide as the source...
+            row.fill(0.0);
+            let (first, weights) = down.of(y);
             for (k, &weight) in weights.iter().enumerate() {
-                let pixel = &row[(first + k) * channels..(first + k + 1) * channels];
-                for (sum, &value) in sums.iter_mut().zip(pixel) {
-                    *sum += weight * value;
+                let source = &data[(first + k) * stride..(first + k + 1) * stride];
+                for (sum, &value) in row.iter_mut().zip(source) {
+                    *sum += weight * value.to_f32();
                 }
             }
-            out.extend(sums[..channels].iter().map(|&sum| T::from_f32(sum)));
+            // ...and that row resized across.
+            for (x, pixel) in result.chunks_exact_mut(channels).enumerate() {
+                let (first, weights) = across.of(x);
+                let mut sums = [0.0f32; 4];
+                for (k, &weight) in weights.iter().enumerate() {
+                    let source = &row[(first + k) * channels..(first + k + 1) * channels];
+                    for (sum, &value) in sums.iter_mut().zip(source) {
+                        *sum += weight * value;
+                    }
+                }
+                for (value, &sum) in pixel.iter_mut().zip(&sums) {
+                    *value = O::from_f32(sum);
+                }
+            }
         }
-    }
+    });
+    drop(bands);
     out
 }
 
@@ -239,6 +274,47 @@ mod tests {
                 assert_eq!(out[(3 * y + 1) * 27 + 3 * x + 1], board[y * 9 + x], "{x}, {y}");
             }
         }
+    }
+
+    #[test]
+    fn a_large_result_made_in_bands_is_the_result_made_whole() {
+        // A result of more values than are made as one piece: every row
+        // of it is the row a result of that row alone would be, since a
+        // row is made of the source and nothing else. Rows of the source
+        // repeated make every result row the same, whichever band it
+        // fell in.
+        let (width, to_width, to_height) = (600usize, 1800usize, 2400usize);
+        let line: Vec<u8> = (0..width).map(|x| ((x * 37) % 256) as u8).collect();
+        let source: Vec<u8> = (0..800).flat_map(|_| line.iter().copied()).collect();
+        assert!(to_width * to_height > 4 * SPREAD);
+        let large = resize(&source, width, 800, 1, to_width, to_height);
+        let one = resize(&line, width, 1, 1, to_width, 1);
+        assert_eq!(large.len(), to_width * to_height);
+        for (y, row) in large.chunks_exact(to_width).enumerate() {
+            assert!(row == &one[..], "row {y}");
+        }
+        // And busy pixels in several channels, against the same resize
+        // made of the top of the image alone, where the rows it shares
+        // draw on the same source rows.
+        let busy: Vec<u8> = (0..400 * 300 * 4).map(|i| ((i * 31 + (i / 1600) * 7) % 256) as u8).collect();
+        let whole = resize(&busy, 400, 300, 4, 1600, 1200);
+        let top = resize(&busy[..400 * 100 * 4], 400, 100, 4, 1600, 400);
+        assert!(whole[..1600 * 380 * 4] == top[..1600 * 380 * 4]);
+    }
+
+    #[test]
+    fn values_past_black_and_white_are_resized_into_bytes() {
+        // Bytes as values, with an overshoot either side of an edge as
+        // a sharpened image has: resized into bytes, they are what the
+        // values resized come to, each held to what a byte holds.
+        let values: Vec<f32> = (0..6).flat_map(|_| [10.0, 10.0, -40.0, 300.0, 250.0, 250.0]).collect();
+        let bytes: Vec<u8> = resize_into(&values, 6, 6, 1, 18, 12);
+        assert_eq!(bytes.len(), 18 * 12);
+        assert_eq!((bytes[0], bytes[17]), (10, 250));
+        assert!(bytes.contains(&0) && bytes.contains(&255), "{:?}", &bytes[..18]);
+        // The same kind in and out is the resize itself.
+        let same: Vec<u8> = resize_into(&bytes, 18, 12, 1, 9, 5);
+        assert_eq!(same, resize(&bytes, 18, 12, 1, 9, 5));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Left panel: which symbol this is, the photo, and how to get modules in.
 
 use eframe::egui;
-use qr_forensics::imaging::adjust::{Adjust, Channel, Filter, LENS_MIN_PAIRS};
+use qr_forensics::imaging::adjust::{Adjust, Channel, Enlarge, Filter, LENS_MIN_PAIRS, MAX_ENLARGED_SIDE};
 use qr_forensics::imaging::binarize::BinarizeParams;
 use qr_forensics::imaging::detect::anchor_sites;
 use qr_forensics::imaging::sample::Kernel;
@@ -119,10 +119,16 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         about.push_str(&format!(" · cropped from {full_width} × {full_height}"));
     } else if photo.scale() > 1.0 {
         about.push_str(&format!(" · enlarged from {full_width} × {full_height}"));
+    } else if photo.scale() < 1.0 {
+        about.push_str(&format!(" · reduced from {full_width} × {full_height}"));
     }
     ui.weak(about);
     let (width, height) = (photo.width, photo.height);
     let cropped = photo.crop.is_some();
+    // What the photo starts with, which Reset goes back to: no
+    // adjustment but the enlargement a small photo is given.
+    let fresh = Adjust::for_photo(photo.original.width(), photo.original.height());
+    let enlargements = photo.enlargements.clone();
     ui.horizontal_wrapped(|ui| {
         if ui
             .button("Crop to outline")
@@ -130,7 +136,8 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                 "Cut the photo down to the outline, with room about it. A search of the whole photo, which looks at no \
                  more than 4096 pixels on the longer side, then sees that part at its own size; every change of the \
                  adjustments works on that part alone; and the canvas draws it pixel for pixel, where a photo larger \
-                 than a texture may be is drawn reduced. What was found in the photo is dropped; the outline and \
+                 than a texture may be is drawn reduced. The part keeps the photo's adjustments, and is as much \
+                 enlarged or reduced as the photo was. What was found in the photo is dropped; the outline and \
                  anchors stay on the symbol.",
             )
             .clicked()
@@ -173,6 +180,48 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         ui.end_row();
         ui.label("Contrast");
         note(ui.add(egui::Slider::new(&mut adjust.contrast, -1.0..=1.0)).changed());
+        ui.end_row();
+        ui.label("Sharpen");
+        let sharpen = ui.add(egui::Slider::new(&mut adjust.sharpen, 0.0..=1.0)).on_hover_text(
+            "Sharpens the photo with an unsharp mask, in its colours: for a symbol out of focus, or modules a pixel or two \
+             across that the lens has run together, which read as grey as their neighbours. The mask is wider and \
+             stronger the further this is set, a pixel wide at 0.5 and two at 1. Find in outline tries the photo \
+             sharpened and enlarged of itself when it does not decode as it is, and sets this and Enlarge to what \
+             decoded.",
+        );
+        note(sharpen.changed());
+        ui.end_row();
+        ui.label("Enlarge");
+        // The slider goes from step to step of those on offer for this
+        // photo: each twice the last, with what the photo started at,
+        // and what a read set, among them.
+        let last = enlargements.len().saturating_sub(1);
+        let mut step = enlargements.iter().position(|&on_offer| on_offer == adjust.enlarge).unwrap_or(0);
+        let slider = egui::Slider::new(&mut step, 0..=last)
+            .custom_formatter(|step, _| enlargements.get(step.round() as usize).map_or_else(String::new, Enlarge::to_string))
+            .custom_parser(|text| {
+                let asked = Enlarge::parse(text)?.factor();
+                let nearest = (0..enlargements.len()).min_by(|&a, &b| {
+                    (enlargements[a].factor() - asked).abs().total_cmp(&(enlargements[b].factor() - asked).abs())
+                });
+                nearest.map(|step| step as f64)
+            });
+        let enlarge = ui.add_enabled(last > 0, slider).on_hover_text(format!(
+            "The size the photo is worked on at, against its own: resized with Magic Kernel Sharp 2013, in its colours. \
+             Enlarged, modules a pixel or two across become modules the search and the sampling can see, and a small \
+             photo starts enlarged for that. Reduced, grain and the dots of a halftone screen run together, and a large \
+             photo is quicker to work on. The outline and the anchors go with the photo. Any photo may be enlarged {} \
+             times, and a small one further, as far as {MAX_ENLARGED_SIDE} pixels on its longer side. A large photo \
+             enlarged takes time and memory to match: for a small symbol in one, cropping to its outline first is \
+             quicker.",
+            Enlarge::ALWAYS.factor(),
+        ));
+        if enlarge.changed()
+            && let Some(&on_offer) = enlargements.get(step)
+        {
+            adjust.enlarge = on_offer;
+        }
+        note(enlarge.changed());
         ui.end_row();
         ui.label("Lens");
         ui.horizontal(|ui| {
@@ -237,11 +286,18 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     });
     ui.horizontal_wrapped(|ui| {
         note(ui.checkbox(&mut adjust.invert, "Invert photo").on_hover_text("For light symbols on a dark background").changed());
-        if ui.add_enabled(adjust != Adjust::default(), egui::Button::new("Reset adjustments")).clicked() {
-            adjust = Adjust::default();
+        if ui.add_enabled(adjust != fresh, egui::Button::new("Reset adjustments")).clicked() {
+            adjust = fresh;
             note(true);
         }
     });
+    // A way of looking, like the binarised view: not an adjustment, and
+    // not undone or reset with them.
+    ui.checkbox(&mut app.view.greyscale, "Show in greyscale").on_hover_text(
+        "Show the photo in grey, as the search and the sampling read it: the luminance of its colours under the \
+         adjustments above. Only what is shown changes, and what is read is the same either way. With a single \
+         channel chosen, or a filter on, the photo is shown so already.",
+    );
     app.view.adjust_gesture = gesture;
     if checkpoint {
         app.history.checkpoint(&app.doc);

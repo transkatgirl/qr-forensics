@@ -8,7 +8,7 @@ use qr_forensics::decode::padding::PadCandidate;
 use qr_forensics::decode::pipeline::{DecodeReport, GridAnalysis};
 use qr_forensics::decode::sequence::Sequence;
 use qr_forensics::imaging::Luma;
-use qr_forensics::imaging::adjust::Adjust;
+use qr_forensics::imaging::adjust::{Adjust, Enlarge};
 use qr_forensics::imaging::binarize::BinarizeParams;
 use qr_forensics::imaging::detect::{Anchor, Detection};
 use qr_forensics::imaging::projection::{ControlPoint, Projection};
@@ -72,6 +72,10 @@ pub struct FoundReads {
     /// read's own polarity is reckoned, as a detection's is from the
     /// setting it was found under.
     pub photo_inverted: bool,
+    /// The photo's enlargement when they were read: a read made through
+    /// a copy of the photo enlarged again was made at so many times
+    /// this, whatever the photo has been set to since.
+    pub enlarge: Enlarge,
 }
 
 /// How the EC level and mask are chosen.
@@ -334,6 +338,10 @@ pub struct Crop {
     /// the cut is of the straightened photo, whose lens term is then 0,
     /// and the whole photo takes this one back.
     pub k1: f32,
+    /// The enlargement the whole photo had when it was cut, which it
+    /// takes back. The part starts with the same, and may be taken
+    /// further.
+    pub enlarge: Enlarge,
 }
 
 pub struct Photo {
@@ -345,19 +353,25 @@ pub struct Photo {
     pub source: Arc<image::RgbaImage>,
     /// The part of `source` on show, when it is not the whole.
     pub crop: Option<Crop>,
-    /// RGBA of the part on show: the photo as loaded itself, when the
-    /// whole of it is on show and it was not so small as to be enlarged.
+    /// RGBA of the part on show, at its own size: the photo as loaded
+    /// itself, when the whole of it is on show. What the adjustments
+    /// are made to, the enlargement among them.
     pub original: Arc<image::RgbaImage>,
-    /// The part on show at its own size, when `original` is an
-    /// enlargement of it: what a symbol rendered pixel for pixel is read
-    /// off.
-    pub unenlarged: Option<Arc<image::RgbaImage>>,
     pub adjust: Adjust,
+    /// The enlargements on offer for the part on show, least first: the
+    /// steps its size allows ([`Enlarge::steps_for`]), and any other it
+    /// has been set to since, by a read that decoded only through a
+    /// copy of it so enlarged.
+    pub enlargements: Vec<Enlarge>,
     /// What sampling reads: the adjusted image as luminance. Shared, so
     /// that a search or a job on its own thread starts without copying
     /// the photo; a change of adjustments makes a new one.
     pub luma: Arc<Luma>,
     pub texture: egui::TextureHandle,
+    /// Whether the texture shows the photo in grey, as the luminance
+    /// has it, or in its colours: what the view asked for when it was
+    /// last made.
+    pub greyscale: bool,
     /// The binarised view, built when first shown and kept until the
     /// luminance or the settings change.
     pub binarised: Option<Binarised>,
@@ -380,6 +394,14 @@ impl Binarised {
 }
 
 impl Photo {
+    /// Put `enlarge` among the enlargements on offer, where it is not
+    /// one of them already.
+    pub fn offer(&mut self, enlarge: Enlarge) {
+        if let Err(at) = self.enlargements.binary_search(&enlarge) {
+            self.enlargements.insert(at, enlarge);
+        }
+    }
+
     /// Where a point of the photo on show, in its working pixels, lies in
     /// the pixels of the photo as loaded.
     pub fn to_source(&self, point: [f64; 2]) -> [f64; 2] {
@@ -395,8 +417,8 @@ impl Photo {
     }
 
     /// Pixels of the photo on show to a pixel of the photo as loaded:
-    /// one, or the whole factor a small photo, or a small part of one,
-    /// was enlarged by.
+    /// what the Enlarge adjustment makes of it, one for a photo at its
+    /// own size.
     pub fn scale(&self) -> f64 {
         self.width as f64 / self.shown()[2]
     }
@@ -710,6 +732,10 @@ pub struct ViewState {
     /// taken its undo point: a slider drag changes the value every frame
     /// and must make one step of undo, not one a frame.
     pub adjust_gesture: bool,
+    /// Show the photo in grey, as the luminance the pipeline reads, in
+    /// place of its colours. A way of looking: what is read is the same
+    /// either way.
+    pub greyscale: bool,
     /// Which of the inspector's lists the wheel scrolls.
     pub wheel: WheelLatch,
     /// Search the photo, and read an outline, for symbols of the family
@@ -765,6 +791,7 @@ impl Default for ViewState {
             binarize: BinarizeParams::default(),
             binarize_auto: true,
             adjust_gesture: false,
+            greyscale: false,
             wheel: WheelLatch::default(),
             own_family_only: false,
             picked_char: None,

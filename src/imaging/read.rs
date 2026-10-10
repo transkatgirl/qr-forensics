@@ -37,6 +37,17 @@
 //! - the photo turned a quarter at a time, as zxing-cpp's `tryRotate`
 //!   does: the fits walk the photo's axes, and a symbol that sits a
 //!   fraction of a module off at one turn reads at another.
+//! - the photo about the outline enlarged and sharpened
+//!   ([`super::enhance`]), and the whole read made again in that copy,
+//!   from the scan for finder patterns to the decode, when the symbol's
+//!   modules are small enough for it to matter: wechat_qrcode reads a
+//!   small crop at its own size, then at twice it through a network
+//!   that sharpens as it enlarges, and keeps what decodes. A symbol
+//!   blurred by half a module shows the scan no finder pattern and the
+//!   sampler modules as grey as their neighbours, and neither a kernel
+//!   nor a threshold rule nor a turn mends that; the copy does, and
+//!   what was read through it says so ([`ReadResult::enhance`]), so
+//!   that it can be read the same again.
 //!
 //! Before any of those, a decode that solved some blocks but not all is
 //! turned back on the placement. Every module of a verified block is now
@@ -89,9 +100,10 @@
 use std::sync::Arc;
 
 use super::detect::{
-    Anchor, AnchorKind, Detection, Retry, detect_candidates, detect_outline, outline_around, refine_anchors, seen_from_behind,
+    Anchor, AnchorKind, Climb, Detection, Retry, detect_candidates_by, outline_around, refine_anchors, seen_from_behind,
     turns_between,
 };
+use super::enhance::{Enhance, Enhanced};
 use super::projection::{ControlPoint, Project, Projection};
 use super::refine::{MOVES, Scorer, Shifted, Template, Warp, descend_by, fixed_threshold, refine_corners_holding};
 use super::sample::{Kernel, SampleParams, classify, sample_modules_with};
@@ -133,6 +145,12 @@ pub struct ReadResult {
     /// The grid was read as the other QR Code model, of this version,
     /// because its format bits said so and that read ranked better.
     pub reinterpreted: Option<SymbolVersion>,
+    /// What was done to the photo about the symbol for this read: what
+    /// was asked for, or the enlargement and sharpening only which
+    /// decoded. The detection is in the photo's own pixels either way,
+    /// and sampled through the same ([`super::sample::sample_modules_as`])
+    /// gives this grid again.
+    pub enhance: Enhance,
 }
 
 impl ReadResult {
@@ -164,13 +182,20 @@ impl ReadResult {
 }
 
 /// Read the symbol inside `region`, an outline drawn loosely around it,
-/// as [`detect_outline`] takes one, and decode it: the detection refined
-/// and sampled with `params`, then decoded under the format its bits
-/// settle or, failing that, the best attempt of a brute-force search.
+/// as [`super::detect::detect_outline`] takes one, and decode it: the
+/// detection refined and sampled with `params`, then decoded under the
+/// format its bits settle or, failing that, the best attempt of a
+/// brute-force search.
 /// When the decode is not trustworthy the retries the module describes
 /// are tried in turn, dearest last, and the best read is returned: the
 /// first that is trustworthy, or else the one whose attempt ranks
 /// highest. `None` when no symbol can be found at all.
+///
+/// The photo is read as `params` ask for it, enlarged or sharpened or as
+/// it is ([`SampleParams::enhance`]). When that does not decode, and the
+/// symbol's modules are small enough for it to matter or no symbol was
+/// found at all, the whole read is made again through the photo
+/// enlarged and sharpened, lightly and then strongly ([`Enhance::rungs`]).
 pub fn read_outline(
     image: &Luma,
     version: SymbolVersion,
@@ -178,11 +203,111 @@ pub fn read_outline(
     params: &SampleParams,
     opts: &DecodeOptions,
 ) -> Option<ReadResult> {
+    let asked = params.enhance;
+    let mut best = read_outline_through(image, version, region, params, opts, asked);
+    if best.as_ref().is_some_and(ReadResult::is_trustworthy) || work::cancelled() {
+        return best;
+    }
+    // The photo as it is, when it was asked for otherwise and did not
+    // read so; then the rungs, side by side on the cores to spare and
+    // taken in their order.
+    let mut rungs: Vec<Enhance> = Vec::new();
+    if !asked.is_none() {
+        rungs.push(Enhance::NONE);
+    }
+    if worth_enhancing(image, best.as_ref()) {
+        rungs.extend(Enhance::rungs(region));
+    }
+    rungs.retain(|rung| *rung != asked);
+    work::in_turn(
+        &rungs,
+        |&rung| if work::cancelled() { None } else { read_outline_through(image, version, region, params, opts, rung) },
+        |result| result.is_some_and(|result| consider(&mut best, result)),
+    );
+    best
+}
+
+/// Modules of fewer pixels than this, in the pixels the photo had
+/// before it was enlarged, are small enough for a read that did not
+/// decode to be made again through the photo enlarged and sharpened.
+/// The masks reach
+/// a pixel or two, which is what a lens takes from modules of this size
+/// and makes no odds to larger ones: a symbol of large modules that
+/// does not decode is damaged, which is what this crate is for, and
+/// reading it twice more would treble the wait for the same answer.
+const ENHANCE_BELOW_PX: f64 = 6.0;
+
+/// Whether a read that did not decode is worth making again through the
+/// photo enlarged and sharpened: nothing was found at all, which is what
+/// a blur makes of finder patterns, or what was found has modules under
+/// [`ENHANCE_BELOW_PX`].
+fn worth_enhancing(image: &Luma, best: Option<&ReadResult>) -> bool {
+    let Some(read) = best else { return true };
+    let (c, version) = (read.detection.corners, read.detection.version);
+    let across = (distance(c[0], c[1]) + distance(c[3], c[2])) / 2.0 / version.width().max(1) as f64;
+    let down = (distance(c[0], c[3]) + distance(c[1], c[2])) / 2.0 / version.height().max(1) as f64;
+    // A photo enlarged has its modules enlarged with it.
+    let times = image.unenlarged.as_ref().map_or(1, |own| image.width / own.width.max(1)).max(1) as f64;
+    across.min(down) / times < ENHANCE_BELOW_PX
+}
+
+/// [`read_outline`] through the photo as `enhance` makes it, and no
+/// other way: as it is, or in a copy of it about the outline, enlarged
+/// and sharpened, with what is read there brought back to the photo's
+/// own pixels.
+fn read_outline_through(
+    image: &Luma,
+    version: SymbolVersion,
+    region: [[f64; 2]; 4],
+    params: &SampleParams,
+    opts: &DecodeOptions,
+    enhance: Enhance,
+) -> Option<ReadResult> {
+    // Whatever is read, it is read off the pixels handed on: the copy's,
+    // which are enlarged and sharpened already, or the photo's.
+    let plain = SampleParams { enhance: Enhance::NONE, ..*params };
+    if enhance.is_none() {
+        return read_outline_plain(image, version, region, &plain, opts, false);
+    }
+    let view = Enhanced::around(image, region, enhance)?;
+    let mut result = read_outline_plain(&view.luma, version, region.map(|p| view.to_view(p)), &plain, opts, true)?;
+    bring_back(&mut result, &view, enhance);
+    Some(result)
+}
+
+/// A read made in an enlarged and sharpened copy of the photo, with its
+/// detection brought back to the photo's own pixels and the copy noted.
+fn bring_back(result: &mut ReadResult, view: &Enhanced, enhance: Enhance) {
+    let found = &mut result.detection;
+    found.corners = found.corners.map(|c| view.to_photo(c));
+    for anchor in &mut found.anchors {
+        anchor.center = view.to_photo(anchor.center);
+    }
+    found.retry = Some(Retry::Enhanced(enhance));
+    result.enhance = enhance;
+}
+
+/// [`read_outline`] of the pixels given, as they are. `copy` says that
+/// they are a copy of the photo made for this read, enlarged and
+/// sharpened.
+fn read_outline_plain(
+    image: &Luma,
+    version: SymbolVersion,
+    region: [[f64; 2]; 4],
+    params: &SampleParams,
+    opts: &DecodeOptions,
+    copy: bool,
+) -> Option<ReadResult> {
     let variants = variants_of(params);
     let mut best: Option<ReadResult> = None;
+    // In a copy made for this read the detector climbs none of its
+    // ladder: over sixty photographs that read only through a copy, or
+    // not at all, the ladder climbed inside the copies read not one
+    // more. The copy's other three turns, below, read three.
+    let climb = if copy { Climb::Nothing } else { Climb::Unsharpened };
     // The detector's placements, best fit first, each with every way of
     // sampling it: the reads of each, up to the one that settles it.
-    let candidates = detect_candidates(image, version, region, params);
+    let candidates = detect_candidates_by(image, version, region, params, climb);
     let reads_of = |found: &Detection| {
         let mut reads = Vec::new();
         if work::cancelled() {
@@ -216,7 +341,7 @@ pub fn read_outline(
         }
         let turned = image.rotated_cw(quarters);
         let turned_region = rotate_outline_cw(region, quarters, image.width, image.height);
-        let Some(found) = detect_outline(&turned, version, turned_region, params) else { return reads };
+        let Some(found) = detect_candidates_by(&turned, version, turned_region, params, climb).into_iter().next() else { return reads };
         let Some(prepared) = prepare(&turned, found, params) else { return reads };
         work::first_then_in_turn(
             &variants,
@@ -268,13 +393,15 @@ const AROUND_FOUND: f64 = 0.1;
 /// finds the same reader an image of one symbol gets, padded.
 pub fn read_detection(image: &Luma, found: Detection, params: &SampleParams, opts: &DecodeOptions) -> Option<ReadResult> {
     let (version, around) = (found.version, outline_around(found.corners, AROUND_FOUND));
+    // A symbol the search found only in the photo sharpened or enlarged
+    // is read as placed through that copy, where its modules read as the
+    // search saw them, unless the photo was asked for some other way.
+    let through = match found.retry {
+        Some(Retry::Enhanced(enhance)) if params.enhance.is_none() => enhance,
+        _ => params.enhance,
+    };
     let mut best: Option<ReadResult> = None;
-    if let Some(prepared) = prepare(image, found, params)
-        && read_placement(image, &prepared, &variants_of(params), params, opts, &mut |result| consider(&mut best, result))
-    {
-        return best;
-    }
-    if work::cancelled() {
+    if read_found_through(image, found, around, params, opts, through, &mut best) || work::cancelled() {
         return best;
     }
     if let Some(again) = read_outline(image, version, around, params, opts)
@@ -283,6 +410,38 @@ pub fn read_detection(image: &Luma, found: Detection, params: &SampleParams, opt
         best = Some(again);
     }
     best
+}
+
+/// A symbol as the detector placed it, read through the photo as
+/// `enhance` makes it about `around`, every way a placement is read
+/// ([`read_placement`]), the best read kept in `best`; true when a read
+/// settles it.
+fn read_found_through(
+    image: &Luma,
+    mut found: Detection,
+    around: [[f64; 2]; 4],
+    params: &SampleParams,
+    opts: &DecodeOptions,
+    enhance: Enhance,
+    best: &mut Option<ReadResult>,
+) -> bool {
+    let plain = SampleParams { enhance: Enhance::NONE, ..*params };
+    let variants = variants_of(&plain);
+    if enhance.is_none() {
+        return prepare(image, found, &plain)
+            .is_some_and(|prepared| read_placement(image, &prepared, &variants, &plain, opts, &mut |result| consider(best, result)));
+    }
+    let Some(view) = Enhanced::around(image, around, enhance) else { return false };
+    found.corners = found.corners.map(|c| view.to_view(c));
+    for anchor in &mut found.anchors {
+        anchor.center = view.to_view(anchor.center);
+    }
+    prepare(&view.luma, found, &plain).is_some_and(|prepared| {
+        read_placement(&view.luma, &prepared, &variants, &plain, opts, &mut |mut result| {
+            bring_back(&mut result, &view, enhance);
+            consider(best, result)
+        })
+    })
 }
 
 /// Anchors dropped at most from one placement that solves no block, each
@@ -484,6 +643,7 @@ fn read_prepared(
         report,
         pins,
         reinterpreted,
+        enhance: Enhance::NONE,
     };
     Some(if result.is_trustworthy() || work::cancelled() { result } else { refit_by_decode(image, result, &sampling, opts) })
 }
@@ -650,6 +810,7 @@ fn feedback_round(image: &Luma, current: &ReadResult, params: &SampleParams, opt
         report,
         pins,
         reinterpreted: current.reinterpreted,
+        enhance: current.enhance,
     })
 }
 

@@ -21,6 +21,22 @@
 //! underexposed photo, whose symbol spans less than that from ink to
 //! paper, as flat all over, where BoofCV's block Otsu, which has no such
 //! floor, reads it.
+//!
+//! The scan reads the outline a third way besides, against the mean of a
+//! window a few pixels about each pixel ([`window_dark`]), at each of a
+//! few widths, and pools those hits with the rest. A finder pattern
+//! blurred by half a module or more keeps its rings only as ripples: the
+//! light ring between the dark one and the stone rises barely past the
+//! middle of the scale and the dark ring outside it sinks barely below,
+//! so that one threshold for the outline, or the mean of a neighbourhood
+//! as wide as the finder and wider, which is one threshold as far as the
+//! finder is concerned, runs the rings together or loses them. Against a
+//! window of a module or two either side, each ring is darker or lighter
+//! than what lies about it, however faint. OpenCV's ArUco-based QR
+//! detector thresholds at windows of three, thirteen and twenty-three
+//! pixels and keeps what any of them finds, and wechat_qrcode reads each
+//! crop through four binarizers whose windows run from a tenth to a
+//! quarter of it.
 
 use super::Luma;
 use super::sample::{NOISE_RANGE, otsu, robust_spread};
@@ -147,6 +163,87 @@ impl BlockMean {
         let n = sum(&self.counts);
         n > 0.5 && value < (sum(&self.sums) / n) as f32
     }
+}
+
+/// Half-widths, in pixels, of the windows the scan thresholds each pixel
+/// against besides ([`window_dark`]). A window must reach past the stone
+/// of a finder, three modules across, into the ring about it, or the
+/// middle of the stone reads as light as itself; and it must stop short
+/// of the finder's far side, or it is the neighbourhood rule over again.
+/// So each width serves modules from a third of it to about the whole of
+/// it, and the four between them modules from a pixel and a half, the
+/// least the scan looks for, to thirty pixels, past which blur no longer
+/// runs a finder's rings together.
+pub const WINDOW_RADII: [usize; 4] = [4, 8, 16, 32];
+/// How far below the mean of its window a pixel must lie to read dark,
+/// as a share of the spread of the image thresholded: without it the
+/// grain of flat paper reads as a scatter of dark pixels, half of them.
+/// OpenCV's ArUco-based detector takes seven of 255 off its window means
+/// for the same reason.
+pub const WINDOW_BIAS: f32 = 0.03;
+
+/// Each pixel of a `width` × `height` image against the mean of the
+/// window `radius` pixels either side of it, clipped to the image: 1
+/// where it lies more than `bias` below that mean and reads dark, 0
+/// where it reads light, and 2 where it has no value, `NaN` where a
+/// rectified image has no photo. Pixels without a value count for
+/// nothing in the mean.
+///
+/// The means are running sums, down the columns and then across them,
+/// so the cost does not grow with the window, and what is kept is a
+/// byte a pixel.
+pub fn window_dark(data: &[f32], width: usize, height: usize, radius: usize, bias: f32) -> Vec<u8> {
+    assert_eq!(data.len(), width * height);
+    let mut out = vec![2u8; width * height];
+    if width == 0 || height == 0 {
+        return out;
+    }
+    // The sum and count of each column over the rows of the window.
+    let mut sums = vec![0.0f64; width];
+    let mut counts = vec![0i64; width];
+    let take = |sums: &mut [f64], counts: &mut [i64], y: usize, sign: i64| {
+        for (x, &value) in data[y * width..(y + 1) * width].iter().enumerate() {
+            if value.is_finite() {
+                sums[x] += sign as f64 * f64::from(value);
+                counts[x] += sign;
+            }
+        }
+    };
+    for y in 0..=radius.min(height - 1) {
+        take(&mut sums, &mut counts, y, 1);
+    }
+    for y in 0..height {
+        if y > 0 {
+            if y + radius < height {
+                take(&mut sums, &mut counts, y + radius, 1);
+            }
+            if y > radius {
+                take(&mut sums, &mut counts, y - radius - 1, -1);
+            }
+        }
+        let (mut sum, mut count) = (0.0f64, 0i64);
+        for x in 0..=radius.min(width - 1) {
+            sum += sums[x];
+            count += counts[x];
+        }
+        for x in 0..width {
+            if x > 0 {
+                if x + radius < width {
+                    sum += sums[x + radius];
+                    count += counts[x + radius];
+                }
+                if x > radius {
+                    sum -= sums[x - radius - 1];
+                    count -= counts[x - radius - 1];
+                }
+            }
+            let value = data[y * width + x];
+            if value.is_finite() {
+                out[y * width + x] = u8::from(count > 0 && f64::from(value) < sum / count as f64 - f64::from(bias));
+            }
+        }
+    }
+    out
 }
 
 /// Settings of the view: the scan's rule as it runs for one outline.
@@ -315,6 +412,91 @@ mod tests {
         // where the square is darker than it.
         let boxed = binarize(&photo, &BinarizeParams { radius: 32, global: true, region: Some([0, 0, 30, 200]) });
         assert_eq!(boxed.data[100 * 200 + 100], 0.0);
+    }
+
+    #[test]
+    fn window_means_match_a_direct_mean() {
+        // A busy image with a hole in it, against the mean over the
+        // window computed the slow way.
+        let (w, h) = (23, 17);
+        let mut photo = image(w, h, |x, y| ((x * 7 + y * 13) % 11) as f32 / 10.0);
+        for i in [5 * w + 9, 5 * w + 10, 16 * w] {
+            photo.data[i] = f32::NAN;
+        }
+        for radius in [0, 1, 3, 8, 40] {
+            let mask = window_dark(&photo.data, w, h, radius, 0.05);
+            for y in 0..h {
+                for x in 0..w {
+                    let value = photo.data[y * w + x];
+                    if !value.is_finite() {
+                        assert_eq!(mask[y * w + x], 2, "{radius}: ({x}, {y})");
+                        continue;
+                    }
+                    let (mut sum, mut n) = (0.0f64, 0);
+                    for ny in y.saturating_sub(radius)..(y + radius + 1).min(h) {
+                        for nx in x.saturating_sub(radius)..(x + radius + 1).min(w) {
+                            if photo.data[ny * w + nx].is_finite() {
+                                sum += f64::from(photo.data[ny * w + nx]);
+                                n += 1;
+                            }
+                        }
+                    }
+                    let margin = f64::from(value) - (sum / f64::from(n) - 0.05);
+                    if margin.abs() > 1e-6 {
+                        assert_eq!(mask[y * w + x], u8::from(margin < 0.0), "{radius}: ({x}, {y})");
+                    }
+                }
+            }
+        }
+        assert!(window_dark(&[], 0, 0, 4, 0.0).is_empty());
+    }
+
+    #[test]
+    fn a_window_keeps_the_rings_a_blur_has_run_together() {
+        // A finder pattern three pixels a module on paper, blurred by
+        // two thirds of a module: across its middle the dark ring sinks
+        // to 0.44 and the light ring inside it rises to 0.57, so that a
+        // threshold a tenth of the scale either side of the middle, or
+        // the mean of the paper about the finder, reads one dark run
+        // where a window two modules either side still reads dark,
+        // light, dark, light, dark.
+        let (module, side) = (3usize, 60usize);
+        let finder = |x: usize, y: usize| {
+            let (mx, my) = ((x as i64 - 18).div_euclid(module as i64), (y as i64 - 18).div_euclid(module as i64));
+            let ring = (mx - 3).abs().max((my - 3).abs());
+            (0..7).contains(&mx) && (0..7).contains(&my) && ring != 2
+        };
+        let sharp = image(side, side, |x, y| if finder(x, y) { 0.0 } else { 1.0 });
+        let sigma = 2.0f64;
+        let kernel: Vec<f64> = (-6..=6).map(|k| (-0.5 * (f64::from(k) / sigma).powi(2)).exp()).collect();
+        let total: f64 = kernel.iter().sum();
+        let pass = |from: &Luma, across: bool| {
+            image(side, side, |x, y| {
+                let at = |k: i64| {
+                    let (nx, ny) = if across { (x as i64 + k, y as i64) } else { (x as i64, y as i64 + k) };
+                    f64::from(from.data[ny.clamp(0, side as i64 - 1) as usize * side + nx.clamp(0, side as i64 - 1) as usize])
+                };
+                ((-6..=6).zip(&kernel).map(|(k, weight)| weight * at(k)).sum::<f64>() / total) as f32
+            })
+        };
+        let blurred = pass(&pass(&sharp, true), false);
+        let row = 18 + 3 * module + 1;
+        let runs = |dark: &dyn Fn(usize) -> bool| {
+            let mut runs: Vec<(bool, usize)> = Vec::new();
+            for x in 0..side {
+                match runs.last_mut() {
+                    Some(run) if run.0 == dark(x) => run.1 += 1,
+                    _ => runs.push((dark(x), 1)),
+                }
+            }
+            runs.into_iter().filter(|run| run.0).count()
+        };
+        let mean = blurred.data.iter().sum::<f32>() / blurred.data.len() as f32;
+        for threshold in [0.4, 0.6, mean] {
+            assert_eq!(runs(&|x| blurred.data[row * side + x] < threshold), 1, "one threshold, {threshold}, loses the rings");
+        }
+        let mask = window_dark(&blurred.data, side, side, 2 * module, WINDOW_BIAS);
+        assert_eq!(runs(&|x| mask[row * side + x] == 1), 3, "a window reads ring, stone and ring apart");
     }
 
     #[test]

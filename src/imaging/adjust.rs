@@ -1,11 +1,22 @@
-//! Tone adjustments and neighbourhood filters applied to the photo before
-//! it is shown and sampled.
+//! The adjustments made to the photo before it is shown and sampled: its
+//! size, its sharpness, its tone, and a filter over each pixel's
+//! neighbourhood.
+//!
+//! A photo is enlarged or reduced, and sharpened, as it is toned: the
+//! whole of it, in its colours, so that what is shown is what the
+//! pipeline reads. Both were once steps of their own, the enlargement a
+//! part of loading a small photo and the two together a copy made about
+//! one symbol for the sampling to read off ([`super::enhance`]), in
+//! grey; a read that does not decode still makes itself such copies,
+//! and what it read through one the photo so adjusted shows again.
 
-use std::sync::Arc;
-
-use image::RgbaImage;
+use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use super::Luma;
+use super::enhance::{mask_for, unsharp_rgba, unsharp_values};
+use super::resize::{Sample, resize, resize_into};
+use crate::work;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Channel {
@@ -148,6 +159,224 @@ fn median(data: &[f32], width: usize, height: usize, radius: usize) -> Vec<f32> 
     out
 }
 
+/// Pixels toned as one piece of a photo spread over the cores.
+const TONED_AT_ONCE: usize = 1 << 18;
+
+/// The longest a photo's longer side is enlarged to, past the few times
+/// its size any photo may be made ([`Enlarge::ALWAYS`]), and the longest
+/// it is enlarged to at all without its being asked for.
+pub const MAX_ENLARGED_SIDE: u32 = 4096;
+/// Photos smaller than this on their shorter side start enlarged by a
+/// whole factor, so that a symbol rendered at a few pixels a module gets
+/// modules the finder scan can see. A long thin rMQR render is judged by
+/// its height. zxing-cpp has a separate path for such "pure" images; here
+/// they are simply made bigger.
+pub const MIN_PHOTO_SIDE: u32 = 256;
+/// The shortest a photo's shorter side comes to at a reduction offered
+/// for it: a photo may be worked on at less, as a small part cropped
+/// from a photo reduced is, but less is not put forward.
+pub const MIN_REDUCED_SIDE: u32 = 32;
+
+/// The size the photo is worked on at, against its own: a quarter or a
+/// half of it, or a whole number of times it. The photo is resized with
+/// Magic Kernel Sharp 2013 ([`super::resize`]), in its colours, and the
+/// outline and the anchors are in the pixels it comes to.
+///
+/// Enlarged, a symbol of a pixel or two a module has modules the scan
+/// and the sampling can see, and the luminance keeps the photo's own
+/// pixels beside it ([`Luma::unenlarged`]) for a symbol rendered pixel
+/// for pixel, whose square corners the kernel rounds. Reduced, grain and
+/// the dots of a halftone screen run together, as zxing-cpp's
+/// `tryDownscale` has them, and a large photo is the quicker to work on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Enlarge {
+    /// Quarters of the photo's own size: one, two, or four to each
+    /// whole time.
+    quarters: u16,
+}
+
+impl Default for Enlarge {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl Enlarge {
+    pub const QUARTER: Enlarge = Enlarge { quarters: 1 };
+    pub const HALF: Enlarge = Enlarge { quarters: 2 };
+    /// The photo at its own size.
+    pub const NONE: Enlarge = Enlarge { quarters: 4 };
+    /// The most times its size a photo is ever made.
+    pub const MAX_TIMES: u16 = 1024;
+    /// What a photo of any size may be enlarged to when that is asked
+    /// for, however large it is: four times its size. A large photo so
+    /// enlarged is sixteen times the pixels to hold and to work on, and
+    /// is never made so of itself ([`Self::fits_unasked`]).
+    pub const ALWAYS: Enlarge = Self::times(4);
+    /// The steps offered of themselves, each twice the last. A photo
+    /// may be at a whole number of times its size between them besides:
+    /// what a small one starts at ([`Self::for_photo`]), or what a read
+    /// decoded through ([`Self::by`]).
+    pub const LADDER: [Enlarge; 9] = [
+        Self::QUARTER,
+        Self::HALF,
+        Self::NONE,
+        Self::times(2),
+        Self::times(4),
+        Self::times(8),
+        Self::times(16),
+        Self::times(32),
+        Self::times(64),
+    ];
+
+    /// The photo at `times` its own size, once at the least.
+    pub const fn times(times: u16) -> Self {
+        let times = if times < 1 {
+            1
+        } else if times > Self::MAX_TIMES {
+            Self::MAX_TIMES
+        } else {
+            times
+        };
+        Enlarge { quarters: 4 * times }
+    }
+
+    /// How many times its own size the photo is made.
+    pub fn factor(self) -> f64 {
+        f64::from(self.quarters) / 4.0
+    }
+
+    /// The whole number of times, when it is one: 1 for the photo at
+    /// its own size, `None` for a photo reduced.
+    pub fn whole(self) -> Option<usize> {
+        self.quarters.is_multiple_of(4).then(|| usize::from(self.quarters / 4))
+    }
+
+    /// What a photo `width` by `height` measures so resized: a side of a
+    /// photo reduced comes to the nearest whole pixel, and to one at the
+    /// least.
+    pub fn size(self, width: usize, height: usize) -> (usize, usize) {
+        let of = |side: usize| if side == 0 { 0 } else { ((side * usize::from(self.quarters) + 2) / 4).max(1) };
+        (of(width), of(height))
+    }
+
+    /// Whether a photo `width` by `height` may be worked on so: enlarged
+    /// as far as [`Self::ALWAYS`] whatever its size, and further while
+    /// its longer side stays within [`MAX_ENLARGED_SIDE`]. Its own size
+    /// it may always have, and any reduction: a reduced photo is the
+    /// less to hold.
+    pub fn fits(self, width: u32, height: u32) -> bool {
+        self <= Self::ALWAYS || self.fits_unasked(width, height)
+    }
+
+    /// Whether this is put forward as a step for a photo `width` by
+    /// `height`: an enlargement that fits it, or a reduction that
+    /// leaves its shorter side [`MIN_REDUCED_SIDE`] at the least.
+    fn offered(self, width: u32, height: u32) -> bool {
+        self.fits(width, height) && (self >= Self::NONE || self.across(width.min(height)) >= u64::from(MIN_REDUCED_SIDE))
+    }
+
+    /// Whether a photo `width` by `height` is enlarged so without its
+    /// being asked for, when it is loaded or when a read that decoded
+    /// only through a copy of it so enlarged sets it: while its longer
+    /// side stays within [`MAX_ENLARGED_SIDE`]. A photo not enlarged at
+    /// all is.
+    pub fn fits_unasked(self, width: u32, height: u32) -> bool {
+        self <= Self::NONE || self.across(width.max(height)) <= u64::from(MAX_ENLARGED_SIDE)
+    }
+
+    /// What a side of `side` pixels comes to, to the pixel below.
+    fn across(self, side: u32) -> u64 {
+        u64::from(side) * u64::from(self.quarters) / 4
+    }
+
+    /// This, when a photo `width` by `height` may be worked on so, and
+    /// otherwise the most times its size that it may be.
+    pub fn within(self, width: u32, height: u32) -> Self {
+        if self.fits(width, height) {
+            return self;
+        }
+        let within_side = (MAX_ENLARGED_SIDE / width.max(height).max(1)).clamp(1, u32::from(Self::MAX_TIMES)) as u16;
+        Self::times(within_side).max(Self::ALWAYS)
+    }
+
+    /// What a photo `width` by `height` starts at: its own size, unless
+    /// it is under [`MIN_PHOTO_SIDE`] on its shorter side, and then the
+    /// whole number of times that brings it there, as far as the longer
+    /// side allows. Cubic and linear enlargement were tried before Magic
+    /// Kernel Sharp 2013 and lost more of the corpus than they gained: a
+    /// cubic rings at every edge, and even a linear ramp moves the
+    /// corners the edge tracer finds on crumpled paper. This kernel
+    /// reads the corpus as enlarging pixel for pixel did.
+    ///
+    /// A large photo starts at its size, and is never made smaller
+    /// unasked. It was once reduced to 4096 pixels on its longer side,
+    /// and a small symbol in a large photo lost to that the pixels its
+    /// modules had. Only the search of the whole photo still looks at a
+    /// copy that size ([`super::detect::SEARCH_SIDE`]): what it finds,
+    /// like an outline drawn by hand, is refined and read in the photo's
+    /// own pixels.
+    pub fn for_photo(width: u32, height: u32) -> Self {
+        let longest = width.max(height).max(1);
+        let shortest = width.min(height).max(1);
+        if shortest >= MIN_PHOTO_SIDE {
+            return Self::NONE;
+        }
+        Self::times(MIN_PHOTO_SIDE.div_ceil(shortest).min(MAX_ENLARGED_SIDE / longest).clamp(1, u32::from(Self::MAX_TIMES)) as u16)
+    }
+
+    /// The steps offered for a photo `width` by `height`, least first:
+    /// those of the [`Self::LADDER`] it may be worked on at, which for a
+    /// photo of any size go as far as [`Self::ALWAYS`], less the
+    /// reductions that would leave next to nothing of it, and what it
+    /// starts at among them.
+    pub fn steps_for(width: u32, height: u32) -> Vec<Enlarge> {
+        let mut steps: Vec<Enlarge> = Self::LADDER.into_iter().filter(|step| step.offered(width, height)).collect();
+        steps.push(Self::for_photo(width, height));
+        steps.sort();
+        steps.dedup();
+        steps
+    }
+
+    /// The photo `times` as large again as this has it: what a read
+    /// made through a copy of the photo so enlarged read it at. More
+    /// than the photo's own size is a whole number of times it, the
+    /// next one up where the two do not come to one.
+    pub fn by(self, times: u8) -> Self {
+        let quarters = self.quarters.saturating_mul(u16::from(times.max(1)));
+        match quarters {
+            1 | 2 => Enlarge { quarters },
+            _ => Self::times(quarters.div_ceil(4)),
+        }
+    }
+
+    /// What `text` names, as it is shown or as a bare number: `0.5×`,
+    /// `0.25`, `3x`. A number between the sizes there are is the nearest
+    /// of them.
+    pub fn parse(text: &str) -> Option<Self> {
+        let factor: f64 = text.trim().trim_end_matches(['×', 'x', 'X']).trim_end().parse().ok()?;
+        if !(factor > 0.0 && factor.is_finite()) {
+            return None;
+        }
+        Some(if factor < 0.375 {
+            Self::QUARTER
+        } else if factor < 0.75 {
+            Self::HALF
+        } else {
+            Self::times(factor.round().min(f64::from(Self::MAX_TIMES)) as u16)
+        })
+    }
+}
+
+impl fmt::Display for Enlarge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.whole() {
+            Some(times) => write!(f, "{times}×"),
+            None => write!(f, "{}×", self.factor()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Adjust {
     /// A single channel often separates ink from a coloured stain better
@@ -167,6 +396,14 @@ pub struct Adjust {
     /// negative straightens barrel, positive pincushion; 0.0 leaves the
     /// photo as shot. Corners and anchors are in the straightened image.
     pub k1: f32,
+    /// The size the photo is worked on at, against its own. Corners and
+    /// anchors are in the pixels it comes to.
+    pub enlarge: Enlarge,
+    /// How far the photo is sharpened by an unsharp mask, from 0.0 for
+    /// not at all to 1.0: see [`mask_for`]. The mask is laid on the photo
+    /// at the smaller of its own size and the size it is worked on at:
+    /// before it is enlarged, or after it is reduced.
+    pub sharpen: f32,
 }
 
 impl Default for Adjust {
@@ -179,6 +416,8 @@ impl Default for Adjust {
             filter: Filter::None,
             radius: 1,
             k1: 0.0,
+            enlarge: Enlarge::NONE,
+            sharpen: 0.0,
         }
     }
 }
@@ -356,6 +595,13 @@ pub fn undistort(rgba: &[u8], width: usize, height: usize, k1: f32) -> Vec<u8> {
 }
 
 impl Adjust {
+    /// The adjustments a photo `width` by `height` starts with: none,
+    /// but for the enlargement a small one is given
+    /// ([`Enlarge::for_photo`]).
+    pub fn for_photo(width: u32, height: u32) -> Self {
+        Self { enlarge: Enlarge::for_photo(width, height), ..Self::default() }
+    }
+
     fn lookup_table(&self) -> [u8; 256] {
         let gain = ((self.contrast.clamp(-1.0, 0.999) + 1.0) * std::f32::consts::FRAC_PI_4).tan();
         std::array::from_fn(|i| {
@@ -368,60 +614,113 @@ impl Adjust {
         })
     }
 
-    /// Returns the RGBA image to display and the luminance to sample from.
-    /// With a filter on, the display is the filtered luminance in grey, so
-    /// that what is shown is what is sampled.
+    /// Returns the RGBA image to display and the luminance to sample
+    /// from, of a photo `width` by `height`: both at the size the
+    /// enlargement makes of it ([`Enlarge::size`]), which is the
+    /// luminance's. With a filter on, the display is the filtered
+    /// luminance in grey, so that what is shown is what is sampled.
+    ///
+    /// The lens comes first, which bends the photo about its own centre.
+    /// Then the photo is sharpened and resized, in its colours: sharpened
+    /// at its own size and then enlarged, where a mask a pixel or two
+    /// wide is as wide as what a lens blurred and the enlargement is the
+    /// better for the mask's overshoot, which it holds its own result
+    /// to; or reduced and then sharpened, at the size the reduction left
+    /// it. The tone comes after, a curve for each pixel alone, and the
+    /// filter last, whose neighbourhood is measured in the pixels the
+    /// photo is worked on at.
+    ///
+    /// The luminance of a photo enlarged keeps that of the photo at its
+    /// own size beside it ([`Luma::unenlarged`]), under the same
+    /// adjustments less the filter, whose neighbourhood would be that
+    /// many times too wide there. An enlargement the photo's size does
+    /// not allow is held to the most that it does ([`Enlarge::within`]).
     pub fn apply(&self, rgba: &[u8], width: usize, height: usize) -> (Vec<u8>, Luma) {
         assert_eq!(rgba.len(), width * height * 4);
-        // The lens comes first: the tone curve is per pixel and does not
-        // care, but the filter's neighbourhoods should be of the
-        // straightened photo. Nothing is resampled while there is no
-        // distortion to take out.
+        if width == 0 || height == 0 {
+            return self.tone(rgba.to_vec(), width, height);
+        }
+        // Nothing is resampled while there is no distortion to take out.
         let straightened;
-        let rgba = if self.k1 != 0.0 && width > 0 && height > 0 {
+        let rgba = if self.k1 != 0.0 {
             straightened = undistort(rgba, width, height, self.k1);
             &straightened[..]
         } else {
             rgba
         };
-        let table = self.lookup_table();
-        let mut display = Vec::with_capacity(rgba.len());
-        let mut luma = Vec::with_capacity(width * height);
-        for pixel in rgba.as_chunks::<4>().0 {
-            let [r, g, b] = [table[pixel[0] as usize], table[pixel[1] as usize], table[pixel[2] as usize]];
-            let shown = match self.channel {
-                Channel::Color => [r, g, b],
-                Channel::Red => [r; 3],
-                Channel::Green => [g; 3],
-                Channel::Blue => [b; 3],
+        let enlarge = self.enlarge.within(width as u32, height as u32);
+        let (to_width, to_height) = enlarge.size(width, height);
+        let mask = mask_for(self.sharpen);
+        if enlarge <= Enlarge::NONE {
+            let reduced;
+            let rgba = if (to_width, to_height) != (width, height) {
+                reduced = resize(rgba, width, height, 4, to_width, to_height);
+                &reduced[..]
+            } else {
+                rgba
             };
-            display.extend_from_slice(&[shown[0], shown[1], shown[2], 255]);
-            let [r, g, b] = shown.map(|c| c as f32 / 255.0);
-            luma.push(0.299 * r + 0.587 * g + 0.114 * b);
+            let sharp = match mask {
+                Some((sigma, amount)) => unsharp_rgba(rgba, to_width, to_height, sigma, amount),
+                None => rgba.to_vec(),
+            };
+            return self.tone(sharp, to_width, to_height);
         }
+        // The photo at its own size as it is enlarged from, when that is
+        // not the photo as given, and the photo enlarged.
+        let (own, larger) = match mask {
+            Some((sigma, amount)) => {
+                let sharp = unsharp_values(rgba, width, height, sigma, amount);
+                let larger = resize_into(&sharp, width, height, 4, to_width, to_height);
+                (Some(sharp.iter().map(|&value| u8::from_f32(value)).collect::<Vec<u8>>()), larger)
+            }
+            None => (None, resize(rgba, width, height, 4, to_width, to_height)),
+        };
+        let (display, mut luma) = self.tone(larger, to_width, to_height);
+        if enlarge.whole().is_some() {
+            let unfiltered = Adjust { filter: Filter::None, ..*self };
+            luma.unenlarged = Some(Arc::new(unfiltered.tone(own.unwrap_or_else(|| rgba.to_vec()), width, height).1));
+        }
+        (display, luma)
+    }
+
+    /// The tone and the filter, over pixels already straightened,
+    /// resized and sharpened: the RGBA image to display, which is made
+    /// of those pixels where they stand, and the luminance to sample
+    /// from. A photo enlarged is many times the photo, and is not held
+    /// a second time to be toned.
+    fn tone(&self, mut rgba: Vec<u8>, width: usize, height: usize) -> (Vec<u8>, Luma) {
+        let table = self.lookup_table();
+        let mut luma = vec![0.0f32; width * height];
+        // A curve for each pixel alone: the pixels are toned a piece at
+        // a time on the cores to spare, each piece with its luminance.
+        let pieces: Vec<Mutex<(&mut [u8], &mut [f32])>> = rgba.chunks_mut(4 * TONED_AT_ONCE).zip(luma.chunks_mut(TONED_AT_ONCE)).map(Mutex::new).collect();
+        work::map(&pieces, |piece| {
+            let mut piece = piece.lock().expect("a piece is toned once, by one worker");
+            let (pixels, values) = &mut *piece;
+            for (pixel, value) in pixels.as_chunks_mut::<4>().0.iter_mut().zip(values.iter_mut()) {
+                let [r, g, b] = [table[pixel[0] as usize], table[pixel[1] as usize], table[pixel[2] as usize]];
+                let shown = match self.channel {
+                    Channel::Color => [r, g, b],
+                    Channel::Red => [r; 3],
+                    Channel::Green => [g; 3],
+                    Channel::Blue => [b; 3],
+                };
+                *pixel = [shown[0], shown[1], shown[2], 255];
+                let [r, g, b] = shown.map(|c| c as f32 / 255.0);
+                *value = 0.299 * r + 0.587 * g + 0.114 * b;
+            }
+        });
+        drop(pieces);
         if self.filter != Filter::None && width > 0 && height > 0 {
             luma = self.filter.apply(&luma, width, height, self.radius.clamp(1, Filter::MAX_RADIUS) as usize);
-            for (pixel, &value) in display.as_chunks_mut::<4>().0.iter_mut().zip(&luma) {
+            for (pixel, &value) in rgba.as_chunks_mut::<4>().0.iter_mut().zip(&luma) {
                 let grey = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
                 pixel[0] = grey;
                 pixel[1] = grey;
                 pixel[2] = grey;
             }
         }
-        (display, Luma::new(width, height, luma))
-    }
-
-    /// [`Self::apply`] to the pixels a photo is worked on at, with
-    /// `unenlarged` the photo at its own size when those are an
-    /// enlargement of it: the luminance then keeps that of the photo at
-    /// its own size beside it ([`Luma::unenlarged`]), under the same
-    /// adjustments less the filter, whose neighbourhood is measured in
-    /// the enlarged pixels and would be that many times too wide.
-    pub fn apply_photo(&self, working: &RgbaImage, unenlarged: Option<&RgbaImage>) -> (Vec<u8>, Luma) {
-        let of = |adjust: &Adjust, image: &RgbaImage| adjust.apply(image.as_raw(), image.width() as usize, image.height() as usize);
-        let (display, mut luma) = of(self, working);
-        luma.unenlarged = unenlarged.map(|small| Arc::new(of(&Adjust { filter: Filter::None, ..*self }, small).1));
-        (display, luma)
+        (rgba, Luma::new(width, height, luma))
     }
 }
 
@@ -438,14 +737,130 @@ mod tests {
         assert_eq!(luma.data[1], 0.0);
     }
 
+    /// Opaque pixels `width` by `height`, each of the colour `at` gives.
+    fn pixels(width: usize, height: usize, at: impl Fn(usize, usize) -> [u8; 3]) -> Vec<u8> {
+        (0..width * height)
+            .flat_map(|i| {
+                let [r, g, b] = at(i % width, i / width);
+                [r, g, b, 255]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_photo_is_worked_on_at_a_fraction_or_a_whole_number_of_times_its_size() {
+        assert_eq!(Enlarge::default(), Enlarge::NONE);
+        assert_eq!((Enlarge::QUARTER.factor(), Enlarge::HALF.factor(), Enlarge::NONE.factor(), Enlarge::times(3).factor()), (0.25, 0.5, 1.0, 3.0));
+        assert_eq!((Enlarge::HALF.whole(), Enlarge::NONE.whole(), Enlarge::times(24).whole()), (None, Some(1), Some(24)));
+        assert_eq!(Enlarge::times(0), Enlarge::NONE);
+        assert!(Enlarge::LADDER.windows(2).all(|pair| pair[1].factor() == 2.0 * pair[0].factor()), "each step twice the last");
+        // A whole number of times is that many pixels to each; a photo
+        // reduced comes to the nearest whole pixel, and never to none.
+        assert_eq!(Enlarge::times(3).size(110, 60), (330, 180));
+        assert_eq!((Enlarge::HALF.size(5000, 1501), Enlarge::QUARTER.size(5000, 1501)), ((2500, 751), (1250, 375)));
+        assert_eq!((Enlarge::QUARTER.size(1, 9), Enlarge::NONE.size(7, 0)), ((1, 2), (7, 0)));
+        // As it is shown, and read back.
+        let shown: Vec<String> = [Enlarge::QUARTER, Enlarge::HALF, Enlarge::NONE, Enlarge::times(24)].iter().map(Enlarge::to_string).collect();
+        assert_eq!(shown, ["0.25×", "0.5×", "1×", "24×"]);
+        for step in Enlarge::LADDER.into_iter().chain([Enlarge::times(3), Enlarge::times(37)]) {
+            assert_eq!(Enlarge::parse(&step.to_string()), Some(step));
+        }
+        assert_eq!((Enlarge::parse(" 3x "), Enlarge::parse("0.3"), Enlarge::parse("0.6"), Enlarge::parse("1.4")), (Some(Enlarge::times(3)), Some(Enlarge::QUARTER), Some(Enlarge::HALF), Some(Enlarge::NONE)));
+        assert_eq!((Enlarge::parse("large"), Enlarge::parse("0"), Enlarge::parse("-2"), Enlarge::parse("")), (None, None, None, None));
+        // A read made through a copy so many times as large again.
+        assert_eq!((Enlarge::NONE.by(4), Enlarge::times(3).by(2), Enlarge::times(2).by(1), Enlarge::times(2).by(0)), (Enlarge::times(4), Enlarge::times(6), Enlarge::times(2), Enlarge::times(2)));
+        assert_eq!((Enlarge::QUARTER.by(2), Enlarge::HALF.by(2), Enlarge::QUARTER.by(4)), (Enlarge::HALF, Enlarge::NONE, Enlarge::NONE));
+        assert_eq!((Enlarge::QUARTER.by(3), Enlarge::HALF.by(3)), (Enlarge::NONE, Enlarge::times(2)), "the next whole number up");
+    }
+
+    #[test]
+    fn a_small_photo_starts_enlarged_and_a_large_one_at_its_size() {
+        // By the whole number of times that brings its shorter side to
+        // 256 pixels, as far as its longer side allows.
+        assert_eq!(Enlarge::for_photo(11, 11), Enlarge::times(24));
+        assert_eq!(Enlarge::for_photo(110, 110), Enlarge::times(3));
+        assert_eq!(Enlarge::for_photo(100, 60), Enlarge::times(5));
+        assert_eq!(Enlarge::for_photo(255, 4000), Enlarge::NONE, "no whole factor fits");
+        // A long thin render is judged by its height, within the limit
+        // on its width.
+        assert_eq!(Enlarge::for_photo(587, 86), Enlarge::times(3));
+        assert_eq!((Enlarge::for_photo(3000, 100), Enlarge::for_photo(5000, 100)), (Enlarge::NONE, Enlarge::NONE));
+        // A large photo keeps every pixel it has.
+        assert_eq!((Enlarge::for_photo(256, 256), Enlarge::for_photo(640, 480), Enlarge::for_photo(8192, 4096)), (Enlarge::NONE, Enlarge::NONE, Enlarge::NONE));
+        assert_eq!(Adjust::for_photo(110, 110), Adjust { enlarge: Enlarge::times(3), ..Adjust::default() });
+        assert_eq!(Adjust::for_photo(640, 480), Adjust::default());
+        // What a photo may be worked on at: enlarged four times whatever
+        // its size, and further within 4096 pixels on its longer side;
+        // at its own size whatever that is; and reduced, however little
+        // that leaves of it.
+        assert_eq!(Enlarge::ALWAYS, Enlarge::times(4));
+        assert!(Enlarge::times(2).fits(20_000, 20_000) && Enlarge::times(4).fits(20_000, 20_000) && !Enlarge::times(5).fits(20_000, 20_000));
+        assert!(Enlarge::times(8).fits(512, 100) && !Enlarge::times(8).fits(513, 100));
+        assert!(Enlarge::NONE.fits(1, 1) && Enlarge::NONE.fits(20_000, 20_000));
+        assert!(Enlarge::HALF.fits(20, 20) && Enlarge::QUARTER.fits(20_000, 16));
+        assert_eq!(Enlarge::times(64).within(1000, 700), Enlarge::times(4));
+        assert_eq!((Enlarge::times(2).within(5000, 1500), Enlarge::times(8).within(5000, 1500)), (Enlarge::times(2), Enlarge::times(4)));
+        assert_eq!(Enlarge::times(64).within(330, 330), Enlarge::times(12));
+        assert_eq!((Enlarge::QUARTER.within(40, 40), Enlarge::HALF.within(16, 900)), (Enlarge::QUARTER, Enlarge::HALF));
+        // Without its being asked for, a photo is enlarged only within
+        // that many pixels, as one is when it is loaded.
+        assert!(Enlarge::times(2).fits_unasked(2048, 100) && !Enlarge::times(2).fits_unasked(2049, 100));
+        assert!(Enlarge::NONE.fits_unasked(20_000, 20_000) && Enlarge::HALF.fits_unasked(20_000, 20_000));
+        assert!(Enlarge::for_photo(86, 587).fits_unasked(86, 587) && Enlarge::for_photo(11, 11).fits_unasked(11, 11));
+        assert_eq!(Enlarge::times(3).within(110, 110), Enlarge::times(3));
+        // The steps offered: each twice the last as far as they fit,
+        // down to a reduction that leaves 32 pixels on the shorter side,
+        // and what the photo starts at among them.
+        let steps = |width, height| Enlarge::steps_for(width, height).iter().map(Enlarge::to_string).collect::<Vec<_>>().join(" ");
+        assert_eq!(steps(110, 110), "0.5× 1× 2× 3× 4× 8× 16× 32×");
+        assert_eq!(steps(350, 350), "0.25× 0.5× 1× 2× 4× 8×");
+        assert_eq!(steps(5000, 1500), "0.25× 0.5× 1× 2× 4×", "a large photo may still be enlarged four times");
+        assert_eq!(steps(11, 11), "1× 2× 4× 8× 16× 24× 32× 64×");
+        assert_eq!((steps(64, 900), steps(63, 900)), ("0.5× 1× 2× 4×".to_owned(), "1× 2× 4×".to_owned()));
+    }
+
+    #[test]
+    fn a_photo_is_enlarged_and_reduced_in_its_colours() {
+        // Red ink on the left half and white paper on the right.
+        let ink = |width: usize, height: usize| pixels(width, height, |x, _| if x < width / 2 { [200, 30, 40] } else { [255; 3] });
+        let own = ink(6, 4);
+        let twice = Adjust { enlarge: Enlarge::times(2), ..Default::default() };
+        let (display, luma) = twice.apply(&own, 6, 4);
+        assert_eq!((display.len(), luma.width, luma.height), (12 * 8 * 4, 12, 8));
+        // The kernel's own enlargement of every channel, and the
+        // luminance of that.
+        assert_eq!(display, resize(&own, 6, 4, 4, 12, 8));
+        assert_eq!(&display[..4], &[200, 30, 40, 255]);
+        assert_eq!(luma.data, Adjust::default().apply(&display, 12, 8).1.data);
+        // Beside it, the photo at its own size.
+        let small = luma.unenlarged.as_ref().expect("the photo's own pixels are kept");
+        assert_eq!(**small, Adjust::default().apply(&own, 6, 4).1);
+        assert!(small.unenlarged.is_none());
+        // Reduced, it keeps nothing beside it, as at its own size.
+        let wide = ink(80, 66);
+        let half = Adjust { enlarge: Enlarge::HALF, ..Default::default() };
+        let (display, luma) = half.apply(&wide, 80, 66);
+        assert_eq!((luma.width, luma.height, luma.unenlarged.is_none()), (40, 33, true));
+        assert_eq!(display, resize(&wide, 80, 66, 4, 40, 33));
+        assert_eq!((&display[..4], &display[39 * 4..40 * 4]), (&[200, 30, 40, 255][..], &[255; 4][..]));
+        assert!(Adjust::default().apply(&wide, 80, 66).1.unenlarged.is_none());
+        // More than the photo's size allows is held to what it does.
+        let strip = ink(2049, 2);
+        let (display, luma) = Adjust { enlarge: Enlarge::times(8), ..Default::default() }.apply(&strip, 2049, 2);
+        assert_eq!((luma.width, luma.height, luma.unenlarged.is_some()), (4 * 2049, 8, true));
+        assert_eq!(display, resize(&strip, 2049, 2, 4, 4 * 2049, 8));
+        // A reduction is made however little it leaves: a part cropped
+        // from a photo reduced is worked on as the photo was.
+        let (_, luma) = Adjust { enlarge: Enlarge::QUARTER, ..Default::default() }.apply(&own, 6, 4);
+        assert_eq!((luma.width, luma.height), (2, 1));
+    }
+
     #[test]
     fn a_photo_enlarged_keeps_its_own_size_adjusted_but_not_filtered() {
-        // Ink on the left half and paper on the right, at its own size
-        // and twice it.
-        let halves = |width: u32, height: u32| RgbaImage::from_fn(width, height, |x, _| image::Rgba(if x < width / 2 { [0, 0, 0, 255] } else { [255; 4] }));
-        let (own, working) = (halves(4, 2), halves(8, 4));
-        let adjust = Adjust { invert: true, filter: Filter::Blur, radius: 1, ..Default::default() };
-        let (display, luma) = adjust.apply_photo(&working, Some(&own));
+        // Ink on the left half and paper on the right, enlarged twice.
+        let own = pixels(4, 2, |x, _| if x < 2 { [0; 3] } else { [255; 3] });
+        let adjust = Adjust { invert: true, filter: Filter::Blur, radius: 1, enlarge: Enlarge::times(2), ..Default::default() };
+        let (display, luma) = adjust.apply(&own, 4, 2);
         assert_eq!((display.len(), luma.width, luma.height), (8 * 4 * 4, 8, 4));
         // The working pixels are inverted and blurred across the edge...
         assert!((luma.data[0] - 1.0).abs() < 1e-6 && (luma.data[7] - 0.0).abs() < 1e-6, "{:?}", &luma.data[..8]);
@@ -458,7 +873,82 @@ mod tests {
         }
         assert!(small.unenlarged.is_none());
         // A photo worked on at its own size keeps nothing beside it.
-        assert!(adjust.apply_photo(&working, None).1.unenlarged.is_none());
+        assert!(Adjust { enlarge: Enlarge::NONE, ..adjust }.apply(&own, 4, 2).1.unenlarged.is_none());
+    }
+
+    #[test]
+    fn a_photo_is_sharpened_in_its_colours() {
+        // A soft edge from red ink to white paper: two pixels between
+        // them, a third and two thirds of the way.
+        let soft = |x: usize, width: usize| match (x + 1).cmp(&(width / 2)) {
+            std::cmp::Ordering::Less => 0.0,
+            std::cmp::Ordering::Equal => 1.0 / 3.0,
+            std::cmp::Ordering::Greater if x == width / 2 => 2.0 / 3.0,
+            std::cmp::Ordering::Greater => 1.0,
+        };
+        let edge = |width: usize, height: usize| pixels(width, height, |x, _| [220, (40.0 + 180.0 * soft(x, width)) as u8, (60.0 + 160.0 * soft(x, width)) as u8]);
+        let photo = edge(40, 12);
+        assert_eq!(Adjust { sharpen: 0.0, ..Default::default() }.apply(&photo, 40, 12).0, photo, "no sharpening leaves the photo alone");
+        let pixel = |display: &[u8], x: usize| [display[(5 * 40 + x) * 4], display[(5 * 40 + x) * 4 + 1], display[(5 * 40 + x) * 4 + 2]];
+        let mut steps = Vec::new();
+        for sharpen in [0.25, 0.5, 1.0] {
+            let (display, luma) = Adjust { sharpen, ..Default::default() }.apply(&photo, 40, 12);
+            // Flat tone keeps its colour; the channel with no edge in it
+            // is as it was all the way across; and the others step more
+            // steeply between the two pixels of the edge.
+            assert_eq!((pixel(&display, 3), pixel(&display, 36)), ([220, 40, 60], [220, 220, 220]), "{sharpen}");
+            assert!((0..40).all(|x| pixel(&display, x)[0] == 220), "{sharpen}");
+            let step = i32::from(pixel(&display, 20)[1]) - i32::from(pixel(&display, 19)[1]);
+            assert!(step > 60, "{sharpen}: {step}");
+            steps.push(step);
+            // What is sampled is the luminance of what is shown.
+            assert_eq!(luma, Adjust::default().apply(&display, 40, 12).1);
+        }
+        assert!(steps.windows(2).all(|pair| pair[0] < pair[1]), "the more the sharper: {steps:?}");
+        // Sharpened at its own size and then enlarged, with the photo
+        // at its own size, sharpened, beside it.
+        let sharp = Adjust { sharpen: 0.5, ..Default::default() };
+        let both = Adjust { enlarge: Enlarge::times(3), ..sharp };
+        let (display, luma) = both.apply(&photo, 40, 12);
+        assert_eq!((display.len(), luma.width, luma.height), (120 * 36 * 4, 120, 36));
+        assert_eq!(luma.unenlarged.as_deref(), Some(&sharp.apply(&photo, 40, 12).1));
+        assert_eq!(&display[(15 * 120 + 9) * 4..(15 * 120 + 9) * 4 + 4], &[220, 40, 60, 255]);
+        // Reduced and then sharpened, at the size the reduction left.
+        let large = edge(80, 64);
+        let reduced = Adjust { enlarge: Enlarge::HALF, ..Default::default() }.apply(&large, 80, 64).0;
+        let (display, luma) = Adjust { enlarge: Enlarge::HALF, ..sharp }.apply(&large, 80, 64);
+        assert_eq!((luma.width, luma.height), (40, 32));
+        assert_eq!(display, sharp.apply(&reduced, 40, 32).0);
+    }
+
+    #[test]
+    fn a_photo_sharpened_and_enlarged_reads_as_a_copy_of_it_made_for_a_read() {
+        use crate::imaging::enhance::{Enhance, Enhanced, Sharpen};
+        // Busy grey pixels. What a read sees through a copy of the photo
+        // about a symbol, sharpened and enlarged, the whole photo under
+        // the same two adjustments shows, to the half of a grey level a
+        // byte rounds away.
+        let (w, h) = (48, 36);
+        let photo = pixels(w, h, |x, y| [((((x * 31 + y * 17) % 23) * 255 / 22 + ((x / 5 + y / 3) % 2) * 255) / 2) as u8; 3]);
+        let plain = Adjust::default().apply(&photo, w, h).1;
+        let near = |adjusted: &Luma, copy: &Luma, what: &str| {
+            assert_eq!((adjusted.width, adjusted.height), (copy.width, copy.height), "{what}");
+            let worst = adjusted.data.iter().zip(&copy.data).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(worst < 0.0025, "{what}: {worst}");
+        };
+        for (sharpen, enlarge) in [(Sharpen::Light, 1u8), (Sharpen::Strong, 1), (Sharpen::Light, 3), (Sharpen::Strong, 4), (Sharpen::Off, 2)] {
+            let copy = Enhanced::window(&plain, [0, 0, w, h], Enhance { enlarge, sharpen }).unwrap();
+            let adjust = Adjust { sharpen: sharpen.amount(), enlarge: Enlarge::NONE.by(enlarge), ..Default::default() };
+            near(&adjust.apply(&photo, w, h).1, &copy.luma, &format!("{sharpen:?}, {enlarge} times"));
+        }
+        // A photo enlarged already is read through a copy made from the
+        // pixels it had, in one step: so is the photo enlarged as many
+        // times again.
+        let twice = Adjust { enlarge: Enlarge::times(2), ..Default::default() };
+        let copy = Enhanced::window(&twice.apply(&photo, w, h).1, [0, 0, 2 * w, 2 * h], Enhance { enlarge: 2, sharpen: Sharpen::Light }).unwrap();
+        let adjust = Adjust { sharpen: Sharpen::Light.amount(), enlarge: twice.enlarge.by(2), ..Default::default() };
+        assert_eq!(adjust.enlarge, Enlarge::times(4));
+        near(&adjust.apply(&photo, w, h).1, &copy.luma, "enlarged twice, and twice again");
     }
 
     #[test]

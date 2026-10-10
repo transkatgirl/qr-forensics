@@ -11,7 +11,8 @@
 //! qr-forensics decode [--family qr|micro|rmqr|model1]
 //!                     [--outline x,y,x,y,x,y,x,y] [--hex | --escaped]
 //!                     [--charset name] [--corners] [--details] [--grid]
-//!                     [--partial] [--surface] [--full-search] <image>...
+//!                     [--partial] [--surface] [--enlarge n]
+//!                     [--sharpen light|strong] [--full-search] <image>...
 //! ```
 //!
 //! An option that takes a value takes the next argument, or what follows
@@ -32,8 +33,10 @@
 //! the error correction level and mask, the character set the bytes were
 //! read in, the symbology identifier, the symbol's place in a
 //! structured append sequence when it has one, and how many codewords
-//! of padding were pinned when the read took that, as OpenCV's detector
-//! hands back each symbol's ECI and BoofCV its level, mask and encoding.
+//! of padding were pinned when the read took that, and what the photo
+//! was read through when that was not the photo as it is, enlarged or
+//! sharpened, as OpenCV's detector hands back each symbol's ECI and
+//! BoofCV its level, mask and encoding.
 //! `--charset` names the character set to read byte data in when the
 //! symbol declares none, where it is otherwise guessed: `utf-8`,
 //! `iso-8859-1`, `windows-1252`, `shift_jis`, `gb18030`, `big5`, `euc-kr`,
@@ -49,6 +52,19 @@
 //! shadow or a fall-off of light across an evenly printed symbol. The
 //! neighbourhood rule is still tried when the surface does not decode.
 //!
+//! `--enlarge` and `--sharpen` read every symbol off a copy of the
+//! photo about it, sharpened by an unsharp mask and enlarged two, three
+//! or four times with Magic Kernel Sharp 2013: for modules a pixel or
+//! two across, or a symbol out of focus. The window makes the same of
+//! the whole photo, with Enlarge and Sharpen under Photo, where `light`
+//! is 0.5 and `strong` 1; here the outline stays in the photo's pixels.
+//! Neither is needed for such a symbol to be read: a read that does not
+//! decode, of a symbol whose modules are small, is made again through
+//! the photo enlarged and sharpened of itself, as wechat_qrcode reads a
+//! small crop a second time enlarged, and `--details` says of each
+//! symbol what it was read through when that was not the photo as it
+//! is. They set what is tried first, and reproduce a read.
+//!
 //! `--full-search` searches a photo at the full size a search goes to
 //! from the start, where the search otherwise looks at a copy no larger
 //! than a thousand pixels on its longer side first and finds what it
@@ -63,8 +79,8 @@
 //! The outline is drawn top-left first and clockwise, in the photo's own
 //! pixels, upright as its EXIF orientation has it; only a photo under
 //! 256 pixels on its shorter side is worked on at another size, enlarged
-//! by a whole factor, and its outline is in the enlarged pixels. What is
-//! inside it is read as
+//! by a whole factor as the window's Enlarge starts for one, and its
+//! outline is in the enlarged pixels. What is inside it is read as
 //! the window's Find in outline reads it: as a QR Code first and, when that
 //! does not decode, as a Micro QR or rMQR symbol too, on the evidence
 //! Find in outline asks of another family, the best of the reads being
@@ -110,8 +126,8 @@ use qr_forensics::decode::pipeline::DecodeOptions;
 use qr_forensics::decode::sequence::{ParityCheck, Part, Sequence};
 use qr_forensics::decode::text::Charset;
 use qr_forensics::imaging::Luma;
-use qr_forensics::imaging::adjust::Adjust;
 use qr_forensics::imaging::detect::{SearchParams, find_symbols_with};
+use qr_forensics::imaging::enhance::{Enhance, Sharpen};
 use qr_forensics::imaging::photo;
 use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline};
 use qr_forensics::imaging::sample::SampleParams;
@@ -119,7 +135,7 @@ use qr_forensics::symbol::{Family, SymbolVersion};
 
 const USAGE: &str = "usage: qr-forensics decode [--family qr|micro|rmqr|model1] [--outline x,y,x,y,x,y,x,y] \
                      [--hex | --escaped] [--charset name] [--corners] [--details] [--grid] [--partial] \
-                     [--surface] [--full-search] <image>...";
+                     [--surface] [--enlarge n] [--sharpen light|strong] [--full-search] <image>...";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Show {
@@ -145,6 +161,8 @@ struct Options {
     partial: bool,
     /// Read each symbol against a threshold surface first.
     surface: bool,
+    /// Read each symbol off the photo enlarged or sharpened first.
+    enhance: Enhance,
     search: SearchParams,
     images: Vec<OsString>,
 }
@@ -172,6 +190,7 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
         grid: false,
         partial: false,
         surface: false,
+        enhance: Enhance::NONE,
         search: SearchParams::default(),
         images: Vec::new(),
     };
@@ -241,6 +260,22 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
                 flag()?;
                 options.surface = true;
             }
+            "--enlarge" => {
+                let value = value("a factor")?;
+                options.enhance.enlarge = match value.parse() {
+                    Ok(factor) if (1..=Enhance::MAX_ENLARGE).contains(&factor) => factor,
+                    _ => return Err(format!("--enlarge takes a factor from 1 to {}, not {value}", Enhance::MAX_ENLARGE)),
+                };
+            }
+            "--sharpen" => {
+                let value = value("light or strong")?;
+                options.enhance.sharpen = match value.as_str() {
+                    "off" => Sharpen::Off,
+                    "light" => Sharpen::Light,
+                    "strong" => Sharpen::Strong,
+                    other => return Err(format!("--sharpen takes light or strong, not {other}")),
+                };
+            }
             "--full-search" => {
                 flag()?;
                 options.search.coarse_to_fine = false;
@@ -260,7 +295,7 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
 /// photo is small and never shrunk, as luminance, with the default tone
 /// adjustments.
 fn load(path: &Path) -> Result<Luma, String> {
-    Ok(photo::luma(photo::open(path).map_err(|e| e.to_string())?, &Adjust::default()))
+    Ok(photo::luma_as_loaded(photo::open(path).map_err(|e| e.to_string())?))
 }
 
 /// The version a search of `family` starts from, as the window starts.
@@ -308,6 +343,9 @@ fn details(result: &ReadResult) -> String {
     }
     if result.padding_pinned() {
         parts.push(format!("{} padding codewords pinned", result.pins.len()));
+    }
+    if !result.enhance.is_none() {
+        parts.push(format!("photo {}", result.enhance));
     }
     parts.join(", ")
 }
@@ -413,9 +451,9 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
         }
     };
     let params = if options.surface {
-        SampleParams { local: false, surface: true, ..SampleParams::default() }
+        SampleParams { local: false, surface: true, enhance: options.enhance, ..SampleParams::default() }
     } else {
-        SampleParams::default()
+        SampleParams { enhance: options.enhance, ..SampleParams::default() }
     };
     let opts = DecodeOptions { charset: options.charset, ..DecodeOptions::default() };
     let mut status = 0;
@@ -517,6 +555,16 @@ mod tests {
         assert!(parse(&[OsString::from("--family")]).is_err());
         assert!(parse(&[OsString::from("--outline"), OsString::from("1,2,3"), OsString::from("a.png")]).is_err());
         assert!(parse(&[OsString::from("--what"), OsString::from("a.png")]).is_err());
+        // The photo enlarged and sharpened, each on its own or both.
+        assert_eq!(options.enhance, Enhance::NONE);
+        let enhanced: Vec<OsString> = ["--enlarge", "3", "--sharpen=strong", "a.png"].iter().map(OsString::from).collect();
+        assert_eq!(parse(&enhanced).unwrap().enhance, Enhance { enlarge: 3, sharpen: Sharpen::Strong });
+        let sharpened = parse(&[OsString::from("--sharpen"), OsString::from("light"), OsString::from("a.png")]).unwrap();
+        assert_eq!(sharpened.enhance, Enhance { enlarge: 1, sharpen: Sharpen::Light });
+        for bad in ["--enlarge=5", "--enlarge=0", "--enlarge=two", "--sharpen=very"] {
+            assert!(parse(&[OsString::from(bad), OsString::from("a.png")]).is_err(), "{bad}");
+        }
+        assert!(parse(&[OsString::from("--sharpen")]).is_err());
         assert!(parse(&[]).is_err());
         assert_eq!(run(&[OsString::from("--help")]), 2);
         assert_eq!(run(&[OsString::from("/nowhere/at/all.png")]), 2);

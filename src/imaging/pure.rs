@@ -10,7 +10,7 @@
 //! the last word.
 //!
 //! A small photo is enlarged before the pipeline sees it
-//! ([`super::photo::enlarged`]), smoothly, and a render so enlarged has
+//! ([`super::adjust::Enlarge`]), smoothly, and a render so enlarged has
 //! no clean runs either: its edges are ramps and its corners round. It
 //! is read off the pixels it had, which the enlarged image keeps beside
 //! it ([`Luma::unenlarged`]), each counted as the pixels it was made
