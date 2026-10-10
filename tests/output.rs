@@ -299,3 +299,56 @@ fn a_kanji_segment_tips_doubtful_bytes_to_shift_jis() {
     assert_eq!(report.text.plain(), "日本字");
     assert_eq!(report.text.encoding.as_deref(), Some("Shift_JIS (guessed)"));
 }
+
+#[test]
+fn every_character_of_the_message_knows_the_bits_it_came_from() {
+    let (version, ec) = (SymbolVersion::Qr(4), EcLevel::M);
+    let layout = layout(version, ec);
+    let grid = encode(
+        version,
+        ec,
+        Some(0),
+        &[Segment::numeric("31415").unwrap(), Segment::bytes("naïve é"), Segment::alphanumeric("A1B").unwrap(), Segment::kanji("日本").unwrap()],
+    )
+    .unwrap();
+    let report = decode_plain(&grid, &layout, 0);
+    let message = "31415naïve éA1B日本";
+    assert_eq!(report.text.plain(), message);
+    let sources = &report.text.sources;
+    assert_eq!(sources.len(), message.chars().count());
+    // In the message's order, each inside the payload of its segment.
+    for (source, ch) in sources.iter().zip(message.chars()) {
+        let payload = &report.parse.segments[source.segment].payload;
+        assert!(payload.start <= source.bits.start && source.bits.end <= payload.end, "{ch:?}: {source:?} outside {payload:?}");
+    }
+    assert!(sources.windows(2).all(|pair| pair[0].bits.start <= pair[1].bits.start));
+    let (segments, cells, widths): (Vec<usize>, Vec<usize>, Vec<usize>) =
+        (sources.iter().map(|s| s.segment).collect(), sources.iter().map(|s| s.cell).collect(), sources.iter().map(|s| s.bits.len()).collect());
+    assert_eq!(segments, [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3]);
+    // Digits by the group of three, and the two that are left over; a
+    // byte to a character but for the two that take two; alphanumeric
+    // characters by the pair, and the odd one; kanji thirteen bits each.
+    assert_eq!(widths, [10, 10, 10, 7, 7, 8, 8, 16, 8, 8, 8, 16, 11, 11, 6, 13, 13]);
+    // The cell a character begins at: a character of two bytes takes
+    // two cells of byte data.
+    assert_eq!(cells, [0, 1, 2, 3, 4, 0, 1, 2, 4, 5, 6, 7, 0, 1, 2, 0, 1]);
+    // The bits named are the bits that spell the character: with those
+    // of the ï unreadable, it alone is lost.
+    let mut torn = grid.clone();
+    let i_umlaut = &sources[7];
+    for bit in i_umlaut.bits.clone() {
+        let (cw, place) = layout.stream_bit_location(bit).unwrap();
+        let module = layout.codeword_modules(cw)[usize::from(place)];
+        torn.set(module.x as usize, module.y as usize, qr_forensics::symbol::grid::Module::Unknown);
+    }
+    // Every error correction codeword gone too, so that nothing fills
+    // them in again.
+    for &cw in layout.blocks.iter().flat_map(|block| &block.codewords[block.data_len..]) {
+        erase_codeword(&mut torn, &layout, cw);
+    }
+    let lost = decode_plain(&torn, &layout, 0).text.plain();
+    let expected: String = message.chars().map(|ch| if ch == 'ï' { UNKNOWN_CHAR } else { ch }).collect();
+    assert_eq!(lost.replace(&format!("{UNKNOWN_CHAR}{UNKNOWN_CHAR}"), &UNKNOWN_CHAR.to_string()), expected);
+    // A message put together from parts has no bits of its own.
+    assert!(Sequence::default().assembled().sources.is_empty());
+}

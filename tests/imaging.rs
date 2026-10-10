@@ -9,7 +9,7 @@ use qr_forensics::decode::pipeline::{BlockOutcome, DecodeOptions, SolveMethod, a
 use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::adjust::Filter;
 use qr_forensics::imaging::detect::{AnchorKind, detect_outline, find_symbols, find_symbols_fine, refine_anchors};
-use qr_forensics::imaging::read::drop_contradicted_anchors;
+use qr_forensics::imaging::read::{drop_contradicted_anchors, read_outline};
 use qr_forensics::imaging::refine::Template;
 use qr_forensics::symbol::function_map::{FunctionMap, Role};
 use qr_forensics::imaging::homography::Homography;
@@ -1945,4 +1945,30 @@ fn degradation_thresholds() {
         let anchors = result.as_ref().map_or(0, |(d, _)| d.detection.count(AnchorKind::Alignment));
         println!("lens k1 {k1}: {} ({anchors} alignment)", degradation_summary(&result, &truth));
     }
+}
+
+#[test]
+fn a_search_or_a_read_called_off_comes_back_at_once_with_nothing() {
+    use qr_forensics::work::Cancel;
+    // A photo a search finds its symbol in, and a read reads.
+    let version = SymbolVersion::Qr(3);
+    let image = render(&symbol(version, EcLevel::M), QUAD, (800, 640), |_, _, v| v);
+    let params = SampleParams::default();
+    let whole = [[0.0, 0.0], [800.0, 0.0], [800.0, 640.0], [0.0, 640.0]];
+    let request = Cancel::new();
+    // Answering to a request no one has made, the work is done as ever.
+    let found = request.scope(|| find_symbols(&image, Family::Qr, &params));
+    assert_eq!(found.iter().map(|found| found.version).collect::<Vec<_>>(), [version]);
+    let read = request.scope(|| read_outline(&image, SymbolVersion::Qr(2), whole, &params, &DecodeOptions::default()));
+    assert!(read.is_some_and(|read| read.is_trustworthy()));
+    // Called off before it starts, it climbs no rung and fits nothing.
+    request.cancel();
+    let started = std::time::Instant::now();
+    assert!(request.scope(|| find_symbols(&image, Family::Qr, &params)).is_empty());
+    assert!(request.scope(|| find_symbols(&image, Family::Micro, &params)).is_empty());
+    let read = request.scope(|| read_outline(&image, SymbolVersion::Qr(2), whole, &params, &DecodeOptions::default()));
+    assert!(read.is_none_or(|read| !read.is_trustworthy()));
+    assert!(started.elapsed().as_secs() < 5, "work called off went on for {:?}", started.elapsed());
+    // Outside the request's scope, work is its own again.
+    assert!(!find_symbols(&image, Family::Qr, &params).is_empty());
 }

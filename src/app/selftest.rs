@@ -34,6 +34,20 @@
 //! symbols                     search the whole photo and list the symbols
 //!                             found
 //! use <n>                     adopt the n-th symbol found, counting from 1
+//! only on|off                 look for the family in use alone
+//! readall                     read every symbol found through to its message
+//! load <n>                    load the n-th symbol read into the grid
+//! crop | whole                cut the photo down to the outline, or show
+//!                             all of it again
+//! known <text>                the text known of the message: the rest of
+//!                             the line
+//! at <n> | start <mode>       where it starts: the n-th character, counting
+//!                             from 1, or the start of the message as
+//!                             byte, alphanumeric, numeric or kanji
+//! pintext | beginnings        pin the known text, or try the ways messages
+//!                             commonly begin
+//! pick <n>|none               outline the modules of the n-th character
+//! export png|svg <name>       save the repaired symbol to <dir>
 //! refine                      refine the corners against the fixed patterns
 //! apply                       write corrections into the grid
 //! say                         print the version, decode and status line
@@ -45,10 +59,11 @@ use std::path::PathBuf;
 use eframe::egui;
 use qr_forensics::imaging::adjust::Adjust;
 use qr_forensics::symbol::grid::Module;
+use qr_forensics::symbol::tables::Mode;
 use qr_forensics::symbol::{EcLevel, SymbolVersion};
 
 use super::state::*;
-use super::{Action, App};
+use super::{Action, App, ExportFormat};
 
 pub(super) struct SelfTest {
     dir: PathBuf,
@@ -149,6 +164,29 @@ impl App {
             "find" => actions.push(Action::FindCorners),
             "symbols" => actions.push(Action::FindSymbols),
             "use" => actions.push(Action::UseProposal(number(0) as usize - 1)),
+            "only" => self.view.own_family_only = word(0) == "on",
+            "readall" => actions.push(Action::ReadFound),
+            "load" => actions.push(Action::LoadRead(number(0) as usize - 1)),
+            "crop" => actions.push(Action::CropToOutline),
+            "whole" => actions.push(Action::ShowWholePhoto),
+            "known" => self.view.known_text = step.strip_prefix("known").unwrap_or_default().trim().to_owned(),
+            "at" => (self.view.known_at, self.view.known_from_start) = (number(0) as usize - 1, false),
+            "start" => {
+                self.view.known_from_start = true;
+                self.view.known_mode = match word(0) {
+                    "alphanumeric" => Mode::Alphanumeric,
+                    "numeric" => Mode::Numeric,
+                    "kanji" => Mode::Kanji,
+                    _ => Mode::Byte,
+                };
+            }
+            "pintext" => actions.push(Action::PinText),
+            "beginnings" => actions.push(Action::TryBeginnings),
+            "pick" => self.view.picked_char = word(0).parse::<usize>().ok().map(|n| n - 1),
+            "export" => {
+                let format = if word(0) == "svg" { ExportFormat::Svg } else { ExportFormat::Png };
+                self.export_image(&test.dir.join(word(1)), format);
+            }
             "refine" => actions.push(Action::RefineCorners),
             "apply" => actions.push(Action::ApplyCorrections),
             "stage" => self.view.stage = if word(0) == "align" { Stage::Align } else { Stage::Edit },

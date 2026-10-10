@@ -13,10 +13,12 @@ use qr_forensics::imaging::binarize::BinarizeParams;
 use qr_forensics::imaging::detect::{Anchor, Detection};
 use qr_forensics::imaging::projection::{ControlPoint, Projection};
 use qr_forensics::imaging::detect::SearchParams;
+use qr_forensics::imaging::read::ReadResult;
 use qr_forensics::imaging::sample::{Classified, SampleParams};
 use qr_forensics::symbol::function_map::FunctionMap;
 use qr_forensics::symbol::grid::{Mirror, Module, ModuleGrid};
 use qr_forensics::symbol::layout::{CwId, SymbolLayout};
+use qr_forensics::symbol::tables::Mode;
 use qr_forensics::symbol::{EcLevel, SymbolVersion};
 
 /// Where an anchor's photo position came from.
@@ -57,6 +59,19 @@ pub struct Proposals {
     /// where a click meant for the grid would put the outline back as
     /// found, over whatever was placed by hand since.
     pub adopted: Option<usize>,
+    /// What Read all made of them, once it has run.
+    pub reads: Option<FoundReads>,
+}
+
+/// What reading every symbol a search found made of them.
+pub struct FoundReads {
+    /// A read for each symbol found, in the list's order: `None` for one
+    /// that could not be read at all.
+    pub results: Vec<Option<ReadResult>>,
+    /// The photo's Invert setting when they were read, from which a
+    /// read's own polarity is reckoned, as a detection's is from the
+    /// setting it was found under.
+    pub photo_inverted: bool,
 }
 
 /// How the EC level and mask are chosen.
@@ -310,12 +325,29 @@ impl History {
     }
 }
 
+/// The part of a photo's pixels as loaded that is on show.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Crop {
+    /// Left, top, width and height, in the pixels of the photo as loaded.
+    pub rect: [u32; 4],
+    /// The lens term the photo was straightened by before it was cut:
+    /// the cut is of the straightened photo, whose lens term is then 0,
+    /// and the whole photo takes this one back.
+    pub k1: f32,
+}
+
 pub struct Photo {
     pub name: String,
     pub width: usize,
     pub height: usize,
-    /// RGBA as loaded, after any downscaling.
-    pub original: Vec<u8>,
+    /// The photo as loaded, with its transparency laid on white: what a
+    /// crop is cut from.
+    pub source: Arc<image::RgbaImage>,
+    /// The part of `source` on show, when it is not the whole.
+    pub crop: Option<Crop>,
+    /// RGBA of the part on show: the photo as loaded itself, when the
+    /// whole of it is on show and it was not so small as to be enlarged.
+    pub original: Arc<image::RgbaImage>,
     pub adjust: Adjust,
     /// What sampling reads: the adjusted image as luminance. Shared, so
     /// that a search or a job on its own thread starts without copying
@@ -344,6 +376,36 @@ impl Binarised {
 }
 
 impl Photo {
+    /// Where a point of the photo on show, in its working pixels, lies in
+    /// the pixels of the photo as loaded.
+    pub fn to_source(&self, point: [f64; 2]) -> [f64; 2] {
+        let [x, y, w, h] = self.shown();
+        [x + point[0] * w / self.width as f64, y + point[1] * h / self.height as f64]
+    }
+
+    /// The other way about from [`Self::to_source`]: where a point of the
+    /// photo as loaded lies in the working pixels of the photo on show.
+    pub fn to_working(&self, point: [f64; 2]) -> [f64; 2] {
+        let [x, y, w, h] = self.shown();
+        [(point[0] - x) * self.width as f64 / w, (point[1] - y) * self.height as f64 / h]
+    }
+
+    /// Pixels of the photo on show to a pixel of the photo as loaded:
+    /// one, or the whole factor a small photo, or a small part of one,
+    /// was enlarged by.
+    pub fn scale(&self) -> f64 {
+        self.width as f64 / self.shown()[2]
+    }
+
+    /// The part of the photo as loaded that is on show: left, top, width
+    /// and height.
+    fn shown(&self) -> [f64; 4] {
+        match self.crop {
+            Some(crop) => crop.rect.map(f64::from),
+            None => [0.0, 0.0, f64::from(self.source.width()), f64::from(self.source.height())],
+        }
+    }
+
     /// A square outline in the middle of the photo, to start from.
     pub fn default_corners(&self) -> [[f64; 2]; 4] {
         let (w, h) = (self.width as f64, self.height as f64);
@@ -530,6 +592,13 @@ pub enum InnerList {
     Blocks,
     Codewords,
     SequenceText,
+    /// The messages of the symbols Read all read.
+    Reads,
+}
+
+impl InnerList {
+    const ALL: [InnerList; 5] =
+        [InnerList::ResultText, InnerList::Blocks, InnerList::Codewords, InnerList::SequenceText, InnerList::Reads];
 }
 
 /// Which of the inspector's lists the wheel belongs to, if any. A list
@@ -540,7 +609,7 @@ pub enum InnerList {
 #[derive(Default)]
 pub struct WheelLatch {
     /// Where each list lay on the last frame, by [`InnerList`]'s order.
-    rects: [Option<egui::Rect>; 4],
+    rects: [Option<egui::Rect>; 5],
     owner: Option<InnerList>,
     /// Where the pointer was when `owner` was last settled.
     settled_at: Option<egui::Pos2>,
@@ -561,9 +630,7 @@ impl WheelLatch {
             return;
         }
         self.settled_at = Some(pointer);
-        self.owner = [InnerList::ResultText, InnerList::Blocks, InnerList::Codewords, InnerList::SequenceText]
-            .into_iter()
-            .find(|&list| rects[list as usize].is_some_and(|rect| rect.contains(pointer)));
+        self.owner = InnerList::ALL.into_iter().find(|&list| rects[list as usize].is_some_and(|rect| rect.contains(pointer)));
     }
 
     /// Whether `list` has the wheel.
@@ -641,6 +708,24 @@ pub struct ViewState {
     pub adjust_gesture: bool,
     /// Which of the inspector's lists the wheel scrolls.
     pub wheel: WheelLatch,
+    /// Search the photo, and read an outline, for symbols of the family
+    /// in use alone. The other families are searched from the finder
+    /// patterns the first leaves over, and on a damaged QR Code that is
+    /// most of the time a search takes.
+    pub own_family_only: bool,
+    /// The character of the message, counted from 0, whose modules are
+    /// outlined on the grid: the one last clicked in the result.
+    pub picked_char: Option<usize>,
+    /// Text the user knows the message to hold, to be pinned.
+    pub known_text: String,
+    /// Where it stands: at the start of the message under a header of
+    /// `known_mode`, or from character `known_at` of the text as read.
+    pub known_from_start: bool,
+    pub known_at: usize,
+    pub known_mode: Mode,
+    /// A press of the paste shortcut has already been answered: the
+    /// release that follows it is not a second request.
+    pub pasted_on_press: bool,
 }
 
 impl Default for ViewState {
@@ -677,6 +762,13 @@ impl Default for ViewState {
             binarize_auto: true,
             adjust_gesture: false,
             wheel: WheelLatch::default(),
+            own_family_only: false,
+            picked_char: None,
+            known_text: String::new(),
+            known_from_start: false,
+            known_at: 0,
+            known_mode: Mode::Byte,
+            pasted_on_press: false,
         }
     }
 }

@@ -8,3 +8,4 @@
 pub mod decode;
 pub mod imaging;
 pub mod symbol;
+pub mod work;

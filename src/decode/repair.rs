@@ -152,6 +152,49 @@ pub fn render_rgba(grid: &ModuleGrid, scale: usize, quiet: usize) -> (usize, usi
     (width, height, pixels)
 }
 
+/// Render a grid as an SVG image: a white sheet `quiet` modules wider
+/// than the symbol all round, the dark modules as one path, each run of
+/// them along a row a rectangle, and the unknown ones as another in the
+/// mid-grey [`render_rgba`] gives them. A module is one unit of the
+/// drawing, which a printer or a page scales to any size without the
+/// blur a scaled bitmap takes on; shown at its own size it is `scale`
+/// pixels a module, as the bitmap is.
+pub fn render_svg(grid: &ModuleGrid, scale: usize, quiet: usize) -> String {
+    let (width, height) = (grid.width() + 2 * quiet, grid.height() + 2 * quiet);
+    let runs_of = |module: Module| {
+        let mut path = String::new();
+        for y in 0..grid.height() {
+            let mut x = 0;
+            while x < grid.width() {
+                let start = x;
+                while x < grid.width() && grid.get(x, y) == module {
+                    x += 1;
+                }
+                if x > start {
+                    path.push_str(&format!("M{} {}h{}v1h-{}z", start + quiet, y + quiet, x - start, x - start));
+                } else {
+                    x += 1;
+                }
+            }
+        }
+        path
+    };
+    let mut svg = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {width} {height}\" width=\"{}\" height=\"{}\" \
+         shape-rendering=\"crispEdges\">\n<rect width=\"{width}\" height=\"{height}\" fill=\"#fff\"/>\n",
+        width * scale,
+        height * scale
+    );
+    for (module, fill) in [(Module::Unknown, "#808080"), (Module::Dark, "#000")] {
+        let path = runs_of(module);
+        if !path.is_empty() {
+            svg.push_str(&format!("<path fill=\"{fill}\" d=\"{path}\"/>\n"));
+        }
+    }
+    svg.push_str("</svg>\n");
+    svg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +214,27 @@ mod tests {
         assert_eq!(at(8, 8), [0, 0, 0, 255]);
         assert_eq!(quiet_zone(SymbolVersion::Qr(1)), 4);
         assert_eq!(quiet_zone(SymbolVersion::Rmqr(0)), 2);
+    }
+
+    #[test]
+    fn the_drawing_has_a_rectangle_for_every_run_of_modules() {
+        // Two dark modules side by side, then light, unknown and dark.
+        let grid = ModuleGrid::from_text("110?1\n00000\n?1111").unwrap();
+        let svg = render_svg(&grid, 10, 2);
+        assert_eq!(
+            svg,
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 9 7\" width=\"90\" height=\"70\" shape-rendering=\"crispEdges\">\n\
+             <rect width=\"9\" height=\"7\" fill=\"#fff\"/>\n\
+             <path fill=\"#808080\" d=\"M5 2h1v1h-1zM2 4h1v1h-1z\"/>\n\
+             <path fill=\"#000\" d=\"M2 2h2v1h-2zM6 2h1v1h-1zM3 4h4v1h-4z\"/>\n\
+             </svg>\n"
+        );
+        // A grid with nothing unknown has no grey, and the same dark
+        // modules as the bitmap: one unit of the drawing to each.
+        let clean = ModuleGrid::from_text("101\n010\n111").unwrap();
+        let svg = render_svg(&clean, 4, 0);
+        assert!(!svg.contains("#808080"));
+        let area: usize = svg.match_indices('h').filter_map(|(i, _)| svg[i + 1..].split('v').next()?.parse::<usize>().ok()).sum();
+        assert_eq!(area, clean.count(Module::Dark));
     }
 }

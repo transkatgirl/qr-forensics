@@ -101,7 +101,8 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         if ui.button("Open…").clicked() {
             actions.push(Action::OpenImage);
         }
-        if ui.button("Paste").on_hover_text("Use the image on the clipboard").clicked() {
+        let paste = format!("Use the image on the clipboard, or an image file copied there ({})", ui.ctx().format_shortcut(&super::PASTE));
+        if ui.button("Paste").on_hover_text(paste).clicked() {
             actions.push(Action::PasteImage);
         }
         if app.photo.is_some() && ui.button("Close").clicked() {
@@ -112,8 +113,34 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         ui.weak("Optional. Drop an image on the window, or paint the grid by hand.");
         return;
     };
-    ui.weak(format!("{} · {} × {}", photo.name, photo.width, photo.height));
+    let mut about = format!("{} · {} × {}", photo.name, photo.width, photo.height);
+    let (full_width, full_height) = photo.source.dimensions();
+    if photo.crop.is_some() {
+        about.push_str(&format!(" · cropped from {full_width} × {full_height}"));
+    } else if photo.scale() > 1.0 {
+        about.push_str(&format!(" · enlarged from {full_width} × {full_height}"));
+    }
+    ui.weak(about);
     let (width, height) = (photo.width, photo.height);
+    let cropped = photo.crop.is_some();
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .button("Crop to outline")
+            .on_hover_text(
+                "Cut the photo down to the outline, with room about it. A search of the whole photo, which looks at no \
+                 more than 4096 pixels on the longer side, then sees that part at its own size; every change of the \
+                 adjustments works on that part alone; and the canvas draws it pixel for pixel, where a photo larger \
+                 than a texture may be is drawn reduced. What was found in the photo is dropped; the outline and \
+                 anchors stay on the symbol.",
+            )
+            .clicked()
+        {
+            actions.push(Action::CropToOutline);
+        }
+        if cropped && ui.button("Whole photo").on_hover_text("Show the whole photo again, with the outline where it was on it").clicked() {
+            actions.push(Action::ShowWholePhoto);
+        }
+    });
 
     // The controls work on a copy; the document takes the change through
     // an action, after one undo point per gesture.
@@ -158,22 +185,31 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                 .step_by(0.005)
                 .fixed_decimals(3)
                 .clamping(egui::SliderClamping::Edits);
-            let lens = ui.add(slider).on_hover_text(
-                "Takes radial lens distortion out of the photo. Negative straightens edges that bow outwards \
-                 (barrel), positive edges that bow inwards (pincushion).",
-            );
+            // A lens bends the photo about its centre, which a crop has
+            // lost: the term is set on the whole photo, and applied
+            // before the cut.
+            const CROPPED_HINT: &str = "A lens bends the photo about its centre, which a cropped photo has lost: show the \
+                                        whole photo to set it, and crop again";
+            let lens = ui
+                .add_enabled(!cropped, slider)
+                .on_hover_text(
+                    "Takes radial lens distortion out of the photo. Negative straightens edges that bow outwards \
+                     (barrel), positive edges that bow inwards (pincushion).",
+                )
+                .on_disabled_hover_text(CROPPED_HINT);
             note(lens.changed());
             let enough = app.doc.anchors.len() + 4 >= LENS_MIN_PAIRS;
             if ui
-                .add_enabled(enough, egui::Button::new("Estimate"))
+                .add_enabled(enough && !cropped, egui::Button::new("Estimate"))
                 .on_hover_text(
                     "Fit the lens setting to the corners and anchors, which lie on a plane once the distortion is \
                      gone. They move with the photo.",
                 )
-                .on_disabled_hover_text(format!(
-                    "Needs the four corners and at least {} anchors on the symbol first: press Find in outline",
-                    LENS_MIN_PAIRS - 4
-                ))
+                .on_disabled_hover_text(if cropped {
+                    CROPPED_HINT.to_owned()
+                } else {
+                    format!("Needs the four corners and at least {} anchors on the symbol first: press Find in outline", LENS_MIN_PAIRS - 4)
+                })
                 .clicked()
             {
                 actions.push(Action::EstimateLens);
@@ -364,22 +400,37 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
         {
             actions.push(Action::SuggestVersions);
         }
-        let searching = app.search.is_some();
-        if ui
-            .add_enabled(!searching, egui::Button::new(if searching { "Searching…" } else { "Search whole photo" }))
+        if app.search.is_some() {
+            if ui.button("Stop searching").on_hover_text("Call the search of the photo off").clicked() {
+                actions.push(Action::CancelSearch);
+            }
+        } else if ui
+            .button("Search whole photo")
             .on_hover_text(
-                "Search the whole photo for symbols of every family and list what is found, those that decode as \
-                 found first. Takes a few seconds.",
+                "Search the whole photo for symbols and list what is found, those that decode as found first. Takes \
+                 a few seconds, and longer on a damaged symbol, whose finder patterns are tried every way; it can be \
+                 stopped. A photo over 4096 pixels on a side is searched in a copy reduced to that, and what is found \
+                 is placed and read in the photo's own pixels; a symbol too small to show in the copy is found by \
+                 Find in outline, which looks at the photo itself.",
             )
             .clicked()
         {
             actions.push(Action::FindSymbols);
         }
+        if busy && ui.button("Stop").on_hover_text("Call off the step under way; nothing is changed").clicked() {
+            actions.push(Action::CancelJob);
+        }
     });
+    let family = app.doc.version.family();
+    ui.checkbox(&mut app.view.own_family_only, format!("Only look for {}", family.label())).on_hover_text(
+        "Search whole photo and Find in outline look for symbols of the family chosen under Symbol, and no other. The \
+         other families are otherwise looked for from every finder pattern the first search leaves over, which on a \
+         damaged QR Code is most of the time a search takes.",
+    );
     ui.checkbox(&mut app.view.search.coarse_to_fine, "Search a small copy first").on_hover_text(
-        "Search a copy of the photo shrunk to a thousand pixels first, and the full-size photo only if that shows \
-         nothing. Much faster on a large photo. Turn off for a symbol only a few pixels a module, which the copy \
-         loses.",
+        "Search a copy of the photo shrunk to a thousand pixels first, and the photo at the full size a search goes \
+         to, 4096 pixels on its longer side, only if that shows nothing. Much faster on a large photo. Turn off for \
+         a symbol only a few pixels a module, which the copy loses.",
     );
     if let Some(proposals) = &app.proposals {
         let in_use = super::proposal_in_use(proposals, &app.doc.corners);
@@ -413,9 +464,24 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
                 actions.push(Action::UseProposal(i));
             }
         }
-        if ui.small_button("Clear the list").clicked() {
-            actions.push(Action::ClearProposals);
-        }
+        ui.horizontal(|ui| {
+            let label = if running == Some(JobKind::ReadFound) { "Reading…" } else { "Read all" };
+            if ui
+                .add_enabled(!busy, egui::Button::new(label))
+                .on_hover_text(
+                    "Read every symbol found through to its message, as the command line reads a photo. The messages \
+                     are listed under Symbols read, where each can be copied or loaded into the grid, and the parts \
+                     of a structured append message go into the sequence.",
+                )
+                .on_disabled_hover_text(BUSY_HINT)
+                .clicked()
+            {
+                actions.push(Action::ReadFound);
+            }
+            if ui.small_button("Clear the list").clicked() {
+                actions.push(Action::ClearProposals);
+            }
+        });
     }
     if let Some(guesses) = &app.guesses {
         for guess in guesses.iter().take(4) {

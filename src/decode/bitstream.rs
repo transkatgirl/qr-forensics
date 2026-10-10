@@ -231,6 +231,36 @@ pub fn hanzi_code(value: u32) -> (u16, bool) {
     (code as u16, valid)
 }
 
+/// The 13-bit kanji value of a Shift-JIS code, the other way about from
+/// [`kanji_code`]; `None` for a code kanji mode cannot hold.
+pub fn kanji_value(code: u16) -> Option<u32> {
+    let packed = match code {
+        0x8140..=0x9FFC => code - 0x8140,
+        0xE040..=0xEBBF => code - 0xC140,
+        _ => return None,
+    };
+    let value = u32::from(packed >> 8) * 0xC0 + u32::from(packed & 0xFF);
+    (kanji_code(value) == (code, true)).then_some(value)
+}
+
+/// The 13-bit hanzi value of a GB 2312 code, the other way about from
+/// [`hanzi_code`]; `None` for a code hanzi mode cannot hold.
+pub fn hanzi_value(code: u16) -> Option<u32> {
+    let packed = match code {
+        0xA1A1..=0xAAFE => code - 0xA1A1,
+        0xB0A1..=0xFAFE => code - 0xA6A1,
+        _ => return None,
+    };
+    let value = u32::from(packed >> 8) * 0x60 + u32::from(packed & 0xFF);
+    (hanzi_code(value) == (code, true)).then_some(value)
+}
+
+/// The value of a character in alphanumeric mode, 0 to 44; `None` for a
+/// character the mode lacks.
+pub fn alphanumeric_value(ch: char) -> Option<u32> {
+    ALPHANUMERIC.iter().position(|&c| char::from(c) == ch).map(|i| i as u32)
+}
+
 /// What a standard encoder writes after the data in a stream of `total`
 /// bits whose data ends at `end_bit`: a terminator of up to
 /// `terminator_bits` zeros, zeros to the next codeword boundary, then the

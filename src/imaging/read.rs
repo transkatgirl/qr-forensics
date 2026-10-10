@@ -70,6 +70,21 @@
 //!
 //! Each retry is dearer than the last and runs only while the decode is
 //! not yet trustworthy, so a photo that reads at once costs one pass.
+//! Once the first try of a kind has failed, the tries after it are made
+//! side by side on the cores to spare, as [`crate::work`] describes, and
+//! taken in the order given here: what is read is what one core read.
+//!
+//! One retry costs next to nothing and is made of every decode that is
+//! no read: the padding. A short message in a large symbol leaves most
+//! of the data codewords as filler whose values the standard fixes, and
+//! damage that falls on them is damage to what is already known. So when
+//! the padding can be located, by the segment headers or by its own
+//! pattern, its codewords are pinned at their values and the blocks
+//! solved again ([`crate::decode::padding`]); and when every block then
+//! verifies and the headers bear the padding out, that is the read, and
+//! it says that it was made so. A strip of tape across a third of a
+//! version 10 symbol that holds a short address leaves no block that
+//! error correction alone can solve, and all five solve this way.
 
 use std::sync::Arc;
 
@@ -82,12 +97,14 @@ use super::refine::{MOVES, Scorer, Shifted, Template, Warp, descend_by, fixed_th
 use super::sample::{Kernel, SampleParams, classify, sample_modules_with};
 use super::{Luma, rotate_outline_cw, unrotate_point_cw};
 use crate::decode::codewords::Pins;
+use crate::decode::padding::recover_padding_after;
 use crate::decode::pipeline::{DecodeOptions, DecodeReport, GridAnalysis, analyze, brute_force, decode};
 use crate::decode::repair::known_modules;
 use crate::symbol::function_map::FunctionMap;
 use crate::symbol::{Family, SymbolVersion};
 use crate::symbol::grid::ModuleGrid;
 use crate::symbol::layout::SymbolLayout;
+use crate::work;
 
 /// What one read of a photo made of it.
 #[derive(Clone, Debug)]
@@ -109,6 +126,10 @@ pub struct ReadResult {
     pub grid: ModuleGrid,
     pub analysis: GridAnalysis,
     pub report: DecodeReport,
+    /// The pins the report was decoded under: those of the padding, its
+    /// terminator and any header it settled, when the grid reads only
+    /// with its padding taken as known, and none otherwise.
+    pub pins: Pins,
     /// The grid was read as the other QR Code model, of this version,
     /// because its format bits said so and that read ranked better.
     pub reinterpreted: Option<SymbolVersion>,
@@ -129,6 +150,12 @@ impl ReadResult {
     /// The version the grid was read under.
     pub fn version(&self) -> SymbolVersion {
         self.reinterpreted.unwrap_or(self.detection.version)
+    }
+
+    /// The read stands only with the padding pinned: error correction
+    /// alone did not solve every block.
+    pub fn padding_pinned(&self) -> bool {
+        !self.pins.is_empty()
     }
 
     fn outranks(&self, other: &ReadResult) -> bool {
@@ -154,33 +181,59 @@ pub fn read_outline(
     let variants = variants_of(params);
     let mut best: Option<ReadResult> = None;
     // The detector's placements, best fit first, each with every way of
-    // sampling it.
-    for found in detect_candidates(image, version, region, params) {
-        let Some(prepared) = prepare(image, found, params) else { continue };
-        if read_placement(image, &prepared, &variants, params, opts, &mut |result| consider(&mut best, result)) {
-            return best;
+    // sampling it: the reads of each, up to the one that settles it.
+    let candidates = detect_candidates(image, version, region, params);
+    let reads_of = |found: &Detection| {
+        let mut reads = Vec::new();
+        if work::cancelled() {
+            return reads;
         }
+        if let Some(prepared) = prepare(image, found.clone(), params) {
+            read_placement(image, &prepared, &variants, params, opts, &mut |result| {
+                let settled = result.is_trustworthy();
+                reads.push(result);
+                settled
+            });
+        }
+        reads
+    };
+    if work::first_then_in_turn(&candidates, reads_of, |reads| reads.into_iter().any(|result| consider(&mut best, result))) {
+        return best;
     }
     // Nothing found in the photo as it is: the detector's own ladder has
     // already been through the transformed copies, and a turn would find
     // no more.
     best.as_ref()?;
+    if work::cancelled() {
+        return best;
+    }
     // The photo turned a quarter at a time, read in full each way and the
     // result brought back to the photo's own pixels.
-    for quarters in 1..4u8 {
+    let reads_turned = |&quarters: &u8| {
+        let mut reads = Vec::new();
+        if work::cancelled() {
+            return reads;
+        }
         let turned = image.rotated_cw(quarters);
         let turned_region = rotate_outline_cw(region, quarters, image.width, image.height);
-        let Some(found) = detect_outline(&turned, version, turned_region, params) else { continue };
-        let Some(prepared) = prepare(&turned, found, params) else { continue };
-        for &(kernel, local) in &variants {
-            if let Some(mut result) = read_prepared(&turned, &prepared, kernel, local, params, opts) {
+        let Some(found) = detect_outline(&turned, version, turned_region, params) else { return reads };
+        let Some(prepared) = prepare(&turned, found, params) else { return reads };
+        work::first_then_in_turn(
+            &variants,
+            |&(kernel, local)| if work::cancelled() { None } else { read_prepared(&turned, &prepared, kernel, local, params, opts) },
+            |result| {
+                let Some(mut result) = result else { return false };
                 unturn(&mut result.detection, quarters, image.width, image.height, region);
-                if consider(&mut best, result) {
-                    return best;
-                }
-            }
-        }
-    }
+                let settled = result.is_trustworthy();
+                reads.push(result);
+                settled
+            },
+        );
+        reads
+    };
+    // Side by side, as far as the photo's size leaves room for turned
+    // copies of it.
+    work::in_turn_by(image.copies_at_once(), &[1, 2, 3], reads_turned, |reads| reads.into_iter().any(|result| consider(&mut best, result)));
     best
 }
 
@@ -219,6 +272,9 @@ pub fn read_detection(image: &Luma, found: Detection, params: &SampleParams, opt
     if let Some(prepared) = prepare(image, found, params)
         && read_placement(image, &prepared, &variants_of(params), params, opts, &mut |result| consider(&mut best, result))
     {
+        return best;
+    }
+    if work::cancelled() {
         return best;
     }
     if let Some(again) = read_outline(image, version, around, params, opts)
@@ -264,13 +320,21 @@ fn read_placement(
     keep: &mut dyn FnMut(ReadResult) -> bool,
 ) -> bool {
     let mut verified = 0;
-    for &(kernel, local) in variants {
-        if let Some(result) = read_prepared(image, prepared, kernel, local, params, opts) {
-            verified = verified.max(result.report.blocks_verified());
-            if keep(result) {
-                return true;
-            }
-        }
+    let settled = work::first_then_in_turn(
+        variants,
+        |&(kernel, local)| if work::cancelled() { None } else { read_prepared(image, prepared, kernel, local, params, opts) },
+        |result| {
+            result.is_some_and(|result| {
+                verified = verified.max(result.report.blocks_verified());
+                keep(result)
+            })
+        },
+    );
+    if settled {
+        return true;
+    }
+    if work::cancelled() {
+        return false;
     }
     let few = &variants[..variants.len().min(2)];
     let found = &prepared.detection;
@@ -294,7 +358,7 @@ fn read_placement(
     for _ in 0..DOUBT_LIMIT {
         // A block that verified knows which anchors mislead, and the
         // refit to it has already dropped them.
-        if verified > 0 {
+        if verified > 0 || work::cancelled() {
             break;
         }
         let Some(k) = doubtful_anchor(&doubted.detection) else { break };
@@ -405,6 +469,11 @@ fn read_prepared(
             reinterpreted = Some(other);
         }
     }
+    let read_as = Arc::new(FunctionMap::new(reinterpreted.unwrap_or(found.version)));
+    let (report, pins) = match SymbolLayout::new(read_as, report.ec) {
+        Some(layout) => with_padding(&grid, &layout, report, opts),
+        None => (report, Pins::new()),
+    };
     let result = ReadResult {
         detection: found.clone(),
         agreement: prepared.agreement,
@@ -413,9 +482,27 @@ fn read_prepared(
         grid,
         analysis,
         report,
+        pins,
         reinterpreted,
     };
-    Some(if result.is_trustworthy() { result } else { refit_by_decode(image, result, &sampling, opts) })
+    Some(if result.is_trustworthy() || work::cancelled() { result } else { refit_by_decode(image, result, &sampling, opts) })
+}
+
+/// A decode that is no read, made again with the padding pinned, when
+/// that makes a read of it: every block verified, the stream parsing,
+/// and the segment headers, once they can be read, bearing out where the
+/// padding was placed. The report comes back with the pins it was then
+/// decoded under, or as it was with none. A decode the pins leave short
+/// of a read is left as it was: what they would add to it rests on the
+/// padding alone, with nothing to confirm it.
+fn with_padding(grid: &ModuleGrid, layout: &SymbolLayout, report: DecodeReport, opts: &DecodeOptions) -> (DecodeReport, Pins) {
+    if report.is_trustworthy() {
+        return (report, Pins::new());
+    }
+    match recover_padding_after(grid, layout, report.mask, &Pins::new(), opts, &report) {
+        Some(recovery) if recovery.confirmed && recovery.report.is_trustworthy() => (recovery.report, recovery.pins),
+        _ => (report, Pins::new()),
+    }
 }
 
 /// Known modules a decode must add to the fixed patterns before the
@@ -440,6 +527,9 @@ const FEEDBACK_WINDOW: f64 = 5.0;
 /// the kernel and threshold rule the read was made with.
 fn refit_by_decode(image: &Luma, mut current: ReadResult, params: &SampleParams, opts: &DecodeOptions) -> ReadResult {
     for _ in 0..FEEDBACK_ROUNDS {
+        if work::cancelled() {
+            break;
+        }
         let Some(next) = feedback_round(image, &current, params, opts) else { break };
         if next.report.score <= current.report.score {
             break;
@@ -543,6 +633,7 @@ fn feedback_round(image: &Luma, current: &ReadResult, params: &SampleParams, opt
     let own = Arc::new(FunctionMap::new(found.version));
     let analysis = analyze(&grid, &own);
     let report = decode(&grid, &layout, current.report.mask, &Pins::new(), opts);
+    let (report, pins) = with_padding(&grid, &layout, report, opts);
     let whole = Scorer::new(image, &Template::whole(&own), corners, threshold);
     let agreement = (whole.agreement_known(&projection, found.inverted)?.0, whole.fixed());
     let mut detection = found.clone();
@@ -557,6 +648,7 @@ fn feedback_round(image: &Luma, current: &ReadResult, params: &SampleParams, opt
         grid,
         analysis,
         report,
+        pins,
         reinterpreted: current.reinterpreted,
     })
 }

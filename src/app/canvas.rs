@@ -29,6 +29,9 @@ const TIMING: Color32 = Color32::from_rgb(0, 200, 200);
 const EDGE: Color32 = Color32::from_rgb(235, 150, 40);
 /// Outlines of symbols a search of the whole photo found.
 const PROPOSAL: Color32 = Color32::from_rgb(255, 120, 200);
+/// The modules of the character picked in the result, and that character
+/// in the result's text.
+pub(super) const PICKED: Color32 = Color32::from_rgb(160, 235, 0);
 /// Modules of photo shown around the symbol in the Edit stage.
 const MARGIN: i32 = 2;
 /// Half-size of an anchor handle's hit area, in screen points.
@@ -216,7 +219,9 @@ fn align_stage(
             }
             if !photo.binarised.as_ref().is_some_and(|b| b.is_for(&photo.luma, &view.binarize)) {
                 let bw = binarize(&photo.luma, &view.binarize);
-                let image = egui::ColorImage::from_gray_iter([bw.width, bw.height], bw.data.iter().map(|&v| if v < 0.5 { 0 } else { 255 }));
+                let gray: Vec<u8> = bw.data.iter().map(|&v| if v < 0.5 { 0 } else { 255 }).collect();
+                // Within what a texture may measure, as the photo's own is.
+                let image = super::texture_gray(gray, bw.width, bw.height, ui.input(|i| i.max_texture_side));
                 let texture = ui.ctx().load_texture("binarised", image, egui::TextureOptions::LINEAR);
                 photo.binarised = Some(Binarised { source: photo.luma.clone(), params: view.binarize, texture });
             }
@@ -974,6 +979,21 @@ fn edit_stage(ui: &mut egui::Ui, app: &mut App, response: &egui::Response, paint
                 painter.text(rect.center() + vec2(1.0, 1.0), egui::Align2::CENTER_CENTER, &label, font.clone(), Color32::BLACK);
                 painter.text(rect.center(), egui::Align2::CENTER_CENTER, &label, font, SELECT);
             }
+        }
+    }
+
+    // The modules of the character picked in the result: one for each bit
+    // of the data stream the character is made of.
+    if let Some(source) = app.view.picked_char.and_then(|at| derived.report.text.sources.get(at)) {
+        for bit in source.bits.clone() {
+            let Some((cw, place)) = derived.layout.stream_bit_location(bit) else { continue };
+            let span = derived.layout.codewords[cw];
+            // A bit the codeword has no module for is fixed by the layout.
+            let Some(i) = usize::from(place).checked_sub(usize::from(span.bit_offset)).filter(|&i| i < usize::from(span.nbits)) else {
+                continue;
+            };
+            let pos = derived.layout.codeword_modules(cw)[i];
+            painter.rect_stroke(module_rect(pos.x as usize, pos.y as usize), 0.0, Line::new(2.5, PICKED), StrokeKind::Inside);
         }
     }
 

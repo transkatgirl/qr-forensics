@@ -5,6 +5,7 @@ pub mod bch;
 pub mod bitstream;
 pub mod codewords;
 pub mod gf256;
+pub mod known;
 pub mod padding;
 pub mod pipeline;
 pub mod repair;

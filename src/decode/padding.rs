@@ -256,12 +256,13 @@ pub fn detect_padding(layout: &SymbolLayout, report: &DecodeReport) -> Option<Pa
         .max_by_key(|c| (c.score(), c.first_pad_codeword))
 }
 
-/// Pins for every pad codeword of a candidate. Manual pins are left alone.
+/// Pins for every pad codeword of a candidate. Pins made by hand, by the
+/// codeword or as known text, are left alone.
 fn pad_pins(layout: &SymbolLayout, candidate: &PadCandidate, pins: &mut Pins) -> usize {
     let mut added = 0;
     for j in candidate.first_pad_codeword..layout.data_stream.len() {
         let cw = layout.data_stream[j];
-        if pins.get(&cw).is_some_and(|p| p.source == PinSource::Manual) {
+        if pins.get(&cw).is_some_and(|p| p.source.is_by_hand()) {
             continue;
         }
         let pin = Pin {
@@ -357,8 +358,20 @@ pub fn recover_padding(
     pins: &Pins,
     opts: &DecodeOptions,
 ) -> Option<PaddingRecovery> {
-    let before = decode(grid, layout, mask, pins, opts);
-    let mut candidate = detect_padding(layout, &before)?;
+    recover_padding_after(grid, layout, mask, pins, opts, &decode(grid, layout, mask, pins, opts))
+}
+
+/// [`recover_padding`] for a caller that has already decoded the grid
+/// under these pins: `before` is that decode.
+pub fn recover_padding_after(
+    grid: &ModuleGrid,
+    layout: &SymbolLayout,
+    mask: u8,
+    pins: &Pins,
+    opts: &DecodeOptions,
+    before: &DecodeReport,
+) -> Option<PaddingRecovery> {
+    let mut candidate = detect_padding(layout, before)?;
     let mut first_pad = candidate.first_pad_codeword;
 
     let mut new_pins = pins.clone();
@@ -435,5 +448,5 @@ pub fn recover_padding(
 
 /// Drop every pin that padding recovery placed.
 pub fn clear_padding_pins(pins: &mut Pins) {
-    pins.retain(|_, pin| pin.source == PinSource::Manual);
+    pins.retain(|_, pin| pin.source.is_by_hand());
 }

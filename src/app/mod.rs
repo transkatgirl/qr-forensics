@@ -14,18 +14,19 @@ use std::sync::Arc;
 
 use eframe::egui;
 use qr_forensics::decode::codewords::{Pin, PinSource, Pins};
+use qr_forensics::decode::known::{Place, lay_over, text_pins, try_beginnings};
 use qr_forensics::decode::padding::{clear_padding_pins, detect_padding, recover_padding};
 use qr_forensics::decode::pipeline::{Attempt, DecodeOptions, analyze, brute_force, brute_force_mirrored, decode};
-use qr_forensics::decode::repair::{quiet_zone, render_rgba, repaired_grid};
+use qr_forensics::decode::repair::{quiet_zone, render_rgba, render_svg, repaired_grid};
 use qr_forensics::decode::sequence::Part;
 use qr_forensics::decode::text::Charset;
-use qr_forensics::imaging::adjust::{Adjust, LENS_MIN_PAIRS, estimate_k1, remap_point};
-use qr_forensics::imaging::photo::normalize_size;
+use qr_forensics::imaging::adjust::{Adjust, LENS_MIN_PAIRS, estimate_k1, remap_point, undistort};
+use qr_forensics::imaging::photo::{crop_box, enlarged, flatten_alpha};
 use qr_forensics::imaging::detect::{
-    Anchor, AnchorKind, Detection, SearchParams, anchor_sites, decodes_as_found, find_symbols_of_families,
-    refine_anchors, settle_loose_corners,
+    Anchor, AnchorKind, Detection, SEARCH_SIDE, SearchParams, anchor_sites, decodes_as_found, find_symbols_of_families,
+    find_symbols_with, refine_anchors, settle_loose_corners,
 };
-use qr_forensics::imaging::read::{ReadResult, read_outline};
+use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline};
 use qr_forensics::imaging::refine::{Refinement, refine_corners, refine_corners_holding};
 use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::sample::{Kernel, SampleParams, VersionGuess, classify, sample_modules_with, suggest_versions};
@@ -33,6 +34,7 @@ use qr_forensics::symbol::function_map::{FunctionMap, looks_inverted};
 use qr_forensics::symbol::grid::{Mirror, Module, Symmetry};
 use qr_forensics::symbol::layout::{CwId, SymbolLayout};
 use qr_forensics::symbol::{EcLevel, Family, SymbolVersion};
+use qr_forensics::work::{self, Cancel};
 use state::*;
 
 /// Pixels per module in exported images.
@@ -44,6 +46,18 @@ const UNDO: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers
 const REDO: egui::KeyboardShortcut =
     egui::KeyboardShortcut::new(egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT), egui::Key::Z);
 const OPEN: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
+/// Paste, as the menu shows it. The key itself never reaches the window
+/// as a shortcut: see [`App::shortcuts`].
+const PASTE: egui::KeyboardShortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::V);
+
+/// What the repaired symbol is saved as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExportFormat {
+    /// A bitmap, [`EXPORT_SCALE`] pixels a module.
+    Png,
+    /// A drawing, which scales to any size without blur.
+    Svg,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Transform {
@@ -119,6 +133,26 @@ pub(crate) enum Action {
     /// Adopt one of the symbols found: its version, outline and anchors.
     UseProposal(usize),
     ClearProposals,
+    /// Call off the search of the whole photo that is under way.
+    CancelSearch,
+    /// Call off the step of the alignment that is under way.
+    CancelJob,
+    /// Read every symbol the search found through to its message.
+    ReadFound,
+    /// Put the outline on one of the symbols read and write the grid as
+    /// it was read, with the pins it was read under.
+    LoadRead(usize),
+    /// Pin the text the user knows, at the place the inspector gives.
+    PinText,
+    /// Try the ways messages commonly begin and pin the one that error
+    /// correction bears out.
+    TryBeginnings,
+    /// Remove the pins made from known text.
+    ClearTextPins,
+    /// Cut the photo down to the outline, from its pixels as loaded.
+    CropToOutline,
+    /// Show the whole photo again after a crop.
+    ShowWholePhoto,
     /// Refine the corners and every anchor against the photo.
     RefineCorners,
     ClearAnchors,
@@ -131,8 +165,8 @@ pub(crate) enum Action {
     /// Write every corrected module and regenerated function pattern into
     /// the grid.
     ApplyCorrections,
-    /// Save the repaired symbol as a PNG.
-    ExportImage,
+    /// Save the repaired symbol as an image.
+    ExportImage(ExportFormat),
     DismissNotice,
     FitView,
     Quit,
@@ -153,7 +187,20 @@ struct PendingSearch {
     receiver: std::sync::mpsc::Receiver<Vec<Detection>>,
     /// The photo's Invert setting when the search began.
     photo_inverted: bool,
+    /// The one family searched for, when the search is not of every
+    /// family.
+    family: Option<Family>,
     started: std::time::Instant,
+    /// Calls the search off: asked when the search is dropped, whether
+    /// by the user or because its photo has gone, so that a thread no
+    /// one is waiting for does not go on searching.
+    cancel: Cancel,
+}
+
+impl Drop for PendingSearch {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 /// A slow step of the alignment running on a thread of its own: finding
@@ -172,6 +219,14 @@ struct PendingJob {
     version: SymbolVersion,
     receiver: std::sync::mpsc::Receiver<JobResult>,
     started: std::time::Instant,
+    /// Calls the job off, as a search's does: see [`PendingSearch`].
+    cancel: Cancel,
+}
+
+impl Drop for PendingJob {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 /// Which step a job is running, for the status bar and the buttons.
@@ -183,6 +238,8 @@ enum JobKind {
     Refine,
     /// Ranking the versions on the corners.
     Suggest,
+    /// Reading every symbol the search found.
+    ReadFound,
 }
 
 impl JobKind {
@@ -193,6 +250,7 @@ impl JobKind {
             JobKind::Adopt => "Placing the corners on the symbol found",
             JobKind::Refine => "Refining the corners and anchors",
             JobKind::Suggest => "Ranking the versions on these corners",
+            JobKind::ReadFound => "Reading the symbols found",
         }
     }
 }
@@ -208,6 +266,10 @@ enum JobResult {
     /// Refine: `None` when the corners form no usable outline.
     Refine(Option<Refined>),
     Suggest(Vec<VersionGuess>),
+    /// Read all: what each symbol found reads as, in the order of the
+    /// outlines the symbols had when the job began, and the photo's
+    /// Invert setting they were read under.
+    ReadFound { outlines: Vec<[[f64; 2]; 4]>, reads: Vec<Option<ReadResult>>, photo_inverted: bool },
 }
 
 /// A detection refined against the photo, with everything else that
@@ -239,6 +301,8 @@ struct ReadNote {
     verified: usize,
     blocks: usize,
     trustworthy: bool,
+    /// The read stands only with the symbol's padding pinned.
+    padding_pinned: bool,
     /// The grid read as the other QR Code model, which its format word
     /// named and which decoded.
     reinterpreted: Option<SymbolVersion>,
@@ -285,6 +349,11 @@ pub struct App {
     /// The EC level and mask were carried over during a stroke; settle them
     /// by brute force once it ends.
     settle_pending: bool,
+    /// The most a texture may measure on a side, as the window last said:
+    /// a photo larger than that is drawn through a texture shrunk to fit,
+    /// stretched over the photo's own pixels, which everything else
+    /// works in.
+    texture_limit: usize,
     #[cfg(feature = "selftest")]
     selftest: Option<selftest::SelfTest>,
 }
@@ -391,6 +460,8 @@ impl App {
             photo_generation: 0,
             message: None,
             settle_pending: false,
+            // What egui allows until a window says what its own limit is.
+            texture_limit: 2048,
             #[cfg(feature = "selftest")]
             selftest: selftest::SelfTest::from_env(),
         }
@@ -521,32 +592,58 @@ impl App {
         self.notify(format!("Reading the grid as {} version {version}.", version.family().label()));
     }
 
-    fn set_photo(&mut self, ctx: &egui::Context, name: String, image: image::RgbaImage) {
-        let image = normalize_size(image);
-        let (width, height) = (image.width() as usize, image.height() as usize);
-        let original = image.into_raw();
-        let adjust = Adjust::default();
-        let (display, luma) = adjust.apply(&original, width, height);
-        let texture = ctx.load_texture(
-            "photo",
-            egui::ColorImage::from_rgba_unmultiplied([width, height], &display),
-            egui::TextureOptions::LINEAR,
-        );
-        let photo = Photo { name, width, height, original, adjust, luma: Arc::new(luma), texture, binarised: None };
+    fn set_photo(&mut self, ctx: &egui::Context, name: String, mut image: image::RgbaImage) {
+        // On white where it is transparent, before anything is cut or
+        // resized from it.
+        flatten_alpha(&mut image);
         // The outline, the anchors and the adjustments are of the photo
         // they were placed on: the new photo starts without them, and no
         // undo or redo brings another photo's back onto it. The symbol,
         // the grid and its pins, stays as it is, with its own history.
-        self.history.photo_changed(&self.doc);
+        self.show_photo(ctx, name, Arc::new(image), None, Adjust::default());
+        let Some(photo) = &self.photo else { return };
         self.doc.corners = photo.default_corners();
         self.doc.anchors.clear();
-        self.doc.adjust = adjust;
-        let loaded = format!(
-            "Loaded {} ({width} × {height}). Press Search whole photo to look for the symbols in it, or drag the \
-             corners loosely around the symbol and press Find in outline.",
-            photo.name
+        let (width, height) = (photo.width, photo.height);
+        let mut loaded = format!("Loaded {} ({width} × {height}", photo.name);
+        if photo.scale() > 1.0 {
+            loaded.push_str(&format!(
+                ", enlarged {:.0} times from {} × {} so that its modules can be seen",
+                photo.scale(),
+                photo.source.width(),
+                photo.source.height()
+            ));
+        }
+        loaded.push_str(
+            "). Press Search whole photo to look for the symbols in it, or drag the corners loosely around the symbol \
+             and press Find in outline.",
         );
-        self.photo = Some(photo);
+        if width.max(height) > SEARCH_SIDE {
+            loaded.push_str(&format!(
+                " A photo this large is searched whole in a copy reduced to {SEARCH_SIDE} pixels on its longer side; an \
+                 outline is read in the photo's own pixels. If the search misses a small symbol, draw the outline \
+                 round it and press Find in outline, or Crop to outline and search again.",
+            ));
+        }
+        // The photo is searched for symbols only when the user asks: a
+        // search takes seconds, and the outline may as well be drawn by
+        // hand.
+        self.notify(loaded);
+    }
+
+    /// Put a photo as loaded, or the part `crop` of it, on show under
+    /// `adjust`: its working copy, luminance and texture made, and
+    /// whatever was found or under way on the photo shown before
+    /// dropped. Where the outline and anchors go is the caller's to say.
+    fn show_photo(&mut self, ctx: &egui::Context, name: String, source: Arc<image::RgbaImage>, crop: Option<Crop>, adjust: Adjust) {
+        let original = working_copy(&source, crop);
+        let (width, height) = (original.width() as usize, original.height() as usize);
+        let (display, luma) = adjust.apply(original.as_raw(), width, height);
+        self.texture_limit = ctx.input(|i| i.max_texture_side);
+        let texture = ctx.load_texture("photo", texture_image(display, width, height, self.texture_limit), egui::TextureOptions::LINEAR);
+        self.history.photo_changed(&self.doc);
+        self.doc.adjust = adjust;
+        self.photo = Some(Photo { name, width, height, source, crop, original, adjust, luma: Arc::new(luma), texture, binarised: None });
         self.view.stage = Stage::Align;
         self.view.align_view.auto_fit = true;
         self.view.binarize_auto = true;
@@ -558,22 +655,91 @@ impl App {
         self.search = None;
         self.job = None;
         self.photo_generation += 1;
-        // The photo is searched for symbols only when the user asks: a
-        // search takes seconds, and the outline may as well be drawn by
-        // hand.
-        self.notify(loaded);
+    }
+
+    /// Show another part of the photo as loaded, `rect` of it or the
+    /// whole, with the outline and the anchors carried to where they lie
+    /// in it. A lens term in force is of the whole photo, about its
+    /// centre, and means nothing of a part: the part is cut from the
+    /// photo straightened by it, and takes 0 for its own, and the whole
+    /// photo takes the term back. Returns how many times the part now on
+    /// show was enlarged, one for a part that needed none of it; `None`
+    /// with no photo.
+    fn reframe(&mut self, ctx: &egui::Context, rect: Option<[u32; 4]>) -> Option<f64> {
+        let old = self.photo.as_ref()?;
+        let lens = old.crop.map_or(self.doc.adjust.k1, |crop| crop.k1);
+        let crop = rect.map(|rect| Crop { rect, k1: lens });
+        let adjust = Adjust { k1: if crop.is_some() { 0.0 } else { lens }, ..self.doc.adjust };
+        let corners = self.doc.corners.map(|c| old.to_source(c));
+        let mut anchors = self.doc.anchors.clone();
+        for anchor in &mut anchors {
+            anchor.anchor.center = old.to_source(anchor.anchor.center);
+        }
+        let (name, source) = (old.name.clone(), old.source.clone());
+        self.show_photo(ctx, name, source, crop, adjust);
+        let new = self.photo.as_ref()?;
+        self.doc.corners = corners.map(|c| new.to_working(c));
+        for anchor in &mut anchors {
+            anchor.anchor.center = new.to_working(anchor.anchor.center);
+        }
+        self.doc.anchors = anchors;
+        Some(new.scale())
+    }
+
+    /// Cut the photo down to the outline, with room about it. A search of
+    /// the whole photo looks at a copy no larger than [`SEARCH_SIDE`],
+    /// and then sees that part at its own size; every change of the
+    /// adjustments works on that part alone; and a part too small for
+    /// its modules to be seen is enlarged as a small photo is.
+    fn crop_to_outline(&mut self, ctx: &egui::Context) {
+        let Some(photo) = &self.photo else {
+            self.fail("Load a photo first.");
+            return;
+        };
+        let (width, height) = photo.source.dimensions();
+        let rect = crop_box(self.doc.corners.map(|c| photo.to_source(c)), width, height);
+        let Some(rect) = rect.filter(|&rect| rect != photo.crop.map_or([0, 0, width, height], |crop| crop.rect)) else {
+            self.fail(
+                "There is nothing to crop to: drag the corners around the symbol first, so that the outline takes in \
+                 less than the photo on show and lies on it.",
+            );
+            return;
+        };
+        let lens = photo.crop.is_none() && self.doc.adjust.k1 != 0.0;
+        let Some(enlarged) = self.reframe(ctx, Some(rect)) else { return };
+        let mut text = format!("Cropped to the outline: {} × {} pixels of the photo as loaded", rect[2], rect[3]);
+        if enlarged > 1.0 {
+            text.push_str(&format!(", enlarged {enlarged:.0} times so that the modules can be seen"));
+        }
+        text.push_str(". What was found in the photo was dropped with the rest of it: search, or Find in outline, again.");
+        if lens {
+            text.push_str(" The lens setting was applied before the cut, and is 0 for the cropped photo.");
+        }
+        self.notify(text);
+    }
+
+    /// Put the whole photo back on show after a crop.
+    fn show_whole_photo(&mut self, ctx: &egui::Context) {
+        if self.photo.as_ref().is_none_or(|photo| photo.crop.is_none()) {
+            return;
+        }
+        if self.reframe(ctx, None).is_some()
+            && let Some(photo) = &self.photo
+        {
+            self.notify(format!(
+                "Showing the whole photo again ({} × {}). The outline and anchors are where they were on it.",
+                photo.width, photo.height
+            ));
+        }
     }
 
     /// Recompute the photo's luminance and texture after a change to its
     /// adjustments.
     fn reapply_adjust(&mut self) {
         if let Some(photo) = &mut self.photo {
-            let (display, luma) = photo.adjust.apply(&photo.original, photo.width, photo.height);
+            let (display, luma) = photo.adjust.apply(photo.original.as_raw(), photo.width, photo.height);
             photo.luma = Arc::new(luma);
-            photo.texture.set(
-                egui::ColorImage::from_rgba_unmultiplied([photo.width, photo.height], &display),
-                egui::TextureOptions::LINEAR,
-            );
+            photo.texture.set(texture_image(display, photo.width, photo.height, self.texture_limit), egui::TextureOptions::LINEAR);
             photo.binarised = None;
         }
     }
@@ -645,8 +811,14 @@ impl App {
     }
 
     fn paste_image(&mut self, ctx: &egui::Context) {
-        let pasted = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_image());
-        match pasted {
+        let mut clipboard = match arboard::Clipboard::new() {
+            Ok(clipboard) => clipboard,
+            Err(error) => {
+                self.fail(format!("The clipboard could not be read ({error})."));
+                return;
+            }
+        };
+        match clipboard.get_image() {
             Ok(data) => {
                 let (w, h) = (data.width as u32, data.height as u32);
                 match image::RgbaImage::from_raw(w, h, data.bytes.into_owned()) {
@@ -654,7 +826,13 @@ impl App {
                     None => self.fail("The clipboard image has an unexpected layout."),
                 }
             }
-            Err(error) => self.fail(format!("No image on the clipboard ({error}).")),
+            // A file copied in a file manager is on the clipboard by its
+            // path, not its pixels: it is opened as one dropped on the
+            // window is.
+            Err(error) => match clipboard.get().file_list() {
+                Ok(files) if !files.is_empty() => self.load_path(ctx, &files[0]),
+                _ => self.fail(format!("No image on the clipboard ({error}).")),
+            },
         }
     }
 
@@ -713,8 +891,9 @@ impl App {
         let luma = photo.luma.clone();
         let searched_inverted = photo.adjust.invert;
         let (version, corners, params, opts) = (self.doc.version, self.doc.corners, self.view.sample, self.opts);
+        let own_family_only = self.view.own_family_only;
         self.start_job(ctx, JobKind::FindCorners, move || {
-            JobResult::Corners(read_inside(&luma, version, corners, &params, &opts, searched_inverted))
+            JobResult::Corners(read_inside(&luma, version, corners, &params, &opts, searched_inverted, own_family_only))
         });
     }
 
@@ -727,6 +906,13 @@ impl App {
             self.fail("Load a photo first.");
             return;
         };
+        if photo.crop.is_some() {
+            self.fail(
+                "A lens bends the photo about its centre, which a cropped photo has lost: show the whole photo, fit \
+                 the lens there, and crop again.",
+            );
+            return;
+        }
         let (width, height) = (photo.width, photo.height);
         let (w, h) = (self.derived.func.width as f64, self.derived.func.height as f64);
         let mut pairs: Vec<([f64; 2], [f64; 2])> =
@@ -783,6 +969,13 @@ impl App {
                     None => self.notify(text),
                 }
             }
+            None if self.view.own_family_only => self.fail(format!(
+                "No {} finder pattern was found inside the outline. Draw the outline loosely around the whole symbol, \
+                 so that its finder patterns are inside, and try again; or untick Only look for {} to try the other \
+                 families.",
+                searched.label(),
+                searched.label()
+            )),
             None => self.fail(
                 "No finder pattern of any family was found inside the outline. Draw the outline loosely around the \
                  whole symbol, so that its finder patterns are inside, and try again; or press Search whole \
@@ -901,10 +1094,12 @@ impl App {
     /// running.
     fn start_job(&mut self, ctx: &egui::Context, kind: JobKind, work: impl FnOnce() -> JobResult + Send + 'static) {
         let (sender, receiver) = std::sync::mpsc::channel();
-        let ctx = ctx.clone();
+        let cancel = Cancel::new();
+        let (ctx, request) = (ctx.clone(), cancel.clone());
         std::thread::spawn(move || {
-            let result = work();
-            // The window may have closed meanwhile; nothing to do then.
+            let result = request.scope(work);
+            // The window may have closed meanwhile, or the job been
+            // called off; nothing to do then.
             let _ = sender.send(result);
             ctx.request_repaint();
         });
@@ -914,6 +1109,7 @@ impl App {
             version: self.doc.version,
             receiver,
             started: std::time::Instant::now(),
+            cancel,
         });
     }
 
@@ -961,12 +1157,14 @@ impl App {
                  Suggest version again.",
             ),
             JobResult::Suggest(guesses) => self.guesses = Some(guesses),
+            JobResult::ReadFound { outlines, reads, photo_inverted } => self.finish_read_found(&outlines, reads, photo_inverted),
         }
     }
 
     /// Search the whole photo for symbols of every family and offer what
-    /// is found, as a reader tries every symbology it knows. Only ever at
-    /// the user's asking.
+    /// is found, as a reader tries every symbology it knows; or for the
+    /// family in use alone, when that is asked. Only ever at the user's
+    /// asking.
     fn search_symbols(&mut self, ctx: &egui::Context) {
         let Some(photo) = &self.photo else {
             self.fail("Load a photo first.");
@@ -980,7 +1178,11 @@ impl App {
         let luma = photo.luma.clone();
         let params = self.view.sample;
         let search = self.view.search;
-        self.start_search(ctx, photo_inverted, move || find_symbols_of_every_family(&luma, &params, &search));
+        let family = self.view.own_family_only.then(|| self.doc.version.family());
+        self.start_search(ctx, photo_inverted, family, move || match family {
+            Some(family) => find_symbols_of_family(&luma, family, &params, &search),
+            None => find_symbols_of_every_family(&luma, &params, &search),
+        });
     }
 
     /// Run `work`, a search of the photo, on a thread of its own;
@@ -990,13 +1192,16 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         photo_inverted: bool,
+        family: Option<Family>,
         work: impl FnOnce() -> Vec<Detection> + Send + 'static,
     ) {
         let (sender, receiver) = std::sync::mpsc::channel();
-        let ctx = ctx.clone();
+        let cancel = Cancel::new();
+        let (ctx, request) = (ctx.clone(), cancel.clone());
         std::thread::spawn(move || {
-            let found = work();
-            // The window may have closed meanwhile; nothing to do then.
+            let found = request.scope(work);
+            // The window may have closed meanwhile, or the search been
+            // called off; nothing to do then.
             let _ = sender.send(found);
             ctx.request_repaint();
         });
@@ -1004,7 +1209,9 @@ impl App {
             generation: self.photo_generation,
             receiver,
             photo_inverted,
+            family,
             started: std::time::Instant::now(),
+            cancel,
         });
     }
 
@@ -1031,17 +1238,25 @@ impl App {
         if search.generation != self.photo_generation || self.photo.is_none() {
             return;
         }
-        self.finish_search(found, search.photo_inverted);
+        self.finish_search(found, search.photo_inverted, search.family);
     }
 
-    /// Offer what a search of the whole photo found.
-    fn finish_search(&mut self, found: Vec<Detection>, photo_inverted: bool) {
+    /// Offer what a search of the whole photo found. `family` is the one
+    /// family it looked for, when it did not look for every one.
+    fn finish_search(&mut self, found: Vec<Detection>, photo_inverted: bool, family: Option<Family>) {
         if found.is_empty() {
             self.proposals = None;
-            self.fail(
-                "No symbol of any family was found in the photo. Drag the corners loosely around the symbol and \
-                 press Find in outline.",
-            );
+            self.fail(match family {
+                Some(family) => format!(
+                    "No {} symbol was found in the photo. Drag the corners loosely around the symbol and press Find in \
+                     outline, or untick Only look for {} to search for the other families.",
+                    family.label(),
+                    family.label()
+                ),
+                None => "No symbol of any family was found in the photo. Drag the corners loosely around the symbol and \
+                         press Find in outline."
+                    .to_owned(),
+            });
             return;
         }
         let count = found.len();
@@ -1052,11 +1267,137 @@ impl App {
             .as_ref()
             .and_then(|before| proposal_in_use(before, &self.doc.corners))
             .and_then(|_| found.iter().position(|f| same_outline(&f.corners, &self.doc.corners)));
-        self.proposals = Some(Proposals { found, photo_inverted, adopted });
+        self.proposals = Some(Proposals { found, photo_inverted, adopted, reads: None });
         self.view.stage = Stage::Align;
         let what = if count == 1 { "Found 1 symbol".to_owned() } else { format!("Found {count} symbols") };
-        let how = "outlined on the photo. Pick one under Alignment, or click its outline, to place the corners on it.";
+        let how = "outlined on the photo. Pick one under Alignment, or click its outline, to place the corners on it; \
+                   or press Read all to read every one through to its message.";
         self.notify(format!("{what}, {how}"));
+    }
+
+    /// Read every symbol the search found through to its message, each
+    /// as the command line reads one, on a thread of their own and side
+    /// by side.
+    fn read_found(&mut self, ctx: &egui::Context) {
+        if self.job_busy() {
+            return;
+        }
+        let (Some(photo), Some(proposals)) = (&self.photo, &self.proposals) else {
+            self.fail("There are no symbols found to read: press Search whole photo first.");
+            return;
+        };
+        let luma = photo.luma.clone();
+        let photo_inverted = photo.adjust.invert;
+        // A detection says how its symbol read against the photo as it
+        // was searched: with Invert photo changed since, the symbol reads
+        // the other way against the photo as it is.
+        let flipped = proposals.photo_inverted != photo_inverted;
+        let found: Vec<Detection> = proposals.found.iter().map(|found| Detection { inverted: found.inverted ^ flipped, ..found.clone() }).collect();
+        let (params, opts) = (self.view.sample, self.opts);
+        self.start_job(ctx, JobKind::ReadFound, move || {
+            let outlines = found.iter().map(|found| found.corners).collect();
+            let reads = work::map(&found, |found| read_detection(&luma, found.clone(), &params, &opts));
+            JobResult::ReadFound { outlines, reads, photo_inverted }
+        });
+    }
+
+    /// Take in what Read all read: the reads are listed beside the
+    /// symbols, and the parts of a structured append message among those
+    /// that decoded are put in the sequence.
+    fn finish_read_found(&mut self, outlines: &[[[f64; 2]; 4]], reads: Vec<Option<ReadResult>>, photo_inverted: bool) {
+        let name = self.photo.as_ref().map_or_else(String::new, |photo| photo.name.clone());
+        let same_list = |proposals: &&mut Proposals| proposals.found.iter().map(|found| &found.corners).eq(outlines);
+        let Some(proposals) = self.proposals.as_mut().filter(same_list) else {
+            self.notify("The list of symbols found changed while they were being read, so the reads were dropped; press Read all again.");
+            return;
+        };
+        let decoded = reads.iter().flatten().filter(|read| read.is_trustworthy()).count();
+        let mut parts = 0;
+        for (i, read) in reads.iter().enumerate() {
+            if let Some(read) = read.as_ref().filter(|read| read.is_trustworthy())
+                && let Some(part) = Part::from_report(&read.report, format!("{name}, symbol {}", i + 1))
+            {
+                self.view.sequence.add(part);
+                parts += 1;
+            }
+        }
+        let total = reads.len();
+        proposals.reads = Some(FoundReads { results: reads, photo_inverted });
+        let mut text = format!("Read {decoded} of {total} symbols found through to a message; they are listed under Symbols read.");
+        if decoded < total {
+            text.push_str(" Load one that did not decode to work on its grid.");
+        }
+        if parts > 0 {
+            let what = if parts == 1 { "1 part".to_owned() } else { format!("{parts} parts") };
+            text.push_str(&format!(" {what} of a structured append message went into the sequence."));
+        }
+        self.notify(text);
+    }
+
+    /// Put the outline on a symbol Read all read, and make the document
+    /// what was read there: the symbol's version, the modules as they
+    /// were sampled, and the pins the read was made under.
+    fn load_read(&mut self, i: usize) {
+        // A step under way would lay what it works out over what is
+        // loaded here.
+        if self.job_busy() {
+            return;
+        }
+        let picked = self.proposals.as_ref().and_then(|proposals| {
+            let reads = proposals.reads.as_ref()?;
+            Some((reads.results.get(i)?.clone()?, reads.photo_inverted))
+        });
+        let (Some((read, read_inverted)), true) = (picked, self.photo.is_some()) else {
+            self.fail("That symbol has no read to load; press Read all again.");
+            return;
+        };
+        self.checkpoint();
+        let (version, decoded, padding_pinned) = (read.version(), read.is_trustworthy(), read.padding_pinned());
+        let (verified, blocks) = (read.report.blocks_verified(), read.report.blocks.len());
+        let mut found = read.detection;
+        if read.reinterpreted.is_some() {
+            // Read as the other QR Code model, whose anchors are its
+            // finders alone.
+            found.version = version;
+            found.anchors.retain(|a| a.kind != AnchorKind::Alignment);
+        }
+        let pins_ec = (!read.pins.is_empty()).then_some(read.report.ec);
+        self.doc = Document { grid: read.grid, pins: read.pins, pins_ec, ..self.doc.blank_like(version) };
+        self.view.selected = None;
+        self.view.highlight_block = None;
+        self.view.table_block = None;
+        self.view.picked_char = None;
+        self.view.edit_view.auto_fit = true;
+        self.brute = None;
+        self.guesses = None;
+        self.model = None;
+        self.preview = None;
+        self.dirty = true;
+        self.set_photo_invert(read_inverted ^ found.inverted);
+        self.doc.corners = found.corners;
+        self.doc.anchors = found.anchors.iter().map(|&anchor| DocAnchor { anchor, source: AnchorSource::Detected }).collect();
+        // What read this symbol is what Sample would have to use to read
+        // it the same again.
+        if decoded {
+            self.view.sample.kernel = read.kernel;
+            self.view.sample.local = read.local;
+        }
+        if let Some(proposals) = &mut self.proposals {
+            proposals.adopted = Some(i);
+        }
+        self.detection = Some(found);
+        self.view.stage = Stage::Edit;
+        let how = match (decoded, padding_pinned) {
+            (true, true) => "it decodes with its padding pinned, and the pins are in place".to_owned(),
+            (true, false) => "it decodes".to_owned(),
+            (false, _) => format!("{verified} of {blocks} blocks verified"),
+        };
+        self.notify(format!(
+            "Loaded symbol {} as it was read, {} {version}: {how}. The outline and anchors are on it and the grid holds \
+             its modules as sampled (undoable).",
+            i + 1,
+            version.family().label()
+        ));
     }
 
     /// Take a detection a job refined and made ready as the document's
@@ -1171,7 +1512,14 @@ impl App {
                 " Read through: {} of {} blocks verified{}.",
                 read.verified,
                 read.blocks,
-                if read.trustworthy { ", the message decodes" } else { "" }
+                match (read.trustworthy, read.padding_pinned) {
+                    (true, true) => {
+                        ", the message decodes once its padding is pinned: after sampling, press Pin the padding \
+                         under Padding recovery and pins"
+                    }
+                    (true, false) => ", the message decodes",
+                    (false, _) => "",
+                }
             ));
             if let Some(other) = read.reinterpreted {
                 text.push_str(&format!(" The format bits name {}, and the grid reads as one.", other.family().label()));
@@ -1490,6 +1838,28 @@ impl App {
                 self.adopt_proposal(ctx, found, photo_inverted);
             }
             Action::ClearProposals => self.proposals = None,
+            Action::CancelSearch => {
+                // Dropping the search calls it off: its thread stops at
+                // the next turn of its loop.
+                if self.search.take().is_some() {
+                    self.notify("The search of the photo was called off.");
+                }
+            }
+            Action::CancelJob => {
+                if let Some(job) = self.job.take() {
+                    self.notify(format!("{} was called off; nothing was changed.", job.kind.label()));
+                }
+            }
+            Action::ReadFound => self.read_found(ctx),
+            Action::LoadRead(i) => self.load_read(i),
+            Action::CropToOutline => self.crop_to_outline(ctx),
+            Action::ShowWholePhoto => self.show_whole_photo(ctx),
+            Action::PinText => self.pin_text(),
+            Action::TryBeginnings => self.pin_a_beginning(),
+            Action::ClearTextPins => {
+                self.begin_edit();
+                self.doc.pins.retain(|_, pin| pin.source != PinSource::Text);
+            }
             Action::RefineCorners => self.refine(ctx),
             Action::SetAdjust(adjust) => {
                 if self.doc.adjust != adjust {
@@ -1587,13 +1957,17 @@ impl App {
                 };
                 self.notify(format!("Applied corrections: {changed} modules changed.{rest}"));
             }
-            Action::ExportImage => {
+            Action::ExportImage(format) => {
+                let (what, extension) = match format {
+                    ExportFormat::Png => ("PNG image", "png"),
+                    ExportFormat::Svg => ("SVG image", "svg"),
+                };
                 let picked = rfd::FileDialog::new()
-                    .add_filter("PNG image", &["png"])
-                    .set_file_name("repaired.png")
+                    .add_filter(what, &[extension])
+                    .set_file_name(format!("repaired.{extension}"))
                     .save_file();
                 let Some(path) = picked else { return };
-                self.export_image(&path);
+                self.export_image(&path, format);
             }
             Action::AddToSequence => {
                 let label = self.photo.as_ref().map_or_else(|| "grid".to_owned(), |p| p.name.clone());
@@ -1633,14 +2007,98 @@ impl App {
         }
     }
 
-    /// Save the grid as error correction leaves it as a PNG at `path`,
+    /// Pin the text the inspector's Known text holds, at the place it
+    /// gives, and say what that did.
+    fn pin_text(&mut self) {
+        let place = if self.view.known_from_start { Place::Start(self.view.known_mode) } else { Place::Char(self.view.known_at) };
+        let found = text_pins(&self.derived.layout, &self.derived.report, place, &self.view.known_text, self.opts.charset);
+        let found = match found {
+            Ok(found) => found,
+            Err(error) => {
+                self.fail(format!("The text was not pinned: {error}."));
+                return;
+            }
+        };
+        let before = self.derived.report.blocks_verified();
+        self.begin_edit();
+        // Pins made under another EC level name other codewords.
+        if self.doc.pins_ec != Some(self.derived.ec) {
+            self.doc.pins.clear();
+            self.doc.pins_ec = Some(self.derived.ec);
+        }
+        lay_over(&mut self.doc.pins, &found.pins);
+        self.refresh();
+        let (after, total) = (self.derived.report.blocks_verified(), self.derived.report.blocks.len());
+        let progress = if after > before {
+            format!("{after} of {total} blocks now verify, up from {before}")
+        } else {
+            format!("{after} of {total} blocks verify, as before")
+        };
+        let mut text = format!("Pinned {} characters in {} codewords: {progress}.", found.pinned, found.pins.len());
+        if found.left_out > 0 {
+            text.push_str(&format!(
+                " {} at the ends were left out: they are packed in a group with characters that were not given.",
+                found.left_out
+            ));
+        }
+        if found.contradicted > 0 {
+            text.push_str(&format!(
+                " {} of the bits pinned differ from bits error correction had confirmed: check the text and where it \
+                 starts, or undo.",
+                found.contradicted
+            ));
+        }
+        self.notify(text);
+    }
+
+    /// Try the ways messages commonly begin and pin the one that error
+    /// correction bears out, when one is.
+    fn pin_a_beginning(&mut self) {
+        let pins = self.active_pins();
+        let (before, total) = (self.derived.report.blocks_verified(), self.derived.report.blocks.len());
+        let found = try_beginnings(&self.doc.grid, &self.derived.layout, self.derived.mask, &pins, &self.opts, &self.derived.report);
+        let Some(found) = found else {
+            self.fail(
+                "None of the common beginnings made a block verify that had not: either the message begins some other \
+                 way, or its first block is too damaged for a beginning alone to solve. Type what you know of it under \
+                 Known text.",
+            );
+            return;
+        };
+        self.begin_edit();
+        self.doc.pins = found.pins;
+        self.doc.pins_ec = Some(self.derived.ec);
+        self.view.known_text = found.text.to_owned();
+        match found.place {
+            Place::Char(at) => (self.view.known_from_start, self.view.known_at) = (false, at),
+            Place::Start(mode) => (self.view.known_from_start, self.view.known_mode) = (true, mode),
+        }
+        self.notify(format!(
+            "The message begins {:?}: with that pinned, {} of {total} blocks verify, up from {before}.",
+            found.text,
+            found.report.blocks_verified()
+        ));
+    }
+
+    /// Save the grid as error correction leaves it as an image at `path`,
     /// and say what was saved: a symbol whose every block solved is the
     /// repaired one, which an ordinary reader can scan, and anything
     /// short of that is said to be.
-    fn export_image(&mut self, path: &Path) {
+    fn export_image(&mut self, path: &Path, format: ExportFormat) {
         let repaired = repaired_grid(&self.doc.grid, &self.derived.layout, self.derived.mask, &self.derived.report);
-        let (w, h, pixels) = render_rgba(&repaired, EXPORT_SCALE, quiet_zone(self.doc.version));
-        let saved = image::save_buffer(path, &pixels, w as u32, h as u32, image::ExtendedColorType::Rgba8);
+        let quiet = quiet_zone(self.doc.version);
+        let (w, h, saved) = match format {
+            ExportFormat::Png => {
+                let (w, h, pixels) = render_rgba(&repaired, EXPORT_SCALE, quiet);
+                let saved = image::save_buffer(path, &pixels, w as u32, h as u32, image::ExtendedColorType::Rgba8);
+                (w, h, saved.map_err(|error| error.to_string()))
+            }
+            ExportFormat::Svg => {
+                let (w, h) = ((repaired.width() + 2 * quiet) * EXPORT_SCALE, (repaired.height() + 2 * quiet) * EXPORT_SCALE);
+                let saved = std::fs::write(path, render_svg(&repaired, EXPORT_SCALE, quiet));
+                (w, h, saved.map_err(|error| error.to_string()))
+            }
+        };
         match saved {
             Ok(()) => {
                 let unknown = repaired.count(Module::Unknown);
@@ -1671,7 +2129,17 @@ impl App {
         if open {
             actions.push(Action::OpenImage);
         }
-        if ui.ctx().egui_wants_keyboard_input() {
+        let typing = ui.ctx().egui_wants_keyboard_input();
+        let (pasted, released) = ui.input(|i| {
+            let released = |event: &egui::Event| {
+                matches!(event, egui::Event::Key { key: egui::Key::V, pressed: false, modifiers, .. } if modifiers.command)
+            };
+            (i.events.iter().any(|event| matches!(event, egui::Event::Paste(_))), i.events.iter().any(released))
+        });
+        if paste_asked(pasted, released, typing, &mut self.view.pasted_on_press) {
+            actions.push(Action::PasteImage);
+        }
+        if typing {
             return;
         }
         ui.input(|i| {
@@ -1699,6 +2167,7 @@ impl App {
             if i.key_pressed(egui::Key::Escape) {
                 self.view.selected = None;
                 self.view.highlight_block = None;
+                self.view.picked_char = None;
             }
         });
     }
@@ -1712,7 +2181,7 @@ impl App {
                 if ui.add(shortcut(ui, "Open Image…", &OPEN)).clicked() {
                     actions.push(Action::OpenImage);
                 }
-                if ui.button("Paste Image from Clipboard").clicked() {
+                if ui.add(shortcut(ui, "Paste Image from Clipboard", &PASTE)).clicked() {
                     actions.push(Action::PasteImage);
                 }
                 if ui.add_enabled(self.photo.is_some(), egui::Button::new("Close Image")).clicked() {
@@ -1724,7 +2193,14 @@ impl App {
                 }
                 ui.separator();
                 if ui.button("Export Repaired Image…").clicked() {
-                    actions.push(Action::ExportImage);
+                    actions.push(Action::ExportImage(ExportFormat::Png));
+                }
+                if ui
+                    .button("Export Repaired Image as SVG…")
+                    .on_hover_text("A drawing, which prints and scales at any size without blur")
+                    .clicked()
+                {
+                    actions.push(Action::ExportImage(ExportFormat::Svg));
                 }
                 ui.separator();
                 if ui.button("Quit").clicked() {
@@ -1792,17 +2268,24 @@ impl App {
             // and a search may run side by side.
             let mut running = Vec::new();
             if let Some(job) = &self.job {
-                running.push(format!("{}… {:.0} s", job.kind.label(), job.started.elapsed().as_secs_f32()));
+                running.push((format!("{}… {:.0} s", job.kind.label(), job.started.elapsed().as_secs_f32()), Action::CancelJob));
             }
             if let Some(search) = &self.search {
-                running.push(format!(
-                    "Searching the photo for symbols of every family… {:.0} s",
-                    search.started.elapsed().as_secs_f32()
-                ));
+                let what = search.family.map_or("symbols of every family".to_owned(), |family| format!("{} symbols", family.label()));
+                let text = format!("Searching the photo for {what}… {:.0} s", search.started.elapsed().as_secs_f32());
+                running.push((text, Action::CancelSearch));
             }
             if !running.is_empty() {
                 ui.spinner();
-                ui.label(running.join("  ·  "));
+                for (i, (text, stop)) in running.into_iter().enumerate() {
+                    if i > 0 {
+                        ui.label("·");
+                    }
+                    ui.label(text);
+                    if ui.small_button("Stop").on_hover_text("Call it off. Nothing it has worked out so far is taken in.").clicked() {
+                        actions.push(stop);
+                    }
+                }
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
             } else if let Some((x, y)) = self.view.hover
                 && self.view.stage == Stage::Edit
@@ -1855,6 +2338,17 @@ impl App {
         if self.settle_pending && self.view.stroke.is_none() {
             self.dirty = true;
         }
+        // A photo opened before the window had said how large a texture
+        // may be, as one named on the command line is, was drawn through
+        // a texture no larger than egui allows unasked: it is made again
+        // when the limit turns out to be another.
+        let limit = ui.input(|i| i.max_texture_side);
+        if limit != self.texture_limit {
+            let before = std::mem::replace(&mut self.texture_limit, limit);
+            if self.photo.as_ref().is_some_and(|photo| photo.width.max(photo.height) > before.min(limit)) {
+                self.reapply_adjust();
+            }
+        }
         self.catch_up();
         self.poll_search();
         self.poll_job();
@@ -1885,6 +2379,24 @@ impl App {
             ctx.request_repaint();
         }
     }
+}
+
+/// Whether a frame's input asks for the image on the clipboard to be
+/// pasted. Paste never arrives as a shortcut: the window's backend turns
+/// the press into a paste of the clipboard's text, and when the
+/// clipboard holds none, as with a screenshot on it, sends nothing for
+/// the press at all; only the key's release comes through. So a paste of
+/// text is taken as the request, and so is the release of the key when
+/// its press brought none, which `pasted_on_press` remembers between the
+/// two. While a text field has the keyboard, `typing`, a paste is the
+/// field's and asks nothing here.
+fn paste_asked(pasted: bool, released: bool, typing: bool, pasted_on_press: &mut bool) -> bool {
+    *pasted_on_press |= pasted;
+    let asked = !typing && (pasted || (released && !*pasted_on_press));
+    if released {
+        *pasted_on_press = false;
+    }
+    asked
 }
 
 /// Short name for an EC level in the context of a version.
@@ -1920,8 +2432,13 @@ fn read_inside(
     params: &SampleParams,
     opts: &DecodeOptions,
     searched_inverted: bool,
+    own_family_only: bool,
 ) -> Option<(Prepared, Option<Family>)> {
-    let (read, other) = read_outline_of_any_family(luma, version, corners, params, opts)?;
+    let (read, other) = if own_family_only {
+        (read_outline(luma, version, corners, params, opts)?, None)
+    } else {
+        read_outline_of_any_family(luma, version, corners, params, opts)?
+    };
     let asked = other.map_or(version, family_start);
     Some((prepared_from_read(luma, asked, read, searched_inverted, params), other))
 }
@@ -1956,25 +2473,35 @@ pub(crate) fn read_outline_of_any_family(
     }
     let current = version.family();
     let mut best: Option<(ReadResult, Option<Family>)> = own.map(|read| (read, None));
-    for family in Family::SEARCHED.into_iter().filter(|&f| f != current) {
-        let Some(read) = read_outline(luma, family_start(family), corners, params, opts) else { continue };
-        let vouched = read.is_trustworthy()
-            || (read.detection.info.named_version == Some(read.detection.version)
-                && read.detection.score() >= OTHER_FAMILY_SCORE);
-        if !vouched || quad_area(&read.detection.corners) < OTHER_FAMILY_FILL * quad_area(&corners) {
-            continue;
-        }
-        if read.is_trustworthy() {
-            return Some((read, Some(family)));
-        }
-        let outranks = |held: &ReadResult| {
-            standing(read.report.blocks_verified(), read.agreement) > standing(held.report.blocks_verified(), held.agreement)
-        };
-        if best.as_ref().is_none_or(|(held, _)| outranks(held)) {
-            best = Some((read, Some(family)));
-        }
-    }
-    best
+    // The other families side by side, the read asked for having come to
+    // nothing, and each taken in the families' order.
+    let others: Vec<Family> = Family::SEARCHED.into_iter().filter(|&f| f != current).collect();
+    let mut decoded = None;
+    work::in_turn(
+        &others,
+        |&family| (family, if work::cancelled() { None } else { read_outline(luma, family_start(family), corners, params, opts) }),
+        |(family, read)| {
+            let Some(read) = read else { return false };
+            let vouched = read.is_trustworthy()
+                || (read.detection.info.named_version == Some(read.detection.version)
+                    && read.detection.score() >= OTHER_FAMILY_SCORE);
+            if !vouched || quad_area(&read.detection.corners) < OTHER_FAMILY_FILL * quad_area(&corners) {
+                return false;
+            }
+            if read.is_trustworthy() {
+                decoded = Some((read, Some(family)));
+                return true;
+            }
+            let outranks = |held: &ReadResult| {
+                standing(read.report.blocks_verified(), read.agreement) > standing(held.report.blocks_verified(), held.agreement)
+            };
+            if best.as_ref().is_none_or(|(held, _)| outranks(held)) {
+                best = Some((read, Some(family)));
+            }
+            false
+        },
+    );
+    decoded.or(best)
 }
 
 /// What a read that did not decode has to show for itself, for choosing
@@ -2006,7 +2533,7 @@ fn prepared_from_read(
     searched_inverted: bool,
     params: &SampleParams,
 ) -> Prepared {
-    let trustworthy = result.is_trustworthy();
+    let (trustworthy, padding_pinned) = (result.is_trustworthy(), result.padding_pinned());
     let mut found = result.detection;
     if let Some(other) = result.reinterpreted
         && trustworthy
@@ -2022,6 +2549,7 @@ fn prepared_from_read(
         verified: result.report.blocks_verified(),
         blocks: result.report.blocks.len(),
         trustworthy,
+        padding_pinned,
         reinterpreted: result.reinterpreted,
     };
     Prepared { found, agreement: result.agreement, guesses, searched_inverted, read: Some(read) }
@@ -2121,14 +2649,90 @@ const CREDIBLE_SCORE: f64 = 0.75;
 /// detections of about the same size and place are the same symbol,
 /// listed once under the better claim.
 pub(crate) fn find_symbols_of_every_family(luma: &Luma, params: &SampleParams, search: &SearchParams) -> Vec<Detection> {
-    let mut all = find_symbols_of_families(luma, &Family::SEARCHED, params, search, &credible);
-    // The decode is asked of each as found, on the photo itself: it says
-    // which of two claims on one place is the symbol, and puts what needs
-    // no work at the head of the list.
-    for found in &mut all {
-        found.decodes = Some(decodes_as_found(luma, found, params));
+    listed(luma, find_symbols_of_families(luma, &Family::SEARCHED, params, search, &credible), params)
+}
+
+/// What a search of the whole photo finds of one family alone, listed as
+/// [`find_symbols_of_every_family`] lists what it finds. The families
+/// with one finder pattern are searched from every finder the photo
+/// shows, a QR Code's among them: it is for the user who knows which
+/// family the symbol is of, and above all for a damaged QR Code, whose
+/// leftover finders the search of every family spends most of its time
+/// taking for Micro QR and rMQR symbols.
+pub(crate) fn find_symbols_of_family(luma: &Luma, family: Family, params: &SampleParams, search: &SearchParams) -> Vec<Detection> {
+    listed(luma, find_symbols_with(luma, family, params, search), params)
+}
+
+/// Detections as a search lists them: the decode asked of each as found,
+/// on the photo itself, which says which of two claims on one place is
+/// the symbol and puts what needs no work at the head of the list.
+fn listed(luma: &Luma, mut all: Vec<Detection>, params: &SampleParams) -> Vec<Detection> {
+    let decodes = work::map(&all, |found| !work::cancelled() && decodes_as_found(luma, found, params));
+    for (found, decodes) in all.iter_mut().zip(decodes) {
+        found.decodes = Some(decodes);
     }
     merge_detections(all)
+}
+
+/// The pixels a photo is worked on at: those of the photo as loaded, or
+/// of the part `crop` of it, enlarged when they are too few for modules
+/// to be seen and otherwise as they are. They are the photo's own,
+/// shared, when the whole of it is on show and needed no enlarging.
+fn working_copy(source: &Arc<image::RgbaImage>, crop: Option<Crop>) -> Arc<image::RgbaImage> {
+    let Some(crop) = crop else { return enlarged(source).map_or_else(|| source.clone(), Arc::new) };
+    let [x, y, w, h] = crop.rect;
+    let cut = if crop.k1 == 0.0 {
+        image::imageops::crop_imm(&**source, x, y, w, h).to_image()
+    } else {
+        // The outline the crop was made to lay on the photo straightened.
+        let (width, height) = source.dimensions();
+        let straightened = undistort(source.as_raw(), width as usize, height as usize, crop.k1);
+        let straightened = image::RgbaImage::from_raw(width, height, straightened).expect("straightening keeps the photo's size");
+        image::imageops::crop_imm(&straightened, x, y, w, h).to_image()
+    };
+    Arc::new(match enlarged(&cut) {
+        Some(larger) => larger,
+        None => cut,
+    })
+}
+
+/// Pixels as a texture holds them: as they are when they fit within
+/// `limit` on each side, the most a texture may measure on this machine,
+/// and otherwise shrunk to fit. Only what is drawn is shrunk. The
+/// outline, the sampling and the search are in the photo's own pixels,
+/// and the texture is stretched over them; zoomed far into a photo
+/// larger than the limit, the canvas shows less than the sampling reads,
+/// and a crop, which is smaller, is drawn in full.
+pub(crate) fn texture_image(rgba: Vec<u8>, width: usize, height: usize, limit: usize) -> egui::ColorImage {
+    let (shown_width, shown_height) = texture_size(width, height, limit);
+    if (shown_width, shown_height) == (width, height) {
+        return egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
+    }
+    let full = image::RgbaImage::from_raw(width as u32, height as u32, rgba).expect("the pixels are of the size given");
+    let shown = image::imageops::thumbnail(&full, shown_width as u32, shown_height as u32);
+    egui::ColorImage::from_rgba_unmultiplied([shown_width, shown_height], shown.as_raw())
+}
+
+/// [`texture_image`] for one channel, a byte a pixel.
+pub(crate) fn texture_gray(gray: Vec<u8>, width: usize, height: usize, limit: usize) -> egui::ColorImage {
+    let (shown_width, shown_height) = texture_size(width, height, limit);
+    if (shown_width, shown_height) == (width, height) {
+        return egui::ColorImage::from_gray([width, height], &gray);
+    }
+    let full = image::GrayImage::from_raw(width as u32, height as u32, gray).expect("the pixels are of the size given");
+    let shown = image::imageops::thumbnail(&full, shown_width as u32, shown_height as u32);
+    egui::ColorImage::from_gray([shown_width, shown_height], shown.as_raw())
+}
+
+/// The size an image `width` by `height` is drawn through a texture at:
+/// its own, or the largest of its shape that fits within `limit`.
+fn texture_size(width: usize, height: usize, limit: usize) -> (usize, usize) {
+    let longest = width.max(height);
+    if longest <= limit.max(1) {
+        return (width, height);
+    }
+    let scale = limit.max(1) as f64 / longest as f64;
+    (((width as f64 * scale) as usize).clamp(1, limit.max(1)), ((height as f64 * scale) as usize).clamp(1, limit.max(1)))
 }
 
 /// The detections of every family as one list, what decodes first and
@@ -2254,7 +2858,7 @@ mod tests {
     /// A photo as the app loads it, for the search helpers.
     fn load(name: &str) -> Luma {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/photos").join(name);
-        let image = normalize_size(image::open(&path).expect("photo opens").to_rgba8());
+        let image = qr_forensics::imaging::photo::normalize_size(image::open(&path).expect("photo opens").to_rgba8());
         let (width, height) = (image.width() as usize, image.height() as usize);
         Adjust::default().apply(image.as_raw(), width, height).1
     }
@@ -2447,11 +3051,20 @@ mod tests {
     fn an_export_of_an_unsolved_symbol_says_so() {
         let mut app = App::blank();
         let path = std::env::temp_dir().join(format!("qr-forensics-export-test-{}.png", std::process::id()));
-        app.export_image(&path);
+        app.export_image(&path, ExportFormat::Png);
         let _ = std::fs::remove_file(&path);
         let notice = &app.message.as_ref().expect("a notice").text;
         assert!(notice.starts_with("Saved "), "{notice}");
         assert!(notice.contains("Not every block is solved (0 of 1)"), "{notice}");
+        // As a drawing, the same symbol at the same size, and the same
+        // word about it.
+        let path = path.with_extension("svg");
+        app.export_image(&path, ExportFormat::Svg);
+        let drawing = std::fs::read_to_string(&path).expect("the drawing was written");
+        let _ = std::fs::remove_file(&path);
+        assert!(drawing.starts_with("<svg ") && drawing.contains("viewBox=\"0 0 33 33\" width=\"330\" height=\"330\""), "{drawing}");
+        let notice = &app.message.as_ref().expect("a notice").text;
+        assert!(notice.contains("(330 × 330)") && notice.contains("Not every block is solved (0 of 1)"), "{notice}");
     }
 
     // The tests from here on show the window, frame by frame, to an egui
@@ -2516,6 +3129,9 @@ mod tests {
         app: App,
         /// The window's size, in points.
         size: egui::Vec2,
+        /// The most a texture may measure on a side, when the window
+        /// says: `None` leaves it at what egui allows unasked, 2048.
+        texture_side: Option<usize>,
         time: f64,
         /// What the last frame painted.
         shapes: Vec<egui::epaint::ClippedShape>,
@@ -2531,7 +3147,7 @@ mod tests {
             let (w, h, pixels) = render_rgba(&painted_grid(), 10, 4);
             let image = image::RgbaImage::from_raw(w as u32, h as u32, pixels).expect("a render is an image");
             app.set_photo(&ctx, "render".into(), image);
-            let mut bench = Self { ctx, app, size: egui::vec2(1440.0, 900.0), time: 0.0, shapes: Vec::new() };
+            let mut bench = Self { ctx, app, size: egui::vec2(1440.0, 900.0), texture_side: None, time: 0.0, shapes: Vec::new() };
             bench.settle();
             bench
         }
@@ -2539,6 +3155,7 @@ mod tests {
         fn frame(&mut self, events: Vec<egui::Event>) {
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)),
+                max_texture_side: self.texture_side,
                 time: Some(self.time),
                 events,
                 ..Default::default()
@@ -2733,7 +3350,7 @@ mod tests {
         assert_ne!(before.kernel, Kernel::Centre);
         let read = |trustworthy: bool| {
             let (kernel, local, verified) = (Kernel::Centre, !before.local, usize::from(trustworthy));
-            let note = ReadNote { kernel, local, verified, blocks: 1, trustworthy, reinterpreted: None };
+            let note = ReadNote { kernel, local, verified, blocks: 1, trustworthy, padding_pinned: false, reinterpreted: None };
             Prepared { read: Some(note), ..prepared(detection(SymbolVersion::Qr(2), STRAIGHT)) }
         };
         // The best of the attempts at a read that decoded nothing says
@@ -2784,7 +3401,7 @@ mod tests {
         bench.app.doc.corners = STRAIGHT;
         // A symbol found that the outline happens to lie on, and has not
         // been put on from the list.
-        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: None });
+        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: None, reads: None });
         bench.app.doc.set_anchor(finder_anchor([75.0, 75.0]), AnchorSource::Detected);
         bench.step();
         bench.step();
@@ -2819,7 +3436,7 @@ mod tests {
         // quarter, which the two share about (200, 200).
         let diamond = [[165.0, 40.0], [290.0, 165.0], [165.0, 290.0], [40.0, 165.0]];
         let found = vec![detection(SymbolVersion::Qr(2), diamond), detection(SymbolVersion::Micro(3), square(170.0, 170.0, 140.0))];
-        bench.app.proposals = Some(Proposals { found, photo_inverted: false, adopted: None });
+        bench.app.proposals = Some(Proposals { found, photo_inverted: false, adopted: None, reads: None });
         let at = bench.locate();
         // Inside the box about the first and outside its outline, there
         // is nothing to click.
@@ -2843,7 +3460,7 @@ mod tests {
     fn the_symbol_the_outline_was_put_on_is_not_offered_again_on_the_canvas() {
         let mut bench = Bench::new();
         bench.app.doc.corners = STRAIGHT;
-        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: Some(0) });
+        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: Some(0), reads: None });
         let at = bench.locate();
         // A click inside the symbol, clear of the handles, is not a click
         // on the symbol found: it would put the outline back as found,
@@ -2862,7 +3479,7 @@ mod tests {
         // A search run again lists the symbol the outline lies on as the
         // one in use still.
         let again = vec![detection(SymbolVersion::Micro(3), square(170.0, 170.0, 140.0)), detection(SymbolVersion::Qr(2), STRAIGHT)];
-        bench.app.finish_search(again, false);
+        bench.app.finish_search(again, false, None);
         assert_eq!(bench.app.proposals.as_ref().and_then(|p| p.adopted), Some(1));
     }
 
@@ -3029,11 +3646,11 @@ mod tests {
         let mut bench = Bench::new();
         let ctx = bench.ctx.clone();
         bench.app.doc.corners = STRAIGHT;
-        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: None });
+        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: None, reads: None });
         // A search and a step that are still under way when the lens
         // changes, and would move the outline were they taken in.
         let elsewhere = || detection(SymbolVersion::Qr(2), square(0.0, 0.0, 10.0));
-        bench.app.start_search(&ctx, false, move || slowly(vec![elsewhere()]));
+        bench.app.start_search(&ctx, false, None, move || slowly(vec![elsewhere()]));
         bench.app.start_job(&ctx, JobKind::Adopt, move || slowly(JobResult::Adopt(prepared(elsewhere()))));
         bench.app.history.checkpoint(&bench.app.doc);
         let adjust = Adjust { k1: -0.05, ..bench.app.doc.adjust };
@@ -3048,7 +3665,7 @@ mod tests {
         bench.act(Action::UseProposal(0));
         assert_eq!(bench.app.running(), None);
         // Undo takes the lens back, and with it whatever was found since.
-        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: None });
+        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: None, reads: None });
         bench.act(Action::Undo);
         assert_eq!(bench.app.doc.adjust.k1, 0.0);
         assert!(bench.app.proposals.is_none());
@@ -3109,7 +3726,7 @@ mod tests {
         let notice = bench.notice();
         assert!(notice.is_error, "{}", notice.text);
         assert!(notice.text.starts_with("Refining the corners and anchors stopped on an internal error"), "{}", notice.text);
-        bench.app.start_search(&ctx, false, die);
+        bench.app.start_search(&ctx, false, None, die);
         bench.settle();
         let notice = bench.notice();
         assert!(notice.is_error, "{}", notice.text);
@@ -3131,5 +3748,519 @@ mod tests {
         bench.settle();
         let proposals = bench.app.proposals.as_ref().expect("the symbol is found");
         assert_eq!(proposals.found.first().map(|found| found.version), Some(SymbolVersion::Qr(2)));
+    }
+
+    #[test]
+    fn a_paste_is_asked_for_once_whether_or_not_its_press_brought_text() {
+        let mut held = false;
+        // A screenshot on the clipboard: the press brings nothing, and
+        // the release asks.
+        assert!(paste_asked(false, true, false, &mut held));
+        // Text on the clipboard: the press brings a paste, which asks,
+        // and the release that follows does not ask again.
+        assert!(paste_asked(true, false, false, &mut held));
+        assert!(!paste_asked(false, true, false, &mut held));
+        assert!(paste_asked(false, true, false, &mut held), "the next press is its own");
+        // Press and release in one frame are one request.
+        assert!(paste_asked(true, true, false, &mut held));
+        assert!(!held);
+        // A paste into a text field is the field's, whatever it brought.
+        assert!(!paste_asked(true, false, true, &mut held));
+        assert!(!paste_asked(false, true, true, &mut held));
+        assert!(!paste_asked(false, true, true, &mut held));
+    }
+
+    #[test]
+    fn a_search_or_a_step_under_way_is_called_off() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        // Work that goes on until it is called off, and counts itself
+        // out when it stops.
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let until_called_off = || {
+            let stopped = stopped.clone();
+            move || {
+                let started = std::time::Instant::now();
+                while !work::cancelled() && started.elapsed().as_secs() < 60 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                stopped.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        let wait_for = |count: usize| {
+            let started = std::time::Instant::now();
+            while stopped.load(Ordering::SeqCst) < count {
+                assert!(started.elapsed().as_secs() < 20, "the work was not called off");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        let (searching, stepping) = (until_called_off(), until_called_off());
+        bench.app.start_search(&ctx, false, None, move || {
+            searching();
+            vec![detection(SymbolVersion::Qr(2), square(0.0, 0.0, 10.0))]
+        });
+        bench.app.start_job(&ctx, JobKind::Adopt, move || {
+            stepping();
+            JobResult::Adopt(prepared(detection(SymbolVersion::Qr(6), STRAIGHT)))
+        });
+        bench.step();
+        // Each is on show with a way to stop it, in the status bar and
+        // beside the buttons that started them.
+        let texts = bench.texts();
+        assert!(texts.iter().filter(|text| *text == "Stop").count() >= 3, "{texts:?}");
+        assert!(texts.iter().any(|text| text == "Stop searching"));
+        bench.act(Action::CancelSearch);
+        assert!(bench.app.search.is_none());
+        assert_eq!(bench.notice().text, "The search of the photo was called off.");
+        bench.act(Action::CancelJob);
+        assert!(bench.app.job.is_none());
+        assert!(bench.notice().text.starts_with("Placing the corners on the symbol found was called off"), "{}", bench.notice().text);
+        // Their threads stop, and what they hand back is not taken in.
+        wait_for(2);
+        bench.settle();
+        assert!(bench.app.proposals.is_none());
+        assert_eq!(bench.app.doc.version, SymbolVersion::Qr(2));
+        // With nothing under way there is nothing to call off, and no
+        // notice of it.
+        bench.app.message = None;
+        bench.act(Action::CancelSearch);
+        bench.act(Action::CancelJob);
+        assert!(bench.app.message.is_none());
+        // A search and a step whose photo goes are called off with it.
+        let (searching, stepping) = (until_called_off(), until_called_off());
+        bench.app.start_search(&ctx, false, None, move || {
+            searching();
+            Vec::new()
+        });
+        bench.app.start_job(&ctx, JobKind::Refine, move || {
+            stepping();
+            JobResult::Refine(None)
+        });
+        bench.act(Action::ClosePhoto);
+        wait_for(4);
+    }
+
+    #[test]
+    fn a_search_looks_for_the_family_in_use_alone_when_asked() {
+        let mut bench = Bench::new();
+        // Every family, as a search goes unless told otherwise.
+        bench.act(Action::FindSymbols);
+        assert_eq!(bench.app.search.as_ref().map(|search| search.family), Some(None));
+        bench.step();
+        assert!(bench.texts().iter().any(|text| text.starts_with("Searching the photo for symbols of every family")));
+        bench.act(Action::CancelSearch);
+        // The family chosen under Symbol alone.
+        bench.app.view.own_family_only = true;
+        bench.act(Action::SetVersion(SymbolVersion::Micro(2)));
+        bench.act(Action::FindSymbols);
+        assert_eq!(bench.app.search.as_ref().map(|search| search.family), Some(Some(Family::Micro)));
+        bench.step();
+        let texts = bench.texts();
+        assert!(texts.iter().any(|text| text.starts_with("Searching the photo for Micro QR symbols")), "{texts:?}");
+        assert!(texts.iter().any(|text| text == "Only look for Micro QR"));
+        bench.act(Action::CancelSearch);
+        // Finding none of it says which family, and how to look wider.
+        bench.app.finish_search(Vec::new(), false, Some(Family::Micro));
+        let notice = bench.notice();
+        assert!(notice.is_error && notice.text.starts_with("No Micro QR symbol was found"), "{}", notice.text);
+        assert!(notice.text.contains("untick Only look for Micro QR"), "{}", notice.text);
+        // The render's QR Code, looked for as that and nothing else.
+        bench.act(Action::SetVersion(SymbolVersion::Qr(2)));
+        bench.act(Action::FindSymbols);
+        assert_eq!(bench.app.search.as_ref().map(|search| search.family), Some(Some(Family::Qr)));
+        bench.settle();
+        let found = &bench.app.proposals.as_ref().expect("the symbol is found").found;
+        assert_eq!(found.iter().map(|found| found.version).collect::<Vec<_>>(), [SymbolVersion::Qr(2)]);
+    }
+
+    #[test]
+    fn every_symbol_found_is_read_and_one_read_is_loaded_into_the_grid() {
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/photos");
+        let photo = image::open(dir.join("zxing_qrcode-3_01.png")).expect("photo opens").to_rgba8();
+        let message = std::fs::read_to_string(dir.join("zxing_qrcode-3_01.txt")).expect("the photo's text");
+        bench.app.set_photo(&ctx, "photo".into(), photo);
+        // Before a search has found anything there is nothing to read.
+        bench.act(Action::ReadFound);
+        assert!(bench.notice().is_error && bench.app.job.is_none(), "{}", bench.notice().text);
+        bench.act(Action::FindSymbols);
+        bench.settle();
+        assert!(bench.notice().text.contains("press Read all"), "{}", bench.notice().text);
+        bench.act(Action::ReadFound);
+        assert_eq!(bench.app.running(), Some(JobKind::ReadFound));
+        bench.settle();
+        let reads = bench.app.proposals.as_ref().and_then(|proposals| proposals.reads.as_ref()).expect("the symbols were read");
+        assert_eq!(reads.results.len(), 1);
+        let read = reads.results[0].as_ref().expect("the symbol could be sampled");
+        assert!(read.is_trustworthy() && !read.padding_pinned());
+        assert_eq!(read.text(), message);
+        let version = read.version();
+        assert!(bench.notice().text.starts_with("Read 1 of 1 symbols found through to a message"), "{}", bench.notice().text);
+        // The read is listed in the inspector, with how it stands and
+        // what it says.
+        let texts = bench.texts();
+        assert!(texts.iter().any(|text| text == "Symbols read"), "{texts:?}");
+        assert!(texts.iter().any(|text| *text == format!("1. QR Code {version}")), "{texts:?}");
+        assert!(texts.contains(&message), "{texts:?}");
+        assert!(texts.iter().any(|text| text == "1 of 1 decoded"));
+        // Loaded, the document is what was read: the symbol's version
+        // and modules, under the outline the read left on it.
+        assert_ne!(bench.app.doc.version, version);
+        bench.act(Action::LoadRead(0));
+        bench.step();
+        assert_eq!(bench.app.view.stage, Stage::Edit);
+        bench.assert_all_of(version);
+        assert!(bench.app.derived.report.is_trustworthy());
+        assert_eq!(bench.app.derived.report.text.plain(), message);
+        assert!(bench.notice().text.starts_with("Loaded symbol 1 as it was read"), "{}", bench.notice().text);
+        let in_use = bench.app.proposals.as_ref().and_then(|proposals| proposal_in_use(proposals, &bench.app.doc.corners));
+        assert_eq!(in_use, Some(0), "the outline lies on the symbol loaded");
+        // One undo takes the whole of it back.
+        bench.act(Action::Undo);
+        assert_eq!(bench.app.doc.version, SymbolVersion::Qr(2));
+        // A list that has changed since the reads were asked for does
+        // not take them.
+        let stale = bench.app.proposals.as_ref().map(|proposals| vec![proposals.found[0].corners, STRAIGHT]).unwrap();
+        bench.app.finish_read_found(&stale, vec![None, None], false);
+        assert!(bench.notice().text.starts_with("The list of symbols found changed"), "{}", bench.notice().text);
+        // A read that has gone cannot be loaded.
+        bench.act(Action::ClearProposals);
+        bench.act(Action::LoadRead(0));
+        assert!(bench.notice().is_error);
+    }
+
+    /// A version 3-L QR Code that holds `text` as byte data.
+    fn symbol_of(text: &str) -> ModuleGrid {
+        use qrcode_generator::{Segment, qr};
+        let symbol = qr::Encoder::new(qr::ErrorCorrection::Low)
+            .version(qr::Version::new(3).unwrap())
+            .boost_error_correction(false)
+            .encode_segments(&[Segment::bytes(text)])
+            .unwrap();
+        ModuleGrid::from_bools(symbol.width(), symbol.height(), symbol.modules())
+    }
+
+    /// `grid` with one module wrong in each of the data codewords
+    /// `wrong`, by their places in the message.
+    fn with_wrong(grid: &ModuleGrid, layout: &SymbolLayout, wrong: impl IntoIterator<Item = usize>) -> ModuleGrid {
+        let mut grid = grid.clone();
+        for i in wrong {
+            let module = layout.codeword_modules(layout.data_stream[i])[3];
+            let (x, y) = (module.x as usize, module.y as usize);
+            grid.set(x, y, grid.get(x, y).inverted());
+        }
+        grid
+    }
+
+    impl Bench {
+        /// Put `grid` in the document, as a version 3 QR Code, and bring
+        /// what follows from it up to date.
+        fn hold(&mut self, grid: ModuleGrid) {
+            self.app.doc = Document { grid, ..Document::blank(SymbolVersion::Qr(3)) };
+            self.app.dirty = true;
+            self.step();
+            self.step();
+        }
+
+        /// Where the last frame painted `text`, and how it was laid out.
+        fn text_shape(&self, text: &str) -> Option<(egui::Pos2, Arc<egui::Galley>)> {
+            fn walk(shape: &egui::Shape, text: &str, out: &mut Option<(egui::Pos2, Arc<egui::Galley>)>) {
+                match shape {
+                    egui::Shape::Text(shape) if shape.galley.text() == text => *out = Some((shape.pos, shape.galley.clone())),
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, text, out)),
+                    _ => {}
+                }
+            }
+            let mut out = None;
+            self.shapes.iter().for_each(|clipped| walk(&clipped.shape, text, &mut out));
+            out
+        }
+
+        /// How many rectangles the last frame outlined in `color`.
+        fn outlined(&self, color: egui::Color32) -> usize {
+            fn walk(shape: &egui::Shape, color: egui::Color32, count: &mut usize) {
+                match shape {
+                    egui::Shape::Rect(rect) if rect.stroke.color == color => *count += 1,
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| walk(shape, color, count)),
+                    _ => {}
+                }
+            }
+            let mut count = 0;
+            self.shapes.iter().for_each(|clipped| walk(&clipped.shape, color, &mut count));
+            count
+        }
+    }
+
+    #[test]
+    fn a_character_clicked_in_the_result_shows_its_modules_on_the_grid() {
+        let mut bench = Bench::new();
+        bench.act(Action::ClosePhoto);
+        let text = "https://example.com/q?id=7Q2M-XK4P-99AD";
+        bench.hold(symbol_of(text));
+        assert!(bench.app.derived.report.is_trustworthy());
+        assert_eq!(bench.outlined(canvas::PICKED), 0);
+        // The x of example, the tenth character: its glyph in the result.
+        let (at, galley) = bench.text_shape(text).expect("the result shows the message");
+        let row = &galley.rows[0];
+        assert!(row.row.glyphs.len() > 9, "the message's first row holds its tenth character");
+        let glyph = row.row.glyphs[9].logical_rect().center();
+        bench.click(at + row.pos.to_vec2() + glyph.to_vec2(), egui::PointerButton::Primary);
+        assert_eq!(bench.app.view.picked_char, Some(9));
+        // Known text starts there, and the grid outlines the eight
+        // modules the character is made of, over two codewords.
+        assert_eq!((bench.app.view.known_at, bench.app.view.known_from_start), (9, false));
+        assert_eq!(bench.outlined(canvas::PICKED), 8);
+        let texts = bench.texts();
+        let line = texts.iter().find(|text| text.starts_with("Character 10 “x”")).unwrap_or_else(|| panic!("{texts:?}"));
+        assert!(line.contains("byte") && line.contains("stream bits 84 to 91") && line.contains("codewords "), "{line}");
+        // The codewords named are those the bits lie in.
+        let layout = bench.app.derived.layout.clone();
+        assert!(line.contains(&format!("codewords {}, {} of block 1", layout.data_stream[10], layout.data_stream[11])), "{line}");
+        // A second click on it lets go, and so does Esc.
+        let (at, galley) = bench.text_shape(text).expect("the result shows the message");
+        let row = &galley.rows[0];
+        let glyph = row.row.glyphs[9].logical_rect().center();
+        bench.click(at + row.pos.to_vec2() + glyph.to_vec2(), egui::PointerButton::Primary);
+        assert_eq!(bench.app.view.picked_char, None);
+        assert_eq!(bench.outlined(canvas::PICKED), 0);
+        bench.app.view.picked_char = Some(3);
+        bench.frame(vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert_eq!(bench.app.view.picked_char, None);
+        // A character that is no longer there outlines nothing.
+        bench.app.view.picked_char = Some(500);
+        bench.step();
+        assert_eq!(bench.outlined(canvas::PICKED), 0);
+    }
+
+    #[test]
+    fn known_text_is_pinned_from_the_inspector() {
+        let mut bench = Bench::new();
+        // A window tall enough to show the whole of the inspector, whose
+        // lower sections are otherwise scrolled out of what is painted.
+        bench.size = egui::vec2(1440.0, 3000.0);
+        bench.act(Action::ClosePhoto);
+        let text = "https://example.com/q?id=7Q2M-XK4P-99AD";
+        let clean = symbol_of(text);
+        bench.hold(clean.clone());
+        let layout = bench.app.derived.layout.clone();
+        // Fifteen codewords wrong, twelve of them under the address's
+        // beginning: more than twice what the block corrects.
+        bench.hold(with_wrong(&clean, &layout, (2..=13).chain([26, 31, 37])));
+        assert_eq!(bench.app.derived.report.blocks_solved(), 0);
+        bench.app.view.known_text = "https://example.com/".to_owned();
+        bench.step();
+        // The inspector says what pinning would do before it is done.
+        let texts = bench.texts();
+        assert!(texts.iter().any(|text| text == "Pins 20 characters, in 21 codewords."), "{texts:?}");
+        bench.act(Action::PinText);
+        assert!(bench.app.derived.report.is_trustworthy());
+        assert_eq!(bench.app.derived.report.text.plain(), text);
+        assert_eq!(bench.notice().text, "Pinned 20 characters in 21 codewords: 1 of 1 blocks now verify, up from 0.");
+        assert_eq!(bench.app.doc.pins.len(), 21);
+        assert!(bench.app.doc.pins.values().all(|pin| pin.source == PinSource::Text));
+        assert_eq!(bench.app.doc.pins_ec, Some(bench.app.derived.ec));
+        bench.step();
+        let texts = bench.texts();
+        assert!(texts.iter().any(|text| text.starts_with("Pins: 0 by hand, 21 known text")), "{texts:?}");
+        // One undo takes the pins back, and Remove text pins the same.
+        bench.act(Action::Undo);
+        assert!(bench.app.doc.pins.is_empty());
+        bench.act(Action::Redo);
+        bench.act(Action::ClearTextPins);
+        assert!(bench.app.doc.pins.is_empty());
+        bench.step();
+        assert_eq!(bench.app.derived.report.blocks_solved(), 0);
+        // Text that cannot be pinned where it is put is refused, with
+        // the reason, and nothing changes.
+        bench.app.view.known_at = 500;
+        bench.act(Action::PinText);
+        let notice = bench.notice();
+        assert!(notice.is_error && notice.text.contains("has 39 characters, and none at that place"), "{}", notice.text);
+        assert!(bench.app.doc.pins.is_empty());
+        // A common beginning, tried and borne out: eight codewords wrong
+        // under `https://`, one more than the block corrects.
+        bench.hold(with_wrong(&clean, &layout, 2..=9));
+        assert_eq!(bench.app.derived.report.blocks_solved(), 0);
+        bench.act(Action::TryBeginnings);
+        assert!(bench.notice().text.starts_with("The message begins \"https://\": with that pinned, 1 of 1 blocks verify, up from 0."), "{}", bench.notice().text);
+        bench.step();
+        assert!(bench.app.derived.report.is_trustworthy());
+        assert_eq!(bench.app.derived.report.text.plain(), text);
+        assert_eq!((bench.app.view.known_text.as_str(), bench.app.view.known_at, bench.app.view.known_from_start), ("https://", 0, false));
+        // A message that begins no common way is left as it is, and
+        // told so.
+        bench.hold(with_wrong(&symbol_of("Invoice 2026-1010 for the lathe, due on receipt"), &layout, 2..=9));
+        bench.act(Action::TryBeginnings);
+        assert!(bench.notice().is_error && bench.app.doc.pins.is_empty(), "{}", bench.notice().text);
+    }
+
+    #[test]
+    fn a_large_photo_keeps_its_pixels_and_is_drawn_through_a_texture_that_fits() {
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        // A photo wider than a texture may be here, the bench's render,
+        // 330 pixels square, small in it at (3000, 600).
+        let (w, h, pixels) = render_rgba(&painted_grid(), 10, 4);
+        let render = image::RgbaImage::from_raw(w as u32, h as u32, pixels).expect("a render is an image");
+        let mut large = image::RgbaImage::from_pixel(5000, 1500, image::Rgba([255, 255, 255, 255]));
+        image::imageops::replace(&mut large, &render, 3000, 600);
+        bench.app.set_photo(&ctx, "large".into(), large);
+        // Loaded at its own size, pixel for pixel, and told of what its
+        // size costs.
+        let photo = bench.app.photo.as_ref().expect("the photo is loaded");
+        assert_eq!((photo.width, photo.height, photo.scale()), (5000, 1500, 1.0));
+        assert_eq!((photo.luma.width, photo.luma.height), (5000, 1500));
+        assert!(Arc::ptr_eq(&photo.source, &photo.original), "a photo that needs no enlarging is held once");
+        let notice = &bench.notice().text;
+        assert!(notice.starts_with("Loaded large (5000 × 1500)") && notice.contains("Crop to outline"), "{notice}");
+        // What draws it is no larger than a texture may be, and is
+        // stretched over the photo's own pixels.
+        assert_eq!(photo.texture.size(), [2048, 614]);
+        // The symbol is read where it lies, at its ten pixels a module:
+        // an outline in the photo's own pixels reads every fixed module.
+        bench.app.doc.corners = square(3040.0, 640.0, 250.0);
+        bench.step();
+        let (matching, fixed) = bench.app.preview.as_ref().expect("the outline makes a grid").fixed;
+        assert_eq!(matching, fixed);
+        // A search of the whole of it looks at a copy reduced to the size
+        // a search goes to, and places what it finds in the photo's own
+        // pixels.
+        bench.act(Action::FindSymbols);
+        bench.settle();
+        let found = &bench.app.proposals.as_ref().expect("the symbol is found").found;
+        assert_eq!(found.iter().map(|found| found.version).collect::<Vec<_>>(), [SymbolVersion::Qr(2)]);
+        for (corner, on_symbol) in found[0].corners.iter().zip(square(3040.0, 640.0, 250.0)) {
+            assert!((corner[0] - on_symbol[0]).hypot(corner[1] - on_symbol[1]) < 2.0, "{:?}", found[0].corners);
+        }
+        // So is the black and white view of it.
+        bench.app.view.align_overlay = AlignOverlay::Binarised;
+        bench.step();
+        let binarised = bench.app.photo.as_ref().and_then(|photo| photo.binarised.as_ref()).expect("the view was made");
+        assert_eq!(binarised.texture.size(), [2048, 614]);
+        // A change of the adjustments keeps the texture within the limit.
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { contrast: 0.2, ..bench.app.doc.adjust }));
+        assert_eq!(bench.app.photo.as_ref().map(|photo| photo.texture.size()), Some([2048, 614]));
+        // A photo opened before the window has said what its limit is,
+        // as one named on the command line is, is drawn in full once it
+        // says so.
+        bench.texture_side = Some(8192);
+        bench.step();
+        let photo = bench.app.photo.as_ref().expect("the photo is on show");
+        assert_eq!(photo.texture.size(), [5000, 1500]);
+        // The black and white view, on show, was made again with it.
+        assert_eq!(photo.binarised.as_ref().map(|view| view.texture.size()), Some([5000, 1500]));
+        // A small photo is still enlarged, and says so.
+        let small = image::imageops::resize(&render, 110, 110, image::imageops::FilterType::Nearest);
+        bench.app.set_photo(&ctx, "small".into(), small);
+        let photo = bench.app.photo.as_ref().expect("the photo is loaded");
+        assert_eq!((photo.width, photo.height, photo.scale()), (330, 330, 3.0));
+        assert!(bench.notice().text.starts_with("Loaded small (330 × 330, enlarged 3 times from 110 × 110"), "{}", bench.notice().text);
+        bench.step();
+        assert!(bench.texts().iter().any(|text| text == "small · 330 × 330 · enlarged from 110 × 110"), "{:?}", bench.texts());
+    }
+
+    #[test]
+    fn texture_sizes_fit_the_limit_and_keep_the_shape() {
+        assert_eq!(texture_size(330, 330, 2048), (330, 330));
+        assert_eq!(texture_size(2048, 100, 2048), (2048, 100));
+        assert_eq!(texture_size(8000, 6000, 2048), (2048, 1536));
+        assert_eq!(texture_size(6000, 8000, 4096), (3072, 4096));
+        assert_eq!(texture_size(100_000, 3, 2048), (2048, 1), "no side comes to nothing");
+        // The pixels are those given when they fit, and fewer of the
+        // same when they do not.
+        let pixels = |w: usize, h: usize| (0..w * h).flat_map(|i| [(i % 251) as u8, 0, 0, 255]).collect::<Vec<u8>>();
+        let whole = texture_image(pixels(40, 30), 40, 30, 64);
+        assert_eq!(whole.size, [40, 30]);
+        assert_eq!(whole.pixels[41], egui::Color32::from_rgb(41, 0, 0));
+        assert_eq!(texture_image(pixels(400, 300), 400, 300, 64).size, [64, 48]);
+        assert_eq!(texture_gray(vec![255; 400 * 300], 400, 300, 64).size, [64, 48]);
+        assert_eq!(texture_gray(vec![0; 40 * 30], 40, 30, 64).size, [40, 30]);
+    }
+
+    #[test]
+    fn a_photo_is_cropped_to_its_outline_from_its_pixels_as_loaded() {
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        // The bench's render, 330 pixels square, at (3000, 600) of a
+        // large photo.
+        let (w, h, pixels) = render_rgba(&painted_grid(), 10, 4);
+        let render = image::RgbaImage::from_raw(w as u32, h as u32, pixels).expect("a render is an image");
+        let mut large = image::RgbaImage::from_pixel(5000, 1500, image::Rgba([255, 255, 255, 255]));
+        image::imageops::replace(&mut large, &render, 3000, 600);
+        bench.app.set_photo(&ctx, "large".into(), large);
+        // The outline on the symbol and an anchor on its first finder.
+        let on_symbol = square(3040.0, 640.0, 250.0);
+        bench.app.doc.corners = on_symbol;
+        bench.app.doc.set_anchor(finder_anchor([3075.0, 675.0]), AnchorSource::Manual);
+        bench.act(Action::CropToOutline);
+        bench.step();
+        // Cut a fifth of the outline's size about it, and small enough
+        // now to be drawn pixel for pixel.
+        let photo = bench.app.photo.as_ref().expect("the photo is on show");
+        assert_eq!(photo.crop.map(|crop| (crop.rect, crop.k1)), Some(([2990, 590, 350, 350], 0.0)));
+        assert_eq!((photo.width, photo.height, photo.scale()), (350, 350, 1.0));
+        assert_eq!(photo.texture.size(), [350, 350]);
+        assert!(bench.notice().text.starts_with("Cropped to the outline: 350 × 350 pixels of the photo as loaded. What was found"), "{}", bench.notice().text);
+        // The outline and the anchor went with the symbol, which reads
+        // there as it did.
+        assert_eq!(bench.app.doc.corners, square(50.0, 50.0, 250.0));
+        assert_eq!(bench.app.doc.anchors.iter().map(|a| (a.anchor.center, a.source)).collect::<Vec<_>>(), [([85.0, 85.0], AnchorSource::Manual)]);
+        let (matching, fixed) = bench.app.preview.as_ref().expect("the outline makes a grid").fixed;
+        assert_eq!(matching, fixed);
+        assert!(bench.texts().iter().any(|text| text == "large · 350 × 350 · cropped from 5000 × 1500"), "{:?}", bench.texts());
+        // A lens bends the photo about its centre, which the crop lost.
+        bench.act(Action::EstimateLens);
+        assert!(bench.notice().is_error && bench.notice().text.contains("show the whole photo"), "{}", bench.notice().text);
+        // The whole photo again, with the outline where it was on it.
+        bench.act(Action::ShowWholePhoto);
+        bench.step();
+        let photo = bench.app.photo.as_ref().expect("the photo is on show");
+        assert_eq!((photo.width, photo.height, photo.crop), (5000, 1500, None));
+        assert_eq!(bench.app.doc.corners, on_symbol);
+        assert_eq!(bench.app.doc.anchors[0].anchor.center, [3075.0, 675.0]);
+        assert!(bench.notice().text.starts_with("Showing the whole photo again (5000 × 1500)"), "{}", bench.notice().text);
+        // With a lens term in force, the crop is cut from the photo
+        // straightened by it and takes none of its own; the whole photo
+        // takes the term back.
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { k1: -0.05, ..bench.app.doc.adjust }));
+        bench.act(Action::CropToOutline);
+        let photo = bench.app.photo.as_ref().expect("the photo is on show");
+        assert_eq!(photo.crop.map(|crop| crop.k1), Some(-0.05));
+        assert_eq!((bench.app.doc.adjust.k1, photo.adjust.k1), (0.0, 0.0));
+        assert!(bench.notice().text.contains("The lens setting was applied before the cut"), "{}", bench.notice().text);
+        bench.act(Action::ShowWholePhoto);
+        assert_eq!(bench.app.doc.adjust.k1, -0.05);
+        assert!(bench.app.photo.as_ref().is_some_and(|photo| photo.crop.is_none() && photo.adjust.k1 == -0.05));
+        // A part too small for its modules to be seen is enlarged, as a
+        // small photo is, and the outline with it.
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { k1: 0.0, ..bench.app.doc.adjust }));
+        bench.app.doc.corners = square(3040.0, 640.0, 100.0);
+        bench.act(Action::CropToOutline);
+        let photo = bench.app.photo.as_ref().expect("the photo is on show");
+        assert_eq!(photo.crop.map(|crop| crop.rect), Some([3020, 620, 140, 140]));
+        assert_eq!((photo.width, photo.height, photo.scale()), (280, 280, 2.0));
+        assert_eq!(bench.app.doc.corners, square(40.0, 40.0, 200.0));
+        assert!(bench.notice().text.contains("enlarged 2 times"), "{}", bench.notice().text);
+        bench.act(Action::ShowWholePhoto);
+        assert_eq!(bench.app.doc.corners, square(3040.0, 640.0, 100.0));
+        // An outline that takes in the whole photo leaves nothing to
+        // crop to, and one off the photo nothing to cut.
+        bench.app.doc.corners = [[0.0, 0.0], [5000.0, 0.0], [5000.0, 1500.0], [0.0, 1500.0]];
+        bench.act(Action::CropToOutline);
+        assert!(bench.notice().is_error && bench.app.photo.as_ref().is_some_and(|photo| photo.crop.is_none()));
+        bench.app.doc.corners = square(9000.0, 9000.0, 100.0);
+        bench.act(Action::CropToOutline);
+        assert!(bench.notice().is_error && bench.app.photo.as_ref().is_some_and(|photo| photo.crop.is_none()));
     }
 }

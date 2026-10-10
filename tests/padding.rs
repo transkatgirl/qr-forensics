@@ -9,6 +9,13 @@ use qr_forensics::decode::bitstream::{Certainty, EndOfData, LostReason};
 use qr_forensics::decode::codewords::{PinSource, Pins};
 use qr_forensics::decode::padding::{check_tail, clear_padding_pins, detect_padding, pad_tail, recover_padding};
 use qr_forensics::decode::pipeline::{BlockOutcome, DecodeOptions, SolveMethod, decode};
+use qr_forensics::decode::repair::render_rgba;
+use qr_forensics::imaging::Luma;
+use qr_forensics::imaging::adjust::Adjust;
+use qr_forensics::imaging::detect::{SearchParams, find_symbols_with};
+use qr_forensics::imaging::read::{read_detection, read_outline};
+use qr_forensics::imaging::sample::SampleParams;
+use qr_forensics::symbol::Family;
 use qr_forensics::symbol::grid::{Module, ModuleGrid};
 use qr_forensics::symbol::layout::SymbolLayout;
 use qr_forensics::symbol::{EcLevel, SymbolVersion};
@@ -410,4 +417,63 @@ fn an_unreadable_header_with_one_reading_is_pinned() {
     assert!(inference.inferred.is_empty());
     assert_eq!(before.blocks_solved(), 4);
     assert_eq!(recover(&grid, &layout, mask).unwrap().solved_after, 4, "still one codeword short");
+}
+
+/// A grid as a photo of it: eight pixels a module on white, with its
+/// quiet zone, and the outline of the whole photo.
+fn photo_of(grid: &ModuleGrid) -> (Luma, [[f64; 2]; 4]) {
+    let (w, h, pixels) = render_rgba(grid, 8, 4);
+    let luma = Adjust::default().apply(&pixels, w, h).1;
+    (luma, [[0.0, 0.0], [w as f64, 0.0], [w as f64, h as f64], [0.0, h as f64]])
+}
+
+#[test]
+fn a_read_of_a_photo_pins_the_padding_when_that_is_what_it_takes() {
+    // 10-M with a short address: five blocks, four of them all padding.
+    let (version, ec, mask) = (SymbolVersion::Qr(10), EcLevel::M, 4);
+    let text = "https://example.com/t/8F3K2";
+    let clean = encode(version, ec, Some(mask), &[Segment::bytes(text)]).unwrap();
+    // A strip of white tape down the symbol, over a third of its width:
+    // every block has more wrong codewords than it corrects.
+    let mut taped = clean.clone();
+    for y in 0..taped.height() {
+        for x in 12..32 {
+            taped.set(x, y, Module::Light);
+        }
+    }
+    let (params, opts) = (SampleParams::default(), DecodeOptions::default());
+    let (image, whole) = photo_of(&taped);
+    let read = read_outline(&image, SymbolVersion::Qr(2), whole, &params, &opts).expect("the symbol is found");
+    assert_eq!(read.version(), version);
+    assert!(read.is_trustworthy());
+    assert!(read.padding_pinned());
+    assert_eq!(read.text(), text);
+    // The pins are the recovery's own, and without them the grid as
+    // read solves no block.
+    assert!(read.pins.values().all(|pin| !pin.source.is_by_hand()));
+    let layout = layout(version, read.report.ec);
+    assert_eq!(decode(&read.grid, &layout, read.report.mask, &Pins::new(), &opts).blocks_verified(), 0);
+    assert_eq!(decode(&read.grid, &layout, read.report.mask, &read.pins, &opts).text.plain(), text);
+    // A search of the photo reads it the same way.
+    let found = find_symbols_with(&image, Family::Qr, &params, &SearchParams::default());
+    let read = found.into_iter().find_map(|found| read_detection(&image, found, &params, &opts)).expect("the symbol is found");
+    assert!(read.is_trustworthy() && read.padding_pinned());
+    assert_eq!(read.text(), text);
+    // A symbol that error correction reads is read by it, and nothing
+    // is pinned.
+    let (image, whole) = photo_of(&clean);
+    let read = read_outline(&image, SymbolVersion::Qr(2), whole, &params, &opts).unwrap();
+    assert!(read.is_trustworthy() && !read.padding_pinned());
+    assert!(read.pins.is_empty());
+    // Tape over more than half the symbol leaves too little of the
+    // error correction codewords to bear the padding out: no read is
+    // claimed.
+    for y in 0..taped.height() {
+        for x in 8..40 {
+            taped.set(x, y, Module::Light);
+        }
+    }
+    let (image, whole) = photo_of(&taped);
+    let read = read_outline(&image, SymbolVersion::Qr(2), whole, &params, &opts);
+    assert!(read.is_none_or(|read| !read.is_trustworthy() && !read.padding_pinned()));
 }

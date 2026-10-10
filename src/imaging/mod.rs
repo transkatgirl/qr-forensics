@@ -21,10 +21,23 @@ pub struct Luma {
     pub data: Vec<f32>,
 }
 
+/// The pixels that copies of a photo worked side by side may come to
+/// between them. A photo is searched and read through copies of itself,
+/// closed, thresholded or turned, and with a core to spare for each a
+/// large photo would have them all in memory at once: four bytes a pixel
+/// for each copy, and as much again for what a scan makes of it.
+const PIXELS_AT_ONCE: usize = 48_000_000;
+
 impl Luma {
     pub fn new(width: usize, height: usize, data: Vec<f32>) -> Self {
         assert_eq!(data.len(), width * height);
         Self { width, height, data }
+    }
+
+    /// How many copies the size of this image may be worked side by
+    /// side: as many as come to [`PIXELS_AT_ONCE`], and one at least.
+    pub(crate) fn copies_at_once(&self) -> usize {
+        (PIXELS_AT_ONCE / (self.width * self.height).max(1)).max(1)
     }
 
     /// Bilinear sample at pixel coordinates, where (0.5, 0.5) is the centre
@@ -119,5 +132,15 @@ mod tests {
         let frame = [[0.0, 0.0], [2.0, 0.0], [2.0, 3.0], [0.0, 3.0]];
         assert_eq!(rotate_outline_cw(frame, 1, 2, 3), [[0.0, 0.0], [3.0, 0.0], [3.0, 2.0], [0.0, 2.0]]);
         assert_eq!(rotate_outline_cw(frame, 2, 2, 3), frame);
+    }
+
+    #[test]
+    fn the_larger_the_photo_the_fewer_copies_of_it_at_once() {
+        let of = |width: usize, height: usize| Luma { width, height, data: Vec::new() }.copies_at_once();
+        assert!(of(1280, 960) >= 8, "a small photo has every rung of the ladder at once");
+        assert_eq!(of(4032, 3024), 3);
+        assert_eq!(of(8064, 6048), 1);
+        assert_eq!(of(20_000, 20_000), 1, "never none");
+        assert_eq!(of(2, 3), 8_000_000);
     }
 }

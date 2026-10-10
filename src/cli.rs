@@ -30,8 +30,9 @@
 //!
 //! `--details` adds what the decode settled on the way to the message:
 //! the error correction level and mask, the character set the bytes were
-//! read in, the symbology identifier, and the symbol's place in a
-//! structured append sequence when it has one, as OpenCV's detector
+//! read in, the symbology identifier, the symbol's place in a
+//! structured append sequence when it has one, and how many codewords
+//! of padding were pinned when the read took that, as OpenCV's detector
 //! hands back each symbol's ECI and BoofCV its level, mask and encoding.
 //! `--charset` names the character set to read byte data in when the
 //! symbol declares none, where it is otherwise guessed: `utf-8`,
@@ -48,16 +49,22 @@
 //! shadow or a fall-off of light across an evenly printed symbol. The
 //! neighbourhood rule is still tried when the surface does not decode.
 //!
-//! `--full-search` searches a photo at its full size from the start,
-//! where the search otherwise looks at a copy no larger than a thousand
-//! pixels on its longer side first and finds what it shows again at full
-//! size, which on a large photo is many times faster.
+//! `--full-search` searches a photo at the full size a search goes to
+//! from the start, where the search otherwise looks at a copy no larger
+//! than a thousand pixels on its longer side first and finds what it
+//! shows again at full size, which on a large photo is many times
+//! faster. The full size a search goes to is 4096 pixels on the longer
+//! side: a larger photo is searched in a copy reduced to that, and the
+//! symbols the copy shows are read from the photo's own pixels. A symbol
+//! too small to show in the copy is read through `--outline`: what is
+//! inside an outline is placed and read in the photo's own pixels,
+//! however large the photo.
 //!
-//! The outline is drawn top-left first and clockwise, in the pixels of
-//! the photo at the size the app works at, and upright as its EXIF
-//! orientation has it: photos over 4096 pixels on their longer side are
-//! shrunk to it, and photos under 256 on their shorter side enlarged by
-//! a whole factor. What is inside it is read as
+//! The outline is drawn top-left first and clockwise, in the photo's own
+//! pixels, upright as its EXIF orientation has it; only a photo under
+//! 256 pixels on its shorter side is worked on at another size, enlarged
+//! by a whole factor, and its outline is in the enlarged pixels. What is
+//! inside it is read as
 //! the window's Find in outline reads it: as a QR Code first and, when that
 //! does not decode, as a Micro QR or rMQR symbol too, on the evidence
 //! Find in outline asks of another family, the best of the reads being
@@ -71,7 +78,12 @@
 //! settled, with `--corners` where it lies, and the message: as text,
 //! with `--escaped` the control characters spelt out, or with `--hex` the
 //! message's bytes. A read stands as `read` when every block is confirmed
-//! and the message parses; `unconfirmed` when every block solved and the
+//! and the message parses; `read, padding pinned` when it is that only
+//! with the filler after a short message taken as known, which the
+//! standard fixes, so that damage there costs no error correction: the
+//! window's Pin the padding, tried of every decode that is no read, and
+//! kept when every block then confirms and the segment headers bear out
+//! where the padding lies; `unconfirmed` when every block solved and the
 //! message parses but a block has nothing left over to confirm it, as
 //! one solved at the very limit of its error correction has not;
 //! `malformed` when every block is confirmed and the message does not
@@ -244,8 +256,9 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
     Ok(options)
 }
 
-/// A photo as the app loads it: the file's pixels at the working size, as
-/// luminance, with the default tone adjustments.
+/// A photo as the app loads it: the file's pixels, enlarged when the
+/// photo is small and never shrunk, as luminance, with the default tone
+/// adjustments.
 fn load(path: &Path) -> Result<Luma, String> {
     let image = normalize_size(photo::open(path).map_err(|e| e.to_string())?);
     let (width, height) = (image.width() as usize, image.height() as usize);
@@ -264,10 +277,12 @@ fn start_version(family: Family) -> SymbolVersion {
 
 /// How a read stands, as the module describes: `read`, or what keeps it
 /// from being one.
-fn standing(result: &ReadResult) -> String {
+pub(crate) fn standing(result: &ReadResult) -> String {
     let report = &result.report;
     let blocks = report.blocks.len();
-    if result.is_trustworthy() {
+    if result.is_trustworthy() && result.padding_pinned() {
+        "read, padding pinned".to_owned()
+    } else if result.is_trustworthy() {
         "read".to_owned()
     } else if report.is_complete() && report.score.stream_valid {
         format!("unconfirmed, {} of {blocks} blocks confirmed", report.blocks_verified())
@@ -292,6 +307,9 @@ fn details(result: &ReadResult) -> String {
     parts.extend(report.text.symbology.clone());
     if let Some(part) = Part::from_report(report, String::new()) {
         parts.push(format!("part {} of {}", part.index, part.total));
+    }
+    if result.padding_pinned() {
+        parts.push(format!("{} padding codewords pinned", result.pins.len()));
     }
     parts.join(", ")
 }
@@ -650,6 +668,42 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         let (fields, _) = fields_and_grid(&text);
         assert_eq!(&fields[1..], ["QR Code 3", "read", expected.trim_end()], "{text}");
+    }
+
+    #[test]
+    fn a_read_that_took_the_padding_pinned_says_so() {
+        use qr_forensics::decode::repair::render_rgba;
+        use qr_forensics::symbol::grid::{Module, ModuleGrid};
+        use qrcode_generator::{Segment, qr};
+        // A short address in a version 10-M symbol, with a strip of white
+        // tape down a third of it: more wrong codewords in every block
+        // than the block corrects, nearly all of them padding.
+        let message = "https://example.com/t/8F3K2";
+        let symbol = qr::Encoder::new(qr::ErrorCorrection::Medium)
+            .version(qr::Version::new(10).unwrap())
+            .boost_error_correction(false)
+            .encode_segments(&[Segment::bytes(message)])
+            .unwrap();
+        let mut grid = ModuleGrid::from_bools(symbol.width(), symbol.height(), symbol.modules());
+        for y in 0..grid.height() {
+            for x in 12..32 {
+                grid.set(x, y, Module::Light);
+            }
+        }
+        let (width, height, pixels) = render_rgba(&grid, 8, 4);
+        let path = std::env::temp_dir().join(format!("qr-forensics-taped-{}.png", std::process::id()));
+        image::save_buffer(&path, &pixels, width as u32, height as u32, image::ExtendedColorType::Rgba8).unwrap();
+        let mut out = Vec::new();
+        let status = run_to(&[OsString::from("--details"), path.clone().into_os_string()], &mut out);
+        let _ = std::fs::remove_file(&path);
+        let text = String::from_utf8(out).unwrap();
+        let (fields, _) = fields_and_grid(&text);
+        // A read, by the status and by the line, which says how it
+        // stands and what it took.
+        assert_eq!(status, 0, "{text}");
+        assert_eq!(&fields[1..3], ["QR Code 10", "read, padding pinned"], "{text}");
+        assert!(fields[3].ends_with(" padding codewords pinned"), "{text}");
+        assert_eq!(fields.last().map(String::as_str), Some(message), "{text}");
     }
 
     #[test]

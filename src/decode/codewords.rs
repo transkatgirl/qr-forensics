@@ -13,6 +13,9 @@ use crate::symbol::tables;
 pub enum PinSource {
     /// Typed into the codeword inspector.
     Manual,
+    /// Bits of text the user knows the message to hold, placed by
+    /// [`super::known`].
+    Text,
     /// A pad codeword placed by padding recovery.
     Padding,
     /// Terminator and zero-fill bits placed by padding recovery.
@@ -33,6 +36,14 @@ pub struct Pin {
 impl Pin {
     pub fn full(value: u8, source: PinSource) -> Self {
         Self { mask: 0xFF, value, source }
+    }
+}
+
+impl PinSource {
+    /// The user's own assertion, by the codeword or as known text: what
+    /// padding recovery neither replaces nor takes away with its own.
+    pub fn is_by_hand(self) -> bool {
+        matches!(self, PinSource::Manual | PinSource::Text)
     }
 }
 

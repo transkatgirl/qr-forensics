@@ -4,24 +4,30 @@ use eframe::egui::{self, Color32, RichText};
 use qr_forensics::decode::bch::InfoRead;
 use qr_forensics::decode::bitstream::{Certainty, EndOfData, LostReason, SegmentContent};
 use qr_forensics::decode::codewords::PinSource;
+use qr_forensics::decode::known::{Place, TextPinError, text_pins};
 use qr_forensics::decode::pipeline::{BlockOutcome, BlockReport, CodewordReport, CwStatus, SolveMethod};
 use qr_forensics::decode::rs::RsFailure;
 use qr_forensics::decode::sequence::ParityCheck;
 use qr_forensics::decode::text::{Charset, TextReport, UNKNOWN_CHAR, control_picture};
 use qr_forensics::symbol::{Family, SymbolVersion};
 use qr_forensics::symbol::layout::{CodewordSpan, CwId};
+use qr_forensics::symbol::tables::Mode;
 
 use super::state::*;
-use super::{Action, App, Transform, ec_name};
+use super::{Action, App, ExportFormat, Transform, ec_name};
 
 const GOOD: Color32 = Color32::from_rgb(40, 170, 80);
 
 pub(super) fn show(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     app.view.wheel.follow(ui.input(|i| i.pointer.hover_pos()));
     result_section(ui, app, actions);
+    if app.proposals.as_ref().is_some_and(|proposals| proposals.reads.is_some()) {
+        section(ui, "Symbols read", true, |ui| reads_section(ui, app, actions));
+    }
     section(ui, "Format and version", true, |ui| format_section(ui, app, actions));
     section(ui, "Blocks", true, |ui| blocks_section(ui, app));
     section(ui, "Codewords", true, |ui| codewords_section(ui, app, actions));
+    section(ui, "Known text", true, |ui| known_text_section(ui, app, actions));
     section(ui, "Padding recovery and pins", true, |ui| padding_section(ui, app, actions));
     section(ui, "Structured append", !app.view.sequence.is_empty(), |ui| sequence_section(ui, app, actions));
     section(ui, "Segments", false, |ui| segments_section(ui, app));
@@ -143,12 +149,47 @@ fn result_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
             return;
         }
         let area = egui::ScrollArea::vertical().id_salt("result_text").max_height(180.0);
+        let picked = app.view.picked_char.filter(|&at| at < report.text.sources.len());
+        let mut clicked = None;
         let shown = latched(area, &app.view.wheel, InnerList::ResultText).show(ui, |ui| match app.view.result_mode {
-            ResultMode::Text => ui.label(text_job(ui, &report.text)),
-            other => ui.label(mono(shown_as(&report.text, other))),
+            ResultMode::Text => {
+                // A label as egui draws one, with its text still to be
+                // selected by dragging, and the character a click lands
+                // on taken note of: the text is laid out a glyph to a
+                // character, in the message's order.
+                let label = egui::Label::new(text_job(ui, &report.text, picked)).sense(egui::Sense::click());
+                let (at, galley, response) = label.layout_in_ui(ui);
+                if ui.is_rect_visible(response.rect) {
+                    let (color, underline) = (ui.visuals().text_color(), egui::Stroke::NONE);
+                    egui::text_selection::LabelSelectionState::label_text_selection(ui, &response, at, galley.clone(), color, underline);
+                }
+                if response.clicked()
+                    && let Some(pointer) = response.interact_pointer_pos()
+                {
+                    clicked = char_under(&galley, pointer - at);
+                }
+                response.on_hover_text(
+                    "Click a character to outline the modules it is made of on the grid, and to start Known text there. \
+                     Esc clears it.",
+                );
+            }
+            other => {
+                ui.label(mono(shown_as(&report.text, other)));
+            }
         });
         app.view.wheel.place(InnerList::ResultText, laid_out(&shown));
+        if let Some(at) = clicked.filter(|&at| at < report.text.sources.len()) {
+            // A second click on the character lets go of it.
+            app.view.picked_char = (picked != Some(at)).then_some(at);
+            if app.view.picked_char.is_some() {
+                (app.view.known_at, app.view.known_from_start) = (at, false);
+                app.view.stage = Stage::Edit;
+            }
+        }
     });
+    if let Some(at) = app.view.picked_char.filter(|&at| at < report.text.sources.len()) {
+        ui.small(picked_line(app, at));
+    }
     ui.horizontal(|ui| {
         ui.label("Show as");
         for mode in ResultMode::ALL {
@@ -220,7 +261,7 @@ fn result_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         {
             actions.push(Action::AddToSequence);
         }
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui
             .button("Apply corrections")
             .on_hover_text(
@@ -232,22 +273,31 @@ fn result_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
             actions.push(Action::ApplyCorrections);
         }
         if ui
-            .button("Export image…")
-            .on_hover_text("Save the repaired symbol as a PNG that an ordinary reader can scan")
+            .button("Export PNG…")
+            .on_hover_text("Save the repaired symbol as a bitmap that an ordinary reader can scan")
             .clicked()
         {
-            actions.push(Action::ExportImage);
+            actions.push(Action::ExportImage(ExportFormat::Png));
+        }
+        if ui
+            .button("Export SVG…")
+            .on_hover_text("Save the repaired symbol as a drawing, which prints and scales at any size without blur")
+            .clicked()
+        {
+            actions.push(Action::ExportImage(ExportFormat::Svg));
         }
     });
     ui.add_space(4.0);
 }
 
-/// The message laid out with its certainties coloured.
-fn text_job(ui: &egui::Ui, text: &TextReport) -> egui::text::LayoutJob {
+/// The message laid out with its certainties coloured, and the character
+/// `picked`, when there is one, marked as the grid marks its modules.
+fn text_job(ui: &egui::Ui, text: &TextReport, picked: Option<usize>) -> egui::text::LayoutJob {
     let visuals = ui.visuals();
     let font = egui::FontId::monospace(14.0);
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = ui.available_width();
+    let mut before = 0;
     for span in &text.spans {
         let mut format = egui::TextFormat::simple(font.clone(), visuals.text_color());
         match span.certainty {
@@ -258,9 +308,212 @@ fn text_job(ui: &egui::Ui, text: &TextReport) -> egui::text::LayoutJob {
                 format.background = visuals.error_fg_color;
             }
         }
-        job.append(&displayable(&span.text), 0.0, format);
+        let shown = displayable(&span.text);
+        let count = shown.chars().count();
+        match picked.filter(|&at| (before..before + count).contains(&at)) {
+            Some(at) => {
+                // The span in three: up to the character, it, and the rest.
+                let start = shown.char_indices().nth(at - before).map_or(shown.len(), |(i, _)| i);
+                let end = shown[start..].chars().next().map_or(start, |ch| start + ch.len_utf8());
+                let marked = egui::TextFormat { color: Color32::BLACK, background: super::canvas::PICKED, ..format.clone() };
+                job.append(&shown[..start], 0.0, format.clone());
+                job.append(&shown[start..end], 0.0, marked);
+                job.append(&shown[end..], 0.0, format);
+            }
+            None => job.append(&shown, 0.0, format),
+        }
+        before += count;
     }
     job
+}
+
+/// The character of a laid-out text that lies under a point, which is
+/// given from the text's own top left: the one whose glyph the point is
+/// on, counted through the rows before it and the line breaks that end
+/// them. `None` between rows and past a row's end.
+fn char_under(galley: &egui::Galley, at: egui::Vec2) -> Option<usize> {
+    let mut before = 0;
+    for placed in &galley.rows {
+        if (placed.min_y()..=placed.max_y()).contains(&at.y) {
+            let x = at.x - placed.pos.x;
+            let on = |glyph: &egui::epaint::text::Glyph| (glyph.logical_rect().left()..glyph.logical_rect().right()).contains(&x);
+            return placed.row.glyphs.iter().position(on).map(|i| before + i);
+        }
+        before += placed.char_count_including_newline().0;
+    }
+    None
+}
+
+/// One line about the character picked in the result: what it is, the
+/// bits of the data stream it is made of, and the codewords they lie in.
+fn picked_line(app: &App, at: usize) -> String {
+    let (report, layout) = (&app.derived.report, &app.derived.layout);
+    let source = &report.text.sources[at];
+    let shown: String = report.text.plain().chars().nth(at).map(|ch| displayable(&ch.to_string())).unwrap_or_default();
+    let mut codewords: Vec<CwId> = source.bits.clone().filter_map(|bit| layout.stream_bit_location(bit).map(|(cw, _)| cw)).collect();
+    codewords.dedup();
+    let names: Vec<String> = codewords.iter().map(CwId::to_string).collect();
+    let block = codewords.first().map_or(0, |&cw| layout.codewords[cw].block + 1);
+    let mode = report.parse.segments.get(source.segment).map_or("", |segment| segment.mode.label());
+    format!(
+        "Character {} “{shown}” · {} · stream bits {} to {} · codeword{} {} of block {block}, outlined on the grid",
+        at + 1,
+        mode.to_lowercase(),
+        source.bits.start,
+        source.bits.end.saturating_sub(1),
+        if names.len() == 1 { "" } else { "s" },
+        names.join(", ")
+    )
+}
+
+/// The symbols a search found, as Read all read them: each with how its
+/// read stands and its message, to copy, or to load into the grid.
+fn reads_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
+    let Some(reads) = app.proposals.as_ref().and_then(|proposals| proposals.reads.as_ref()) else { return };
+    let visuals = ui.visuals().clone();
+    let busy = app.job.is_some();
+    let area = egui::ScrollArea::vertical().id_salt("reads").max_height(260.0);
+    let shown = latched(area, &app.view.wheel, InnerList::Reads).show(ui, |ui| {
+        for (i, read) in reads.results.iter().enumerate() {
+            let Some(read) = read else {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("{}.", i + 1)).strong());
+                    ui.colored_label(visuals.error_fg_color, "could not be sampled where it was found");
+                });
+                continue;
+            };
+            let version = read.version();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("{}. {} {version}", i + 1, version.family().label())).strong());
+                let color = if read.is_trustworthy() { GOOD } else { visuals.error_fg_color };
+                ui.colored_label(color, crate::cli::standing(read));
+                if ui.add_enabled(!read.report.text.is_empty(), egui::Button::new("Copy").small()).clicked() {
+                    ui.ctx().copy_text(read.text());
+                }
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Load").small())
+                    .on_hover_text(
+                        "Put the outline and anchors on this symbol and write the grid as it was read, with the pins \
+                         it was read under: a new grid of the symbol's version (undoable).",
+                    )
+                    .on_disabled_hover_text("Wait for the step under way to finish")
+                    .clicked()
+                {
+                    actions.push(Action::LoadRead(i));
+                }
+            });
+            if !read.report.text.is_empty() {
+                ui.label(text_job(ui, &read.report.text, None));
+            }
+        }
+    });
+    app.view.wheel.place(InnerList::Reads, laid_out(&shown));
+    let decoded: Vec<String> = reads.results.iter().flatten().filter(|read| read.is_trustworthy()).map(|read| read.text()).collect();
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(!decoded.is_empty(), egui::Button::new("Copy every message"))
+            .on_hover_text("The messages that decoded, one to a line, in the order of the list")
+            .clicked()
+        {
+            ui.ctx().copy_text(decoded.join("\n"));
+        }
+        ui.weak(format!("{} of {} decoded", decoded.len(), reads.results.len()));
+    });
+}
+
+/// Text the user knows the message to hold, and where: pinned, it costs
+/// no error correction.
+fn known_text_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
+    let warn = ui.visuals().warn_fg_color;
+    ui.small(
+        "What you already know of the message costs no error correction once it is pinned: an address that begins \
+         https://, a number printed beside the symbol. Type it, say where it starts, and pin it.",
+    );
+    ui.add(
+        egui::TextEdit::multiline(&mut app.view.known_text)
+            .desired_rows(1)
+            .desired_width(f32::INFINITY)
+            .font(egui::TextStyle::Monospace)
+            .hint_text("https://example.com/"),
+    )
+    .on_hover_text("Enter gives a line feed. Byte data is taken in the character set the result is shown in.");
+    let length = app.derived.report.text.sources.len();
+    let spec = app.derived.layout.stream;
+    let view = &mut app.view;
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Starts at");
+        ui.radio_value(&mut view.known_from_start, false, "character")
+            .on_hover_text("A character of the text as read, in the segment it is read in. Click one in the result to set it.");
+        let mut number = view.known_at + 1;
+        let field = egui::DragValue::new(&mut number).range(1..=length.max(1)).speed(0.2);
+        if ui.add_enabled(!view.known_from_start, field).on_hover_text("The first character of the message is 1").changed() {
+            view.known_at = number.saturating_sub(1);
+        }
+        ui.radio_value(&mut view.known_from_start, true, "the start, as").on_hover_text(
+            "The very start of the message, whatever its header reads as: for a symbol whose first codewords are too \
+             damaged to say how the message is packed. The mode is pinned with the text.",
+        );
+        ui.add_enabled_ui(view.known_from_start, |ui| {
+            egui::ComboBox::from_id_salt("known_mode").selected_text(view.known_mode.label()).show_ui(ui, |ui| {
+                for mode in [Mode::Byte, Mode::Alphanumeric, Mode::Numeric, Mode::Kanji, Mode::Hanzi] {
+                    if spec.count_bits(mode).is_some() {
+                        ui.selectable_value(&mut view.known_mode, mode, mode.label());
+                    }
+                }
+            });
+        });
+    });
+    // What pinning would do, said before it is done.
+    let place = if view.known_from_start { Place::Start(view.known_mode) } else { Place::Char(view.known_at) };
+    let found = text_pins(&app.derived.layout, &app.derived.report, place, &view.known_text, app.opts.charset);
+    match &found {
+        Ok(found) => {
+            let mut text = format!("Pins {} characters, in {} codewords.", found.pinned, found.pins.len());
+            if found.left_out > 0 {
+                text.push_str(&format!(" {} at the ends share a group with characters not given, and are left out.", found.left_out));
+            }
+            ui.small(text);
+            if found.contradicted > 0 {
+                ui.colored_label(
+                    warn,
+                    format!(
+                        "{} of its bits differ from bits error correction has confirmed: the text, or where it starts, \
+                         looks wrong.",
+                        found.contradicted
+                    ),
+                );
+            }
+        }
+        Err(TextPinError::Empty) => {}
+        Err(error) => {
+            ui.colored_label(warn, format!("Cannot be pinned: {error}."));
+        }
+    }
+    let text_pins = app.doc.pins.values().filter(|pin| pin.source == PinSource::Text).count();
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(found.is_ok(), egui::Button::new("Pin text"))
+            .on_hover_text("Fix these characters at their values, bit for bit, so that damage under them costs nothing. Undoable.")
+            .clicked()
+        {
+            actions.push(Action::PinText);
+        }
+        if ui
+            .add_enabled(!app.derived.report.is_trustworthy(), egui::Button::new("Try common beginnings"))
+            .on_hover_text(
+                "Try the ways messages commonly begin, https:// and WIFI: and BEGIN:VCARD among them, and pin the one \
+                 that makes a block verify that did not. Error correction over the rest of the block is what bears a \
+                 beginning out.",
+            )
+            .on_disabled_hover_text("The message is decoded and verified already")
+            .clicked()
+        {
+            actions.push(Action::TryBeginnings);
+        }
+        if ui.add_enabled(text_pins > 0, egui::Button::new("Remove text pins")).clicked() {
+            actions.push(Action::ClearTextPins);
+        }
+    });
 }
 
 /// The message in one of the result modes, as a plain string.
@@ -341,7 +594,7 @@ fn sequence_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
         ui.set_min_width(ui.available_width());
         let area = egui::ScrollArea::vertical().id_salt("sequence_text").max_height(180.0);
         let shown = latched(area, &app.view.wheel, InnerList::SequenceText).show(ui, |ui| {
-            ui.label(text_job(ui, &assembled));
+            ui.label(text_job(ui, &assembled, None));
         });
         app.view.wheel.place(InnerList::SequenceText, laid_out(&shown));
     });
@@ -756,6 +1009,7 @@ fn codewords_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
             let value = item.final_value.map_or("--".to_owned(), |v| format!("{v:02X}"));
             let pin = match item.pin.map(|p| p.source) {
                 Some(PinSource::Manual) => " pin",
+                Some(PinSource::Text) => " txt",
                 Some(PinSource::Padding) => " pad",
                 Some(PinSource::Terminator) => " end",
                 Some(PinSource::Header) => " hdr",
@@ -823,11 +1077,18 @@ fn padding_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) 
     let warn = ui.visuals().warn_fg_color;
     let pins = &app.doc.pins;
     let count = |source: PinSource| pins.values().filter(|p| p.source == source).count();
-    let (manual, padding, terminator, header) =
-        (count(PinSource::Manual), count(PinSource::Padding), count(PinSource::Terminator), count(PinSource::Header));
+    let (manual, text, padding, terminator, header) = (
+        count(PinSource::Manual),
+        count(PinSource::Text),
+        count(PinSource::Padding),
+        count(PinSource::Terminator),
+        count(PinSource::Header),
+    );
 
     if !pins.is_empty() {
-        ui.label(format!("Pins: {manual} by hand, {padding} padding, {terminator} terminator, {header} header"));
+        ui.label(format!(
+            "Pins: {manual} by hand, {text} known text, {padding} padding, {terminator} terminator, {header} header"
+        ));
         if app.doc.pins_ec != Some(derived.ec) {
             ui.colored_label(
                 warn,

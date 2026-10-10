@@ -146,12 +146,21 @@
 //! pass found, and the copy serves the same end: a twelve-megapixel
 //! photo that took two minutes to search at full size takes twenty
 //! seconds.
+//!
+//! A photo keeps the size it has: it is not made smaller when it is
+//! loaded, and what is found in it is fitted, refined and sampled in its
+//! own pixels, however many they are. Only the search of the whole
+//! photo looks at less. It is made in a copy of the photo reduced to
+//! [`SEARCH_SIDE`] pixels on its longer side, as every photo once was
+//! when it was loaded, and each symbol the copy shows is then found
+//! again in the photo itself through its outline, as a symbol shown by
+//! a shrunk copy is. A symbol too small to show in the copy is not
+//! found by the search: an outline drawn round it finds it.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::f64::consts::SQRT_2;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::Luma;
 use super::adjust::Filter;
@@ -169,11 +178,28 @@ use super::regions;
 use crate::symbol::function_map::{FunctionMap, InfoCopy, Role};
 use crate::symbol::grid::ModuleGrid;
 use crate::symbol::{Family, Pos, SymbolVersion, tables};
+use crate::work;
 
 /// How far beyond the outline the search reaches, as a fraction of its size.
 pub(crate) const MARGIN: f64 = 0.15;
-/// Longest side of the rectified image, in pixels.
+/// Longest side of the image rectified for the scan of an outline for
+/// finder patterns, in pixels: what is inside a larger outline is first
+/// scanned reduced to this. The scan only proposes. Every finder it
+/// proposes is fitted, and every corner, anchor and module after it is
+/// placed and read, in the photo's own pixels, and an outline may be no
+/// more than four times its symbol across, so that a module of the
+/// largest symbol still has two pixels in the reduced scan. Scanning a
+/// large outline unreduced from the start was tried when photos stopped
+/// being shrunk at loading: on a forty-eight megapixel photo it found
+/// nothing the reduced scan did not, and with the grain such a photo
+/// has it took eight times as long. So the unreduced scan is the last
+/// resort of a search that has found nothing: see [`detect_candidates`].
 const MAX_RECTIFIED: f64 = 2048.0;
+/// No limit on the rectified image: the photo's own pixels.
+const UNREDUCED: f64 = f64::INFINITY;
+/// The longest side, in pixels, of the photo a search of the whole of it
+/// looks at: a larger photo is searched in a copy reduced to this.
+pub const SEARCH_SIDE: usize = 4096;
 /// Smallest module worth looking for, in rectified pixels.
 const MIN_MODULE: f64 = 1.5;
 /// A module is at most this many times the outline's shorter side divided
@@ -370,6 +396,11 @@ const MAX_PROPOSALS: usize = 12;
 /// tried after every triple and have a budget of their own, so that false
 /// triples cannot spend it for them.
 const MAX_PAIR_PROPOSALS: usize = 6;
+/// Proposals fitted side by side, at most, once the best of them has come
+/// to nothing: every fit of such a batch is waited for, and a fit made
+/// for a proposal that another of the batch disposes of is wasted, so
+/// the batch is kept well under the dozen that may fail.
+const FITS_AT_ONCE: usize = 8;
 /// Scan clusters a search of the whole photo refines, strongest first.
 /// [`MAX_CANDIDATES`] is as many as one symbol in an outline needs, and a
 /// sheet of twenty symbols threw up ninety-one clusters, sixty of them
@@ -902,15 +933,25 @@ pub fn detect_candidates(
             return found;
         }
     }
-    let found = detect_candidates_in(image, version, region, params, true, None);
+    let found = detect_candidates_in(image, version, region, params, true, None, MAX_RECTIFIED);
     if found.is_empty() {
         // Nothing read as a symbol: the ladder, cheapest step first.
-        return Retry::LADDER
+        let found = Retry::LADDER
             .into_iter()
             .filter(|step| !matches!(step, Retry::Upscaled { factor } if *factor <= enlarge))
+            .take_while(|_| !work::cancelled())
             .map(|step| detect_candidates_through(image, version, region, params, step))
             .find(|found| !found.is_empty())
             .unwrap_or_default();
+        // And last, for an outline so large that all of those scanned it
+        // reduced, the scan in the photo's own pixels: no outline goes
+        // unfound for want of pixels the photo has. Last, since it is
+        // the dearest look there is, and on a photo with grain the one
+        // most likely to take the grain for finders.
+        if found.is_empty() && scanned_reduced(region) && !work::cancelled() {
+            return detect_candidates_in(image, version, region, params, true, None, UNREDUCED);
+        }
+        return found;
     }
     // A second pass for a symbol whose modules are too small for the scan
     // to read well. The first pass enlarges the photo by what the family's
@@ -955,7 +996,7 @@ fn detect_candidates_through(
     step: Retry,
 ) -> Vec<Detection> {
     let Some(view) = View::around(image, region, step) else { return Vec::new() };
-    let mut found = detect_candidates_in(&view.luma, version, region.map(|p| view.to_view(p)), params, true, view.local_radius);
+    let mut found = detect_candidates_in(&view.luma, version, region.map(|p| view.to_view(p)), params, true, view.local_radius, MAX_RECTIFIED);
     for detection in &mut found {
         view.unscale(detection);
         detection.retry = Some(step);
@@ -981,11 +1022,23 @@ fn needed_upscale(region: [[f64; 2]; 4], family: Family) -> u8 {
     ((TARGET_MODULE_PX * fewest / shorter).ceil() as u8).clamp(1, MAX_UPSCALE)
 }
 
+/// Whether the scan of `region` for finder patterns looks at it reduced:
+/// the outline, with the scan's margin about it, is longer than
+/// [`MAX_RECTIFIED`] on a side.
+fn scanned_reduced(region: [[f64; 2]; 4]) -> bool {
+    let across = distance(region[0], region[1]).max(distance(region[3], region[2]));
+    let down = distance(region[0], region[3]).max(distance(region[1], region[2]));
+    (1.0 + 2.0 * MARGIN) * across.max(down) > MAX_RECTIFIED
+}
+
 /// [`detect_candidates`] on the photo as it is: the finder patterns inside
 /// the outline, then a fit in each frame they propose, when `with_frames`,
 /// and in the outline's own frame last; the placements found, best first.
 /// `local_radius` narrows the scan's local threshold to that many pixels
-/// about each pixel, as a rung of the ladder asks.
+/// about each pixel, as a rung of the ladder asks. `longest` is the most
+/// the image rectified for the scan may measure on a side:
+/// [`MAX_RECTIFIED`], or [`UNREDUCED`] for a scan in the photo's own
+/// pixels.
 fn detect_candidates_in(
     image: &Luma,
     version: SymbolVersion,
@@ -993,8 +1046,9 @@ fn detect_candidates_in(
     params: &SampleParams,
     with_frames: bool,
     local_radius: Option<f64>,
+    longest: f64,
 ) -> Vec<Detection> {
-    let Some(rect) = Rectified::new(image, region).map(|rect| rect.narrowed(local_radius)) else { return Vec::new() };
+    let Some(rect) = Rectified::with_longest(image, region, longest).map(|rect| rect.narrowed(local_radius)) else { return Vec::new() };
     let threshold = fixed_threshold(params);
     let family = version.family();
     let all = collect_capstones(image, &rect, threshold, family);
@@ -1021,7 +1075,10 @@ fn detect_candidates_in(
     }
     let mut found: Vec<(Detection, Rank)> = Vec::new();
     for frame in frames {
-        let Some(geometry) = Frame::new(frame, MAX_RECTIFIED) else { continue };
+        if work::cancelled() {
+            break;
+        }
+        let Some(geometry) = Frame::new(frame, longest) else { continue };
         let capstones: Vec<Capstone> = all.iter().map(|c| c.reframed(&geometry)).collect();
         let mut settled = false;
         for (mut fit, ranked) in detect_in_frame(image, version, &geometry, &capstones, threshold, params) {
@@ -1270,7 +1327,7 @@ fn detect_in_frame(
         let mut fits: Vec<(Detection, f64)> = Vec::new();
         let mut next = 0;
         let mut widened = false;
-        while next < tried.len() {
+        while next < tried.len() && !work::cancelled() {
             let func = FunctionMap::new(tried[next]);
             next += 1;
             for found in align_version(image, &func, &capstones, inverted, threshold, params.band, prename) {
@@ -1582,12 +1639,16 @@ struct Rectified {
 }
 
 impl Rectified {
+    /// The photo inside `region`, reduced as an outline the search of
+    /// the whole photo proposes is.
+    #[cfg(test)]
     fn new(image: &Luma, region: [[f64; 2]; 4]) -> Option<Self> {
         Self::with_longest(image, region, MAX_RECTIFIED)
     }
 
-    /// The same, with the longest side of the rectified image capped at
-    /// `longest` pixels rather than [`MAX_RECTIFIED`].
+    /// The photo inside `region`, and a margin about it, resampled square
+    /// to the region, with the longest side of the result capped at
+    /// `longest` pixels: a larger region comes out reduced.
     fn with_longest(image: &Luma, region: [[f64; 2]; 4], longest: f64) -> Option<Self> {
         let frame = Frame::new(region, longest)?;
         let mut data = Vec::with_capacity(frame.width * frame.height);
@@ -4030,12 +4091,58 @@ pub fn find_symbols_with(image: &Luma, family: Family, params: &SampleParams, se
 /// a photo of a QR Code took four seconds to search for QR Codes and a
 /// hundred and twelve more to search for Micro QR symbols, on the same
 /// pixels.
+///
+/// A photo longer than [`SEARCH_SIDE`] on a side is searched in a copy
+/// reduced to that, and each symbol the copy shows is found again in the
+/// photo's own pixels through its outline, when the search would vouch
+/// for the placement there, or else stands as the copy placed it,
+/// scaled up: either way it comes back in the photo's own pixels, where
+/// whatever is done with it next, a refinement or a read, is done.
 pub fn find_symbols_of_families(
     image: &Luma,
     families: &[Family],
     params: &SampleParams,
     search: &SearchParams,
-    credible: &dyn Fn(&Detection) -> bool,
+    credible: &(dyn Fn(&Detection) -> bool + Sync),
+) -> Vec<Detection> {
+    let Some(copy) = reduced_for_search(image) else {
+        return search_whole(image, families, params, search, credible);
+    };
+    let (across, down) = (image.width as f64 / copy.width as f64, image.height as f64 / copy.height as f64);
+    let found = search_whole(&copy, families, params, search, credible);
+    work::map(&found, |found| {
+        let mut found = found.clone();
+        found.corners = found.corners.map(|[x, y]| [x * across, y * down]);
+        for anchor in &mut found.anchors {
+            anchor.center = [anchor.center[0] * across, anchor.center[1] * down];
+        }
+        if work::cancelled() { found } else { refine_found(image, found, params) }
+    })
+}
+
+/// The copy of a photo that a search of the whole of it looks at, when
+/// that is not the photo itself: the photo reduced, smoothly, so that
+/// its longer side is [`SEARCH_SIDE`]. `None` for a photo no larger.
+fn reduced_for_search(image: &Luma) -> Option<Luma> {
+    let longest = image.width.max(image.height);
+    if longest <= SEARCH_SIDE {
+        return None;
+    }
+    let scale = SEARCH_SIDE as f32 / longest as f32;
+    let (width, height) = (((image.width as f32 * scale) as u32).max(1), ((image.height as f32 * scale) as u32).max(1));
+    let full = image::ImageBuffer::<image::Luma<f32>, &[f32]>::from_raw(image.width as u32, image.height as u32, &image.data[..])?;
+    let reduced = image::imageops::resize(&full, width, height, image::imageops::FilterType::Triangle);
+    Some(Luma::new(width as usize, height as usize, reduced.into_raw()))
+}
+
+/// [`find_symbols_of_families`] of a photo, or a copy of one, that is no
+/// larger than the search looks at.
+fn search_whole(
+    image: &Luma,
+    families: &[Family],
+    params: &SampleParams,
+    search: &SearchParams,
+    credible: &(dyn Fn(&Detection) -> bool + Sync),
 ) -> Vec<Detection> {
     let whole = [[0.0, 0.0], [image.width as f64, 0.0], [image.width as f64, image.height as f64], [0.0, image.height as f64]];
     let mut all: Vec<Detection> = Vec::new();
@@ -4077,7 +4184,7 @@ pub fn find_symbols_of_families(
 
 /// Add what one family's search of a copy found to `all`, and its
 /// credible QR Codes to `taken`.
-fn note(all: &mut Vec<Detection>, taken: &mut Vec<Detection>, family: Family, found: Vec<Detection>, credible: &dyn Fn(&Detection) -> bool) {
+fn note(all: &mut Vec<Detection>, taken: &mut Vec<Detection>, family: Family, found: Vec<Detection>, credible: &(dyn Fn(&Detection) -> bool + Sync)) {
     if family == Family::Qr {
         taken.extend(found.iter().filter(|d| credible(d)).cloned());
     }
@@ -4093,15 +4200,26 @@ fn search_view(
     params: &SampleParams,
     taken: &mut Vec<Detection>,
     known: &[Detection],
-    credible: &dyn Fn(&Detection) -> bool,
+    credible: &(dyn Fn(&Detection) -> bool + Sync),
 ) -> Searched {
     let mut all = Searched::default();
-    for &family in families {
-        let found = view.find(family, params, taken, known);
-        if found.more {
-            all.more.push(family);
+    // The finders of the QR Codes found are withheld from the families
+    // after, so QR Code is searched for on its own. The families that
+    // follow it take nothing from one another, and are searched for side
+    // by side.
+    let mut rest = families;
+    while let Some((&first, after)) = rest.split_first() {
+        let together = if first == Family::Qr { 1 } else { 1 + after.iter().take_while(|&&family| family != Family::Qr).count() };
+        let (batch, later) = rest.split_at(together);
+        let withheld: &[Detection] = taken;
+        let found = work::map(batch, |&family| view.find(family, params, withheld, known));
+        for (&family, found) in batch.iter().zip(found) {
+            if found.more {
+                all.more.push(family);
+            }
+            note(&mut all.detections, taken, family, found.detections, credible);
         }
-        note(&mut all.detections, taken, family, found.detections, credible);
+        rest = later;
     }
     all
 }
@@ -4135,11 +4253,14 @@ fn search_coarse(
     families: &[Family],
     params: &SampleParams,
     taken: &mut Vec<Detection>,
-    credible: &dyn Fn(&Detection) -> bool,
+    credible: &(dyn Fn(&Detection) -> bool + Sync),
 ) -> Searched {
     let mut all = Searched::default();
     let mut wanted: Vec<Family> = families.to_vec();
     for factor in coarse_factors(image) {
+        if work::cancelled() {
+            break;
+        }
         let Some(view) = ScannedView::through(image, Retry::Downscaled { factor }, params, &wanted) else { continue };
         let found = search_view(&view, &wanted, params, taken, &all.detections, credible);
         // The modules in the copy's own pixels.
@@ -4181,16 +4302,61 @@ fn search_fine(
     params: &SampleParams,
     taken: &mut Vec<Detection>,
     known: &[Detection],
-    credible: &dyn Fn(&Detection) -> bool,
+    credible: &(dyn Fn(&Detection) -> bool + Sync),
 ) -> Vec<Detection> {
     let mut all: Vec<Detection> = known.to_vec();
     let mut wanted: Vec<Family> = families.to_vec();
-    for step in std::iter::once(None).chain(Retry::LADDER.iter().copied().map(Some)) {
-        let view = match step {
-            None => ScannedView::of(image, params, &wanted),
-            Some(step) => ScannedView::through(image, step, params, &wanted),
-        };
-        let Some(view) = view else { continue };
+    let steps: Vec<Option<Retry>> = std::iter::once(None).chain(Retry::LADDER.iter().copied().map(Some)).collect();
+    let view_of = |step: Option<Retry>, wanted: &[Family]| match step {
+        None => ScannedView::of(image, params, wanted),
+        Some(step) => ScannedView::through(image, step, params, wanted),
+    };
+    let mut climbed = 0;
+    if all.is_empty() {
+        // While no symbol is known, a rung that shows none leaves the
+        // next the same search to make, of the same families with the
+        // same finders withheld. So the rungs after the first, which on
+        // a sound photo shows the symbol, are climbed side by side and
+        // taken in their order up to the first that shows one: a photo
+        // of a symbol too damaged to find has every rung climbed, and
+        // climbed one after another that took minutes.
+        // A large photo has fewer of its rungs at once: each is a copy
+        // of it.
+        let withheld: &[Detection] = taken;
+        let mut shown = None;
+        work::first_then_in_turn_by(
+            image.copies_at_once(),
+            &steps,
+            |&step| {
+                let mut withheld = withheld.to_vec();
+                let found = match (!work::cancelled()).then(|| view_of(step, &wanted)).flatten() {
+                    Some(view) => search_view(&view, &wanted, params, &mut withheld, &[], credible),
+                    None => Searched::default(),
+                };
+                (found, withheld)
+            },
+            |(found, withheld)| {
+                climbed += 1;
+                let any = !found.detections.is_empty();
+                if any {
+                    shown = Some((found, withheld));
+                }
+                any
+            },
+        );
+        let Some((found, withheld)) = shown else { return Vec::new() };
+        *taken = withheld;
+        all.extend(found.detections);
+        if found.more.is_empty() {
+            return all;
+        }
+        wanted = found.more;
+    }
+    for &step in &steps[climbed..] {
+        if work::cancelled() {
+            break;
+        }
+        let Some(view) = view_of(step, &wanted) else { continue };
         let found = search_view(&view, &wanted, params, taken, &all, credible);
         all.extend(found.detections);
         if all.is_empty() {
@@ -4250,7 +4416,7 @@ fn refine_found(image: &Luma, coarse: Detection, params: &SampleParams) -> Detec
     // unmirrored there, and report it so.
     // The outline the copy gave sets the threshold's reach at full size,
     // as any outline does: the coarse search runs no rung of the ladder.
-    match detect_candidates_in(image, coarse.version, clockwise(coarse.corners), params, false, None).into_iter().next() {
+    match detect_candidates_in(image, coarse.version, clockwise(coarse.corners), params, false, None, MAX_RECTIFIED).into_iter().next() {
         Some(fine) if vouched(image, &fine, params) => fine,
         _ => coarse,
     }
@@ -4348,8 +4514,10 @@ struct ScannedView<'a> {
     /// The scan's candidates, strongest first, and the regions', best first.
     candidates: Vec<Candidate>,
     regions: Vec<Candidate>,
-    /// Each candidate's refinement once made: the scan's, then the regions'.
-    refined: RefCell<[Vec<Option<Option<Capstone>>>; 2]>,
+    /// Each candidate's refinement once made: the scan's, then the
+    /// regions'. The families' searches of the copy run side by side and
+    /// ask for the same candidates.
+    refined: [Vec<OnceLock<Option<Capstone>>>; 2],
 }
 
 impl<'a> ScannedView<'a> {
@@ -4382,7 +4550,7 @@ impl<'a> ScannedView<'a> {
         let max_module = rect.frame.size[0].min(rect.frame.size[1]) * widest;
         let candidates = scan_for_finders(&rect, threshold, max_module);
         let regions = region_candidates(&rect, threshold, max_module, &candidates);
-        let refined = RefCell::new([vec![None; candidates.len()], vec![None; regions.len()]]);
+        let refined = [vec![OnceLock::new(); candidates.len()], vec![OnceLock::new(); regions.len()]];
         Some(Self { luma, origin, scale, step, local_radius, rect, threshold, candidates, regions, refined })
     }
 
@@ -4393,12 +4561,10 @@ impl<'a> ScannedView<'a> {
     /// A candidate's capstone, refined when first asked for: `source` 0
     /// is the scan's candidates, 1 the regions'.
     fn refined(&self, source: usize, i: usize) -> Option<Capstone> {
-        let mut memo = self.refined.borrow_mut();
-        if memo[source][i].is_none() {
+        *self.refined[source][i].get_or_init(|| {
             let candidate = if source == 0 { &self.candidates[i] } else { &self.regions[i] };
-            memo[source][i] = Some(refine_capstone(&self.luma, &self.rect, candidate, self.threshold));
-        }
-        memo[source][i].flatten()
+            refine_capstone(&self.luma, &self.rect, candidate, self.threshold)
+        })
     }
 
     /// The finder patterns of `family` verified against the copy, as
@@ -4497,34 +4663,60 @@ impl<'a> ScannedView<'a> {
         // off a finder of a QR Code, was vouched for by the few modules
         // of its timing patterns reading right by chance where the best
         // fit, of another version, was not.
-        let detect = |found: &[Detection], p: &Proposal| {
-            detect_candidates_in(image, start, p.outline, params, false, self.local_radius)
+        let fit = |p: &Proposal| {
+            detect_candidates_in(image, start, p.outline, params, false, self.local_radius, MAX_RECTIFIED)
                 .into_iter()
                 .next()
-                .filter(|d| vouched(image, d, params) && !found.iter().any(|f| covers(f, quad_centre(d.corners))))
+                .filter(|d| vouched(image, d, params))
+        };
+        // The proposals in their turn, until `most` have come to nothing,
+        // each detected unless a symbol found by then lies where it does.
+        // The fit is nearly all the time a search takes, and says the
+        // same whatever was found before it. The first is made alone: on
+        // a sound photo the best proposal is the symbol, and disposes of
+        // the rest. Once one has come to nothing, the proposals next in
+        // line are fitted side by side on the cores to spare, and still
+        // taken one at a time: a fit made for a proposal that a symbol
+        // found meanwhile disposes of is thrown away, as on one core it
+        // would never have been made.
+        let detect_each = |proposals: &[Proposal], most: usize, found: &mut Vec<Detection>, unfitted: &mut Vec<Vec<usize>>| {
+            let mut fits: Vec<Option<Option<Detection>>> = vec![None; proposals.len()];
+            let mut failed = 0;
+            for (i, p) in proposals.iter().enumerate() {
+                if failed >= most || work::cancelled() {
+                    break;
+                }
+                if !stands(found.as_slice(), p) {
+                    continue;
+                }
+                if fits[i].is_none() {
+                    let crew = work::Crew::gather(if failed == 0 { 0 } else { FITS_AT_ONCE.min(most - failed) - 1 });
+                    let ahead: Vec<usize> = (i..proposals.len())
+                        .filter(|&j| fits[j].is_none() && stands(found.as_slice(), &proposals[j]))
+                        .take(crew.width())
+                        .collect();
+                    let fitted = crew.map(&ahead, |&j| if work::cancelled() { None } else { fit(&proposals[j]) });
+                    for (&j, fitted) in ahead.iter().zip(fitted) {
+                        fits[j] = Some(fitted);
+                    }
+                }
+                let detection = fits[i].take().flatten().filter(|d| !found.iter().any(|f| covers(f, quad_centre(d.corners))));
+                match detection {
+                    Some(detection) => found.push(detection),
+                    None => {
+                        failed += 1;
+                        if p.timed {
+                            unfitted.push(p.members.clone());
+                        }
+                    }
+                }
+            }
         };
         let mut found: Vec<Detection> = Vec::new();
         // The capstones of proposals with a timing pattern between them
         // that came to nothing.
         let mut unfitted: Vec<Vec<usize>> = Vec::new();
-        let mut failed = 0;
-        for p in &proposals {
-            if failed >= MAX_PROPOSALS {
-                break;
-            }
-            if !stands(&found, p) {
-                continue;
-            }
-            match detect(&found, p) {
-                Some(detection) => found.push(detection),
-                None => {
-                    failed += 1;
-                    if p.timed {
-                        unfitted.push(p.members.clone());
-                    }
-                }
-            }
-        }
+        detect_each(&proposals, MAX_PROPOSALS, &mut found, &mut unfitted);
         if family.has_three_finders() {
             // The capstones no symbol was found on, in pairs. A partial
             // capstone's centre is placed by three quarters of it, and a
@@ -4547,24 +4739,7 @@ impl<'a> ScannedView<'a> {
                 })
                 .collect();
             pairs.sort_by(|a, b| a.badness.total_cmp(&b.badness));
-            let mut failed = 0;
-            for p in &pairs {
-                if failed >= MAX_PAIR_PROPOSALS {
-                    break;
-                }
-                if !stands(&found, p) {
-                    continue;
-                }
-                match detect(&found, p) {
-                    Some(detection) => found.push(detection),
-                    None => {
-                        failed += 1;
-                        if p.timed {
-                            unfitted.push(p.members.clone());
-                        }
-                    }
-                }
-            }
+            detect_each(&pairs, MAX_PAIR_PROPOSALS, &mut found, &mut unfitted);
         }
         // Capstones with a timing pattern between them and no symbol
         // found on any of them: a symbol this copy shows and could not
@@ -7267,7 +7442,7 @@ mod tests {
         let symbol = draw_grid(&micro_m2(), [200.0, 200.0], 8.0, 0.0, (400, 400));
         let image = lit(&symbol, |x, y| if x >= 120 && y >= 120 { 0.4 } else { 1.0 });
         let region = [[0.0, 0.0], [400.0, 0.0], [400.0, 400.0], [0.0, 400.0]];
-        assert!(detect_candidates_in(&image, version, region, &SampleParams::default(), true, None).is_empty());
+        assert!(detect_candidates_in(&image, version, region, &SampleParams::default(), true, None, MAX_RECTIFIED).is_empty());
         let found = detect_outline(&image, version, region, &SampleParams::default()).expect("found through the ladder");
         assert_eq!(found.retry, Some(Retry::Thresholded { radius: NARROW_RADIUS }), "{found:?}");
         assert_eq!(found.version, version);
@@ -7304,7 +7479,68 @@ mod tests {
         assert_eq!(needed_upscale([[0.0, 0.0], [200.0, 0.0], [200.0, 200.0], [0.0, 200.0]], Family::Qr), 1);
         assert_eq!(needed_upscale([[0.0, 0.0], [100.0, 0.0], [100.0, 10.0], [0.0, 10.0]], Family::Rmqr), 3);
     }
+
+    /// Paper `width` by `height` with a Micro QR M2 symbol on it at each
+    /// of `places`, `module_px` pixels a module and a little turned.
+    fn paper_with_symbols(width: usize, height: usize, module_px: f64, places: &[[usize; 2]]) -> Luma {
+        let side = (13.0 * module_px * 1.6) as usize;
+        let symbol = draw_grid(&micro_m2(), [side as f64 / 2.0, side as f64 / 2.0], module_px, 7.0, (side, side));
+        let mut data = vec![0.92f32; width * height];
+        for &[x, y] in places {
+            for row in 0..side {
+                let at = (y - side / 2 + row) * width + x - side / 2;
+                data[at..at + side].copy_from_slice(&symbol.data[row * side..(row + 1) * side]);
+            }
+        }
+        Luma::new(width, height, data)
+    }
+
+    #[test]
+    fn the_search_of_a_large_photo_looks_at_a_copy_and_answers_in_the_photos_own_pixels() {
+        // The copy is the photo reduced to the search's side on its
+        // longer one, whichever that is, and a photo no larger is
+        // searched as it is.
+        let flat = |width: usize, height: usize| Luma::new(width, height, vec![0.5; width * height]);
+        assert!(reduced_for_search(&flat(SEARCH_SIDE, 300)).is_none());
+        let copy = reduced_for_search(&flat(5000, 1000)).expect("a photo over the search's side");
+        assert_eq!((copy.width, copy.height), (4096, 819));
+        assert!(copy.data.iter().all(|v| (v - 0.5).abs() < 1e-4), "reducing keeps the tone");
+        assert_eq!(reduced_for_search(&flat(300, 8192)).map(|copy| (copy.width, copy.height)), Some((150, 4096)));
+        // A symbol of eight pixels a module on paper larger than that:
+        // found in the copy, where it has under seven, and placed where
+        // it lies in the photo, at the size it has there.
+        let image = paper_with_symbols(4800, 3600, 8.0, &[[3300, 2500]]);
+        let found = find_symbols(&image, Family::Micro, &SampleParams::default());
+        assert_eq!(found.iter().map(|d| d.version).collect::<Vec<_>>(), [SymbolVersion::Micro(2)]);
+        assert!(distance(quad_centre(found[0].corners), [3300.0, 2500.0]) < 1.5, "{:?}", found[0].corners);
+        let side = distance(found[0].corners[0], found[0].corners[1]);
+        assert!((side - 104.0).abs() < 2.0, "thirteen modules of eight pixels, not {side}");
+    }
+
+    #[test]
+    fn an_outline_too_large_to_scan_whole_is_scanned_reduced_and_placed_in_the_photos_own_pixels() {
+        // Up to the scan's size with its margin, an outline is scanned
+        // as it is; beyond, reduced.
+        let outline = |side: f64| [[100.0, 100.0], [100.0 + side, 100.0], [100.0 + side, 100.0 + side], [100.0, 100.0 + side]];
+        assert!(!scanned_reduced(outline(1575.0)));
+        assert!(scanned_reduced(outline(1576.0)));
+        assert!(scanned_reduced([[0.0, 0.0], [4000.0, 0.0], [4000.0, 300.0], [0.0, 300.0]]), "by its longer side");
+        // A symbol of fifty pixels a module in an outline two and a half
+        // thousand across, where the scan sees it at a little over
+        // thirty: the finder it proposes is fitted in the photo itself,
+        // and the symbol placed to the pixel there.
+        let image = paper_with_symbols(3000, 3000, 50.0, &[[1500, 1500]]);
+        let (version, params) = (SymbolVersion::Micro(2), SampleParams::default());
+        let region = outline(2500.0);
+        assert!(scanned_reduced(region));
+        let found = detect_outline(&image, version, region, &params).expect("the symbol is found");
+        assert_eq!((found.version, found.retry), (version, None));
+        assert!(distance(quad_centre(found.corners), [1500.0, 1500.0]) < 1.5, "{:?}", found.corners);
+        let side = distance(found.corners[0], found.corners[1]);
+        assert!((side - 650.0).abs() < 2.0, "thirteen modules of fifty pixels, not {side}");
+        // An outline that holds nothing has been scanned every way,
+        // its own pixels last, and holds nothing still.
+        let blank = Luma::new(2400, 2400, vec![0.92; 2400 * 2400]);
+        assert!(detect_candidates(&blank, version, outline(2000.0), &params).is_empty());
+    }
 }
-
-
-
