@@ -234,6 +234,34 @@ fn every_image_is_searched_as_its_sidecar_says() {
 }
 
 #[test]
+#[ignore = "a search that climbs to an enlarged copy of the photo: half a minute"]
+fn a_symbol_sheared_to_a_rhombus_is_found_in_the_photo_around_it() {
+    // `cpp_qrcode-2_30a` of the blackbox corpus, a version 2 symbol
+    // sheared until its columns lean nearly fifty degrees from square to
+    // its rows. It reads at every turn through the outline its sidecar
+    // gives, and was not found in the photo around it: all three of its
+    // finders were seen and their corners measured, and the three were
+    // turned away as no symbol's because the line between two of them
+    // met the sides it crossed too far off square, which is the shear
+    // itself. The sides that face are parallel, and that is what is
+    // asked of them now.
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/blackbox");
+    let name = "cpp_qrcode-2_30a";
+    let message = std::fs::read_to_string(dir.join(format!("{name}.txt"))).unwrap();
+    let case = Case {
+        name: name.to_owned(),
+        image: dir.join(format!("{name}.webp")),
+        sidecar: dir.join(format!("{name}.outline")),
+        quick: false,
+        messages: vec![message],
+        reads: 1,
+    };
+    let searched = search(&case);
+    assert!(searched.misread.is_empty(), "{:?}", searched.misread);
+    assert_eq!(searched.matched, case.reads, "{:?}", searched.lines);
+}
+
+#[test]
 fn every_sidecar_has_its_image_and_every_image_its_sidecar() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/opencv");
     let cases = cases();

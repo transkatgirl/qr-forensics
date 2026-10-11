@@ -485,8 +485,9 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
     );
     ui.checkbox(&mut app.view.search.coarse_to_fine, "Search a small copy first").on_hover_text(
         "Search a copy of the photo shrunk to a thousand pixels first, and the photo at the full size a search goes \
-         to, 4096 pixels on its longer side, only if that shows nothing. Much faster on a large photo. Turn off for \
-         a symbol only a few pixels a module, which the copy loses.",
+         to, 4096 pixels on its longer side, in full only if that shows nothing, and otherwise only for the finder \
+         patterns its regions show beside the symbols found. Much faster on a large photo. Turn off for a symbol \
+         only a few pixels a module, which the copy may lose.",
     );
     if let Some(proposals) = &app.proposals {
         let in_use = super::proposal_in_use(proposals, &app.doc.corners);

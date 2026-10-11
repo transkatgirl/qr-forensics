@@ -153,12 +153,17 @@
 //! A large photo is searched first in a copy shrunk to about a thousand
 //! pixels on its longer side, and each symbol the copy shows is found
 //! again at full size through its own outline; the photo is searched at
-//! full size only when no copy shows a symbol, or when a copy shows the
-//! finders of one it could not fit. BoofCV's detector is
+//! full size only when no copy shows a symbol, when a copy shows the
+//! finders of one it could not fit, or when the last copy shows a symbol
+//! too small for it to show well. BoofCV's detector is
 //! quick because its costly refinement touches only the shapes a cheap
 //! pass found, and the copy serves the same end: a twelve-megapixel
 //! photo that took two minutes to search at full size takes twenty
-//! seconds.
+//! seconds. What a copy does not show it says nothing of, so where the
+//! copies settle the search the photo at its own size is asked one thing
+//! more, cheaply, as BoofCV asks it everything: what finder patterns its
+//! regions show on none of the symbols found, and what symbols those
+//! make.
 //!
 //! A photo keeps the size it has: it is not made smaller when it is
 //! loaded, and what is found in it is fitted, refined and sampled in its
@@ -190,7 +195,7 @@ use crate::decode::bch;
 use crate::decode::pipeline::{AttemptScore, DecodeOptions, brute_force};
 use super::regions;
 use crate::symbol::function_map::{FunctionMap, InfoCopy, Role};
-use crate::symbol::grid::ModuleGrid;
+use crate::symbol::grid::{ModuleGrid, Symmetry};
 use crate::symbol::{Family, Pos, SymbolVersion, tables};
 use crate::work;
 
@@ -529,26 +534,32 @@ const PAIR_BADNESS: f64 = 0.5;
 const FRAME_LIKENESS: f64 = 0.05;
 /// Where the line from one finder's centre to another's may cross the
 /// side of each that faces the other, as a share of the side either way
-/// from its middle, and how far from square to that line the side may
-/// lie, in degrees, for the two to stand as finders of one symbol. In a
-/// symbol the line between two of its finders runs along a row or a
-/// column of modules, through the middle of the sides that face and
-/// square to them; perspective bends that a little, and a finder fitted
-/// to a blurred print turns a little. The crossing is BoofCV's test,
-/// which connects two position patterns only when the line between
-/// their centres crosses a side of each within 0.35 of its middle; the
-/// angle is OpenCV's, whose ArUco-based detector asks that two finders
-/// of one symbol face each other, and each the line between them, to
-/// within fifteen degrees (`maxRotation`), and the thirty here leave
-/// room for the turn a blurred finder's fit takes. BoofCV asks less of
-/// the angle, only that the two sides crossed lie nearly parallel to
-/// each other, which they do however steeply the symbol is seen, where
-/// the line between two finders of a symbol foreshortened past about
-/// two to one along its diagonal meets their sides more than thirty
-/// degrees off square: three such finders propose nothing together, and
-/// are left to propose in pairs.
-const FACING_MIDPOINT: f64 = 0.3;
-const FACING_DEGREES: f64 = 30.0;
+/// from its middle, and how far from parallel to each other the two
+/// sides crossed may lie, in degrees, for the two to stand as finders of
+/// one symbol. In a symbol the line between two of its finders runs
+/// along a row or a column of modules, through the middle of the sides
+/// that face; perspective bends that a little, and a finder fitted to a
+/// blurred print turns a little. Both are BoofCV's tests, which connects
+/// two position patterns only when the line between their centres
+/// crosses a side of each within 0.35 of its middle and the two sides
+/// crossed lie within forty-five degrees of parallel
+/// (`QrCodePositionPatternGraphGenerator`, `SquareGraph::almostParallel`).
+///
+/// The angle was once asked of each side against the line, after
+/// OpenCV's ArUco-based detector, which asks that two finders of one
+/// symbol face each other, and each the line between them, to within
+/// fifteen degrees (`maxRotation`): thirty here, to leave room for the
+/// turn a blurred finder's fit takes, and the crossing within three
+/// tenths. The sides that face lie parallel however steeply the symbol
+/// is seen, where the line between two finders of a symbol foreshortened
+/// past about two to one along its diagonal meets them more than thirty
+/// degrees off square. Three such finders proposed nothing together and
+/// were left to propose in pairs, and the pairs found nothing either: a
+/// symbol sheared to a rhombus, which read at every turn through an
+/// outline drawn round it, was not found in the photo around it, with
+/// all three of its finders seen and their corners measured.
+const FACING_MIDPOINT: f64 = 0.35;
+const FACING_PARALLEL: f64 = 45.0;
 /// An outline the capstones propose is fitted only when its centre lies
 /// within the outline given, with the search margin, and its size is
 /// between these shares of the outline given: the outline says where the
@@ -924,6 +935,53 @@ impl Detection {
         swapped
     }
 
+    /// This placement relabelled for its symbol turned or reflected by
+    /// `symmetry`, as [`ModuleGrid::symmetric`] turns a grid: the same
+    /// outline with the symbol's corners at other corners of it, so that
+    /// a grid sampled through the result is the grid sampled through
+    /// this one, turned so. Each anchor names the module its pattern has
+    /// gone to, and one that lands where the version has no pattern of
+    /// its kind goes, as a finder pattern turned into the corner without
+    /// one does: it has nothing there to be refined against. A point
+    /// traced along an edge is on the edge wherever the turn takes it.
+    /// The information bits are as they were read here, for the caller
+    /// to read again.
+    fn turned(&self, symmetry: Symmetry) -> Detection {
+        let func = FunctionMap::new(self.version);
+        let sites = sites(&func);
+        let mut turned = self.clone();
+        turned.corners = symmetry.map_corners(self.corners);
+        // The corner each corner of the result was.
+        let was = symmetry.map_corners([0usize, 1, 2, 3]);
+        let moved = |corners: &[usize]| corners.iter().filter_map(|i| was.iter().position(|j| j == i)).collect::<Vec<usize>>();
+        turned.edged_corners = moved(&self.edged_corners);
+        turned.measured_corners = moved(&self.measured_corners);
+        turned.anchors = self
+            .anchors
+            .iter()
+            .filter_map(|anchor| {
+                let at = symmetry.map_point(func.width, func.height, anchor.at);
+                let sited = anchor.kind == AnchorKind::Edge
+                    || sites.iter().any(|site| site.kind == anchor.kind && (site.at[0] - at[0]).abs() < 1e-6 && (site.at[1] - at[1]).abs() < 1e-6);
+                sited.then_some(Anchor { at, ..*anchor })
+            })
+            .collect();
+        turned.mirrored = self.mirrored != symmetry.is_reflection();
+        // The turn is reckoned as for a placement seen from the front:
+        // a reflection is that placement in mirror order.
+        let front = if symmetry.is_reflection() { [turned.corners[0], turned.corners[3], turned.corners[2], turned.corners[1]] } else { turned.corners };
+        turned.turns = (self.turns + turns_between(self.corners, front)) % 4;
+        turned
+    }
+
+    /// Whether `other` places the same version on the same outline with
+    /// each corner of the symbol at the same corner of it
+    /// ([`placements_alike`]): the same reading of the photo, whatever
+    /// anchors each stands on.
+    pub(crate) fn placed_as(&self, other: &Detection) -> bool {
+        self.version == other.version && placements_alike(self.corners, other.corners)
+    }
+
     /// The map from module coordinates to the photo through the corners
     /// and anchors found.
     pub fn projection(&self) -> Option<Projection> {
@@ -1290,6 +1348,45 @@ pub(crate) fn seen_from_behind(image: &Luma, found: &Detection, params: &SampleP
     Some(swapped)
 }
 
+/// A placement whose fixed patterns fit its symbol turned or reflected
+/// by `symmetry` and not as placed, put the way they fit: the same
+/// outline with the symbol's corners at other corners of it
+/// ([`Detection::turned`]), and the symbol's information bits read
+/// again through them.
+///
+/// The fit that ranks the placements of an outline can put a square a
+/// quarter turn out on two of a symbol's finders above the same square
+/// the right way up on all three, and the few offered to the decode need
+/// not include the second. A grid sampled through the first shows a
+/// finder pattern in the corner that has none and data where one should
+/// be, which the grid's own analysis reads and names the turn for
+/// ([`crate::decode::pipeline::GridAnalysis::orientation`]); BoofCV's
+/// Micro QR reader, with one position pattern to go by, tries each of
+/// the four turns and keeps the one that decodes.
+///
+/// A square symbol's fixed patterns are their own transpose but for one
+/// module, so a turn and the same turn seen from behind fit alike, and
+/// which of the two was named is chance. The format bits decide between
+/// them, as they do for a placement fitted ([`align_assignment`]): the
+/// one seen from the front, unless the bits spell a word more clearly
+/// through the mirror order. An rMQR symbol's patterns fit one way only.
+pub(crate) fn turned_on_symbol(image: &Luma, found: &Detection, symmetry: Symmetry, params: &SampleParams) -> Detection {
+    let func = FunctionMap::new(found.version);
+    let threshold = fixed_threshold(params);
+    let reread = |mut placed: Detection| {
+        placed.mirrored_by_decode = false;
+        placed.info = read_info(image, &func, placed.corners, placed.inverted, threshold, params.band);
+        placed
+    };
+    let turned = reread(found.turned(symmetry));
+    if found.version.family() == Family::Rmqr {
+        return turned;
+    }
+    let other = reread(turned.transposed());
+    let (front, behind) = if turned.mirrored { (other, turned) } else { (turned, other) };
+    if bch::mirror_wins(front.info.format, behind.info.format) { behind } else { front }
+}
+
 /// Least share of fixed modules that must read right for a symbol read
 /// straight off the pixels to be believed: such a read is exact or wrong.
 const PURE_MIN_FIT: f64 = 0.97;
@@ -1520,14 +1617,19 @@ pub fn decodes_as_found(image: &Luma, found: &Detection, params: &SampleParams) 
 /// A name that reads as its word outright stands on less: on the fixed
 /// patterns alone reading that well, whatever the quiet zone does. A
 /// string of bits is a word outright once in a thousand, not once in
-/// two, and the fit reads the fixed modules and the quiet zone against
+/// two, and the fit read the fixed modules and the quiet zone against
 /// one split of them all, which light the paper has and the symbol has
-/// not throws: in a dark photograph with a lamp's bright spot on the
+/// not threw: in a dark photograph with a lamp's bright spot on the
 /// paper beside a version 7 symbol the split fell between the spot and
 /// everything else, and the placement whose version information and
 /// format word both read outright, with 97 fixed modules in a hundred
 /// right against their own split, was given a fit of 44 in a hundred and
-/// ranked below a version 6 symbol fitted to the same finders.
+/// ranked below a version 6 symbol fitted to the same finders. The fit
+/// is read against a threshold that follows the light across the symbol
+/// now ([`Scorer::agreement_shaded`]): a version 2 symbol beside such a
+/// lamp has no word to name its version, and fell to the same split. A
+/// name read outright stands on the fixed patterns alone as before, for
+/// the light no four corners can follow.
 type Rank = (i8, f64);
 
 fn rank(found: &Detection, fit: f64, trusted: Option<Prename>) -> Rank {
@@ -4363,8 +4465,10 @@ pub struct SearchParams {
     /// Search a copy of the photo shrunk to [`COARSE_SIDE`] pixels on its
     /// longer side first, and find each symbol the copy shows again at
     /// full size, through the outline the copy gave; search the photo at
-    /// full size only when the copy shows nothing, or shows the finders
-    /// of a symbol it could not fit. BoofCV's detector
+    /// full size only when the copy shows nothing, shows the finders of
+    /// a symbol it could not fit, or shows a symbol too small for it to
+    /// show well, and otherwise only by the finder patterns its regions
+    /// show beside the symbols found. BoofCV's detector
     /// costs little because its contour pass is cheap and its grey
     /// refinement touches only the shapes that pass it; here the search
     /// at full size fits the whole placement machinery to every outline
@@ -4395,6 +4499,18 @@ pub const COARSE_SIDE: f64 = 1024.0;
 /// ones at 1.7 pixels a module and nothing of the one turned
 /// thirty-seven degrees, and settled the search.
 pub const COARSE_MIN_MODULE: f64 = 2.0;
+/// Least module size, in pixels of the last shrunk copy searched, of a
+/// finder pattern that copy is taken to have shown, whatever it made of
+/// it: the photo at its own size is asked only for smaller ones
+/// ([`search_beside`]). A copy makes out some finders of two pixels a
+/// module and not others, which is why the photo is asked at all: one
+/// showed two symbols at 2.1 and nothing of a third of the same module.
+/// A finder it did show and could fit no symbol to is no better fitted
+/// at full size: two symbols lying mostly under others on a sheet of
+/// eight, a finder of each showing at four and a half pixels a module
+/// in the copy, cost the look twenty-six seconds to make nothing of a
+/// second time.
+const COARSE_SHOWN_MODULE: f64 = 3.0;
 
 /// [`find_symbols`] as `search` says to go about it.
 pub fn find_symbols_with(image: &Luma, family: Family, params: &SampleParams, search: &SearchParams) -> Vec<Detection> {
@@ -4496,12 +4612,20 @@ fn search_whole(
     if search.coarse_to_fine {
         let coarse = search_coarse(image, &pending, params, &mut taken, &mut doubts, credible);
         // Only when no family shows anywhere, in a render or a shrunk
-        // copy, is the photo searched at full size for every family; and
-        // when the last copy shows finders of a symbol it could not fit,
-        // for the families whose finders they are.
+        // copy, or the last copy shows a symbol too small for it to
+        // show well, is the photo searched at full size for every
+        // family; and when the last copy shows finders of a symbol it
+        // could not fit, for the families whose finders they are.
         if !coarse.detections.is_empty() || !all.is_empty() {
             if coarse.more.is_empty() {
+                // What the copies showed, and what the photo at its own
+                // size shows beside it that they did not.
+                let shown = !coarse.detections.is_empty();
                 all.extend(coarse.detections);
+                if let Some(shrunk) = coarse.shrunk.filter(|_| shown && !work::cancelled()) {
+                    let beside = search_beside(image, &pending, params, &mut taken, &all, shrunk, &mut doubts, credible);
+                    all.extend(beside);
+                }
                 drop_settled_claims(&mut all, &doubts);
                 return all;
             }
@@ -4640,6 +4764,17 @@ fn coarse_factors(image: &Luma) -> Vec<u8> {
 /// centres gather in `doubts`. No detections when no copy shows a
 /// symbol, or the photo is too small to shrink; `more` is the last
 /// copy's, the families to search the photo at full size for.
+///
+/// The last copy searched is held to what the copies before it are. One
+/// that shows a symbol under [`COARSE_MIN_MODULE`] sends the search on
+/// to the next larger copy for every family, and after the half-size
+/// copy the next larger is the photo: `more` is then every family. It
+/// was once whatever finders the last copy left, which for a copy that
+/// could not make the finders out is none, and the search ended there:
+/// of three symbols in a twelve-megapixel photograph of a dim room, the
+/// half-size copy showed one at 1.8 pixels a module, and a version 1
+/// symbol of the same module beside it, which the photo at its own size
+/// shows and an outline reads, was not looked for.
 fn search_coarse(
     image: &Luma,
     families: &[Family],
@@ -4650,12 +4785,16 @@ fn search_coarse(
 ) -> Searched {
     let mut all = Searched::default();
     let mut wanted: Vec<Family> = families.to_vec();
+    // The copy last searched showed a symbol too small for it to show
+    // well.
+    let mut small = false;
     for factor in coarse_factors(image) {
         if work::cancelled() {
             break;
         }
         let Some(view) = ScannedView::through(image, Retry::Downscaled { factor }, params, &wanted) else { continue };
         let found = search_view(&view, &wanted, params, taken, &all.detections, credible);
+        all.shrunk = Some(factor);
         // The modules in the copy's own pixels.
         let smallest = found.detections.iter().map(|d| module_size_of(d) / view.scale).fold(f64::INFINITY, f64::min);
         let fresh = all.detections.len();
@@ -4665,17 +4804,74 @@ fn search_coarse(
         if all.detections.is_empty() {
             continue;
         }
-        if smallest >= COARSE_MIN_MODULE && all.more.is_empty() {
+        small = smallest < COARSE_MIN_MODULE;
+        if !small && all.more.is_empty() {
             break;
         }
         // Symbols too small for the copy to show well may have others
         // beside them it did not show at all, of any family; finders left
         // over are their own family's business.
-        if smallest >= COARSE_MIN_MODULE {
+        if !small {
             wanted = all.more.clone();
         }
     }
+    if small {
+        all.more = families.to_vec();
+    }
     all
+}
+
+/// What the photo at its own size shows of `families` beside the symbols
+/// `known`, which its shrunk copies found and settled the search on: the
+/// symbols its regions' finder patterns propose ([`ScannedView::beside`]),
+/// and, where those leave finders of a symbol they could not fit, what
+/// the fine search of the families that have them makes of the photo,
+/// as it would had a copy left them.
+///
+/// A copy says what it shows and nothing of what it does not. The search
+/// ended at the first copy whose symbols were all of two pixels a module
+/// or more with no finders left over: in a twelve-megapixel photograph
+/// of three symbols in a dim room the half-size copy showed two of them
+/// at 2.1 pixels a module and nothing of the third, a version 1 symbol
+/// of the same module, which read through an outline and was found by a
+/// search of the photo at its own size from the start. That search is
+/// what the copies are there to spare: it fits a template to every
+/// cluster its scan of the rows throws up, grain for the most part, and
+/// took a hundred seconds where the copies took one.
+///
+/// BoofCV looks at every photo at its own size and nowhere else, and can:
+/// its position patterns are the squares among the contours of one
+/// binarisation, and a twelve-megapixel photograph costs it a tenth of a
+/// second. The regions here are that pass, and they alone are asked,
+/// those lying on a symbol already found left out, and those of a module
+/// the last copy searched, shrunk `shrunk` times, will have shown
+/// ([`COARSE_SHOWN_MODULE`]), so that the look costs what the finders
+/// the copies missed cost and no more.
+#[allow(clippy::too_many_arguments)]
+fn search_beside(
+    image: &Luma,
+    families: &[Family],
+    params: &SampleParams,
+    taken: &mut Vec<Detection>,
+    known: &[Detection],
+    shrunk: u8,
+    doubts: &mut Vec<[f64; 2]>,
+    credible: &(dyn Fn(&Detection) -> bool + Sync),
+) -> Vec<Detection> {
+    let Some(view) = ScannedView::beside(image, params, families, known, COARSE_SHOWN_MODULE * f64::from(shrunk)) else { return Vec::new() };
+    if view.regions.is_empty() {
+        return Vec::new();
+    }
+    let found = search_view(&view, families, params, taken, known, credible);
+    let mut all: Vec<Detection> = known.to_vec();
+    all.extend(found.detections);
+    doubts.extend(doubtful_claims(image, &all[known.len()..], params));
+    let wanted = still_wanted(&found.more, families, doubts, &all);
+    if !wanted.is_empty() && !work::cancelled() {
+        let more = search_fine(image, &wanted, params, taken, &all, doubts, credible);
+        all.extend(more);
+    }
+    all.split_off(known.len())
 }
 
 /// The fine search of `families`: the photo as it is, then the ladder of
@@ -4966,16 +5162,41 @@ struct ScannedView<'a> {
 impl<'a> ScannedView<'a> {
     /// The photo as it is, scanned for `families`.
     fn of(image: &'a Luma, params: &SampleParams, families: &[Family]) -> Option<Self> {
-        Self::new(Cow::Borrowed(image), [0.0, 0.0], 1.0, None, None, params, families)
+        Self::new(Cow::Borrowed(image), [0.0, 0.0], 1.0, None, None, params, families, true)
     }
 
     /// The photo transformed by `step`, scanned for `families`; `None`
     /// when the copy cannot be made.
     fn through(image: &'a Luma, step: Retry, params: &SampleParams, families: &[Family]) -> Option<Self> {
         let view = View::whole(image, step)?;
-        Self::new(Cow::Owned(view.luma), view.origin, view.scale, Some(step), view.local_radius, params, families)
+        Self::new(Cow::Owned(view.luma), view.origin, view.scale, Some(step), view.local_radius, params, families, true)
     }
 
+    /// The photo as it is, with the finder patterns its regions show
+    /// that lie on none of the symbols `known`, and none of the scan's:
+    /// what [`search_beside`] looks at. The rows and columns are not
+    /// scanned. A region has read as a finder along two lines of its
+    /// own, and the clusters of the scan have passed no test, are most
+    /// of them grain, and are what a search of a large photo at its own
+    /// size spends its time refining. The finders of a symbol with one
+    /// finder pattern are kept: one may have been claimed off a finder
+    /// of a QR Code no copy showed whole. Those of `shown` photo pixels
+    /// a module or more are left out with those on a symbol: the copies
+    /// have shown them, and made of them what there is to make.
+    fn beside(image: &'a Luma, params: &SampleParams, families: &[Family], known: &[Detection], shown: f64) -> Option<Self> {
+        let mut view = Self::new(Cow::Borrowed(image), [0.0, 0.0], 1.0, None, None, params, families, false)?;
+        let frame = view.rect.frame;
+        // Rectified pixels to a photo pixel.
+        let scale = frame.size[0] / image.width.max(1) as f64;
+        view.regions.retain(|region| {
+            let [x, y] = frame.to_image.apply(region.x, region.y);
+            region.module_mean() < shown * scale && !known.iter().any(|found| found.version.family().has_three_finders() && covers(found, [x, y]))
+        });
+        view.refined[1] = vec![OnceLock::new(); view.regions.len()];
+        Some(view)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn new(
         luma: Cow<'a, Luma>,
         origin: [f64; 2],
@@ -4984,6 +5205,7 @@ impl<'a> ScannedView<'a> {
         local_radius: Option<f64>,
         params: &SampleParams,
         families: &[Family],
+        scanned: bool,
     ) -> Option<Self> {
         let (w, h) = (luma.width as f64, luma.height as f64);
         let region = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]];
@@ -4991,7 +5213,7 @@ impl<'a> ScannedView<'a> {
         let threshold = fixed_threshold(params);
         let widest = families.iter().map(|&f| max_module_fraction(f)).fold(0.0, f64::max);
         let max_module = rect.frame.size[0].min(rect.frame.size[1]) * widest;
-        let mut candidates = scan_for_finders(&rect, threshold, max_module);
+        let mut candidates = if scanned { scan_for_finders(&rect, threshold, max_module) } else { Vec::new() };
         let regions = region_candidates(&rect, threshold, max_module, &mut candidates);
         let refined = [vec![OnceLock::new(); candidates.len()], vec![OnceLock::new(); regions.len()]];
         Some(Self { luma, origin, scale, step, local_radius, rect, threshold, candidates, regions, refined })
@@ -5234,6 +5456,9 @@ struct Searched {
     detections: Vec<Detection>,
     /// The families whose search left [more](Found::more) to find.
     more: Vec<Family>,
+    /// How many times the last copy searched was shrunk, where the
+    /// search was of shrunk copies ([`search_coarse`]).
+    shrunk: Option<u8>,
 }
 
 fn quad_centre(quad: [[f64; 2]; 4]) -> [f64; 2] {
@@ -5372,38 +5597,40 @@ fn qr_triples(image: &Luma, frame: &Frame, capstones: &[Capstone]) -> Vec<Triple
 
 /// Whether two capstones face each other as the finders along one side
 /// of a symbol do: the line between their centres crosses a side of each
-/// within [`FACING_MIDPOINT`] of that side's middle, and within
-/// [`FACING_DEGREES`] of square to it, in the frame's pixels. A capstone
-/// whose corners were not measured faces anything: its square was put
-/// square to the frame and says nothing of its turn.
+/// within [`FACING_MIDPOINT`] of that side's middle, and the two sides
+/// crossed lie within [`FACING_PARALLEL`] of parallel to each other, in
+/// the frame's pixels. Nothing is asked of the angle the line makes with
+/// them, which a symbol seen steeply shears. A capstone whose corners
+/// were not measured faces anything: its square was put square to the
+/// frame and says nothing of its turn.
 fn finders_face(a: &Capstone, b: &Capstone, frame: &Frame) -> bool {
     if !a.measured || !b.measured {
         return true;
     }
     let (pa, pb) = (frame.to_rectified(a.center), frame.to_rectified(b.center));
-    let faces = |c: &Capstone, from: [f64; 2], to: [f64; 2]| {
+    // The side of a capstone that the line from its centre towards the
+    // other's leaves it by, when it crosses near enough the middle.
+    let crossed = |c: &Capstone, from: [f64; 2], to: [f64; 2]| {
         let quad = c.corners.map(|p| frame.to_rectified(p));
         let line = [to[0] - from[0], to[1] - from[1]];
-        (0..4).any(|i| {
+        (0..4).find_map(|i| {
             let (p, q) = (quad[i], quad[(i + 1) % 4]);
             let side = [q[0] - p[0], q[1] - p[1]];
             // from + s·line = p + t·side, with both on their segments.
             let det = line[0] * side[1] - line[1] * side[0];
             if det.abs() < 1e-12 {
-                return false;
+                return None;
             }
             let (dx, dy) = (p[0] - from[0], p[1] - from[1]);
             let s = (dx * side[1] - dy * side[0]) / det;
             let t = (dx * line[1] - dy * line[0]) / det;
-            if !(0.0..=1.0).contains(&s) || !(0.0..=1.0).contains(&t) {
-                return false;
-            }
-            let lengths = (line[0] * line[0] + line[1] * line[1]).sqrt() * (side[0] * side[0] + side[1] * side[1]).sqrt();
-            let cos = (line[0] * side[0] + line[1] * side[1]) / lengths.max(1e-12);
-            (t - 0.5).abs() <= FACING_MIDPOINT && cos.abs() <= FACING_DEGREES.to_radians().sin()
+            ((0.0..=1.0).contains(&s) && (0.0..=1.0).contains(&t) && (t - 0.5).abs() <= FACING_MIDPOINT).then_some(side)
         })
     };
-    faces(a, pa, pb) && faces(b, pb, pa)
+    let (Some(u), Some(v)) = (crossed(a, pa, pb), crossed(b, pb, pa)) else { return false };
+    let lengths = (u[0] * u[0] + u[1] * u[1]).sqrt() * (v[0] * v[0] + v[1] * v[1]).sqrt();
+    let cos = (u[0] * v[0] + u[1] * v[1]) / lengths.max(1e-12);
+    cos.abs() >= FACING_PARALLEL.to_radians().cos()
 }
 
 /// Whether a capstone that could be the finder of another symbol lies
@@ -6813,7 +7040,12 @@ fn align_assignment(
     let agreement = scorer.agreement_known(&projection, inverted)?.0;
     let around = [[-1.0, -1.0], [w + 1.0, -1.0], [w + 1.0, h + 1.0], [-1.0, h + 1.0]].map(|[x, y]| projection.apply(x, y));
     let quiet = Scorer::new(image, &Template::with_quiet_zone(func), around, threshold);
-    let (matching, _) = quiet.agreement_known(&super::refine::Shifted { map: &projection, dx: -1.0, dy: -1.0 }, inverted)?;
+    // Against a threshold that follows the light from corner to corner:
+    // the fit ranks the placements, and against one split of the fixed
+    // modules and the quiet zone together a symbol lit unevenly ranks
+    // below the same square turned to stand on two of its finders, and
+    // is not among the few the decode is offered.
+    let (matching, _) = quiet.agreement_shaded(&super::refine::Shifted { map: &projection, dx: -1.0, dy: -1.0 }, inverted)?;
     // Over every module of the pattern, not only those the photo covers:
     // a placement that runs off the photo is judged on the few modules
     // left, and reads as well as it pleases there.
@@ -7590,16 +7822,52 @@ mod tests {
         // A gentle perspective tilts the line a little off the middle of
         // the sides, and the sides a little off square to it.
         assert!(finders_face(&a, &square_capstone([300.0, 160.0], 8.0, 12.0, &frame), &frame));
-        // Turned thirty-five degrees against its partner, past the thirty
-        // allowed: not one symbol's finders.
-        assert!(!finders_face(&a, &square_capstone([300.0, 100.0], 8.0, 35.0, &frame), &frame));
+        // Turned forty degrees against its partner, the line leaves it
+        // nearer a corner than the middle of a side: not one symbol's
+        // finders.
+        assert!(!finders_face(&a, &square_capstone([300.0, 100.0], 8.0, 40.0, &frame), &frame));
         // Across the diagonal the line leaves each square by a corner.
         assert!(!finders_face(&a, &square_capstone([300.0, 300.0], 8.0, 0.0, &frame), &frame));
         // Far enough off the row that the line crosses near a corner.
         assert!(!finders_face(&a, &square_capstone([300.0, 250.0], 8.0, 0.0, &frame), &frame));
         // Corners never measured say nothing against a partner.
-        let unmeasured = Capstone { measured: false, ..square_capstone([300.0, 100.0], 8.0, 35.0, &frame) };
+        let unmeasured = Capstone { measured: false, ..square_capstone([300.0, 100.0], 8.0, 40.0, &frame) };
         assert!(finders_face(&a, &unmeasured, &frame));
+    }
+
+    #[test]
+    fn the_finders_of_a_symbol_seen_steeply_face_each_other() {
+        // A symbol sheared until its columns run forty-five degrees off
+        // square to its rows, as one seen steeply along its diagonal is:
+        // each finder is a rhombus, and the line between two of them
+        // along a row meets the sides it crosses forty-five degrees off
+        // square, through their middles. The sides crossed are parallel,
+        // which is all that is asked of the angle.
+        let frame = Frame::new([[0.0, 0.0], [800.0, 0.0], [800.0, 800.0], [0.0, 800.0]], MAX_RECTIFIED).unwrap();
+        let (module, lean) = (8.0, std::f64::consts::FRAC_1_SQRT_2);
+        // A point of the symbol, in modules along its row and its column.
+        let at = |[across, down]: [f64; 2]| [100.0 + module * (across + lean * down), 100.0 + module * lean * down];
+        let sheared = |[across, down]: [f64; 2]| Capstone {
+            corners: order_in_frame([[-3.5, -3.5], [3.5, -3.5], [3.5, 3.5], [-3.5, 3.5]].map(|[dx, dy]| at([across + dx, down + dy])), &frame),
+            ..square_capstone(at([across, down]), module, 0.0, &frame)
+        };
+        let (top_left, top_right, bottom_left) = (sheared([3.5, 3.5]), sheared([21.5, 3.5]), sheared([3.5, 21.5]));
+        assert!(finders_face(&top_left, &top_right, &frame));
+        assert!(finders_face(&top_left, &bottom_left, &frame));
+        // The two at the ends of the diagonal still do not: the line
+        // between them leaves each by a corner.
+        assert!(!finders_face(&top_right, &bottom_left, &frame));
+        // A square finder beside a sheared one is no partner of it once
+        // their sides lie past forty-five degrees apart.
+        let steeper = |[across, down]: [f64; 2]| {
+            let at = |[across, down]: [f64; 2]| [100.0 + module * (across + 1.2 * down), 100.0 + module * 0.6 * down];
+            Capstone {
+                corners: order_in_frame([[-3.5, -3.5], [3.5, -3.5], [3.5, 3.5], [-3.5, 3.5]].map(|[dx, dy]| at([across + dx, down + dy])), &frame),
+                ..square_capstone(at([across, down]), module, 0.0, &frame)
+            }
+        };
+        let square = square_capstone([400.0, steeper([3.5, 3.5]).center[1]], module, 0.0, &frame);
+        assert!(!finders_face(&steeper([3.5, 3.5]), &square, &frame));
     }
 
     #[test]
@@ -8259,6 +8527,73 @@ mod tests {
         assert!(distance(quad_centre(found[0].corners), [3300.0, 2500.0]) < 1.5, "{:?}", found[0].corners);
         let side = distance(found[0].corners[0], found[0].corners[1]);
         assert!((side - 104.0).abs() < 2.0, "thirteen modules of eight pixels, not {side}");
+    }
+
+    #[test]
+    fn a_symbol_too_small_for_the_copies_is_found_beside_one_they_show() {
+        // Paper over two thousand pixels across, searched first in a
+        // copy a third its size. A symbol of twelve pixels a module has
+        // four in the copy and settles the search there; one of three
+        // has one, and the copy shows nothing of it, not so much as a
+        // finder left over.
+        let (width, height) = (2100, 1300);
+        let (large, small) = ([600usize, 650usize], [1500usize, 400usize]);
+        let (with_large, with_small) = (paper_with_symbols(width, height, 12.0, &[large]), paper_with_symbols(width, height, 3.0, &[small]));
+        let image = Luma::new(width, height, with_large.data.iter().zip(&with_small.data).map(|(a, b)| a.min(*b)).collect());
+        let (params, families) = (SampleParams::default(), [Family::Micro]);
+        assert_eq!(coarse_factors(&image), [3]);
+        let coarse = search_coarse(&image, &families, &params, &mut Vec::new(), &mut Vec::new(), &|_| true);
+        assert_eq!(coarse.detections.len(), 1, "{:?}", coarse.detections);
+        assert!(distance(quad_centre(coarse.detections[0].corners), large.map(|v| v as f64)) < 1.5);
+        assert!(coarse.more.is_empty());
+        assert_eq!(coarse.shrunk, Some(3));
+        // The photo at its own size shows the small one's finder as a
+        // region on no symbol found, and the symbol is found by it.
+        let shown = COARSE_SHOWN_MODULE * 3.0;
+        let beside = ScannedView::beside(&image, &params, &families, &coarse.detections, shown).expect("a view");
+        assert!(beside.candidates.is_empty(), "the rows are not scanned");
+        assert!(!beside.regions.is_empty());
+        let found = find_symbols(&image, Family::Micro, &params);
+        assert_eq!(found.iter().map(|d| d.version).collect::<Vec<_>>(), [SymbolVersion::Micro(2); 2]);
+        let there = found.iter().find(|d| distance(quad_centre(d.corners), small.map(|v| v as f64)) < 1.5).expect("the small symbol");
+        let side = distance(there.corners[0], there.corners[1]);
+        assert!((side - 39.0).abs() < 2.0, "thirteen modules of three pixels, not {side}");
+        // A region on a QR Code already found proposes nothing: it is
+        // left out before anything is fitted to it. One on a symbol
+        // with a single finder pattern is kept, for the QR Code that
+        // finder may be a third of. And a finder the copy will have
+        // shown, as the large symbol's at four pixels a module there,
+        // is the copy's to have made a symbol of.
+        let over = |version: SymbolVersion, [x, y]: [usize; 2], half: f64| {
+            let (x, y) = (x as f64, y as f64);
+            placed(version, [[x - half, y - half], [x + half, y - half], [x + half, y + half], [x - half, y + half]])
+        };
+        let regions = |known: &[Detection], shown: f64| ScannedView::beside(&image, &params, &families, known, shown).expect("a view").regions.len();
+        let all = regions(&[], f64::INFINITY);
+        assert!(all >= 2, "a finder of each symbol, of {all} regions");
+        assert_eq!(regions(&[over(SymbolVersion::Micro(2), small, 20.0)], f64::INFINITY), all);
+        assert!(regions(&[over(SymbolVersion::Qr(1), small, 40.0)], f64::INFINITY) < all);
+        assert!((1..all).contains(&regions(&[], shown)), "the small symbol's finder and not the large one's");
+    }
+
+    #[test]
+    fn a_last_copy_that_shows_a_symbol_small_sends_the_search_on_to_the_photo() {
+        // The photo's one copy is half its size. A symbol of 3.6 pixels
+        // a module has 1.8 there, which the copy makes out, this one
+        // being nearly square to its rows; what else of that size it
+        // did not make out it cannot say, and every family is owed the
+        // photo itself.
+        let (params, families) = (SampleParams::default(), [Family::Micro, Family::Qr]);
+        let small = paper_with_symbols(2048, 1536, 3.6, &[[700, 800]]);
+        assert_eq!(coarse_factors(&small), [2]);
+        let coarse = search_coarse(&small, &families, &params, &mut Vec::new(), &mut Vec::new(), &|_| true);
+        assert_eq!(coarse.detections.iter().map(|d| d.version).collect::<Vec<_>>(), [SymbolVersion::Micro(2)]);
+        assert_eq!(coarse.more, families);
+        // One of five has two and a half, and the copy settles it.
+        let sound = paper_with_symbols(2048, 1536, 5.0, &[[700, 800]]);
+        let coarse = search_coarse(&sound, &families, &params, &mut Vec::new(), &mut Vec::new(), &|_| true);
+        assert_eq!(coarse.detections.len(), 1);
+        assert!(coarse.more.is_empty(), "{:?}", coarse.more);
     }
 
     #[test]

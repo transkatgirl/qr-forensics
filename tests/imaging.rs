@@ -2268,3 +2268,36 @@ fn a_search_or_a_read_called_off_comes_back_at_once_with_nothing() {
     // Outside the request's scope, work is its own again.
     assert!(!find_symbols(&image, Family::Qr, &params).is_empty());
 }
+
+#[test]
+fn light_from_a_lamp_beside_a_symbol_leaves_it_placed_on_its_three_finders() {
+    use qr_forensics::imaging::detect::detect_candidates;
+    // A version 2 symbol in a dark room, with a lamp's spot on the paper
+    // beside its bottom-left corner: the paper is five times as bright
+    // at one finder pattern as at another, and the ink by the lamp is
+    // lighter than the paper on the far side. The fit that ranks the
+    // placements read the fixed modules and the quiet zone against one
+    // split of them all, by which the paper away from the lamp is dark:
+    // the symbol placed on all three of its finders fitted worse than a
+    // version 1 symbol stood on one or two of them, turned this way and
+    // that, and was not among the placements the decode is offered.
+    // Read against a threshold that follows the light, it fits best and
+    // is offered first.
+    let (version, ec) = (SymbolVersion::Qr(2), EcLevel::L);
+    let grid = symbol(version, ec);
+    let text = decode_plain(&grid, &layout(version, ec), 0).text.plain();
+    let quad = turned_quad([340.0, 320.0], 300.0, 2.0);
+    let (lamp, reach, dark) = ([40.0, 430.0], 150.0, 0.08);
+    let image = render(&grid, quad, (680, 640), |x, y, v| {
+        let from_lamp = (x - lamp[0]).powi(2) + (y - lamp[1]).powi(2);
+        v * (dark + (1.0 - dark) * (-from_lamp / (2.0 * reach * reach)).exp()) as f32
+    });
+    let (params, outline) = (SampleParams::default(), bounding_box(quad, 0.2));
+    let offered = detect_candidates(&image, version, outline, &params);
+    let first = offered.first().expect("found");
+    assert_eq!((first.version, first.count(AnchorKind::Finder)), (version, 3), "{first:?}");
+    assert!(corner_error(first.corners, quad) < 3.0, "{:?}", first.corners);
+    let read = read_outline(&image, version, outline, &params, &DecodeOptions::default()).expect("found");
+    assert!(read.is_trustworthy(), "{:?} of {} blocks", read.report.blocks_verified(), read.report.blocks.len());
+    assert_eq!(read.text(), text);
+}

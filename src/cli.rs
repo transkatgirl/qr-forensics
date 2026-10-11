@@ -75,9 +75,10 @@
 //!
 //! `--full-search` searches a photo at the full size a search goes to
 //! from the start, where the search otherwise looks at a copy no larger
-//! than a thousand pixels on its longer side first and finds what it
-//! shows again at full size, which on a large photo is many times
-//! faster. The full size a search goes to is 4096 pixels on the longer
+//! than a thousand pixels on its longer side first, finds what it shows
+//! again at full size, and then asks the photo at full size only what
+//! finder patterns its regions show beside those symbols, which on a
+//! large photo is many times faster. The full size a search goes to is 4096 pixels on the longer
 //! side: a larger photo is searched in a copy reduced to that, and the
 //! symbols the copy shows are read from the photo's own pixels. A symbol
 //! too small to show in the copy is read through `--outline`: what is

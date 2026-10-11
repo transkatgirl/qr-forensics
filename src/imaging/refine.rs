@@ -63,6 +63,16 @@ const MAX_SCALE_FRACTION: f64 = 0.4;
 const ALONG_FRACTION: f64 = 0.7;
 /// Share of the boundaries, those reading worst, left out of the score.
 pub const TRIM_FRACTION: f64 = 0.2;
+/// The corner of a template that [`Scorer::agreement_shaded`] takes one
+/// threshold from, as a share of the template along each side: a finder
+/// pattern with its separator and the paper beyond it is just under two
+/// fifths of the smallest QR Code with its quiet zone, and two fifths of
+/// a larger symbol holds more of its patterns.
+const SHADE_CORNER: f64 = 0.4;
+/// Fewest modules of each colour a corner must hold for the split of
+/// what it reads to stand as its threshold: a corner of paper alone, or
+/// of paper and two or three timing modules, has no split to speak of.
+const SHADE_MIN_EACH: usize = 4;
 /// How far each corner (top-left, top-right, bottom-right, bottom-left)
 /// moves in one trial, as multiples of the step along one axis: each corner
 /// alone, then the four patterns that together span every joint move of
@@ -448,6 +458,82 @@ impl<'a> Scorer<'a> {
         Some((matching, known))
     }
 
+    /// [`Scorer::agreement_known`] against a threshold that follows the
+    /// light across the template, where that reads every module against
+    /// one split of the lot: each corner of the template has the split
+    /// of its own samples, and a module is read against the four
+    /// interpolated to where it lies. BoofCV reads a module so, against
+    /// the thresholds of its position patterns carried across the symbol
+    /// (`bitIntensityToBitValue`), and a read here may
+    /// ([`super::sample::ThresholdSurface`]).
+    ///
+    /// One split serves a pattern a few modules across, and a whole
+    /// symbol in even light. Light that falls off across a symbol leaves
+    /// the paper at its dim end darker than the split of the whole, and
+    /// every light module there counts as wrong. A version 2 symbol
+    /// beside a lamp, the paper nearly three times as bright at one
+    /// finder as at another, was placed on all three finders with 226 of
+    /// its 236 fixed modules right and read 65 in a hundred with its
+    /// quiet zone against one split; the same square a quarter turn out,
+    /// on two of the finders, read 87.
+    ///
+    /// A corner with too few modules of either colour to have a split
+    /// ([`SHADE_MIN_EACH`]) takes its threshold from the others: the
+    /// plane through the other three when it alone is wanting, which is
+    /// where a steady fall of light puts it, and their mean otherwise. A
+    /// symbol with one finder pattern has little that is fixed beyond
+    /// that corner, and is read against that corner's split all over. A
+    /// threshold the scorer was given is used as it is.
+    pub(crate) fn agreement_shaded(&self, map: &impl Project, inverted: bool) -> Option<(usize, usize)> {
+        if self.threshold.is_some() {
+            return self.agreement_known(map, inverted);
+        }
+        let luma = sample_positions(self.image, map, &self.positions, INNER_FRACTION, POINTS);
+        let unit = |pos: &Pos| [(pos.x as f64 + 0.5) / self.width, (pos.y as f64 + 0.5) / self.height];
+        let within = |f: f64, far: bool| if far { f > 1.0 - SHADE_CORNER } else { f < SHADE_CORNER };
+        // Top-left, top-right, bottom-left, bottom-right.
+        let read: [Option<f32>; 4] = std::array::from_fn(|i| {
+            let (right, bottom) = (i % 2 == 1, i >= 2);
+            let mut values = Vec::new();
+            let mut colours = [0usize; 2];
+            for ((value, &dark), pos) in luma.iter().zip(&self.expected_dark).zip(&self.positions) {
+                let [fx, fy] = unit(pos);
+                if let Some(value) = value
+                    && within(fx, right)
+                    && within(fy, bottom)
+                {
+                    values.push(*value);
+                    colours[usize::from(dark)] += 1;
+                }
+            }
+            colours.iter().all(|&n| n >= SHADE_MIN_EACH).then(|| otsu(values.into_iter()))
+        });
+        let (count, sum) = read.iter().flatten().fold((0usize, 0.0f32), |(n, sum), &t| (n + 1, sum + t));
+        let rest = if count > 0 { sum / count as f32 } else { otsu(luma.iter().flatten().copied()) };
+        let (low, high) = luma.iter().flatten().fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), &v| (low.min(v), high.max(v)));
+        let [tl, tr, bl, br]: [f32; 4] = std::array::from_fn(|i| match (read[i], read[i ^ 1], read[i ^ 2], read[3 - i]) {
+            (Some(own), ..) => own,
+            // Beside it along the row, beside it down the column, and
+            // across the diagonal: no further than anything read.
+            (None, Some(across), Some(down), Some(opposite)) => (across + down - opposite).clamp(low, high),
+            _ => rest,
+        });
+        let share = |f: f64| ((f - SHADE_CORNER / 2.0) / (1.0 - SHADE_CORNER)).clamp(0.0, 1.0) as f32;
+        let known = luma.iter().flatten().count();
+        let matching = luma
+            .iter()
+            .zip(&self.expected_dark)
+            .zip(&self.positions)
+            .filter(|((value, dark), pos)| {
+                let [fx, fy] = unit(pos);
+                let (u, v) = (share(fx), share(fy));
+                let threshold = (1.0 - v) * ((1.0 - u) * tl + u * tr) + v * ((1.0 - u) * bl + u * br);
+                value.is_some_and(|value| (value < threshold) == (**dark != inverted))
+            })
+            .count();
+        Some((matching, known))
+    }
+
     /// (matching, known) in each quarter of the template, top-left,
     /// top-right, bottom-left, bottom-right. A pattern with one quarter
     /// torn away still reads right in the other three; one that is not
@@ -751,6 +837,7 @@ fn holding(held: &[usize]) -> Vec<[f64; 4]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::symbol::SymbolVersion;
 
     #[test]
     fn trimmed_mean_drops_the_worst_fifth() {
@@ -769,5 +856,73 @@ mod tests {
         let h = Homography::from_matrix([2.0, 0.0, 10.0, 0.0, 2.0, 20.0, 0.0, 0.0, 1.0]).unwrap();
         let shifted = Shifted { map: &h, dx: -1.0, dy: -1.0 };
         assert_eq!(shifted.apply(1.0, 1.0), h.apply(0.0, 0.0));
+    }
+
+    /// A symbol of the version `func` maps, eight pixels a module with
+    /// three modules of paper round it, its fixed modules as the version
+    /// has them and its data modules dark and light by turns, every
+    /// pixel's luminance times `light` of how far across the image it
+    /// lies; and the symbol's corners in it.
+    fn drawn(func: &FunctionMap, light: impl Fn(f64) -> f32) -> (Luma, [[f64; 2]; 4]) {
+        let (px, margin) = (8usize, 3usize);
+        let (width, height) = ((func.width + 2 * margin) * px, (func.height + 2 * margin) * px);
+        let mut data = Vec::with_capacity(width * height);
+        for y in 0..height {
+            for x in 0..width {
+                let (mx, my) = ((x / px) as i64 - margin as i64, (y / px) as i64 - margin as i64);
+                let inside = mx >= 0 && my >= 0 && (mx as usize) < func.width && (my as usize) < func.height;
+                let dark = inside && func.expected(mx as usize, my as usize).unwrap_or((mx + my) % 2 == 0);
+                data.push(if dark { 0.25 } else { 0.9 } * light(x as f64 / width as f64));
+            }
+        }
+        let (x0, y0) = ((margin * px) as f64, (margin * px) as f64);
+        let (x1, y1) = (x0 + (func.width * px) as f64, y0 + (func.height * px) as f64);
+        (Luma::new(width, height, data), [[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
+    }
+
+    /// (matching, known) of a symbol's fixed modules and quiet zone at
+    /// `corners`, against one split and against the light.
+    fn fit_of(image: &Luma, func: &FunctionMap, corners: [[f64; 2]; 4], threshold: Option<f32>) -> [(usize, usize); 2] {
+        let (w, h) = (func.width as f64, func.height as f64);
+        let map = Homography::rect_to_quad(w, h, corners).unwrap();
+        let around = [[-1.0, -1.0], [w + 1.0, -1.0], [w + 1.0, h + 1.0], [-1.0, h + 1.0]].map(|[x, y]| map.apply(x, y));
+        let scorer = Scorer::new(image, &Template::with_quiet_zone(func), around, threshold);
+        let shifted = Shifted { map: &map, dx: -1.0, dy: -1.0 };
+        [scorer.agreement_known(&shifted, false).unwrap(), scorer.agreement_shaded(&shifted, false).unwrap()]
+    }
+
+    #[test]
+    fn a_template_in_failing_light_is_read_against_the_light_where_it_lies() {
+        let func = FunctionMap::new(SymbolVersion::Qr(2));
+        // In even light one split reads every module, and so does the
+        // threshold that follows the light.
+        let (even, corners) = drawn(&func, |_| 1.0);
+        let [split, shaded] = fit_of(&even, &func, corners, None);
+        assert_eq!(split.0, split.1, "{split:?}");
+        assert_eq!(shaded, split);
+        // Light that fails to a quarter from the left of the image to the
+        // right leaves the ink on the left as light as the paper on the
+        // right: no one split tells the two apart all the way across,
+        // and the split of the lot calls the paper at the dim end dark.
+        let (failing, corners) = drawn(&func, |across| 1.0 - 0.75 * across as f32);
+        let [split, shaded] = fit_of(&failing, &func, corners, None);
+        assert!(split.0 * 10 < split.1 * 9, "one split read {split:?}");
+        assert_eq!(shaded.0, shaded.1, "{shaded:?}");
+        // The same square a quarter turn out stands a finder where the
+        // symbol has none and none where it has one, in any light.
+        let turned = [corners[1], corners[2], corners[3], corners[0]];
+        let [_, shaded] = fit_of(&failing, &func, turned, None);
+        assert!(shaded.0 * 10 < shaded.1 * 9, "{shaded:?}");
+        // A threshold given is the threshold used.
+        let [split, shaded] = fit_of(&failing, &func, corners, Some(0.3));
+        assert_eq!(shaded, split);
+        assert!(split.0 < split.1);
+        // A symbol with one finder pattern has a split in that corner
+        // alone, and is read against it all over, as it was against the
+        // split of the lot.
+        let micro = FunctionMap::new(SymbolVersion::Micro(2));
+        let (even, corners) = drawn(&micro, |_| 1.0);
+        let [split, shaded] = fit_of(&even, &micro, corners, None);
+        assert_eq!((shaded, split.0), (split, split.1));
     }
 }

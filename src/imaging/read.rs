@@ -41,6 +41,11 @@
 //!   and wechat_qrcode read a symbol mirrored whenever it has failed
 //!   plain, and a mirrored symbol's format word, a bit or two misread,
 //!   passes for a plain one's more often than not;
+//! - the placement turned on its symbol, before any of the above, when
+//!   its fixed patterns fit that way and not as placed: a finder pattern
+//!   in the corner that should have none is as plain as anything a photo
+//!   says, and BoofCV's Micro QR reader, which has one position pattern
+//!   to go by, tries all four turns and keeps the one that decodes;
 //! - the placement without the anchor that lies farthest from where the
 //!   others put it, when not one block has verified: see below;
 //! - the photo turned a quarter at a time, as zxing-cpp's `tryRotate`
@@ -110,7 +115,7 @@ use std::sync::Arc;
 
 use super::detect::{
     Anchor, AnchorKind, Climb, Detection, Retry, detect_candidates_by, outline_around, refine_anchors, seen_from_behind,
-    turns_between,
+    turned_on_symbol, turns_between,
 };
 use super::enhance::{Enhance, Enhanced};
 use super::projection::{ControlPoint, Project, Projection};
@@ -316,7 +321,7 @@ fn read_outline_plain(
     let climb = if copy { Climb::Nothing } else { Climb::Unsharpened };
     // The detector's placements, best fit first, each with every way of
     // sampling it: the reads of each, up to the one that settles it.
-    let candidates = detect_candidates_by(image, version, region, params, climb);
+    let candidates = seated(image, detect_candidates_by(image, version, region, params, climb), params);
     let reads_of = |found: &Detection| {
         let mut reads = Vec::new();
         if work::cancelled() {
@@ -351,7 +356,7 @@ fn read_outline_plain(
         let turned = image.rotated_cw(quarters);
         let turned_region = rotate_outline_cw(region, quarters, image.width, image.height);
         let Some(found) = detect_candidates_by(&turned, version, turned_region, params, climb).into_iter().next() else { return reads };
-        let Some(prepared) = prepare(&turned, found, params) else { return reads };
+        let Some(prepared) = prepare(&turned, seat(&turned, found, params), params) else { return reads };
         work::first_then_in_turn(
             &variants,
             |&(kernel, rule)| if work::cancelled() { None } else { read_prepared(&turned, &prepared, kernel, rule, params, opts) },
@@ -438,7 +443,7 @@ fn read_found_through(
     let plain = SampleParams { enhance: Enhance::NONE, ..*params };
     let variants = variants_of(&plain);
     if enhance.is_none() {
-        return prepare(image, found, &plain)
+        return prepare(image, seat(image, found, &plain), &plain)
             .is_some_and(|prepared| read_placement(image, &prepared, &variants, &plain, opts, &mut |result| consider(best, result)));
     }
     let Some(view) = Enhanced::around(image, around, enhance) else { return false };
@@ -446,7 +451,7 @@ fn read_found_through(
     for anchor in &mut found.anchors {
         anchor.center = view.to_view(anchor.center);
     }
-    prepare(&view.luma, found, &plain).is_some_and(|prepared| {
+    prepare(&view.luma, seat(&view.luma, found, &plain), &plain).is_some_and(|prepared| {
         read_placement(&view.luma, &prepared, &variants, &plain, opts, &mut |mut result| {
             bring_back(&mut result, &view, enhance);
             consider(best, result)
@@ -582,6 +587,58 @@ fn consider(best: &mut Option<ReadResult>, result: ReadResult) -> bool {
     settled
 }
 
+/// A placement the right way up on its symbol: as given, unless the fixed
+/// patterns sampled through it fit the grid turned or reflected and not
+/// as it lies, when it is the placement turned so
+/// ([`turned_on_symbol`]), with what the turned grid's fixed modules
+/// read as its agreement.
+///
+/// The fit that ranks the placements of an outline is no judge of the
+/// turn where light falls unevenly across a symbol or a finder is
+/// damaged, and a square a quarter turn out on two of a symbol's three
+/// finders has been the best fit, and the only placement of that square
+/// offered. Sampled, it shows a finder pattern where the version has
+/// none, and every read of it came back with that noted in its analysis
+/// and no block solved, to be turned by hand in the window. A grid's
+/// fixed patterns fit so much better turned
+/// ([`crate::decode::pipeline::GridAnalysis::orientation`]) only when
+/// the placement is turned, so the turn is made here, before the
+/// corners are refined against patterns that are not where the
+/// placement has them. A turn that would also swap dark and light is
+/// left to the detector, which settles which is ink.
+fn seat(image: &Luma, found: Detection, params: &SampleParams) -> Detection {
+    let func = FunctionMap::new(found.version);
+    let Some(projection) = found.projection() else { return found };
+    let sampled = sample_modules_with(image, &projection, func.width, func.height, params.kernel);
+    let mut grid = classify(&sampled, params).to_grid(func.width, func.height);
+    if found.inverted {
+        grid = grid.inverted();
+    }
+    match analyze(&grid, &func).orientation {
+        Some(turn) if !turn.inverted => {
+            let mut seated = turned_on_symbol(image, &found, turn.symmetry, params);
+            seated.agreement = turn.agreement;
+            seated
+        }
+        _ => found,
+    }
+}
+
+/// The detector's placements each the right way up on its symbol
+/// ([`seat`]), and each once: a placement that was a turn out comes to
+/// lie where the same square the right way up may already stand among
+/// them, and a symbol too damaged to read is not read there twice.
+fn seated(image: &Luma, candidates: Vec<Detection>, params: &SampleParams) -> Vec<Detection> {
+    let mut out: Vec<Detection> = Vec::new();
+    for found in candidates {
+        let found = seat(image, found, params);
+        if !out.iter().any(|kept| kept.placed_as(&found)) {
+            out.push(found);
+        }
+    }
+    out
+}
+
 /// A detection with its corners and anchors refined against the photo,
 /// ready to sample.
 struct Prepared {
@@ -591,7 +648,8 @@ struct Prepared {
 
 /// Refine a detection's corners, with the anchors held and the corners a
 /// finder pattern measured kept, and then every anchor against its own
-/// pattern. `None` when the corners form no usable outline.
+/// pattern. `None` when the corners form no usable outline. The
+/// detection is taken to lie the right way up on its symbol ([`seat`]).
 fn prepare(image: &Luma, mut found: Detection, params: &SampleParams) -> Option<Prepared> {
     let func = FunctionMap::new(found.version);
     let controls: Vec<ControlPoint> = found.anchors.iter().map(|a| a.control_point()).collect();
@@ -1004,5 +1062,114 @@ mod tests {
         let finder = found.anchors.iter().position(|a| a.kind == AnchorKind::Finder).unwrap();
         found.anchors[finder].center[0] += 20.0;
         assert_ne!(doubtful_anchor(&found), Some(finder));
+    }
+
+    /// A version 2 symbol holding `text`, eight pixels a module with four
+    /// modules of paper round it, and its corners in the image.
+    fn drawn(text: &str) -> (Luma, [[f64; 2]; 4]) {
+        use crate::symbol::grid::Module;
+        use qrcode_generator::{Segment, qr};
+        let symbol = qr::Encoder::new(qr::ErrorCorrection::Low)
+            .version(qr::Version::new(2).unwrap())
+            .boost_error_correction(false)
+            .encode_segments(&[Segment::bytes(text)])
+            .unwrap();
+        let grid = ModuleGrid::from_bools(symbol.width(), symbol.height(), symbol.modules());
+        let (n, px, margin) = (grid.width(), 8usize, 4usize);
+        let side = (n + 2 * margin) * px;
+        let mut data = vec![0.92f32; side * side];
+        for y in 0..side {
+            for x in 0..side {
+                let (mx, my) = ((x / px).wrapping_sub(margin), (y / px).wrapping_sub(margin));
+                if mx < n && my < n && grid.get(mx, my) == Module::Dark {
+                    data[y * side + x] = 0.08;
+                }
+            }
+        }
+        let (near, far) = ((margin * px) as f64, ((margin + n) * px) as f64);
+        (Luma::new(side, side, data), [[near, near], [far, near], [far, far], [near, far]])
+    }
+
+    /// A version 2 placement at `corners`, standing on finder patterns
+    /// at the photo points `finders`, each named as the finder of the
+    /// corner it lies nearest and that corner taken as measured by it.
+    fn on_finders(corners: [[f64; 2]; 4], finders: &[[f64; 2]]) -> Detection {
+        let sites = [[3.5, 3.5], [21.5, 3.5], [21.5, 21.5], [3.5, 21.5]];
+        let nearest = |p: [f64; 2]| (0..4).min_by(|&i, &j| distance(corners[i], p).total_cmp(&distance(corners[j], p))).unwrap();
+        Detection {
+            corners,
+            version: SymbolVersion::Qr(2),
+            anchors: finders.iter().map(|&center| Anchor { kind: AnchorKind::Finder, at: sites[nearest(center)], center, partial: false, inferred: false }).collect(),
+            measured_corners: finders.iter().map(|&center| nearest(center)).collect(),
+            ..placed()
+        }
+    }
+
+    #[test]
+    fn a_placement_turned_on_its_symbol_is_seated_the_right_way_up_and_reads() {
+        let text = "the corner without a finder";
+        let (image, square) = drawn(text);
+        let (params, opts) = (SampleParams::default(), DecodeOptions::default());
+        let [tl, tr, br, bl] = square;
+        // The centres of the symbol's three finder patterns, 3.5 modules
+        // in from its corners.
+        let centre = |corner: [f64; 2], [dx, dy]: [f64; 2]| [corner[0] + 28.0 * dx, corner[1] + 28.0 * dy];
+        let (top_left, top_right, bottom_left) = (centre(tl, [1.0, 1.0]), centre(tr, [-1.0, 1.0]), centre(bl, [1.0, -1.0]));
+        let read = |found: Detection| {
+            let prepared = prepare(&image, found, &params).expect("an outline");
+            read_prepared(&image, &prepared, params.kernel, params.rule(), &params, &opts).expect("a decode")
+        };
+
+        // The right way up, a placement is left as it is, and reads.
+        let upright = on_finders(square, &[top_left, top_right, bottom_left]);
+        assert_eq!(seat(&image, upright.clone(), &params), upright);
+        assert_eq!(read(upright.clone()).text(), text);
+
+        // The same square a quarter turn out, standing on two of the
+        // three finders as the detector stands one: its top-left corner
+        // at the symbol's top right, a finder expected at the corner
+        // that has none, and the third finder lying where no pattern of
+        // the placement is. As placed it solves nothing.
+        let turned = Detection { turns: 1, ..on_finders([tr, br, bl, tl], &[top_right, top_left]) };
+        assert_eq!(turned.anchors.iter().map(|a| a.at).collect::<Vec<_>>(), [[3.5, 3.5], [3.5, 21.5]]);
+        let as_placed = read(turned.clone());
+        assert!(!as_placed.is_trustworthy());
+        assert!(as_placed.analysis.orientation.is_some(), "the grid shows the turn");
+
+        // Seated, it is the symbol's own outline: each finder named as
+        // the finder it is, the corners they measured still theirs, the
+        // turn undone, and nothing mirrored.
+        let upright_again = seat(&image, turned.clone(), &params);
+        assert_eq!(upright_again.corners, square);
+        assert_eq!((upright_again.turns, upright_again.mirrored, upright_again.mirrored_by_decode), (0, false, false));
+        let named: Vec<([f64; 2], [f64; 2])> = upright_again.anchors.iter().map(|a| (a.at, a.center)).collect();
+        assert_eq!(named, [([21.5, 3.5], top_right), ([3.5, 3.5], top_left)]);
+        assert_eq!(upright_again.measured_corners, [1, 0]);
+        assert_eq!(upright_again.agreement.0, upright_again.agreement.1, "{:?}", upright_again.agreement);
+        assert_eq!(upright_again.info.format.valid, Some(true));
+        let result = read(upright_again.clone());
+        assert!(result.is_trustworthy());
+        assert_eq!(result.text(), text);
+        assert_eq!(seat(&image, upright_again.clone(), &params), upright_again, "seated once is seated");
+
+        // The square flipped left to right, as a placement taken for the
+        // symbol seen from behind has it, fits as a reflection and as a
+        // turn alike; the format bits read from the front, and it is
+        // seated from the front.
+        let flipped = Detection { mirrored: true, ..on_finders([tr, tl, bl, br], &[top_right, top_left]) };
+        let from_the_front = seat(&image, flipped, &params);
+        assert_eq!((from_the_front.corners, from_the_front.mirrored), (square, false));
+
+        // An anchor that lands where the version has no pattern of its
+        // kind has nothing to be refined against, and goes: here a
+        // finder the turned placement stood at the corner without one.
+        let mut stray = turned.clone();
+        stray.anchors.push(Anchor { kind: AnchorKind::Finder, at: [21.5, 3.5], center: centre(br, [-1.0, -1.0]), partial: false, inferred: false });
+        assert_eq!(seat(&image, stray, &params).anchors.len(), 2);
+
+        // Offered beside the upright placement, the turned one comes to
+        // lie on it and is read once.
+        let offered = seated(&image, vec![upright.clone(), turned], &params);
+        assert_eq!(offered, [upright]);
     }
 }
