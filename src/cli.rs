@@ -33,24 +33,32 @@
 //! the error correction level and mask, the character set the bytes were
 //! read in, the symbology identifier, the symbol's place in a
 //! structured append sequence when it has one, and how many codewords
-//! of padding were pinned when the read took that, and what the photo
-//! was read through when that was not the photo as it is, enlarged or
-//! sharpened, as OpenCV's detector hands back each symbol's ECI and
-//! BoofCV its level, mask and encoding.
+//! of padding were pinned when the read took that, and as what when the
+//! padding is not the standard's, and what the photo was read through
+//! when that was not the photo as it is, enlarged or sharpened, and
+//! `threshold surface` when its modules were read against one, as
+//! OpenCV's detector hands back each symbol's ECI and BoofCV its level,
+//! mask and encoding.
 //! `--charset` names the character set to read byte data in when the
 //! symbol declares none, where it is otherwise guessed: `utf-8`,
 //! `iso-8859-1`, `windows-1252`, `shift_jis`, `gb18030`, `big5`, `euc-kr`,
-//! any other name the ECI table has, or an ECI assignment number.
+//! any other name the ECI table has, or an ECI assignment number. A set
+//! the symbol declares with an ECI designator is read as declared
+//! whatever is named, as ZXing takes a character set hint.
 //! `--partial` prints the symbols that did not decode beside those that
 //! did, where they are otherwise printed only when none did: BoofCV
 //! returns its failures beside its detections for the same reason, that
 //! a damaged symbol among sound ones is still a symbol.
 //!
-//! `--surface` reads every symbol against one threshold that lies as a
-//! smooth surface across it, the window's Threshold surface, where each
-//! module is otherwise judged against its neighbourhood first: for a
-//! shadow or a fall-off of light across an evenly printed symbol. The
-//! neighbourhood rule is still tried when the surface does not decode.
+//! `--surface` reads every symbol first against one threshold that lies
+//! as a smooth surface across it, the window's Threshold surface, where
+//! each module is otherwise judged against its neighbourhood first, then
+//! against one level threshold, and against the surface last: for a
+//! shadow or a fall-off of light across an evenly printed symbol. It is
+//! not needed for such a symbol to be read, and the other rules are
+//! still tried when the surface does not decode; it sets what is tried
+//! first, and reproduces a read that `--details` says was made against
+//! the surface.
 //!
 //! `--enlarge` and `--sharpen` read every symbol off a copy of the
 //! photo about it, sharpened by an unsharp mask and enlarged two, three
@@ -96,14 +104,20 @@
 //! message's bytes. A read stands as `read` when every block is confirmed
 //! and the message parses; `read, padding pinned` when it is that only
 //! with the filler after a short message taken as known, which the
-//! standard fixes, so that damage there costs no error correction: the
-//! window's Pin the padding, tried of every decode that is no read, and
-//! kept when every block then confirms and the segment headers bear out
-//! where the padding lies; `unconfirmed` when every block solved and the
-//! message parses but a block has nothing left over to confirm it, as
-//! one solved at the very limit of its error correction has not;
-//! `malformed` when every block is confirmed and the message does not
-//! parse to its end; and `partial` otherwise, with the blocks that
+//! standard fixes, and an encoder that fills otherwise fixes as well
+//! once what is left of its filler shows which it is, so that damage
+//! there costs no error correction: the window's Pin the padding, tried
+//! of every decode that is no read, and kept when every block then
+//! confirms and the segment headers bear out where the padding lies;
+//! `unconfirmed` when every block solved and the message parses but a
+//! block has too little to confirm it: one whose every error correction
+//! codeword went on filling in codewords that could not be read has
+//! nothing, where one that corrected as many wrong codewords as its
+//! error correction reaches is confirmed by having found them, and one
+//! of the smallest symbols that spent the codewords the standard
+//! reserves for detecting a misdecode is not to be trusted whatever it
+//! found; `malformed` when every block is confirmed and the message does
+//! not parse to its end; and `partial` otherwise, with the blocks that
 //! solved.
 //!
 //! Symbols that carry a structured append header are parts of one
@@ -121,7 +135,9 @@
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 
+use qr_forensics::decode::padding::{Filler, pinned_filler};
 use qr_forensics::decode::pipeline::DecodeOptions;
 use qr_forensics::decode::sequence::{ParityCheck, Part, Sequence};
 use qr_forensics::decode::text::Charset;
@@ -130,7 +146,9 @@ use qr_forensics::imaging::detect::{SearchParams, find_symbols_with};
 use qr_forensics::imaging::enhance::{Enhance, Sharpen};
 use qr_forensics::imaging::photo;
 use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline};
-use qr_forensics::imaging::sample::SampleParams;
+use qr_forensics::imaging::sample::{Rule, SampleParams};
+use qr_forensics::symbol::function_map::FunctionMap;
+use qr_forensics::symbol::layout::SymbolLayout;
 use qr_forensics::symbol::{Family, SymbolVersion};
 
 const USAGE: &str = "usage: qr-forensics decode [--family qr|micro|rmqr|model1] [--outline x,y,x,y,x,y,x,y] \
@@ -328,8 +346,11 @@ pub(crate) fn standing(result: &ReadResult) -> String {
 
 /// What a decode settled on the way to the message, as `--details`
 /// prints it: the level and mask, the character set byte data was read
-/// in, the symbology identifier, and the place in a structured append
-/// sequence.
+/// in, the symbology identifier, the place in a structured append
+/// sequence, the padding that was pinned, and what `--enlarge`,
+/// `--sharpen` and `--surface` would have to ask for to read the symbol
+/// the same again at the first try. The standard's filler goes without
+/// saying, and another is named.
 fn details(result: &ReadResult) -> String {
     let (version, report) = (result.version(), &result.report);
     let mut parts = vec![format!("EC {}", version.ec_label(report.ec))];
@@ -342,10 +363,19 @@ fn details(result: &ReadResult) -> String {
         parts.push(format!("part {} of {}", part.index, part.total));
     }
     if result.padding_pinned() {
-        parts.push(format!("{} padding codewords pinned", result.pins.len()));
+        let mut pinned = format!("{} padding codewords pinned", result.pins.len());
+        let layout = SymbolLayout::new(Arc::new(FunctionMap::new(version)), report.ec);
+        let filler = layout.and_then(|layout| pinned_filler(&layout, report, &result.pins));
+        if let Some(filler) = filler.filter(|&filler| filler != Filler::Standard) {
+            pinned.push_str(&format!(" as {}", filler.label()));
+        }
+        parts.push(pinned);
     }
     if !result.enhance.is_none() {
         parts.push(format!("photo {}", result.enhance));
+    }
+    if result.rule == Rule::Surface {
+        parts.push("threshold surface".to_owned());
     }
     parts.join(", ")
 }
@@ -450,11 +480,8 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
             return 2;
         }
     };
-    let params = if options.surface {
-        SampleParams { local: false, surface: true, enhance: options.enhance, ..SampleParams::default() }
-    } else {
-        SampleParams { enhance: options.enhance, ..SampleParams::default() }
-    };
+    let asked = SampleParams { enhance: options.enhance, ..SampleParams::default() };
+    let params = if options.surface { asked.under(Rule::Surface) } else { asked };
     let opts = DecodeOptions { charset: options.charset, ..DecodeOptions::default() };
     let mut status = 0;
     for image in &options.images {
@@ -642,8 +669,19 @@ mod tests {
         // no byte data.
         let settled: Vec<&str> = fields[3].split(", ").collect();
         assert!(settled.len() >= 2 && settled[0].starts_with("EC ") && settled[1].starts_with("mask "), "{fields:?}");
+        assert!(!settled.contains(&"threshold surface"), "{fields:?}");
         assert!(fields[4].starts_with("at "));
         assert_eq!(fields[5], "1234 ABCD");
+        // Read against the threshold surface, as `--surface` asks first,
+        // the details say so, and say what would read it so again.
+        let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/photos/cpp_micro_M3-Mixed.png").into_os_string();
+        let mut out = Vec::new();
+        assert_eq!(run_to(&[OsString::from("--details"), OsString::from("--surface"), image], &mut out), 0);
+        let text = String::from_utf8(out).unwrap();
+        let (fields, _) = fields_and_grid(&text);
+        assert_eq!(fields.len(), 5, "{text}");
+        assert_eq!(fields[3].split(", ").last(), Some("threshold surface"), "{fields:?}");
+        assert_eq!(fields[4], "1234 ABCD");
     }
 
     /// A pipe whose reader has gone.
@@ -718,38 +756,88 @@ mod tests {
 
     #[test]
     fn a_read_that_took_the_padding_pinned_says_so() {
-        use qr_forensics::decode::repair::render_rgba;
+        use qr_forensics::decode::bitstream::EndOfData;
+        use qr_forensics::decode::codewords::{Pin, PinSource, Pins};
+        use qr_forensics::decode::padding::pad_tail;
+        use qr_forensics::decode::pipeline::decode;
+        use qr_forensics::decode::repair::{render_rgba, repaired_grid};
+        use qr_forensics::symbol::EcLevel;
         use qr_forensics::symbol::grid::{Module, ModuleGrid};
         use qrcode_generator::{Segment, qr};
         // A short address in a version 10-M symbol, with a strip of white
         // tape down a third of it: more wrong codewords in every block
         // than the block corrects, nearly all of them padding.
         let message = "https://example.com/t/8F3K2";
+        let mask = 4;
         let symbol = qr::Encoder::new(qr::ErrorCorrection::Medium)
             .version(qr::Version::new(10).unwrap())
+            .mask(qr::Mask::new(mask).unwrap())
             .boost_error_correction(false)
             .encode_segments(&[Segment::bytes(message)])
             .unwrap();
-        let mut grid = ModuleGrid::from_bools(symbol.width(), symbol.height(), symbol.modules());
-        for y in 0..grid.height() {
-            for x in 12..32 {
-                grid.set(x, y, Module::Light);
+        let standard = ModuleGrid::from_bools(symbol.width(), symbol.height(), symbol.modules());
+        // The same symbol as an encoder that fills with zeros writes it:
+        // its data codewords pinned into a blank grid, zeros from the
+        // first of the padding on, and the grid error correction makes
+        // of them written out.
+        let layout = SymbolLayout::new(Arc::new(FunctionMap::new(SymbolVersion::Qr(10))), EcLevel::M).unwrap();
+        let (opts, none) = (DecodeOptions::default(), Pins::new());
+        let read = decode(&standard, &layout, mask, &none, &opts);
+        let EndOfData::At { bit, .. } = read.parse.end else { panic!("{:?}", read.parse.end) };
+        let first_pad = pad_tail(&layout, bit).first_pad_codeword;
+        let pins: Pins = layout
+            .data_stream
+            .iter()
+            .enumerate()
+            .map(|(j, &cw)| (cw, Pin::full(if j < first_pad { read.codewords[cw].final_value.unwrap() } else { 0 }, PinSource::Manual)))
+            .collect();
+        let blank = layout.func.blank_grid();
+        let zero_filled = repaired_grid(&blank, &layout, mask, &decode(&blank, &layout, mask, &pins, &opts));
+        assert!(decode(&zero_filled, &layout, mask, &none, &opts).is_trustworthy());
+
+        for (mut grid, pinned) in [(standard, " padding codewords pinned"), (zero_filled, " padding codewords pinned as zeros")] {
+            for y in 0..grid.height() {
+                for x in 12..32 {
+                    grid.set(x, y, Module::Light);
+                }
             }
+            let (width, height, pixels) = render_rgba(&grid, 8, 4);
+            let path = std::env::temp_dir().join(format!("qr-forensics-taped-{}-{}.png", std::process::id(), pinned.len()));
+            image::save_buffer(&path, &pixels, width as u32, height as u32, image::ExtendedColorType::Rgba8).unwrap();
+            let mut out = Vec::new();
+            let status = run_to(&[OsString::from("--details"), path.clone().into_os_string()], &mut out);
+            let _ = std::fs::remove_file(&path);
+            let text = String::from_utf8(out).unwrap();
+            let (fields, _) = fields_and_grid(&text);
+            // A read, by the status and by the line, which says how it
+            // stands and what it took: the padding pinned, and as what
+            // when it is not the standard's.
+            assert_eq!(status, 0, "{text}");
+            assert_eq!(&fields[1..3], ["QR Code 10", "read, padding pinned"], "{text}");
+            assert!(fields[3].ends_with(pinned), "{text}");
+            assert_eq!(fields.last().map(String::as_str), Some(message), "{text}");
         }
-        let (width, height, pixels) = render_rgba(&grid, 8, 4);
-        let path = std::env::temp_dir().join(format!("qr-forensics-taped-{}.png", std::process::id()));
-        image::save_buffer(&path, &pixels, width as u32, height as u32, image::ExtendedColorType::Rgba8).unwrap();
-        let mut out = Vec::new();
-        let status = run_to(&[OsString::from("--details"), path.clone().into_os_string()], &mut out);
-        let _ = std::fs::remove_file(&path);
-        let text = String::from_utf8(out).unwrap();
-        let (fields, _) = fields_and_grid(&text);
-        // A read, by the status and by the line, which says how it
-        // stands and what it took.
-        assert_eq!(status, 0, "{text}");
-        assert_eq!(&fields[1..3], ["QR Code 10", "read, padding pinned"], "{text}");
-        assert!(fields[3].ends_with(" padding codewords pinned"), "{text}");
-        assert_eq!(fields.last().map(String::as_str), Some(message), "{text}");
+    }
+
+    #[test]
+    fn a_character_set_the_symbol_declares_is_read_as_declared() {
+        // OpenCV's symbol declares UTF-8 with an ECI designator: with
+        // another set named or with none, it is read in the set it
+        // declares.
+        let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/opencv/encode_version1_mode7.png").into_os_string();
+        let mut lines = Vec::new();
+        for charset in [None, Some("--charset=shift_jis")] {
+            let mut args: Vec<OsString> = charset.into_iter().map(OsString::from).collect();
+            args.extend([OsString::from("--details"), image.clone()]);
+            let mut out = Vec::new();
+            assert_eq!(run_to(&args, &mut out), 0);
+            let text = String::from_utf8(out).unwrap();
+            let (fields, _) = fields_and_grid(&text);
+            assert_eq!(&fields[1..3], ["QR Code 1", "read"], "{text}");
+            assert!(fields[3].contains("UTF-8 (ECI)"), "{text}");
+            lines.push(text);
+        }
+        assert_eq!(lines[0], lines[1]);
     }
 
     #[test]

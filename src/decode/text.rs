@@ -26,10 +26,12 @@ pub const UNKNOWN_CHAR: char = '\u{FFFD}';
 /// The group separator that FNC1 data uses between fields.
 pub const GROUP_SEPARATOR: char = '\u{1D}';
 
-/// Character set for byte-mode data.
+/// Character set for byte-mode data that no ECI designator declares one
+/// for. A set the symbol declares is followed whatever is chosen here, as
+/// ZXing takes a character set hint and BoofCV an encoding to force.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Charset {
-    /// Follow ECI when present, otherwise guess.
+    /// Guess from the bytes.
     #[default]
     Auto,
     Utf8,
@@ -606,7 +608,9 @@ pub fn decode_text_of(family: Family, segments: &[Segment], charset: Charset) ->
     let mut report = TextReport::default();
     let guessed = guess_codec(segments);
     let markers = Markers::of(segments);
-    let mut eci: Option<Codec> = None;
+    // What an ECI designator has declared for the byte data after it:
+    // `Some(None)` when it names no set this reader has.
+    let mut declared: Option<Option<Codec>> = None;
     let mut encodings: Vec<String> = Vec::new();
     let mut first_bytes = true;
     if !segments.is_empty() {
@@ -656,11 +660,7 @@ pub fn decode_text_of(family: Family, segments: &[Segment], charset: Charset) ->
                 }
             }
             SegmentContent::Bytes(cells) => {
-                let (codec, origin) = match (charset.codec(), eci) {
-                    (Some(codec), _) => (codec, "chosen"),
-                    (None, Some(codec)) => (codec, "ECI"),
-                    (None, None) => (guessed, "guessed"),
-                };
+                let (codec, origin) = byte_codec(declared, charset, || guessed);
                 let label = format!("{} ({origin})", codec.name());
                 if !encodings.contains(&label) {
                     encodings.push(label);
@@ -713,18 +713,18 @@ pub fn decode_text_of(family: Family, segments: &[Segment], charset: Charset) ->
             }
             SegmentContent::Eci(Some(value)) => {
                 report.push_eci(*value);
-                eci = eci_codec(*value);
+                declared = Some(eci_codec(*value));
                 if *value == 899 {
                     report.notes.push("ECI 899: the data is binary, not text; its bytes are shown as ISO-8859-1 characters.".into());
                 }
-                if eci.is_none() {
+                if matches!(declared, Some(None)) {
                     // AIM's table has gaps inside the ISO-8859 run: 14 was
                     // kept for an ISO-8859-12 that was never made, and 19
                     // was never assigned. ZXing's CharacterSetECI and
                     // zxing-cpp's ECI skip both.
                     let why = if matches!(value, 14 | 19) { "is reserved and names no character set" } else { "is not supported" };
-                    report.notes.push(format!("ECI {value} {why}; bytes shown as ISO-8859-1."));
-                    eci = Some(Codec::Latin1);
+                    let (shown, _) = byte_codec(declared, charset, || Codec::Latin1);
+                    report.notes.push(format!("ECI {value} {why}; bytes shown as {}.", shown.name()));
                 }
             }
             SegmentContent::Eci(None) => {
@@ -790,19 +790,41 @@ pub fn decode_text_of(family: Family, segments: &[Segment], charset: Charset) ->
     report
 }
 
+/// The character set byte data is read in, and where it came from: the
+/// set an ECI designator before the data declares; without one, the set
+/// chosen; without either, the set guessed from the bytes. A symbol that
+/// declares its character set has said what its bytes are, and a choice
+/// is for the symbol that has not: ZXing takes its character set hint
+/// only for a byte segment no ECI precedes, and BoofCV ranks the encoding
+/// it is told to force below the one an ECI names. A chosen set once
+/// outranked a declared one here, and a batch read with the set its
+/// undeclared symbols were written in misread every symbol that declared
+/// another.
+///
+/// `declared` is `Some(None)` after a designator that names no set this
+/// reader has. That declares nothing that can be followed, so the set
+/// chosen stands there, and with none chosen ISO-8859-1, in which every
+/// byte has a character.
+fn byte_codec(declared: Option<Option<Codec>>, charset: Charset, guess: impl FnOnce() -> Codec) -> (Codec, &'static str) {
+    match (declared, charset.codec()) {
+        (Some(Some(codec)), _) => (codec, "ECI"),
+        (_, Some(codec)) => (codec, "chosen"),
+        (Some(None), None) => (Codec::Latin1, "ECI"),
+        (None, None) => (guess(), "guessed"),
+    }
+}
+
 /// `text` as the bytes of the character set that the byte data of segment
-/// `index` is read in, by the rule [`decode_text_of`] follows: the set
-/// chosen, or the one an ECI designator before the segment declares, or
-/// the one guessed from the bytes. `Err` with the first character that
-/// set lacks.
+/// `index` is read in, by the rule [`decode_text_of`] follows: the set an
+/// ECI designator before the segment declares, or the one chosen, or the
+/// one guessed from the bytes. `Err` with the first character that set
+/// lacks.
 pub fn encode_as_read(segments: &[Segment], index: usize, charset: Charset, text: &str) -> Result<Vec<u8>, char> {
-    let declared = || {
-        segments[..index.min(segments.len())].iter().rev().find_map(|segment| match segment.content {
-            SegmentContent::Eci(Some(value)) => Some(eci_codec(value).unwrap_or(Codec::Latin1)),
-            _ => None,
-        })
-    };
-    charset.codec().or_else(declared).unwrap_or_else(|| guess_codec(segments)).encode(text)
+    let declared = segments[..index.min(segments.len())].iter().rev().find_map(|segment| match segment.content {
+        SegmentContent::Eci(Some(value)) => Some(eci_codec(value)),
+        _ => None,
+    });
+    byte_codec(declared, charset, || guess_codec(segments)).0.encode(text)
 }
 
 /// `text` as bytes of `charset`, UTF-8 when none is chosen. `Err` with
@@ -933,6 +955,17 @@ fn decode_fixed_width(codec: Codec, unit: usize, cells: &[Cell<u8>], at: (usize,
     }
 }
 
+/// A run of readable bytes of byte data, and whether an unreadable byte
+/// lies before it and after it. A run that follows a gap may begin in the
+/// middle of a multi-byte character, and one a gap follows may end in the
+/// middle of one; a run that ends where its segment does ends where the
+/// data ends, and a character cut short there is no character.
+struct Run {
+    bytes: Vec<u8>,
+    after_gap: bool,
+    before_gap: bool,
+}
+
 /// Pick a character set for byte data that carries no ECI: ASCII and UTF-8
 /// when the bytes allow it, then Shift-JIS, then the standard's default.
 /// A kanji segment elsewhere in the symbol tips doubtful byte data towards
@@ -940,9 +973,7 @@ fn decode_fixed_width(codec: Codec, unit: usize, cells: &[Cell<u8>], at: (usize,
 /// a symbol that has one.
 fn guess_codec(segments: &[Segment]) -> Codec {
     let has_kanji = segments.iter().any(|s| matches!(s.content, SegmentContent::Kanji(_)));
-    // Readable runs, and whether each one follows a gap (and so may begin in
-    // the middle of a multi-byte character).
-    let mut runs: Vec<(Vec<u8>, bool)> = Vec::new();
+    let mut runs: Vec<Run> = Vec::new();
     for segment in segments {
         match &segment.content {
             SegmentContent::Eci(_) => break,
@@ -954,24 +985,26 @@ fn guess_codec(segments: &[Segment]) -> Codec {
                         Some(byte) => current.push(byte),
                         None => {
                             if !current.is_empty() {
-                                runs.push((std::mem::take(&mut current), after_gap));
+                                runs.push(Run { bytes: std::mem::take(&mut current), after_gap, before_gap: true });
                             }
                             after_gap = true;
                         }
                     }
                 }
                 if !current.is_empty() {
-                    runs.push((current, after_gap));
+                    // A segment the symbol has no room to finish ends in
+                    // bytes that are not there to read, as a gap does.
+                    runs.push(Run { bytes: current, after_gap, before_gap: segment.truncated });
                 }
             }
             _ => {}
         }
     }
 
-    if runs.iter().all(|(run, _)| run.is_ascii()) {
+    if runs.iter().all(|run| run.bytes.is_ascii()) {
         return Codec::Rs(encoding_rs::UTF_8);
     }
-    if runs.iter().all(|(run, after_gap)| utf8_plausible(run, *after_gap)) {
+    if runs.iter().all(utf8_plausible) {
         return Codec::Rs(encoding_rs::UTF_8);
     }
     // Three double-byte characters in a row is as sure as these sets get.
@@ -989,11 +1022,33 @@ fn guess_codec(segments: &[Segment]) -> Codec {
     if has_kanji && decodes_as_shift_jis(&runs) {
         return Codec::Rs(encoding_rs::SHIFT_JIS);
     }
-    double_byte_evidence(&runs).unwrap_or(Codec::Latin1)
+    if let Some(codec) = double_byte_evidence(&runs) {
+        return codec;
+    }
+    // The standard's default, ISO-8859-1, has only control codes from 0x80
+    // to 0x9F, which text does not hold; windows-1252 is ISO-8859-1 with
+    // the euro sign, the curly quotes and the dashes there, and is what
+    // an encoder handed such text writes without declaring it. The
+    // WHATWG's Encoding Standard, which `encoding_rs` follows, reads
+    // everything labelled ISO-8859-1 so. Bytes in that range are the only
+    // ones the two read differently, so only they are asked.
+    if runs.iter().flat_map(|run| &run.bytes).any(|byte| (0x80..=0x9F).contains(byte)) {
+        return Codec::Rs(encoding_rs::WINDOWS_1252);
+    }
+    Codec::Latin1
 }
 
-fn decodes_as_shift_jis(runs: &[(Vec<u8>, bool)]) -> bool {
-    runs.iter().all(|(run, _)| encoding_rs::SHIFT_JIS.decode_without_bom_handling_and_without_replacement(run).is_some())
+/// The bytes are Shift-JIS from end to end. 0x80 is not a byte of the
+/// set: the WHATWG's decoder, which `encoding_rs` follows, hands it on as
+/// the control code U+0080 where a character may begin, and bytes that
+/// decode only so do not decode. The euro sign of windows-1252 is that
+/// byte, and `€5` passed for Shift-JIS.
+fn decodes_as_shift_jis(runs: &[Run]) -> bool {
+    runs.iter().all(|run| {
+        encoding_rs::SHIFT_JIS
+            .decode_without_bom_handling_and_without_replacement(&run.bytes)
+            .is_some_and(|text| !text.contains('\u{80}'))
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1004,26 +1059,37 @@ enum Evidence {
 }
 
 /// Shift-JIS and ISO-8859-1 overlap heavily: an accented Latin letter
-/// followed by another letter is also a valid double-byte character. Same
-/// approach as zxing: believe Shift-JIS outright on a run of three
-/// double-byte characters or three half-width katakana, and weakly when
-/// the high bytes are not ones Latin-1 text would use.
-fn shift_jis_evidence(runs: &[(Vec<u8>, bool)]) -> Evidence {
+/// followed by another letter is also a valid double-byte character, and
+/// every half-width katakana is a Latin-1 symbol or capital. Believe
+/// Shift-JIS outright on a run of three double-byte characters or three
+/// half-width katakana, as ZXing does, and weakly on a double-byte
+/// character whose lead byte Latin-1 has only a control code for (0x81 to
+/// 0x9F), which is where hiragana, katakana and the common kanji lie.
+///
+/// ZXing believes it weakly besides when a tenth of the bytes are ones
+/// Latin-1 has as symbols rather than letters (0xA0 to 0xBF, and the
+/// multiplication and division signs), and so did this. One such byte is
+/// a tenth of any message of ten bytes or fewer, and each is a half-width
+/// katakana: `Price: £5` read as `Price: ｣5`, `25°C` as `25ｰC` and
+/// `¡Hola!` as `｡Hola!`. BoofCV, which knows two sets for undeclared
+/// bytes, UTF-8 where they are valid UTF-8 and ISO-8859-1 where they are
+/// not, reads all three. Western text is not told from a katakana or two
+/// by counting symbols, so they are not counted: a message whose only
+/// Japanese is one or two half-width katakana reads as Latin-1, and as
+/// what it is when Shift_JIS is chosen.
+fn shift_jis_evidence(runs: &[Run]) -> Evidence {
     if !decodes_as_shift_jis(runs) {
         return Evidence::None;
     }
     let mut can_be_latin1 = true;
-    let mut latin1_symbols = 0;
-    let mut length = 0;
     let (mut longest_double, mut longest_kana) = (0, 0);
-    for (run, _) in runs {
-        length += run.len();
+    for run in runs {
+        let run = &run.bytes;
         let (mut double, mut kana) = (0, 0);
         let mut i = 0;
         while i < run.len() {
             let byte = run[i];
             can_be_latin1 &= !(0x80..=0x9F).contains(&byte);
-            latin1_symbols += usize::from(matches!(byte, 0xA0..=0xBF | 0xD7 | 0xF7));
             match byte {
                 0x81..=0x9F | 0xE0..=0xFC => {
                     double += 1;
@@ -1046,7 +1112,7 @@ fn shift_jis_evidence(runs: &[(Vec<u8>, bool)]) -> Evidence {
     // looking like either.
     if longest_double >= 3 || longest_kana >= 3 {
         Evidence::Strong
-    } else if !can_be_latin1 || latin1_symbols * 10 >= length {
+    } else if !can_be_latin1 {
         Evidence::Weak
     } else {
         Evidence::None
@@ -1059,10 +1125,10 @@ fn shift_jis_evidence(runs: &[(Vec<u8>, bool)]) -> Evidence {
 /// to 0xFE; Big5 takes a lead from 0xA1 to 0xF9 and a trail from 0x40 to
 /// 0x7E or 0xA1 to 0xFE; GBK extends GB 2312 with leads down to 0x81,
 /// which Latin-1 text never contains, so for those validity is enough.
-fn double_byte_evidence(runs: &[(Vec<u8>, bool)]) -> Option<Codec> {
+fn double_byte_evidence(runs: &[Run]) -> Option<Codec> {
     let longest_run = |lead: &dyn Fn(u8) -> bool, trail: &dyn Fn(u8) -> bool| -> Option<usize> {
         let mut longest = 0;
-        for (run, after_gap) in runs {
+        for Run { bytes: run, after_gap, before_gap } in runs {
             // A run that follows a gap may start in the middle of a character.
             let mut i = usize::from(*after_gap && run.first().is_some_and(|&b| trail(b) && !lead(b)));
             let mut chars = 0;
@@ -1075,7 +1141,7 @@ fn double_byte_evidence(runs: &[(Vec<u8>, bool)]) -> Option<Codec> {
                     chars += 1;
                     longest = longest.max(chars);
                     i += 2;
-                } else if i + 1 == run.len() && lead(byte) && *after_gap {
+                } else if i + 1 == run.len() && lead(byte) && *before_gap {
                     // Cut short by the gap at the far end.
                     i += 1;
                 } else {
@@ -1093,7 +1159,7 @@ fn double_byte_evidence(runs: &[(Vec<u8>, bool)]) -> Option<Codec> {
     if big5.is_some_and(|n| n >= 3) {
         return Some(Codec::Rs(encoding_rs::BIG5));
     }
-    let has_gbk_lead = runs.iter().flat_map(|(run, _)| run).any(|&b| (0x81..=0xA0).contains(&b));
+    let has_gbk_lead = runs.iter().flat_map(|run| &run.bytes).any(|&b| (0x81..=0xA0).contains(&b));
     let gbk = longest_run(&|b| (0x81..=0xFE).contains(&b), &|b| (0x40..=0xFE).contains(&b) && b != 0x7F);
     if has_gbk_lead && gbk.is_some_and(|n| n >= 1) {
         return Some(Codec::Rs(encoding_rs::GB18030));
@@ -1101,12 +1167,18 @@ fn double_byte_evidence(runs: &[(Vec<u8>, bool)]) -> Option<Codec> {
     None
 }
 
-fn utf8_plausible(run: &[u8], after_gap: bool) -> bool {
-    let skip = if after_gap { run.iter().take(3).take_while(|&&b| b & 0xC0 == 0x80).count() } else { 0 };
-    match std::str::from_utf8(&run[skip..]) {
+/// The run is UTF-8, less a character a gap has cut at either end of it.
+/// A sequence left unfinished at the end of the run may be finished past
+/// a gap, and only past one: where the data itself ends there, it is not
+/// UTF-8. ISO-8859-1 text that ends in an accented letter ends in a byte
+/// UTF-8 begins a longer character with, and `José` read as UTF-8 with
+/// its last letter lost.
+fn utf8_plausible(run: &Run) -> bool {
+    let bytes = &run.bytes;
+    let skip = if run.after_gap { bytes.iter().take(3).take_while(|&&b| b & 0xC0 == 0x80).count() } else { 0 };
+    match std::str::from_utf8(&bytes[skip..]) {
         Ok(_) => true,
-        // An incomplete sequence at the very end may continue past a gap.
-        Err(e) => e.error_len().is_none(),
+        Err(e) => run.before_gap && e.error_len().is_none(),
     }
 }
 
@@ -1180,6 +1252,93 @@ mod tests {
         let report = decode_text(&[seg], Charset::Windows1252);
         assert_eq!(report.plain(), "€ “ok”");
         assert_eq!(report.encoding.as_deref(), Some("windows-1252 (chosen)"));
+    }
+
+    #[test]
+    fn text_that_ends_in_an_accented_letter_is_not_utf8() {
+        // 0xE9 begins a three-byte character in UTF-8, and nothing
+        // follows it: the data ends there, and is ISO-8859-1.
+        for (bytes, text) in [(&b"Jos\xE9"[..], "José"), (b"https://example.com/caf\xE9", "https://example.com/café"), (b"Fu\xDF", "Fuß")] {
+            let report = decode_text(&[byte_segment(&known(bytes), Certainty::Verified)], Charset::Auto);
+            assert_eq!((report.plain().as_str(), report.encoding.as_deref()), (text, Some("ISO-8859-1 (guessed)")), "{bytes:02X?}");
+        }
+        // The same bytes before a byte that could not be read may be the
+        // start of a character the gap cut, and stay UTF-8, as a run that
+        // begins with the end of one does after a gap.
+        let mut bytes = known(b"Jos\xC3");
+        bytes.push(None);
+        bytes.extend(known(b"\xA9 Mar\xC3\xADa"));
+        let report = decode_text(&[byte_segment(&bytes, Certainty::Verified)], Charset::Auto);
+        assert_eq!(report.encoding.as_deref(), Some("UTF-8 (guessed)"));
+        assert!(report.plain().ends_with(" María"), "{:?}", report.plain());
+        // A segment the symbol cuts short ends as a gap would end it.
+        let mut cut = byte_segment(&known("Jos\u{E9}".as_bytes().split_last().unwrap().1), Certainty::Verified);
+        cut.truncated = true;
+        assert_eq!(decode_text(&[cut], Charset::Auto).encoding.as_deref(), Some("UTF-8 (guessed)"));
+        // And a double-byte set is known by the characters before a gap
+        // that cuts the last of them, where it once took a gap before the
+        // run to excuse a character cut after it.
+        let (encoded, _, _) = encoding_rs::GB18030.encode("中文二维码");
+        let mut bytes = known(&encoded[..encoded.len() - 1]);
+        bytes.push(None);
+        let report = decode_text(&[byte_segment(&bytes, Certainty::Verified)], Charset::Auto);
+        assert_eq!(report.encoding.as_deref(), Some("gb18030 (guessed)"));
+        assert!(report.plain().starts_with("中文二维"), "{:?}", report.plain());
+    }
+
+    #[test]
+    fn a_symbol_or_two_among_ascii_is_latin1_and_not_katakana() {
+        // Each of these decodes as Shift-JIS, its one high byte a
+        // half-width katakana, and a tenth or more of each is bytes
+        // Latin-1 has as symbols.
+        for (bytes, text) in [
+            (&b"Price: \xA35"[..], "Price: £5"),
+            (b"25\xB0C", "25°C"),
+            (b"\xA1Hola!", "¡Hola!"),
+            (b"\xA92024 ACME", "©2024 ACME"),
+            (b"1\xBD cups", "1½ cups"),
+            (b"\xABoui\xBB", "«oui»"),
+        ] {
+            let report = decode_text(&[byte_segment(&known(bytes), Certainty::Verified)], Charset::Auto);
+            assert_eq!((report.plain().as_str(), report.encoding.as_deref()), (text, Some("ISO-8859-1 (guessed)")), "{bytes:02X?}");
+        }
+        // Three katakana in a row are Shift-JIS still, as three
+        // double-byte characters are.
+        for text in ["ｶﾀｶﾅ", "QRｺｰﾄﾞ", "ﾃﾞｻﾞｲﾝQR\r\nhttp://d-qr.net/ex/", "Google モバイル\r\nhttp://google.jp"] {
+            let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode(text);
+            let report = decode_text(&[byte_segment(&known(&bytes), Certainty::Verified)], Charset::Auto);
+            assert_eq!((report.plain().as_str(), report.encoding.as_deref()), (text, Some("Shift_JIS (guessed)")));
+        }
+        // What is given up: a message whose only Japanese is a katakana
+        // or two reads as Latin-1, and as what it is when the set is
+        // chosen. A kanji segment beside it still tips it.
+        let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode("ｱｲ");
+        let seg = byte_segment(&known(&bytes), Certainty::Verified);
+        let report = decode_text(std::slice::from_ref(&seg), Charset::Auto);
+        assert_eq!((report.plain().as_str(), report.encoding.as_deref()), ("±²", Some("ISO-8859-1 (guessed)")));
+        assert_eq!(decode_text(std::slice::from_ref(&seg), Charset::ShiftJis).plain(), "ｱｲ");
+        let mut kanji = byte_segment(&[], Certainty::Verified);
+        kanji.mode = Mode::Kanji;
+        kanji.content = SegmentContent::Kanji(vec![Cell { value: Some(0x935F), certainty: Certainty::Verified, bits: 0..13 }]);
+        assert_eq!(decode_text(&[kanji, seg], Charset::Auto).plain(), "点ｱｲ");
+    }
+
+    #[test]
+    fn bytes_latin1_has_no_text_for_are_windows_1252() {
+        // The euro sign, the curly quotes and the dash of windows-1252
+        // are control codes in ISO-8859-1. 0x80 is no byte of Shift-JIS,
+        // whose decoder hands it on all the same.
+        for (bytes, text) in [(&b"\x805"[..], "€5"), (b"It\x92s \x805 \x96 \x93ok\x94", "It’s €5 – “ok”"), (b"caf\xE9 \x97 5\x80", "café — 5€")] {
+            let report = decode_text(&[byte_segment(&known(bytes), Certainty::Verified)], Charset::Auto);
+            assert_eq!((report.plain().as_str(), report.encoding.as_deref()), (text, Some("windows-1252 (guessed)")), "{bytes:02X?}");
+        }
+        // Without such a byte the two sets read alike, and the guess is
+        // named as the standard's default.
+        let report = decode_text(&[byte_segment(&known(b"caf\xE9 5\xA4"), Certainty::Verified)], Charset::Auto);
+        assert_eq!(report.encoding.as_deref(), Some("ISO-8859-1 (guessed)"));
+        // Chosen, ISO-8859-1 is itself.
+        let report = decode_text(&[byte_segment(&known(b"\x805"), Certainty::Verified)], Charset::Latin1);
+        assert_eq!(report.plain(), "\u{80}5");
     }
 
     #[test]
@@ -1400,6 +1559,37 @@ mod tests {
             );
             assert_eq!((reserved.plain().as_str(), reserved.notes.len()), ("é", 1), "ECI {eci}");
             assert!(reserved.notes[0].contains("reserved") && !reserved.notes[0].contains("not supported"), "{:?}", reserved.notes);
+        }
+    }
+
+    #[test]
+    fn a_declared_eci_outranks_a_chosen_charset() {
+        // The symbol says ISO-8859-5 and the user UTF-8, in which these
+        // bytes are nothing: the symbol knows.
+        let cyrillic = [control(SegmentContent::Eci(Some(7))), byte_segment(&known(&[0xC0, 0xC1]), Certainty::Verified)];
+        for charset in [Charset::Auto, Charset::Utf8, Charset::ShiftJis, Charset::Eci(9)] {
+            let report = decode_text(&cyrillic, charset);
+            assert_eq!((report.plain().as_str(), report.encoding.as_deref()), ("РС", Some("ISO-8859-5 (ECI)")), "{charset:?}");
+            assert_eq!(encode_as_read(&cyrillic, 1, charset, "С"), Ok(vec![0xC1]), "{charset:?}");
+        }
+        // Byte data before the designator is not what it declares.
+        let before = [byte_segment(&known(&[0xC0, 0xC1]), Certainty::Verified), control(SegmentContent::Eci(Some(7))), byte_segment(&known(&[0xC0]), Certainty::Verified)];
+        let report = decode_text(&before, Charset::Latin1);
+        assert_eq!((report.plain().as_str(), report.encoding.as_deref()), ("ÀÁР", Some("ISO-8859-1 (chosen), ISO-8859-5 (ECI)")));
+        assert_eq!(encode_as_read(&before, 0, Charset::Latin1, "Á"), Ok(vec![0xC1]));
+        // A designator that names no set this reader has declares nothing
+        // to follow: the set chosen stands, and the note says what the
+        // bytes are shown as.
+        for (eci, why) in [(123456, "not supported"), (14, "reserved")] {
+            let unnamed = [control(SegmentContent::Eci(Some(eci))), byte_segment(&known(&[0xB1, 0xB2]), Certainty::Verified)];
+            let report = decode_text(&unnamed, Charset::ShiftJis);
+            assert_eq!((report.plain().as_str(), report.encoding.as_deref()), ("ｱｲ", Some("Shift_JIS (chosen)")), "ECI {eci}");
+            assert!(report.notes[0].contains(why) && report.notes[0].ends_with("bytes shown as Shift_JIS."), "{:?}", report.notes);
+            let report = decode_text(&unnamed, Charset::Auto);
+            assert_eq!((report.plain().as_str(), report.encoding.as_deref()), ("±²", Some("ISO-8859-1 (ECI)")), "ECI {eci}");
+            assert!(report.notes[0].ends_with("bytes shown as ISO-8859-1."), "{:?}", report.notes);
+            assert_eq!(encode_as_read(&unnamed, 1, Charset::ShiftJis, "ｱ"), Ok(vec![0xB1]));
+            assert_eq!(encode_as_read(&unnamed, 1, Charset::Auto, "±"), Ok(vec![0xB1]));
         }
     }
 

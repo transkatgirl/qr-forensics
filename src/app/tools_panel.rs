@@ -565,7 +565,7 @@ fn sampling_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
         .on_hover_text(
             "Judge each module against the darkest and lightest of its neighbourhood, so shadows, glare and \
              stains do not tip it. Off, one threshold serves the whole symbol, which suits an evenly lit symbol \
-             that is blurred. Find in outline tries both.",
+             that is blurred. Find in outline tries both, and the threshold surface after them.",
         );
     if params.local {
         ui.horizontal(|ui| {
@@ -589,8 +589,8 @@ fn sampling_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
                     "Let the one threshold lie as a smooth surface across the symbol, the thresholds of its four \
                      corners interpolated between them, as BoofCV reads a symbol: for a shadow across an evenly \
                      printed symbol, or light that fails toward one side, which no level threshold follows and \
-                     which the local one follows along with every stain. Find in outline does not try it of \
-                     itself.",
+                     which the local one follows along with every stain. Find in outline tries it of itself, \
+                     after the local threshold and the level one, or first when it is ticked here.",
                 );
             }
         }
@@ -610,7 +610,7 @@ fn sampling_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
     })
     .response
     .on_hover_text(
-        "How each module's luminance is read. Find in outline tries every kernel, under both threshold rules, and \
+        "How each module's luminance is read. Find in outline tries every kernel, under every threshold rule, and \
          keeps what decodes.",
     );
     if let Some(preview) = &app.preview {

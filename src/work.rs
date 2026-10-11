@@ -3,7 +3,7 @@
 //!
 //! A search of a photo climbs a ladder of copies and fits a placement to
 //! every outline the finder patterns propose; a read tries every kernel
-//! under both threshold rules, and then the photo's other three turns. On
+//! under every threshold rule, and then the photo's other three turns. On
 //! a sound symbol the first try settles it. On a damaged one, which is
 //! what this crate is for, every try is made and fails, one after another
 //! on one core, for minutes. Two things mend that.

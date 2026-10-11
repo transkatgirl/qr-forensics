@@ -11,10 +11,10 @@
 //! connected regions of the binarised image, fits a polygon to the contour
 //! of each, keeps the quadrilaterals, and then asks the pixels along two
 //! lines through each quadrilateral, each joining the midpoints of a pair
-//! of opposite sides, whether they read as 1:1:3:1:1. The region gives the
-//! square's own axes whatever its turn or perspective, and a ring survives
-//! as one region through any number of dark scratches, and through a light
-//! one that cuts it in one place.
+//! of opposite sides, whether they read as 1:1:3:1:1, and is content when
+//! either does. The region gives the square's own axes whatever its turn
+//! or perspective, and a ring survives as one region through any number of
+//! dark scratches, and through a light one that cuts it in one place.
 //!
 //! Here the regions are labelled by union-find over the runs of each row,
 //! with eight-way connectivity, and the quadrilateral is the one of
@@ -23,11 +23,14 @@
 //! and a region that is nothing like a quadrilateral gives one that covers
 //! too little of its hull, and is dropped. The hull is taken over the
 //! corners of the pixels rather than their centres, so the corners come
-//! out on the edge of the ink. Each line check is tried at the midpoints
-//! and a little to either side of them, taking the best, so that a scratch
-//! along the very middle of a finder does not fail it. The labelling is run
-//! twice over each polarity, once on the image as it is and once with gaps
-//! of up to two pixels closed over (a dilation followed by an erosion: the
+//! out on the edge of the ink. Both lines must read, where BoofCV asks one
+//! of the two: each is tried at the midpoints and a little to either side
+//! of them, taking the best, so that a scratch along the very middle of a
+//! finder does not fail it, and a region that reads along both is let past
+//! the detector's cap on the candidates it refines, which a test that one
+//! line could pass would not earn it. The labelling is run twice over each
+//! polarity, once on the image as it is and once with gaps of up to two
+//! pixels closed over (a dilation followed by an erosion: the
 //! morphological closing), so that a finder cut into pieces by thin
 //! scratches is seen whole. The line checks read whichever image the
 //! labelling was made from: a scratch along the centre row of a finder
@@ -98,8 +101,15 @@ const MIN_QUAD_SHARE: f64 = 0.7;
 const MODULE_SLACK: (f64, f64) = (0.8, 1.25);
 /// The two mean side lengths of the quadrilateral may differ by this
 /// factor at most: a square in perspective is foreshortened, but not into
-/// a bar.
-const MAX_SIDE_RATIO: f64 = 1.5;
+/// a bar. Three to one is a finder seen seventy degrees off the square,
+/// past which its modules are too thin along one axis to read. The
+/// factor was one and a half, forty-eight degrees, and the finders of a
+/// symbol photographed from low across a table, two to one and more,
+/// were turned away here with their four corners found: the scan sees
+/// such a finder along a line or two if at all, and no template started
+/// square to the frame settles on it. At two, and at two and a half, one
+/// photograph of five so taken was still found only up the ladder.
+const MAX_SIDE_RATIO: f64 = 3.0;
 /// How far beyond the quadrilateral each line is sampled, as a share of
 /// its length: about half a module, enough that the outer ring is measured
 /// whole when the quadrilateral falls a little short of it, and little
@@ -136,7 +146,11 @@ const SPAN_WEIGHT: f64 = 5.0;
 /// the stone, and off any scratch along the centre row or column.
 const CENTRE_OFFSET: f64 = 0.1;
 /// Most candidates returned, so a busy page cannot flood the detector.
-const MAX_CANDIDATES: usize = 64;
+/// A candidate has read as a finder along two lines, which print seldom
+/// does, and the cap is far above what a sheet of symbols holds: at
+/// sixty-four it cut a sheet of sixty symbols, a hundred and eighty
+/// finders, to a third.
+const MAX_CANDIDATES: usize = 1024;
 /// Hull vertices the search for the hull's diameter looks at, at most:
 /// the search is quadratic in them, and the corners are polished against
 /// the whole hull afterwards.
@@ -914,15 +928,36 @@ mod tests {
     }
 
     #[test]
-    fn candidates_are_capped() {
-        // A ten by ten grid of finders of four pixels a module.
+    fn every_finder_of_a_sheet_is_a_candidate() {
+        // A ten by ten grid of finders of four pixels a module: a sheet
+        // of thirty-three symbols has as many, and a cap of sixty-four
+        // kept two in three of them.
         let bitmap = Bitmap::draw(400, 400, |x, y| {
             let (u, v) = ((x % 40.0) / 4.0, (y % 40.0) / 4.0);
             finder(u, v).unwrap_or(false)
         });
         let found = bitmap.find(2.0, 10.0);
-        assert_eq!(found.len(), MAX_CANDIDATES);
+        assert_eq!(found.len(), 100);
+        assert!(found.len() <= MAX_CANDIDATES);
         assert!(found.windows(2).all(|w| w[0].score <= w[1].score));
+    }
+
+    #[test]
+    fn a_finder_seen_steeply_is_found_and_a_bar_is_not() {
+        // A finder foreshortened two and a half to one, as a symbol
+        // photographed from low across a table shows it: eight pixels a
+        // module along the rows and three and a fifth down the columns.
+        let steep = |down: f64| Bitmap::draw(96, 48, move |x, y| finder((x - 10.0) / 8.0, (y - 10.0) / down).unwrap_or(false));
+        let found = steep(3.2).find(2.0, 10.0);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let c = found[0];
+        assert!((c.x - 38.0).abs() < 0.5 && (c.y - 21.2).abs() < 0.5, "{c:?}");
+        assert!((c.module[0] - 8.0).abs() < 0.2 && (c.module[1] - 3.2).abs() < 0.2, "{c:?}");
+        for (corner, truth) in c.corners.iter().zip([[10.0, 10.0], [66.0, 10.0], [66.0, 32.4], [10.0, 32.4]]) {
+            assert!(distance(*corner, truth) < 1.0, "{c:?}");
+        }
+        // Three and a half to one is past what a finder is read at.
+        assert!(steep(2.3).find(2.0, 10.0).is_empty());
     }
 
     #[test]

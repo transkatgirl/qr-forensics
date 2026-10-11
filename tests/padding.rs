@@ -7,7 +7,7 @@ mod common;
 use common::*;
 use qr_forensics::decode::bitstream::{Certainty, EndOfData, LostReason};
 use qr_forensics::decode::codewords::{PinSource, Pins};
-use qr_forensics::decode::padding::{check_tail, clear_padding_pins, detect_padding, pad_tail, recover_padding};
+use qr_forensics::decode::padding::{Filler, check_tail, clear_padding_pins, detect_padding, pad_tail, pinned_filler, recover_padding};
 use qr_forensics::decode::pipeline::{BlockOutcome, DecodeOptions, SolveMethod, decode};
 use qr_forensics::decode::repair::render_rgba;
 use qr_forensics::imaging::Luma;
@@ -250,24 +250,20 @@ fn works_in_micro_qr_and_rmqr() {
     assert_eq!(recovery.report.text.plain(), "rMQR");
 }
 
-#[test]
-fn zero_padded_symbols_get_no_pins() {
-    let (version, ec, mask) = (SymbolVersion::Qr(6), EcLevel::M, 0);
-    let layout = layout(version, ec);
-    let clean = encode(version, ec, Some(mask), &[Segment::bytes("zeros")]).unwrap();
-    let truth = decode_plain(&clean, &layout, mask);
+/// `clean` as an encoder that fills otherwise than the standard would
+/// have written it: `fill` gives the pad codeword each place from the
+/// first, and the error correction is computed over the data so filled.
+fn refilled(layout: &SymbolLayout, clean: &ModuleGrid, mask: u8, fill: impl Fn(usize) -> u8) -> ModuleGrid {
+    let truth = decode_plain(clean, layout, mask);
     let EndOfData::At { bit, .. } = truth.parse.end else { panic!() };
-    let first_pad = pad_tail(&layout, bit).first_pad_codeword;
-
-    // Rebuild the symbol the way an encoder that pads with zeros would:
-    // zero data after the message and recomputed error correction.
+    let first_pad = pad_tail(layout, bit).first_pad_codeword;
     let mut grid = clean.clone();
     for block in &layout.blocks {
         let mut data: Vec<u8> =
             block.codewords[..block.data_len].iter().map(|&cw| truth.codewords[cw].final_value.unwrap()).collect();
         for (i, value) in data.iter_mut().enumerate() {
             if block.stream_offset + i >= first_pad {
-                *value = 0;
+                *value = fill(block.stream_offset + i - first_pad);
             }
         }
         let ec_words = qr_forensics::decode::rs::rs_encode(&data, block.ec_len);
@@ -275,24 +271,168 @@ fn zero_padded_symbols_get_no_pins() {
             for (i, pos) in layout.codeword_modules(cw).iter().enumerate() {
                 let (x, y) = (pos.x as usize, pos.y as usize);
                 let bit = value & (0x80 >> i) != 0;
-                let masked = bit != qr_forensics::symbol::mask::mask_bit(version, mask, x, y);
+                let masked = bit != qr_forensics::symbol::mask::mask_bit(layout.version(), mask, x, y);
                 grid.set(x, y, Module::from_dark(masked));
             }
         }
     }
-    let report = decode_plain(&grid, &layout, mask);
-    assert!(report.is_trustworthy());
-    assert_eq!(report.text.plain(), "zeros");
-    assert!(report.tail.unwrap().zero_filled);
-    assert!(report.score.tail_plausible);
-    assert_eq!(detect_padding(&layout, &report), None);
+    grid
+}
 
-    // Still none once the symbol is damaged.
-    erase_data_tail(&mut grid, &layout, 1, 20);
-    let damaged = decode_plain(&grid, &layout, mask);
-    assert!(!damaged.is_complete());
-    assert_eq!(detect_padding(&layout, &damaged), None);
-    assert!(recover(&grid, &layout, mask).is_none());
+/// A pad codeword by its place from the first.
+type Fill = fn(usize) -> u8;
+
+/// The fillers looked for, each as the pad codeword it puts a number of
+/// places from the first. The codeword a late start leaves is zero here.
+fn fillers() -> [(Filler, Fill); 4] {
+    [
+        (Filler::Standard, |place| [0xEC, 0x11][place % 2]),
+        (Filler::Late, |place| if place == 0 { 0 } else { [0x11, 0xEC][place % 2] }),
+        (Filler::Swapped, |place| [0x11, 0xEC][place % 2]),
+        (Filler::Zeros, |_| 0),
+    ]
+}
+
+#[test]
+fn a_filler_that_is_not_the_standards_is_found_and_pinned() {
+    // Padding of zeros, the standard's two codewords with the second
+    // first, and the standard's begun a codeword late: none of them is
+    // asked of a read, and each is known without reading it as the
+    // standard's is, once it is seen which a symbol has.
+    let (version, ec, mask) = (SymbolVersion::Qr(6), EcLevel::M, 0);
+    let layout = layout(version, ec);
+    let clean = encode(version, ec, Some(mask), &[Segment::bytes("zeros")]).unwrap();
+    let EndOfData::At { bit, .. } = decode_plain(&clean, &layout, mask).parse.end else { panic!() };
+    let first_pad = pad_tail(&layout, bit).first_pad_codeword;
+    for (filler, fill) in fillers() {
+        let what = format!("{filler:?}");
+        let whole = refilled(&layout, &clean, mask, fill);
+        let truth = decode_plain(&whole, &layout, mask);
+        assert!(truth.is_trustworthy(), "{what}");
+        assert_eq!(truth.text.plain(), "zeros", "{what}");
+        assert_eq!(truth.tail.unwrap().zero_filled, filler == Filler::Zeros, "{what}");
+        let candidate = detect_padding(&layout, &truth).unwrap();
+        assert_eq!((candidate.filler, candidate.first_pad_codeword, candidate.mismatches), (filler, first_pad, 0), "{what}");
+        assert_eq!(candidate.header_certainty, Some(Certainty::Verified), "{what}");
+
+        // A block that is padding throughout loses more of it than its
+        // error correction restores, and the block the message is in
+        // loses pad codewords as well.
+        let mut grid = whole.clone();
+        erase_data_tail(&mut grid, &layout, 1, 20);
+        erase_data_tail(&mut grid, &layout, 0, 12);
+        let damaged = decode_plain(&grid, &layout, mask);
+        assert!(!damaged.blocks[1].is_solved(), "{what}");
+        assert_eq!(detect_padding(&layout, &damaged).map(|c| c.filler), Some(filler), "{what}");
+        let recovery = recover(&grid, &layout, mask).unwrap();
+        assert!(recovery.confirmed && recovery.report.is_trustworthy(), "{what}: {:?}", recovery.report.blocks);
+        assert_eq!(recovery.candidate.filler, filler, "{what}");
+        assert_eq!(pinned_filler(&layout, &recovery.report, &recovery.pins), Some(filler), "{what}");
+        assert_eq!(recovery.report.text.plain(), "zeros", "{what}");
+        for (cw, (got, want)) in recovery.report.codewords.iter().zip(&truth.codewords).enumerate() {
+            assert_eq!(got.final_value, want.final_value, "{what} codeword {cw}");
+        }
+        // The codeword a late start leaves is not pinned, whatever it
+        // holds, and every pad codeword after it is.
+        let stray = layout.data_stream[first_pad];
+        assert_eq!(recovery.pins.contains_key(&stray), filler != Filler::Late, "{what}");
+        assert!(layout.data_stream[first_pad + 1..].iter().all(|cw| recovery.pins[cw].source == PinSource::Padding), "{what}");
+    }
+}
+
+#[test]
+fn padding_that_cannot_be_seen_is_taken_for_the_standards() {
+    // A filler is told by what can be read of it: its own codewords,
+    // those error correction restores in a block that solves, and the
+    // error correction of the blocks that are padding throughout. Here
+    // the message fills the first block and the others cannot be read
+    // at all: the headers alone say where the padding is, and it is
+    // taken for the standard's, as it was when that was the only filler
+    // known. Two codewords of it are the least that name another.
+    let (version, ec, mask) = (SymbolVersion::Qr(6), EcLevel::M, 0);
+    let layout = layout(version, ec);
+    let clean = encode(version, ec, Some(mask), &[Segment::bytes("twenty-five bytes of text")]).unwrap();
+    let EndOfData::At { bit, .. } = decode_plain(&clean, &layout, mask).parse.end else { panic!() };
+    let first_pad = pad_tail(&layout, bit).first_pad_codeword;
+    assert_eq!(first_pad, layout.blocks[1].stream_offset);
+    for (filler, fill) in fillers() {
+        let what = format!("{filler:?}");
+        let whole = refilled(&layout, &clean, mask, fill);
+        let mut grid = whole.clone();
+        let pure = layout.blocks[1..].iter().flat_map(|block| &block.codewords[block.data_len..]);
+        for &cw in layout.data_stream[first_pad..].iter().chain(pure) {
+            erase_codeword(&mut grid, &layout, cw);
+        }
+        let blind = decode_plain(&grid, &layout, mask);
+        assert!(blind.blocks[0].is_verified() && blind.blocks_solved() == 1, "{what}");
+        let candidate = detect_padding(&layout, &blind).unwrap();
+        assert_eq!((candidate.filler, candidate.header_certainty), (Filler::Standard, Some(Certainty::Verified)), "{what}");
+
+        // Two pad codewords of the second block come back. A turn that
+        // begins with the second of the standard's codewords and one
+        // that begins a codeword late differ in the first pad codeword
+        // alone, which is still unreadable, and of the two the one that
+        // leaves it alone is taken.
+        for &cw in &layout.data_stream[40..42] {
+            for pos in layout.codeword_modules(cw) {
+                let (x, y) = (pos.x as usize, pos.y as usize);
+                grid.set(x, y, whole.get(x, y));
+            }
+        }
+        let candidate = detect_padding(&layout, &decode_plain(&grid, &layout, mask)).unwrap();
+        let seen = if filler == Filler::Swapped { Filler::Late } else { filler };
+        assert_eq!((candidate.filler, candidate.matches >= 16, candidate.mismatches), (seen, true, 0), "{what}");
+    }
+}
+
+#[test]
+fn a_filler_found_without_headers_is_fitted_to_them_once_they_read() {
+    // The codewords that hold the header are unreadable, and with pad
+    // codewords of its block gone too the block is past restoring: only
+    // the turn of the two pad codewords, which marks its own place,
+    // shows where the padding is. Pinned from where it can be seen, it
+    // restores the block, and the header then says where the padding
+    // starts: where the turn does, a codeword before it, or at the
+    // second of its two codewords.
+    let (version, ec, mask) = (SymbolVersion::Qr(10), EcLevel::M, 0);
+    let layout = layout(version, ec);
+    let text = "the first block is gone";
+    let clean = encode(version, ec, Some(mask), &[Segment::bytes(text)]).unwrap();
+    let EndOfData::At { bit, .. } = decode_plain(&clean, &layout, mask).parse.end else { panic!() };
+    let first_pad = pad_tail(&layout, bit).first_pad_codeword;
+    assert_eq!(first_pad, 26);
+    for (filler, fill) in fillers() {
+        let what = format!("{filler:?}");
+        let whole = refilled(&layout, &clean, mask, fill);
+        let truth = decode_plain(&whole, &layout, mask);
+        let mut grid = whole.clone();
+        let first = &layout.blocks[0];
+        for &cw in first.codewords[..12].iter().chain(&first.codewords[28..first.data_len]) {
+            erase_codeword(&mut grid, &layout, cw);
+        }
+        let before = decode_plain(&grid, &layout, mask);
+        assert!(!before.blocks[0].is_solved(), "{what}");
+        assert!(matches!(before.parse.end, EndOfData::Lost { .. }), "{what}");
+        let found = detect_padding(&layout, &before);
+        if filler == Filler::Zeros {
+            // A run of zeros marks no place, and is not looked for
+            // without the headers to say where it starts.
+            assert_eq!(found, None);
+            assert!(recover(&grid, &layout, mask).is_none());
+            continue;
+        }
+        let found = found.unwrap();
+        assert_eq!((found.filler, found.end_bit), (Filler::Standard, None), "{what}");
+        assert_eq!(found.first_pad_codeword, first_pad + usize::from(filler != Filler::Standard), "{what}");
+        let recovery = recover(&grid, &layout, mask).unwrap();
+        assert!(recovery.confirmed && recovery.report.is_trustworthy(), "{what}: {:?}", recovery.report.blocks);
+        assert_eq!((recovery.candidate.filler, recovery.candidate.first_pad_codeword), (filler, first_pad), "{what}");
+        assert_eq!(pinned_filler(&layout, &recovery.report, &recovery.pins), Some(filler), "{what}");
+        assert_eq!(recovery.report.text.plain(), text, "{what}");
+        for (cw, (got, want)) in recovery.report.codewords.iter().zip(&truth.codewords).enumerate() {
+            assert_eq!(got.final_value, want.final_value, "{what} codeword {cw}");
+        }
+    }
 }
 
 #[test]

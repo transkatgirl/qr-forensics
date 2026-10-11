@@ -83,6 +83,28 @@ impl Kernel {
     }
 }
 
+/// What a module's luminance is called dark or light against: the
+/// darkest and lightest of its own neighbourhood, as ZXing's
+/// HybridBinarizer judges a pixel; one level threshold for the whole
+/// symbol, as its GlobalHistogramBinarizer does; or one threshold that
+/// lies as a surface across the symbol ([`ThresholdSurface`]), as BoofCV
+/// reads a QR Code. The neighbourhood follows shadows, glare and stains,
+/// and reads the modules of an evenly blurred symbol against neighbours
+/// as grey as themselves; the level reads those, and no shadow; the
+/// surface follows light that changes slowly across the symbol and no
+/// stain. No one of them reads every photo, so a read tries each
+/// ([`SampleParams::rules`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Rule {
+    Neighbourhood,
+    Level,
+    Surface,
+}
+
+impl Rule {
+    pub const ALL: [Rule; 3] = [Rule::Neighbourhood, Rule::Level, Rule::Surface];
+}
+
 /// Mean luminance of each module; `None` where the module lies off the image.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sampled {
@@ -339,7 +361,8 @@ pub struct SampleParams {
     pub band: f32,
     /// Threshold each module against its own neighbourhood instead of the
     /// whole symbol. Follows shadows, glare and stains; the default, as in
-    /// ZXing.
+    /// ZXing. With `threshold` and `surface` this says which [`Rule`] a
+    /// module is read by ([`SampleParams::rule`]).
     pub local: bool,
     /// Neighbourhood half-width in modules for local mode.
     pub local_radius: usize,
@@ -371,6 +394,42 @@ impl Default for SampleParams {
     }
 }
 
+impl SampleParams {
+    /// The rule these parameters read a module by: the neighbourhood's
+    /// when they are local, and otherwise the surface when it is asked
+    /// for and the threshold is found rather than given, or the level.
+    pub fn rule(&self) -> Rule {
+        if self.local {
+            Rule::Neighbourhood
+        } else if self.surface && self.threshold.is_none() {
+            Rule::Surface
+        } else {
+            Rule::Level
+        }
+    }
+
+    /// These parameters with the module read by `rule` instead. The
+    /// surface is found, so a threshold given is let go for it; under
+    /// the neighbourhood rule neither is looked at, and both stay.
+    pub fn under(self, rule: Rule) -> Self {
+        match rule {
+            Rule::Neighbourhood => Self { local: true, ..self },
+            Rule::Level => Self { local: false, surface: false, ..self },
+            Rule::Surface => Self { local: false, surface: true, threshold: None, ..self },
+        }
+    }
+
+    /// The rules a read tries, in order: the one asked for, then the
+    /// others, the neighbourhood before the level before the surface. A
+    /// threshold given is the level the symbol is to be read against,
+    /// and no surface is found beside it.
+    pub fn rules(&self) -> impl Iterator<Item = Rule> {
+        let asked = self.rule();
+        let given = self.threshold.is_some();
+        std::iter::once(asked).chain(Rule::ALL.into_iter().filter(move |&rule| rule != asked && !(given && rule == Rule::Surface)))
+    }
+}
+
 /// Least spread between the darkest and lightest modules of a
 /// neighbourhood for it to hold any information, as a share of the
 /// symbol's own contrast, the gap between the means of its dark and its
@@ -378,9 +437,12 @@ impl Default for SampleParams {
 /// stain or in glare, and calling them dark or light would be guessing.
 /// ZXing's HybridBinarizer draws the line at 24 of 255 whatever the
 /// photo, and so loses an underexposed photo whole, whose symbol spans
-/// less than that from ink to paper; BoofCV's block Otsu has no such
-/// floor. A share of the symbol's contrast falls where ZXing's line does
-/// on a well exposed photo and far lower on a dark one.
+/// less than that from ink to paper; BoofCV's block Otsu draws none at a
+/// fixed luminance, and lowers a block's threshold instead in proportion
+/// to its own square over the variance between the block's dark and its
+/// light, so that what counts as flat goes with the exposure. A share of
+/// the symbol's contrast falls where ZXing's line does on a well exposed
+/// photo and far lower on a dark one.
 pub const FLAT_SHARE: f32 = 0.15;
 /// The spread below which a neighbourhood is flat whatever the symbol's
 /// contrast: the noise of the sensor alone spreads a flat patch by about
@@ -601,8 +663,11 @@ const SURFACE_WINDOW: usize = 9;
 /// A threshold that lies as a smooth surface across the symbol: the
 /// thresholds of its four corners, interpolated bilinearly between them,
 /// as BoofCV reads a QR Code (`bitIntensityToBitValue`), which takes
-/// three of the four from its position patterns and the fourth from the
-/// data in the corner that has none. A shadow that falls across the
+/// three of the four from its position patterns, each the midpoint of
+/// the luminance just inside and just outside the pattern's outline, and
+/// the fourth from the data: the mean of every data module within ten
+/// modules of the right or the bottom edge, on the footing that as many
+/// of them are dark as light. A shadow that falls across the
 /// symbol, or light that fails toward one side, moves every module's
 /// luminance by an amount that changes slowly from corner to corner, and
 /// the surface follows it. One level threshold cannot; and the
@@ -612,10 +677,10 @@ const SURFACE_WINDOW: usize = 9;
 ///
 /// Each corner's threshold is the midpoint between the darkest and
 /// lightest modules of a window [`SURFACE_WINDOW`] modules on a side in
-/// that corner, and stands at the middle of its window; a corner with
-/// too few modules read, or none that differ, takes the level threshold
-/// of the whole symbol. The contrast the unsure band is a share of is
-/// interpolated with it.
+/// that corner, which asks nothing of how many are dark, and stands at
+/// the middle of its window; a corner with too few modules read, or none
+/// that differ, takes the level threshold of the whole symbol. The
+/// contrast the unsure band is a share of is interpolated with it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ThresholdSurface {
     /// Where the corner windows stand, in modules: left and right
@@ -982,7 +1047,8 @@ mod tests {
             ..Default::default()
         };
         assert!(wrong(&level) > 50, "{}", wrong(&level));
-        // The surface is asked for: nothing reads against one otherwise.
+        // The surface is not what a module is read against first; a
+        // read comes to it in its turn.
         assert!(!SampleParams::default().surface);
         let surface = SampleParams {
             surface: true,
@@ -1031,6 +1097,32 @@ mod tests {
         };
         let out = classify(&small, &surface);
         assert!((0..35).all(|i| out.modules[i] == Module::from_dark(i % 2 == 0)));
+    }
+
+    #[test]
+    fn a_read_tries_the_rule_asked_for_first_and_then_the_others() {
+        let asked = SampleParams::default();
+        assert_eq!(asked.rule(), Rule::Neighbourhood);
+        assert_eq!(asked.rules().collect::<Vec<_>>(), [Rule::Neighbourhood, Rule::Level, Rule::Surface]);
+        let surface = asked.under(Rule::Surface);
+        assert_eq!((surface.local, surface.surface, surface.rule()), (false, true, Rule::Surface));
+        assert_eq!(surface.rules().collect::<Vec<_>>(), [Rule::Surface, Rule::Neighbourhood, Rule::Level]);
+        let level = surface.under(Rule::Level);
+        assert_eq!((level.local, level.surface, level.rule()), (false, false, Rule::Level));
+        assert_eq!(level.rules().collect::<Vec<_>>(), [Rule::Level, Rule::Neighbourhood, Rule::Surface]);
+        // Every rule comes back as the rule it was set to.
+        for rule in Rule::ALL {
+            assert_eq!(asked.under(rule).rule(), rule);
+            assert_eq!(surface.under(rule).rule(), rule);
+        }
+        // A threshold given is one level, with no surface beside it: the
+        // surface ticked under it is not what a module is read against,
+        // and a read tries none.
+        let given = SampleParams { threshold: Some(0.4), local: false, surface: true, ..asked };
+        assert_eq!(given.rule(), Rule::Level);
+        assert_eq!(given.rules().collect::<Vec<_>>(), [Rule::Level, Rule::Neighbourhood]);
+        assert_eq!(given.under(Rule::Neighbourhood).threshold, Some(0.4));
+        assert_eq!(given.under(Rule::Surface).threshold, None);
     }
 
     #[test]

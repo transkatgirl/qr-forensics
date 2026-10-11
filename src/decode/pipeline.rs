@@ -66,8 +66,12 @@ pub enum BlockOutcome {
         erasures: usize,
         /// Redundancy left over, in codewords.
         slack: usize,
-        /// Independent bits confirming the solution. Zero means any input
-        /// would have produced a "solution".
+        /// Independent bits confirming the solution: the redundancy left
+        /// over, the known bits of erased codewords it reproduced, and
+        /// what the errors it located confirm
+        /// ([`super::rs::located_error_bits`]). Zero means any input would
+        /// have produced a "solution", as one does that only fills
+        /// unknown codewords and has nothing left over.
         confidence_bits: u32,
         /// The solution spent error correction codewords the standard
         /// reserves for detection in the smallest symbols (ISO/IEC 18004
@@ -287,10 +291,14 @@ fn solve_rank(outcome: &BlockOutcome) -> (bool, u32) {
 /// below any verified solution within it.
 ///
 /// An exact solution ends the search only when it is verified within the
-/// standard. One with nothing to spare, or one that spent the reserved
-/// codewords, is kept as a last resort while the fallbacks look for
-/// better: doubting the one wrong codeword that read faintly turns a
-/// zero-slack solution into a confirmed one.
+/// standard, as one that corrected to the limit of the block's error
+/// correction is by the errors it located. One with too little to confirm
+/// it, which is nothing where it only filled unknown codewords and had
+/// none to spare, or one that spent the reserved codewords, is kept as a
+/// last resort while the fallbacks look for better: doubting the one
+/// wrong codeword that read faintly turns a solution that fills sixteen
+/// unknown codewords and locates that one with nothing to spare into a
+/// confirmed one.
 fn solve_block(
     block: &[CwRead],
     reliability: &[u8],

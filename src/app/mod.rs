@@ -15,7 +15,7 @@ use std::sync::Arc;
 use eframe::egui;
 use qr_forensics::decode::codewords::{Pin, PinSource, Pins};
 use qr_forensics::decode::known::{Place, lay_over, text_pins, try_beginnings};
-use qr_forensics::decode::padding::{clear_padding_pins, detect_padding, recover_padding};
+use qr_forensics::decode::padding::{Filler, clear_padding_pins, detect_padding, recover_padding};
 use qr_forensics::decode::pipeline::{Attempt, DecodeOptions, analyze, brute_force, brute_force_mirrored, decode};
 use qr_forensics::decode::repair::{quiet_zone, render_rgba, render_svg, repaired_grid};
 use qr_forensics::decode::sequence::Part;
@@ -31,7 +31,7 @@ use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline};
 use qr_forensics::imaging::refine::{Refinement, refine_corners, refine_corners_holding};
 use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::enhance::Enhance;
-use qr_forensics::imaging::sample::{Kernel, SampleParams, VersionGuess, classify, sample_modules_with, suggest_versions};
+use qr_forensics::imaging::sample::{Kernel, Rule, SampleParams, VersionGuess, classify, sample_modules_with, suggest_versions};
 use qr_forensics::symbol::function_map::{FunctionMap, looks_inverted};
 use qr_forensics::symbol::grid::{Mirror, Module, Symmetry};
 use qr_forensics::symbol::layout::{CwId, SymbolLayout};
@@ -297,8 +297,9 @@ struct ReadNote {
     /// The sampling kernel the read that decoded best used.
     kernel: Kernel,
     /// The threshold rule it used: each module against its neighbourhood,
-    /// or every module against one split of the symbol.
-    local: bool,
+    /// or every module against one split of the symbol, or against a
+    /// threshold that lies as a surface across it.
+    rule: Rule,
     /// What it read the photo through: a copy of it about the symbol,
     /// enlarged and sharpened, or the photo as it is.
     enhance: Enhance,
@@ -1567,8 +1568,7 @@ impl App {
         // read was made through.
         let mut through = None;
         if decoded {
-            self.view.sample.kernel = read.kernel;
-            self.view.sample.local = read.local;
+            self.view.sample = SampleParams { kernel: read.kernel, ..self.view.sample.under(read.rule) };
             through = self.adjust_as_read(read.enhance, read_enlarge);
         }
         self.view.stage = Stage::Edit;
@@ -1729,13 +1729,15 @@ impl App {
                     read.kernel.label().to_lowercase()
                 ));
             }
-            if read.trustworthy && read.local != self.view.sample.local {
-                self.view.sample.local = read.local;
-                text.push_str(if read.local {
-                    " Only the local threshold decoded it, so Sampling now uses that."
-                } else {
-                    " Only one threshold for the whole symbol decoded it, so Sampling now uses that instead of \
-                     the local one."
+            if read.trustworthy && read.rule != self.view.sample.rule() {
+                self.view.sample = self.view.sample.under(read.rule);
+                text.push_str(match read.rule {
+                    Rule::Neighbourhood => " Only the local threshold decoded it, so Sampling now uses that.",
+                    Rule::Level => " Only one threshold for the whole symbol decoded it, so Sampling now uses that.",
+                    Rule::Surface => {
+                        " Only a threshold that lies as a surface across the symbol decoded it, so Sampling now \
+                         uses that."
+                    }
                 });
             }
         }
@@ -2121,9 +2123,12 @@ impl App {
                         } else {
                             format!("still {} of {total} blocks solved", recovery.solved_after)
                         };
-                        self.notify(format!("Padding recovery pinned {} codewords: {progress}; {check}.", recovery.added));
+                        // The standard's filler goes without saying.
+                        let filler = recovery.candidate.filler;
+                        let what = if filler == Filler::Standard { String::new() } else { format!(" as {}", filler.label()) };
+                        self.notify(format!("Padding recovery pinned {} codewords{what}: {progress}; {check}.", recovery.added));
                     }
-                    None => self.fail("No standard padding could be located in this symbol."),
+                    None => self.fail("No padding could be located in this symbol."),
                 }
             }
             Action::ClearPaddingPins => {
@@ -2752,7 +2757,7 @@ fn prepared_from_read(
         .then(|| (version.family(), suggest_versions(luma, found.corners, version.family(), params)));
     let read = ReadNote {
         kernel: result.kernel,
-        local: result.local,
+        rule: result.rule,
         enhance: result.enhance,
         verified: result.report.blocks_verified(),
         blocks: result.report.blocks.len(),
@@ -3849,9 +3854,10 @@ mod tests {
         let mut bench = Bench::new();
         let before = bench.app.view.sample;
         assert_ne!(before.kernel, Kernel::Centre);
+        assert_ne!(before.rule(), Rule::Surface);
         let read = |trustworthy: bool, enhance: Enhance| {
-            let (kernel, local, verified) = (Kernel::Centre, !before.local, usize::from(trustworthy));
-            let note = ReadNote { kernel, local, enhance, verified, blocks: 1, trustworthy, padding_pinned: false, reinterpreted: None };
+            let (kernel, rule, verified) = (Kernel::Centre, Rule::Surface, usize::from(trustworthy));
+            let note = ReadNote { kernel, rule, enhance, verified, blocks: 1, trustworthy, padding_pinned: false, reinterpreted: None };
             Prepared { read: Some(note), ..prepared(detection(SymbolVersion::Qr(2), STRAIGHT)) }
         };
         let copy = Enhance { enlarge: 2, sharpen: Sharpen::Light };
@@ -3862,8 +3868,11 @@ mod tests {
         assert_eq!(bench.app.doc.adjust, Adjust::default());
         assert!(!text.contains("decoded it"), "{text}");
         let text = bench.app.adopt_prepared(read(true, Enhance::NONE));
-        assert_eq!((bench.app.view.sample.kernel, bench.app.view.sample.local), (Kernel::Centre, !before.local));
+        // The rule goes with the kernel, to the checkbox that asks for it.
+        let sample = bench.app.view.sample;
+        assert_eq!((sample.kernel, sample.rule(), sample.local, sample.surface), (Kernel::Centre, Rule::Surface, false, true));
         assert!(text.contains("sampling kernel decoded it"), "{text}");
+        assert!(text.contains("a surface across the symbol decoded it"), "{text}");
         assert_eq!(bench.app.doc.adjust, Adjust::default(), "read off the photo as it is");
         assert!(!text.contains("only with the photo"), "{text}");
         // A read made through a copy of the photo about the symbol,

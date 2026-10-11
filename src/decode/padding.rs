@@ -7,13 +7,24 @@
 //! from using up error-correction capacity. A segment header whose bits
 //! are unreadable but which has only one reading under which the stream
 //! parses is pinned the same way.
+//!
+//! Not every encoder fills as the standard does. BoofCV stopped checking
+//! the padding of the symbols it reads, by default, over "a bug in a
+//! popular encoder where for messages of a certain length it would be off
+//! by one", and where it does check it lets the pattern begin again; some
+//! encoders fill with zeros. A read does not ask what the padding is, so
+//! such symbols read; but padding that is not the standard's was not
+//! found here, and damage to it was paid for in error correction that a
+//! standard symbol is spared. So a small family of fillers is looked for
+//! ([`Filler`]), and the one a symbol shows is pinned as the standard's
+//! would be.
 
 use super::bitstream::{Certainty, EndOfData, PAD_BYTES, StreamBits, TailAgreement, standard_tail, tail_agreement};
 use super::codewords::{Pin, PinSource, Pins, codeword_bit_mask};
 use super::pipeline::{DecodeOptions, DecodeReport, decode};
 use super::rs::rs_encode;
 use crate::symbol::grid::ModuleGrid;
-use crate::symbol::layout::SymbolLayout;
+use crate::symbol::layout::{BlockSpec, SymbolLayout};
 
 /// A mismatch counts this many times a match when scoring a candidate. Data
 /// agrees with the pad pattern half the time by chance, so anything above 1
@@ -21,16 +32,62 @@ use crate::symbol::layout::SymbolLayout;
 const MISMATCH_PENALTY: i64 = 3;
 
 /// Minimum score for a candidate found without help from segment headers:
-/// two fully matching codewords.
+/// two fully matching codewords. A filler other than the standard's must
+/// score as much wherever it is found, since the headers that say where
+/// the padding starts do not say what it is.
 const MIN_SCAN_SCORE: i64 = 16;
 
-/// Value of pad codeword `stream_index` when padding starts at `first_pad`.
+/// What an encoder fills the data codewords after the message with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filler {
+    /// 0xEC and 0x11 in turn from the first codeword after the terminator,
+    /// as ISO/IEC 18004 has it.
+    Standard,
+    /// The standard's turn begun one codeword late: the codeword where
+    /// the segment headers put the first of the padding is something
+    /// else, and is left as read.
+    Late,
+    /// 0x11 and 0xEC in turn: the standard's two codewords, the second
+    /// first.
+    Swapped,
+    /// Zeros to the end.
+    Zeros,
+}
+
+impl Filler {
+    /// Every filler looked for, in the order they stand in where the
+    /// evidence does not tell them apart: the standard's own first, and
+    /// of the two that differ only in the first codeword the one that
+    /// leaves it alone.
+    pub const ALL: [Filler; 4] = [Filler::Standard, Filler::Late, Filler::Swapped, Filler::Zeros];
+
+    /// The filler in a few words, for saying what was pinned.
+    pub fn label(self) -> &'static str {
+        match self {
+            Filler::Standard => "0xEC and 0x11 in turn",
+            Filler::Late => "0xEC and 0x11 in turn from one codeword late",
+            Filler::Swapped => "0x11 and 0xEC in turn",
+            Filler::Zeros => "zeros",
+        }
+    }
+}
+
+/// Value of pad codeword `stream_index` when padding starts at `first_pad`
+/// and is `filler`; `None` for the codeword a late start leaves as read.
 /// The four-bit final codeword of M1 and M3 is zero when it is padding.
-fn pad_value(layout: &SymbolLayout, stream_index: usize, first_pad: usize) -> u8 {
-    if layout.codewords[layout.data_stream[stream_index]].nbits == 4 {
-        0
+fn pad_value(layout: &SymbolLayout, stream_index: usize, first_pad: usize, filler: Filler) -> Option<u8> {
+    let turn = stream_index - first_pad;
+    if filler == Filler::Late && turn == 0 {
+        None
+    } else if layout.codewords[layout.data_stream[stream_index]].nbits == 4 {
+        Some(0)
     } else {
-        PAD_BYTES[(stream_index - first_pad) % 2]
+        Some(match filler {
+            Filler::Standard => PAD_BYTES[turn % 2],
+            Filler::Late => PAD_BYTES[(turn - 1) % 2],
+            Filler::Swapped => PAD_BYTES[(turn + 1) % 2],
+            Filler::Zeros => 0,
+        })
     }
 }
 
@@ -103,6 +160,8 @@ pub struct PadCandidate {
     /// Stream index of the first pad codeword.
     pub first_pad_codeword: usize,
     pub pad_codewords: usize,
+    /// What the padding appears to be.
+    pub filler: Filler,
     /// End of data according to segment headers, when they led here.
     pub end_bit: Option<usize>,
     /// Certainty of those headers.
@@ -136,9 +195,14 @@ struct Scanner<'a> {
     /// `suffix[phase][j]`: evidence over stream codewords `j..` when codeword
     /// `j` is at `phase` of the pad pattern.
     suffix: [Vec<Evidence>; 2],
+    /// `zeros[j]`: evidence over stream codewords `j..` for zeros there.
+    zeros: Vec<Evidence>,
     /// Per block and phase of its first data codeword: evidence from its EC
     /// codewords, assuming all of its data is padding.
     block_ec: Vec<[Evidence; 2]>,
+    /// Per block: evidence from its EC codewords, assuming all of its data
+    /// is zeros, whose error correction is zeros too.
+    block_zero_ec: Vec<Evidence>,
 }
 
 impl<'a> Scanner<'a> {
@@ -147,6 +211,7 @@ impl<'a> Scanner<'a> {
         let exists = |cw| codeword_bit_mask(layout, cw);
 
         let mut suffix = [vec![(0, 0); count + 1], vec![(0, 0); count + 1]];
+        let mut zeros = vec![(0, 0); count + 1];
         for j in (0..count).rev() {
             let cw = layout.data_stream[j];
             let (value, known) = report.codewords[cw].best();
@@ -155,8 +220,15 @@ impl<'a> Scanner<'a> {
                 let here = compare(value, known & exists(cw), want);
                 suffix[phase][j] = add(here, suffix[1 - phase][j + 1]);
             }
+            zeros[j] = add(compare(value, known & exists(cw), 0), zeros[j + 1]);
         }
 
+        let ec_evidence = |block: &BlockSpec, ec: Vec<u8>| {
+            block.codewords[block.data_len..].iter().zip(ec).fold((0, 0), |acc, (&cw, want)| {
+                let (value, known) = report.codewords[cw].best();
+                add(acc, compare(value, known, want))
+            })
+        };
         let block_ec = layout
             .blocks
             .iter()
@@ -171,43 +243,77 @@ impl<'a> Scanner<'a> {
                             }
                         })
                         .collect();
-                    let ec = rs_encode(&data, block.ec_len);
-                    block.codewords[block.data_len..].iter().zip(ec).fold((0, 0), |acc, (&cw, want)| {
-                        let (value, known) = report.codewords[cw].best();
-                        add(acc, compare(value, known, want))
-                    })
+                    ec_evidence(block, rs_encode(&data, block.ec_len))
                 })
             })
             .collect();
+        let block_zero_ec = layout.blocks.iter().map(|block| ec_evidence(block, vec![0; block.ec_len])).collect();
 
-        Self { layout, suffix, block_ec }
+        Self { layout, suffix, zeros, block_ec, block_zero_ec }
     }
 
-    fn evidence(&self, first_pad: usize) -> Evidence {
-        let mut total = self.suffix[0][first_pad];
+    fn evidence(&self, first_pad: usize, filler: Filler) -> Evidence {
+        // Where the turn of the two pad codewords begins, and with which
+        // of them.
+        let (start, phase) = match filler {
+            Filler::Standard => (first_pad, 0),
+            Filler::Late => (first_pad + 1, 0),
+            Filler::Swapped => (first_pad, 1),
+            Filler::Zeros => {
+                let whole = self.layout.blocks.iter().zip(&self.block_zero_ec).filter(|(block, _)| block.stream_offset >= first_pad);
+                return whole.fold(self.zeros[first_pad], |total, (_, &ec)| add(total, ec));
+            }
+        };
+        let mut total = self.suffix[phase][start];
         for (block, ec) in self.layout.blocks.iter().zip(&self.block_ec) {
-            if block.stream_offset >= first_pad {
-                total = add(total, ec[(block.stream_offset - first_pad) % 2]);
+            if block.stream_offset >= start {
+                total = add(total, ec[(block.stream_offset - start + phase) % 2]);
             }
         }
         total
     }
 
-    fn candidate(&self, first_pad: usize) -> PadCandidate {
-        let (matches, mismatches) = self.evidence(first_pad);
+    fn candidate(&self, first_pad: usize, filler: Filler) -> PadCandidate {
+        let (matches, mismatches) = self.evidence(first_pad, filler);
         PadCandidate {
             first_pad_codeword: first_pad,
             pad_codewords: self.layout.data_stream.len() - first_pad,
+            filler,
             end_bit: None,
             header_certainty: None,
             matches,
             mismatches,
         }
     }
+
+    /// The candidate at `first_pad` that scores best among `fillers`, the
+    /// earlier of them where two score alike.
+    fn best(&self, first_pad: usize, fillers: &[Filler]) -> PadCandidate {
+        let mut best = self.candidate(first_pad, fillers[0]);
+        for &filler in &fillers[1..] {
+            let candidate = self.candidate(first_pad, filler);
+            if candidate.score() > best.score() {
+                best = candidate;
+            }
+        }
+        best
+    }
 }
 
 /// Locate the start of padding, from segment headers when they can be read
 /// and otherwise from the pad pattern itself.
+///
+/// Where the headers say the data ends, the padding is taken for the
+/// standard's unless another filler shows itself there: one that scores
+/// better than the standard's on what can be read, and as well as a
+/// pattern found with no headers must. Without headers only the
+/// standard's turn of two codewords is looked for, wherever it begins.
+/// It marks its own start, which a run of zeros does not: zero is what a
+/// message's own bytes may be, and the zeros of a terminator run into
+/// those of a zero filler with nothing between. Whether the turn then
+/// begins where the headers, once read, put the padding, a codeword
+/// late, or with its second codeword, is settled when they are
+/// ([`recover_padding_after`]).
 pub fn detect_padding(layout: &SymbolLayout, report: &DecodeReport) -> Option<PadCandidate> {
     let count = layout.data_stream.len();
     let scanner = Scanner::new(layout, report);
@@ -220,7 +326,10 @@ pub fn detect_padding(layout: &SymbolLayout, report: &DecodeReport) -> Option<Pa
                 return None;
             }
         } else {
-            let mut candidate = scanner.candidate(first_pad);
+            let standard = scanner.candidate(first_pad, Filler::Standard);
+            let other = scanner.best(first_pad, &Filler::ALL[1..]);
+            let mut candidate =
+                if other.score() >= MIN_SCAN_SCORE && other.score() > standard.score() { other } else { standard };
             candidate.end_bit = Some(bit);
             candidate.header_certainty = Some(certainty);
             // The terminator and zero-fill before the first pad codeword
@@ -243,7 +352,8 @@ pub fn detect_padding(layout: &SymbolLayout, report: &DecodeReport) -> Option<Pa
                 return Some(candidate);
             }
             if certainty == Certainty::Verified {
-                // The headers are right and the tail is not standard padding.
+                // The headers are right and the tail is no padding that
+                // is looked for.
                 return None;
             }
         }
@@ -251,7 +361,7 @@ pub fn detect_padding(layout: &SymbolLayout, report: &DecodeReport) -> Option<Pa
 
     // On equal scores prefer the later start: it pins less.
     (0..count)
-        .map(|first_pad| scanner.candidate(first_pad))
+        .map(|first_pad| scanner.candidate(first_pad, Filler::Standard))
         .filter(|c| c.score() >= MIN_SCAN_SCORE)
         .max_by_key(|c| (c.score(), c.first_pad_codeword))
 }
@@ -265,11 +375,8 @@ fn pad_pins(layout: &SymbolLayout, candidate: &PadCandidate, pins: &mut Pins) ->
         if pins.get(&cw).is_some_and(|p| p.source.is_by_hand()) {
             continue;
         }
-        let pin = Pin {
-            mask: codeword_bit_mask(layout, cw),
-            value: pad_value(layout, j, candidate.first_pad_codeword),
-            source: PinSource::Padding,
-        };
+        let Some(value) = pad_value(layout, j, candidate.first_pad_codeword, candidate.filler) else { continue };
+        let pin = Pin { mask: codeword_bit_mask(layout, cw), value, source: PinSource::Padding };
         if pins.insert(cw, pin) != Some(pin) {
             added += 1;
         }
@@ -408,14 +515,26 @@ pub fn recover_padding_after(
             // padding; the headers now say it starts earlier, in codewords
             // that were unreadable. Padding alternates, so an earlier
             // start of the same parity continues the pattern the scan
-            // found, and the codewords between are padding too. Anything
-            // else contradicts the headers.
-            let continues = headers_first_pad < first_pad && (first_pad - headers_first_pad).is_multiple_of(2);
-            if !continues {
+            // found, and the codewords between are padding too. An
+            // earlier start of the other parity continues it as well,
+            // with its two codewords the other way about where the
+            // headers put the first of them: the turn begun a codeword
+            // late, or with its second codeword, whichever the codeword
+            // there bears out, and it is left as read where it bears out
+            // neither. Anything else contradicts the headers, as does
+            // any start but the one a filler was found at when it is one
+            // that was looked for only where the headers then stood.
+            if headers_first_pad > first_pad || candidate.filler != Filler::Standard {
                 return None;
             }
+            let scanner = Scanner::new(layout, &report);
+            let same_parity = (first_pad - headers_first_pad).is_multiple_of(2);
             first_pad = headers_first_pad;
-            candidate = Scanner::new(layout, &report).candidate(first_pad);
+            candidate = if same_parity {
+                scanner.candidate(first_pad, Filler::Standard)
+            } else {
+                scanner.best(first_pad, &[Filler::Late, Filler::Swapped])
+            };
             candidate.end_bit = Some(bit);
             candidate.header_certainty = Some(certainty);
             added += pad_pins(layout, &candidate, &mut new_pins);
@@ -444,6 +563,24 @@ pub fn recover_padding_after(
         solved_after: report.blocks_solved(),
         report,
     })
+}
+
+/// The filler the padding pins of a decode hold: what
+/// [`recover_padding`] settled on, read back from the pins it left and
+/// from where the segment headers of `report`, the decode made under
+/// them, put the end of the data. `None` when no pad codeword is pinned,
+/// or the pins follow no filler from there, as pins since changed by hand
+/// may not.
+pub fn pinned_filler(layout: &SymbolLayout, report: &DecodeReport, pins: &Pins) -> Option<Filler> {
+    let EndOfData::At { bit, .. } = report.parse.end else { return None };
+    let first_pad = pad_tail(layout, bit).first_pad_codeword;
+    let pinned: Vec<(usize, u8)> = (first_pad..layout.data_stream.len())
+        .filter_map(|j| Some((j, pins.get(&layout.data_stream[j]).filter(|pin| pin.source == PinSource::Padding)?.value)))
+        .collect();
+    if pinned.is_empty() {
+        return None;
+    }
+    Filler::ALL.into_iter().find(|&filler| pinned.iter().all(|&(j, value)| pad_value(layout, j, first_pad, filler) == Some(value)))
 }
 
 /// Drop every pin that padding recovery placed.

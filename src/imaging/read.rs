@@ -14,14 +14,23 @@
 //!
 //! - the runners-up among the detector's placements, which lets the
 //!   decode arbitrate the version where the fit misjudged it;
-//! - the other threshold rule, every module against one split of the
-//!   symbol where each against its neighbourhood was asked for or the
-//!   reverse: the neighbourhood follows shadows and glare, but on an
-//!   evenly lit symbol blurred until its modules run together it reads
-//!   more of them as unsure than one split does, which costs the blocks
-//!   their erasures. BoofCV reads every module against one smooth
-//!   threshold; over its benchmark photos the other rule read 35 of the
-//!   138 symbols the first did not, and lost none as a retry;
+//! - the other threshold rules, of the three a module may be read by
+//!   ([`super::sample::Rule`]): every module against one split of the
+//!   symbol where each against its neighbourhood was asked for, or the
+//!   reverse, and then every module against a threshold that lies as a
+//!   surface across the symbol. The neighbourhood follows shadows and
+//!   glare, but on an evenly lit symbol blurred until its modules run
+//!   together it reads more of them as unsure than one split does, which
+//!   costs the blocks their erasures: over BoofCV's benchmark photos the
+//!   split read 35 of the 138 symbols the neighbourhood did not, and
+//!   lost none as a retry. BoofCV itself reads every module against a
+//!   surface, the thresholds of its position patterns carried across the
+//!   symbol, which follows light that fails toward one side as no split
+//!   does and reads a blurred module against none of its neighbours.
+//!   Of the thirty labelled symbols of that benchmark which were found
+//!   and not read under the first two rules, each read again through
+//!   its own outline, the surface read one, on a crumpled receipt, and
+//!   it is tried last;
 //! - the other sampling kernels, the module's centre alone where the
 //!   area average was asked for, or the vote of five points about it,
 //!   since a smeared print or a symbol drawn as dots reads at the centre
@@ -63,9 +72,9 @@
 //! and when they read better without it the anchor misleads. BoofCV,
 //! when a symbol's bits fail to correct, refits its grid-to-pixel
 //! transform without the located pattern of largest residual and reads
-//! the bits again, up to six times; the residual against a plane only
-//! says which pattern lies farthest from one, which on curled paper the
-//! right patterns do, where the decoded modules say outright which
+//! the bits again, up to six reads in all; the residual against a plane
+//! only says which pattern lies farthest from one, which on curled paper
+//! the right patterns do, where the decoded modules say outright which
 //! anchor reads wrong. None of the readers this crate follows refits to a
 //! partial decode; they have none to learn from.
 //!
@@ -106,7 +115,7 @@ use super::detect::{
 use super::enhance::{Enhance, Enhanced};
 use super::projection::{ControlPoint, Project, Projection};
 use super::refine::{MOVES, Scorer, Shifted, Template, Warp, descend_by, fixed_threshold, refine_corners_holding};
-use super::sample::{Kernel, SampleParams, classify, sample_modules_with};
+use super::sample::{Kernel, Rule, SampleParams, classify, sample_modules_with};
 use super::{Luma, rotate_outline_cw, unrotate_point_cw};
 use crate::decode::codewords::Pins;
 use crate::decode::padding::recover_padding_after;
@@ -131,10 +140,10 @@ pub struct ReadResult {
     /// another when only that decoded.
     pub kernel: Kernel,
     /// The threshold rule the grid was read with, each module against its
-    /// neighbourhood when true and every module against one split of the
-    /// symbol when false: the rule asked for, or the other when only that
-    /// decoded.
-    pub local: bool,
+    /// neighbourhood, or every module against one split of the symbol or
+    /// against a threshold that lies as a surface across it: the rule
+    /// asked for, or another when only that decoded.
+    pub rule: Rule,
     pub grid: ModuleGrid,
     pub analysis: GridAnalysis,
     pub report: DecodeReport,
@@ -345,7 +354,7 @@ fn read_outline_plain(
         let Some(prepared) = prepare(&turned, found, params) else { return reads };
         work::first_then_in_turn(
             &variants,
-            |&(kernel, local)| if work::cancelled() { None } else { read_prepared(&turned, &prepared, kernel, local, params, opts) },
+            |&(kernel, rule)| if work::cancelled() { None } else { read_prepared(&turned, &prepared, kernel, rule, params, opts) },
             |result| {
                 let Some(mut result) = result else { return false };
                 unturn(&mut result.detection, quarters, image.width, image.height, region);
@@ -363,11 +372,12 @@ fn read_outline_plain(
 }
 
 /// The ways of sampling a placement a read tries, in order: the kernel
-/// and threshold rule asked for, then the other rule with that kernel,
-/// then each other kernel under both rules. The rule comes before the
-/// kernels because it decides more often: see the module's account.
-fn variants_of(params: &SampleParams) -> Vec<(Kernel, bool)> {
-    params.kernel.retries().flat_map(|kernel| [(kernel, params.local), (kernel, !params.local)]).collect()
+/// and threshold rule asked for, then the other rules with that kernel
+/// ([`SampleParams::rules`]), then each other kernel under every rule.
+/// The rule comes before the kernels because it decides more often: see
+/// the module's account.
+fn variants_of(params: &SampleParams) -> Vec<(Kernel, Rule)> {
+    params.kernel.retries().flat_map(|kernel| params.rules().map(move |rule| (kernel, rule))).collect()
 }
 
 /// The margin, as a share of its size, of the outline a symbol the
@@ -378,7 +388,7 @@ const AROUND_FOUND: f64 = 0.1;
 
 /// Read a symbol the detector has already placed, as [`read_outline`]
 /// reads one it places itself: the placement refined, sampled every way
-/// in turn, kernel by kernel under both threshold rules, decoded, and
+/// in turn, kernel by kernel under every threshold rule, decoded, and
 /// refitted to what decodes. `None` when the placement cannot be sampled
 /// and nothing is found where it lies.
 ///
@@ -445,9 +455,11 @@ fn read_found_through(
 }
 
 /// Anchors dropped at most from one placement that solves no block, each
-/// followed by a read: BoofCV refits without its worst pattern up to six
-/// times, on every symbol that fails, and here a read is dearer and an
-/// anchor is dropped only when it stands apart.
+/// followed by a read: BoofCV reads a symbol that fails up to six times,
+/// the first with every pattern it located and each of the five after
+/// without the pattern then farthest from its fit, while one lies more
+/// than two pixels off; here a read is dearer and an anchor is dropped
+/// only when it stands apart.
 const DOUBT_LIMIT: usize = 3;
 /// How far, in modules, an anchor must lie from where the corners and
 /// the other anchors put its pattern to be doubted when nothing decodes.
@@ -468,12 +480,12 @@ const DOUBT_MODULES: f64 = 0.35;
 /// order, kept when it verifies more blocks than any read so far; then,
 /// when no read has verified a block, the placement with its most
 /// doubtful anchors dropped, one at a time. The later two are read under
-/// the kernel asked for alone, with both threshold rules: what they
+/// the kernel asked for alone, with every threshold rule: what they
 /// settle does not hang on the kernel.
 fn read_placement(
     image: &Luma,
     prepared: &Prepared,
-    variants: &[(Kernel, bool)],
+    variants: &[(Kernel, Rule)],
     params: &SampleParams,
     opts: &DecodeOptions,
     keep: &mut dyn FnMut(ReadResult) -> bool,
@@ -481,7 +493,7 @@ fn read_placement(
     let mut verified = 0;
     let settled = work::first_then_in_turn(
         variants,
-        |&(kernel, local)| if work::cancelled() { None } else { read_prepared(image, prepared, kernel, local, params, opts) },
+        |&(kernel, rule)| if work::cancelled() { None } else { read_prepared(image, prepared, kernel, rule, params, opts) },
         |result| {
             result.is_some_and(|result| {
                 verified = verified.max(result.report.blocks_verified());
@@ -495,15 +507,16 @@ fn read_placement(
     if work::cancelled() {
         return false;
     }
-    let few = &variants[..variants.len().min(2)];
+    // The variants lead with the kernel asked for under each rule.
+    let few = &variants[..variants.len().min(params.rules().count())];
     let found = &prepared.detection;
     if found.version.family() != Family::Rmqr
         && found.info.format.valid == Some(true)
         && let Some(detection) = seen_from_behind(image, found, params)
     {
         let behind = Prepared { detection, agreement: prepared.agreement };
-        for &(kernel, local) in few {
-            if let Some(result) = read_prepared(image, &behind, kernel, local, params, opts)
+        for &(kernel, rule) in few {
+            if let Some(result) = read_prepared(image, &behind, kernel, rule, params, opts)
                 && result.report.blocks_verified() > verified
             {
                 verified = result.report.blocks_verified();
@@ -522,8 +535,8 @@ fn read_placement(
         }
         let Some(k) = doubtful_anchor(&doubted.detection) else { break };
         doubted.detection.anchors.remove(k);
-        for &(kernel, local) in few {
-            if let Some(result) = read_prepared(image, &doubted, kernel, local, params, opts) {
+        for &(kernel, rule) in few {
+            if let Some(result) = read_prepared(image, &doubted, kernel, rule, params, opts) {
                 verified = verified.max(result.report.blocks_verified());
                 if keep(result) {
                     return true;
@@ -591,19 +604,19 @@ fn prepare(image: &Luma, mut found: Detection, params: &SampleParams) -> Option<
 }
 
 /// Sample a prepared detection with `kernel`, classify it under the
-/// threshold rule `local`, and decode what it reads.
+/// threshold rule `rule`, and decode what it reads.
 fn read_prepared(
     image: &Luma,
     prepared: &Prepared,
     kernel: Kernel,
-    local: bool,
+    rule: Rule,
     params: &SampleParams,
     opts: &DecodeOptions,
 ) -> Option<ReadResult> {
     let found = &prepared.detection;
     let func = Arc::new(FunctionMap::new(found.version));
     let projection = found.projection()?;
-    let sampling = SampleParams { kernel, local, ..*params };
+    let sampling = SampleParams { kernel, ..params.under(rule) };
     let sampled = sample_modules_with(image, &projection, func.width, func.height, kernel);
     let mut grid = classify(&sampled, &sampling).to_grid(func.width, func.height);
     if found.inverted {
@@ -637,7 +650,7 @@ fn read_prepared(
         detection: found.clone(),
         agreement: prepared.agreement,
         kernel,
-        local,
+        rule,
         grid,
         analysis,
         report,
@@ -804,7 +817,7 @@ fn feedback_round(image: &Luma, current: &ReadResult, params: &SampleParams, opt
         detection,
         agreement,
         kernel: current.kernel,
-        local: current.local,
+        rule: current.rule,
         grid,
         analysis,
         report,
@@ -838,7 +851,8 @@ fn window_of(template: &Template, at: [f64; 2]) -> Option<(Template, [usize; 4])
 /// the other way about, for the anchor to be dropped: one is the noise of
 /// a module on the edge of the threshold.
 const DROP_MARGIN: usize = 2;
-/// Anchors dropped at most in one pass: BoofCV's six retries.
+/// Anchors dropped at most in one pass: as many as BoofCV reads a symbol
+/// that fails, which drops one fewer.
 const DROP_LIMIT: usize = 6;
 
 /// The anchors among `anchors` that the known modules of `template` bear

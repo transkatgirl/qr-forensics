@@ -5,6 +5,7 @@ use qr_forensics::decode::bch::InfoRead;
 use qr_forensics::decode::bitstream::{Certainty, EndOfData, LostReason, SegmentContent};
 use qr_forensics::decode::codewords::PinSource;
 use qr_forensics::decode::known::{Place, TextPinError, text_pins};
+use qr_forensics::decode::padding::Filler;
 use qr_forensics::decode::pipeline::{BlockOutcome, BlockReport, CodewordReport, CwStatus, SolveMethod};
 use qr_forensics::decode::rs::RsFailure;
 use qr_forensics::decode::sequence::ParityCheck;
@@ -82,7 +83,7 @@ fn result_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         ui.colored_label(visuals.warn_fg_color, RichText::new("Decoded, but not confirmed").strong());
         if verified < total {
             ui.label(format!(
-                "{} of {total} blocks solved with nothing left over to check the answer.",
+                "{} of {total} blocks solved with too little left over to check the answer.",
                 total - verified
             ));
         }
@@ -232,11 +233,18 @@ fn result_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
             actions.push(Action::SaveBytes);
         }
         let mut charset = app.opts.charset;
-        egui::ComboBox::from_id_salt("charset").selected_text(charset.label()).show_ui(ui, |ui| {
-            for candidate in Charset::ALL {
-                ui.selectable_value(&mut charset, candidate, candidate.label());
-            }
-        });
+        egui::ComboBox::from_id_salt("charset")
+            .selected_text(charset.label())
+            .show_ui(ui, |ui| {
+                for candidate in Charset::ALL {
+                    ui.selectable_value(&mut charset, candidate, candidate.label());
+                }
+            })
+            .response
+            .on_hover_text(
+                "The character set byte data is read in where the symbol declares none; Auto guesses it from the bytes. \
+                 A set the symbol declares with an ECI designator is followed whatever is chosen here",
+            );
         if charset != app.opts.charset {
             actions.push(Action::SetCharset(charset));
         }
@@ -1108,6 +1116,9 @@ fn padding_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) 
                 "Padding starts at message byte {} and runs for {} codewords (located from {source}).",
                 candidate.first_pad_codeword, candidate.pad_codewords
             ));
+            if candidate.filler != Filler::Standard {
+                ui.label(format!("It is not the standard's padding: {}.", candidate.filler.label()));
+            }
             ui.label(format!(
                 "{} of {} readable bits there match the pattern.",
                 candidate.matches,
@@ -1118,7 +1129,7 @@ fn padding_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) 
             ui.weak("Every block is solved; nothing to recover.");
         }
         None => {
-            ui.weak("No standard padding found. The message may fill the symbol, or the encoder padded differently.");
+            ui.weak("No padding found. The message may fill the symbol, or the encoder padded in a way that is not looked for.");
         }
     }
     ui.horizontal_wrapped(|ui| {

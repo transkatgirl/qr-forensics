@@ -7,11 +7,11 @@ use common::*;
 use qr_forensics::decode::bitstream::Certainty;
 use qr_forensics::decode::codewords::Pins;
 use qr_forensics::decode::pipeline::{BlockOutcome, CwStatus, DecodeOptions, SolveMethod, decode};
-use qr_forensics::decode::rs::{CHASE_BITS, RsFailure};
+use qr_forensics::decode::rs::{CHASE_BITS, RsFailure, VERIFIED_BITS, located_error_bits};
 use qr_forensics::decode::text::UNKNOWN_CHAR;
 use qr_forensics::symbol::grid::{CERTAIN, Module, ModuleGrid};
 use qr_forensics::symbol::layout::SymbolLayout;
-use qr_forensics::symbol::{EcLevel, SymbolVersion};
+use qr_forensics::symbol::{EcLevel, Family, SymbolVersion};
 use qrcode_generator::Segment;
 
 fn sample(version: SymbolVersion, ec: EcLevel, mask: u8, rng: &mut Rng) -> (SymbolLayout, ModuleGrid, String) {
@@ -70,9 +70,12 @@ fn recovers_exactly_within_capacity() {
                     BlockOutcome::Solved { method, errors: e, erasures: f, slack: s, confidence_bits, beyond_standard } => {
                         assert_eq!((method, e, f, s), (SolveMethod::ReedSolomon, *errors, *erasures, slack), "{what} block {b}");
                         assert_eq!(beyond_standard, slack < block.reserved, "{what} block {b}");
-                        // An erased four-bit codeword adds its fixed low
-                        // nibble as four check bits; nothing else can.
-                        assert!((8 * slack as u32..=8 * slack as u32 + 4).contains(&confidence_bits));
+                        // The slack, and what the errors located among
+                        // the codewords read confirm. An erased four-bit
+                        // codeword adds its fixed low nibble as four
+                        // check bits; nothing else can.
+                        let sure = 8 * slack as u32 + located_error_bits(block.codewords.len() - erasures, *errors);
+                        assert!((sure..=sure + 4).contains(&confidence_bits), "{what} block {b}: {confidence_bits}");
                     }
                     other => panic!("{what} block {b}: {other:?}"),
                 }
@@ -94,6 +97,77 @@ fn recovers_exactly_within_capacity() {
             assert!(report.is_trustworthy(), "{what}");
         }
     }
+}
+
+#[test]
+fn a_block_corrected_to_the_limit_of_its_error_correction_is_confirmed() {
+    // As many wrong codewords in every block as the standard has its
+    // error correction correct, which where it reserves none, and their
+    // count is even, is every one of them spent: the blocks solve with
+    // nothing to spare, and are confirmed by the errors they located, as
+    // every reader that follows the standard takes them. One wrong
+    // codeword more in a block is past the code, and no read.
+    let mut rng = Rng(0x11A17);
+    for (version, ec) in SAMPLES {
+        let mask = rng.below(version.mask_count() as usize) as u8;
+        let (layout, clean, text) = sample(version, ec, mask, &mut rng);
+        let mut grid = clean.clone();
+        let mut spare = Vec::new();
+        for block in &layout.blocks {
+            let limit = (block.ec_len - block.reserved) / 2;
+            let picked = rng.distinct(limit + 1, block.codewords.len());
+            for &i in &picked[..limit] {
+                corrupt_codeword(&mut grid, &layout, block.codewords[i], rng.below(8));
+            }
+            spare.push(block.codewords[picked[limit]]);
+        }
+        let what = format!("{version}-{ec:?}");
+        let report = decode_plain(&grid, &layout, mask);
+        for (b, block) in layout.blocks.iter().enumerate() {
+            let limit = (block.ec_len - block.reserved) / 2;
+            match report.blocks[b].outcome {
+                BlockOutcome::Solved { method: SolveMethod::ReedSolomon, errors, erasures: 0, slack, confidence_bits, beyond_standard: false } => {
+                    assert_eq!((errors, slack), (limit, block.ec_len - 2 * limit), "{what} block {b}");
+                    assert_eq!(confidence_bits, 8 * slack as u32 + located_error_bits(block.codewords.len(), limit), "{what} block {b}");
+                }
+                other => panic!("{what} block {b}: {other:?}"),
+            }
+            assert!(report.blocks[b].is_verified(), "{what} block {b}");
+        }
+        assert!(report.is_trustworthy(), "{what}");
+        assert_eq!(report.text.plain(), text, "{what}");
+
+        corrupt_codeword(&mut grid, &layout, spare[0], rng.below(8));
+        let report = decode_plain(&grid, &layout, mask);
+        assert!(!report.blocks[0].is_verified(), "{what}: {:?}", report.blocks[0].outcome);
+        assert!(!report.is_trustworthy(), "{what}");
+    }
+}
+
+#[test]
+fn the_limit_confirms_in_every_symbol_the_standard_reserves_nothing_in() {
+    // In every block of every symbol whose error correction the standard
+    // lets be spent to the last codeword, the errors located at the
+    // limit are evidence enough: the least of them, the four an M3-M
+    // symbol corrects among its seventeen codewords, are found in one
+    // block of noise in nearly two million. Where the standard reserves
+    // codewords it is the reserve that speaks, not this.
+    let mut least = (u32::MAX, String::new());
+    for family in Family::ALL {
+        for version in family.versions() {
+            for &ec in version.ec_levels() {
+                let layout = layout(version, ec);
+                for block in layout.blocks.iter().filter(|block| block.reserved == 0 && block.ec_len % 2 == 0) {
+                    let bits = located_error_bits(block.codewords.len(), block.ec_len / 2);
+                    assert!(bits >= 2 * VERIFIED_BITS, "{version}-{ec:?}: {bits} bits");
+                    if bits < least.0 {
+                        least = (bits, format!("{version}-{ec:?}"));
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(least, (20, "M3-M".to_owned()));
 }
 
 #[test]

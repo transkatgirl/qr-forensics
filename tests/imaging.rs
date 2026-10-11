@@ -16,7 +16,7 @@ use qr_forensics::symbol::function_map::{FunctionMap, Role};
 use qr_forensics::imaging::homography::Homography;
 use qr_forensics::imaging::projection::{ControlPoint, Projection};
 use qr_forensics::imaging::refine::{refine_corners, refine_corners_holding};
-use qr_forensics::imaging::sample::{SampleParams, classify, sample_modules, sample_modules_as, suggest_versions};
+use qr_forensics::imaging::sample::{Kernel, Rule, SampleParams, classify, sample_modules, sample_modules_as, sample_modules_with, suggest_versions};
 use qr_forensics::symbol::grid::{CERTAIN, Module, ModuleGrid};
 use qr_forensics::symbol::{EcLevel, Family, SymbolVersion};
 use qrcode_generator::Segment;
@@ -1284,7 +1284,7 @@ fn a_symbol_out_of_focus_reads_through_the_photo_sharpened() {
     // Sampled off the photo as it lies, the same placement reads more
     // than twice as many modules wrong or not at all.
     let sample = |enhance: Enhance| {
-        let how = SampleParams { kernel: read.kernel, local: read.local, enhance, ..params };
+        let how = SampleParams { kernel: read.kernel, enhance, ..params.under(read.rule) };
         let map = read.detection.projection().expect("the placement maps");
         classify(&sample_modules_as(&image, &map, grid.width(), grid.height(), &how), &how).to_grid(grid.width(), grid.height())
     };
@@ -1302,6 +1302,45 @@ fn a_symbol_out_of_focus_reads_through_the_photo_sharpened() {
     let read = read_detection(&image, found[0].clone(), &params, &opts).expect("read where it was found");
     assert!(read.is_trustworthy() && read.text() == truth, "{:?}", read.report.text.plain());
     assert!(corner_error(read.detection.corners, quad) < 1.5);
+}
+
+#[test]
+fn a_blurred_symbol_in_failing_light_reads_against_the_threshold_surface() {
+    // A version 6 symbol out of focus by half a module, under light
+    // that fails to a fourteenth from its left edge to its right. The
+    // paper at the dark end is darker than the ink at the light end,
+    // and no one split of the symbol tells them apart; the blur has run
+    // the modules together, and each read against its neighbourhood has
+    // too many of them unsure for the blocks to solve. A threshold that
+    // lies as a surface across the symbol follows the light and asks
+    // nothing of a module's neighbours, as BoofCV reads every symbol;
+    // it was read against only when asked for, and a read now comes to
+    // it of itself and says so.
+    let (version, ec) = (SymbolVersion::Qr(6), EcLevel::M);
+    let grid = symbol(version, ec);
+    let layout = layout(version, ec);
+    let text = decode_plain(&grid, &layout, 0).text.plain();
+    let module_px = 10.0;
+    let quad = quad_at(version, module_px, [318.0, 318.0]);
+    let (left, right) = (quad[0][0].min(quad[3][0]), quad[1][0].max(quad[2][0]));
+    let lit = render(&grid, quad, (637, 637), |x, _, v| v * (1.0 - 0.93 * ((x - left) / (right - left)).clamp(0.0, 1.0) as f32));
+    let image = defocus(&lit, 0.5 * module_px);
+    let (params, opts) = (SampleParams::default(), DecodeOptions::default());
+    let read = read_outline(&image, SymbolVersion::Qr(2), loosen(quad, 1.12, [1.0, -1.0]), &params, &opts).expect("found");
+    assert!(read.is_trustworthy(), "{:?} of {} blocks", read.report.blocks_verified(), read.report.blocks.len());
+    assert_eq!(read.text(), text);
+    assert_eq!((read.version(), read.rule), (version, Rule::Surface));
+    // Through the very placement that read, no kernel reads under
+    // either of the other rules.
+    let map = read.detection.projection().expect("the placement maps");
+    for rule in [Rule::Neighbourhood, Rule::Level] {
+        for kernel in Kernel::ALL {
+            let how = SampleParams { kernel, ..params.under(rule) };
+            let sampled = sample_modules_with(&image, &map, grid.width(), grid.height(), kernel);
+            let other = classify(&sampled, &how).to_grid(grid.width(), grid.height());
+            assert!(!decode(&other, &layout, 0, &Pins::new(), &opts).is_trustworthy(), "{rule:?} with {kernel:?} reads it too");
+        }
+    }
 }
 
 #[test]
@@ -1451,6 +1490,66 @@ fn the_finders_of_a_qr_code_are_not_micro_qr_symbols() {
 }
 
 #[test]
+fn a_symbol_turned_and_seen_at_an_angle_is_found_in_the_photo_as_it_is() {
+    // A symbol held close to the lens, turned between the two starts the
+    // template has, square to the photo and forty-five degrees from it,
+    // and tilted so that its far side is the smaller. The scan found the
+    // centres of its finders and the fit settled on one or two of the
+    // three, so that the symbol was found some rungs up the ladder, in a
+    // copy that happened to shrink or sharpen it into reach, and not at
+    // all by a search of every family, which a Micro QR symbol claimed
+    // on one of the finders had ended by then; the regions had the
+    // corners of all three, and were dropped for lying where the scan
+    // had looked.
+    let (version, ec) = (SymbolVersion::Qr(1), EcLevel::M);
+    let grid = symbol(version, ec);
+    let params = SampleParams::default();
+    let module_px = 22.0;
+    for (degrees, far) in [(37.0, 0.65), (30.0, 0.8)] {
+        let side = 21.0 * module_px;
+        let size = ((1.9 * side) as usize, (1.9 * side) as usize);
+        let mut quad = turned_quad([size.0 as f64 / 2.0, size.1 as f64 / 2.0], side, degrees);
+        let middle = [(quad[2][0] + quad[3][0]) / 2.0, (quad[2][1] + quad[3][1]) / 2.0];
+        for i in [2, 3] {
+            quad[i] = [middle[0] + (quad[i][0] - middle[0]) * far, middle[1] + (quad[i][1] - middle[1]) * far];
+        }
+        let image = render(&grid, quad, size, |_, _, v| v);
+        let found = find_symbols(&image, Family::Qr, &params);
+        let offered: Vec<_> = found.iter().map(|f| (f.version, f.score(), f.retry)).collect();
+        assert_eq!(found.len(), 1, "{degrees}°: {offered:?}");
+        assert_eq!((found[0].version, found[0].retry), (version, None), "{degrees}°");
+        assert_eq!(found[0].count(AnchorKind::Finder), 3, "{degrees}°: {:?}", found[0].anchors);
+        let error = corner_error(found[0].corners, quad) / (far * module_px);
+        assert!(error < 0.75, "{degrees}°: corners {error:.2} modules off");
+        assert_eq!(read_through(&image, &found[0], &grid, &params), grid, "{degrees}°");
+    }
+}
+
+#[test]
+fn a_symbol_seen_steeply_is_found_in_the_photo_around_it() {
+    // A symbol photographed from low across a table, foreshortened more
+    // than two to one: its finders are bars to a scan that wants a module
+    // about as tall as it is wide, and their regions, whose corners are
+    // the finders' own, were turned away for being no squares. It read
+    // through an outline all along.
+    let (version, ec) = (SymbolVersion::Qr(2), EcLevel::M);
+    let grid = symbol(version, ec);
+    let params = SampleParams::default();
+    for (across, down, lean) in [(10.0, 4.5, 0.0), (9.0, 3.6, 30.0), (4.0, 9.0, -20.0)] {
+        let (w, h) = (25.0 * across, 25.0 * down);
+        // Leaning as well: the top edge slid along itself.
+        let quad = [[150.0 + lean, 150.0], [150.0 + lean + w, 150.0], [150.0 + w, 150.0 + h], [150.0, 150.0 + h]];
+        let image = render(&grid, quad, (560, 520), |_, _, v| v);
+        let found = find_symbols(&image, Family::Qr, &params);
+        let offered: Vec<_> = found.iter().map(|f| (f.version, f.score(), f.retry)).collect();
+        assert_eq!(found.iter().map(|f| f.version).collect::<Vec<_>>(), [version], "{across} by {down} px a module: {offered:?}");
+        let error = (0..4).map(|i| distance(found[0].corners[i], quad[i]) / across.min(down)).fold(0.0, f64::max);
+        assert!(error < 1.0, "{across} by {down} px a module: corners {error:.2} modules off");
+        assert_eq!(read_through(&image, &found[0], &grid, &params), grid, "{across} by {down} px a module");
+    }
+}
+
+#[test]
 fn a_symbol_with_a_finder_gone_is_found_in_the_photo_around_it() {
     // A finder torn off, or under a sticker: an outline drawn round the
     // symbol has always found it from the two that are left, and a search
@@ -1473,6 +1572,103 @@ fn a_symbol_with_a_finder_gone_is_found_in_the_photo_around_it() {
         assert_eq!(found.iter().map(|f| f.version).collect::<Vec<_>>(), [version], "{which}");
         let error = corner_error(found[0].corners, quad) / 10.0;
         assert!(error < 0.75, "{which}: corners {error:.2} modules off");
+    }
+}
+
+#[test]
+fn a_symbol_under_a_shadow_is_found_in_the_photo_around_it() {
+    // A straight shadow over the left two fifths of a symbol, as the
+    // edge of a hand or of a shelf throws one. The paper in the shade is
+    // darker than any one split of the symbol's modules, every light
+    // fixed module there counted against the fit, and the symbol, found,
+    // timed and fitted, scored seven parts in ten and was not offered,
+    // though a read, which judges each module against its neighbourhood,
+    // read it through an outline at once. The search now counts the
+    // fixed modules as the read will before it gives a symbol up.
+    let (version, ec) = (SymbolVersion::Qr(2), EcLevel::M);
+    let grid = symbol(version, ec);
+    let text = decode_plain(&grid, &layout(version, ec), 0).text.plain();
+    let params = SampleParams::default();
+    for module_px in [6.0, 12.0] {
+        let quad = quad_at(version, module_px, [250.0, 200.0]);
+        let edge = quad[0][0] + 0.42 * (quad[1][0] - quad[0][0]);
+        let shade = |x: f64, _: f64, v: f32| if x < edge { 0.3 * v } else { v };
+        let image = render(&grid, quad, (500, 400), shade);
+        let found = find_symbols(&image, Family::Qr, &params);
+        assert_eq!(found.iter().map(|f| f.version).collect::<Vec<_>>(), [version], "{module_px} px a module");
+        // The count that vouched for it is the count it is listed by,
+        // which a search of every family ranks its claim by.
+        assert!(found[0].score() > 0.9, "{module_px} px a module: scored {:.3}", found[0].score());
+        let read = read_detection(&image, found[0].clone(), &params, &DecodeOptions::default()).expect("the symbol found reads");
+        assert!(read.is_trustworthy(), "{module_px} px a module: {:?}", read.report.score);
+        assert_eq!(read.text(), text);
+    }
+    // The shade excuses no more than itself. Three marks that stand as
+    // finders fit nine parts in ten in any light, and in this one as in
+    // full light nothing between or beside them vouches for them.
+    let quad = quad_at(version, 12.0, [250.0, 200.0]);
+    let edge = quad[0][0] + 0.42 * (quad[1][0] - quad[0][0]);
+    let marks = render(&finders_alone(version), quad, (500, 400), |x, _, v| if x < edge { 0.3 * v } else { v });
+    for family in [Family::Qr, Family::Micro] {
+        let offered: Vec<_> = find_symbols(&marks, family, &params).iter().map(|f| (f.version, f.score())).collect();
+        assert!(offered.is_empty(), "as {}: {offered:?}", family.label());
+    }
+}
+
+#[test]
+fn a_symbol_is_placed_the_right_way_up_by_its_format_word() {
+    // Light that fails steeply across a symbol, to a fifth or less at
+    // its far side, as beside a window or under a lamp held close. The
+    // fit of the fixed patterns reads them and the quiet zone against
+    // one split, which calls the paper at the dark side ink, and it
+    // ranked a placement a quarter or a half turn out above the right
+    // one as often as not: with every finder showing, and the more so
+    // with one gone, torn off or under a sticker, when the two that are
+    // left stand as two of three finders at two turns alike. The format
+    // word reads outright beside the finders only the right way up,
+    // each bit against the dark and light of the finder it lies beside,
+    // and decides: the copy round the top-left finder where that finder
+    // is left, and the copy shared between the other two where it is
+    // the one gone.
+    let params = SampleParams::default();
+    let module_px = 10.0;
+    let across = |fall: f32| move |t: f32, _: f32| 1.0 - fall * t;
+    let cornerwise = |fall: f32| move |t: f32, u: f32| (1.0 - fall * t) * (1.0 - fall * u);
+    type Light = Box<dyn Fn(f32, f32) -> f32>;
+    let cases: [(SymbolVersion, Option<&str>, Light); 3] = [
+        (SymbolVersion::Qr(2), None, Box::new(cornerwise(0.8))),
+        (SymbolVersion::Qr(3), Some("top left"), Box::new(across(0.8))),
+        (SymbolVersion::Qr(2), Some("bottom left"), Box::new(across(0.9))),
+    ];
+    for (version, gone, light) in &cases {
+        let n = version.width();
+        let side = module_px * n as f64;
+        let size = (side * 1.6) as usize;
+        let centre = [size as f64 / 2.0, size as f64 / 2.0];
+        let mut grid = symbol(*version, EcLevel::M);
+        // The finder with its separator, torn away to bare paper.
+        if let Some(which) = gone {
+            let [x0, y0] = if *which == "top left" { [0, 0] } else { [0, n - 8] };
+            for y in y0..y0 + 8 {
+                for x in x0..x0 + 8 {
+                    grid.set(x, y, Module::Light);
+                }
+            }
+        }
+        for turn in 0..4 {
+            let quad = turned_quad(centre, side, 90.0 * f64::from(turn) + 4.0);
+            // The light falls from the left of the symbol and its quiet
+            // zone to the right, and from the top to the bottom, as the
+            // photo lies and whichever way the symbol is turned in it.
+            let share = |v: f64, middle: f64| ((v - (middle - 0.6 * side)) / (1.2 * side)).clamp(0.0, 1.0) as f32;
+            let image = render(&grid, quad, (size, size), |x, y, v| v * light(share(x, centre[0]), share(y, centre[1])));
+            let found = detect_outline(&image, SymbolVersion::Qr(2), bounding_box(quad, 0.15), &params).expect("found");
+            let what = format!("{version:?}, {} gone, turned {}°", gone.unwrap_or("no finder"), 90 * turn);
+            assert_eq!(found.version, *version, "{what}");
+            let error = corner_error(found.corners, quad) / module_px;
+            assert!(error < 0.75, "{what}: corners {error:.2} modules off");
+            assert!(!found.mirrored, "{what}");
+        }
     }
 }
 

@@ -11,11 +11,14 @@
 //! regions of the binarised image propose finders too, each fitted a
 //! quadrilateral and read along two lines through it, as BoofCV finds
 //! position patterns, which a scratch through both axes or a steep view
-//! does not break. Each surviving candidate is refined in the photo itself
-//! by fitting a finder-with-ring template to it with the contrast score
-//! the corner refinement uses. A candidate whose template reads right is a
-//! capstone. One with a quarter torn away still counts, as long as the
-//! other three quarters read right. A candidate no template fits is
+//! does not break, and a region that lies on a candidate of the scan's
+//! lends it its four corners. Each surviving candidate is refined in the
+//! photo itself by fitting a finder-with-ring template to it with the
+//! contrast score the corner refinement uses, from the scan's own
+//! reckoning of where it lies and from the region's corners where it has
+//! them. A candidate whose template reads right is a capstone. One with a
+//! quarter torn away still counts, as long as the other three quarters
+//! read right. A candidate no template fits is
 //! asked once more along the lines through its centre alone, as
 //! zxing-cpp asks a concentric pattern: the column, the row and both
 //! diagonals must each read 1:1:3:1:1, and nothing is asked of the ring
@@ -32,7 +35,10 @@
 //!
 //! Capstones are matched to the finder positions of a version, trying each
 //! orientation of a square symbol, so an outline drawn a quarter turn out
-//! still works. The matched capstones give a first map from module
+//! still works. Where they stand as a QR Code's finders more ways than
+//! one, as two of three do, the format word read beside them, each bit
+//! through its own finder's corners as BoofCV reads it, says which way up
+//! the symbol is. The matched capstones give a first map from module
 //! coordinates to photo pixels. Every other distinctive fixed pattern (a
 //! finder the scan missed, alignment patterns, the rMQR finder sub-pattern,
 //! and a few dark modules along each timing pattern, which on a symbol
@@ -289,7 +295,15 @@ const DIAGONAL_TOLERANCE: f64 = 0.75;
 /// expected, as shares of it: along a row or column, and along the
 /// diagonal, which crosses the rings of a finder that sits straight in as
 /// many steps as a row does and the rings of one turned forty-five
-/// degrees, whose own axis it then runs along, in half as many.
+/// degrees, whose own axis it then runs along, in half as many. Along a
+/// column the module is asked to be about what the row made it, so a
+/// finder foreshortened past seven to five is no candidate of the scan's:
+/// that is the regions' to find ([`region_candidates`]), which take one
+/// at three to one. With the band widened to take them here as well,
+/// from two fifths to two and a half, the photographs of symbols seen
+/// steeply read no sooner, having read through their regions, and three
+/// ordinary ones took a tenth to a third longer for the candidates it
+/// let in.
 const MODULE_FIT: (f64, f64) = (0.6, 1.4);
 const DIAGONAL_FIT: (f64, f64) = (0.45, 1.05);
 /// Half candidates, which passed the cross-check on one side only, are
@@ -409,12 +423,21 @@ const MAX_PAIR_PROPOSALS: usize = 6;
 /// for a proposal that another of the batch disposes of is wasted, so
 /// the batch is kept well under the dozen that may fail.
 const FITS_AT_ONCE: usize = 8;
-/// Scan clusters a search of the whole photo refines, strongest first.
-/// [`MAX_CANDIDATES`] is as many as one symbol in an outline needs, and a
-/// sheet of twenty symbols threw up ninety-one clusters, sixty of them
-/// finders, of which the twenty-five strongest made six whole triples:
-/// OpenCV's ArUco-based detector keeps every quadrilateral its
-/// thresholds find, and BoofCV every square.
+/// Scan clusters a search of the whole photo refines, strongest first,
+/// before those a region bears out, which are all refined
+/// ([`within_cap`]). [`MAX_CANDIDATES`] is as many as one symbol in an
+/// outline needs, and a sheet of twenty symbols threw up ninety-one
+/// clusters, sixty of them finders, of which the twenty-five strongest
+/// made six whole triples: OpenCV's ArUco-based detector keeps every
+/// quadrilateral its thresholds find, and BoofCV every square. Those
+/// keep everything because the test their shapes have passed is one
+/// worth passing, and a cluster of the scan's has passed none: a photo
+/// of one symbol on a desk throws up five hundred, and two thousand at
+/// full size, nearly all of them grain. So the cap stays on the clusters
+/// that are the scan's alone, and what a region has read as a finder
+/// along two lines of its own, the test BoofCV's squares pass, is kept
+/// however many there are: a sheet of sixty symbols, twenty of them
+/// turned, read forty-three under one cap for all and fifty-nine so.
 const MAX_SEARCH_CANDIDATES: usize = 128;
 /// How far from the diagonal of its own square, in degrees, the line
 /// between two capstones may lie at each for the pair to be proposed as
@@ -511,13 +534,19 @@ const FRAME_LIKENESS: f64 = 0.05;
 /// symbol the line between two of its finders runs along a row or a
 /// column of modules, through the middle of the sides that face and
 /// square to them; perspective bends that a little, and a finder fitted
-/// to a blurred print turns a little. BoofCV connects two position
-/// patterns only when the line between their centres crosses a side of
-/// each within 0.35 of its middle and the two sides lie nearly parallel,
-/// and OpenCV's ArUco-based detector asks that two finders of one symbol
-/// face each other, and each the line between them, to within fifteen
-/// degrees (`maxRotation`); the thirty here leave room for the turn a
-/// blurred finder's fit takes.
+/// to a blurred print turns a little. The crossing is BoofCV's test,
+/// which connects two position patterns only when the line between
+/// their centres crosses a side of each within 0.35 of its middle; the
+/// angle is OpenCV's, whose ArUco-based detector asks that two finders
+/// of one symbol face each other, and each the line between them, to
+/// within fifteen degrees (`maxRotation`), and the thirty here leave
+/// room for the turn a blurred finder's fit takes. BoofCV asks less of
+/// the angle, only that the two sides crossed lie nearly parallel to
+/// each other, which they do however steeply the symbol is seen, where
+/// the line between two finders of a symbol foreshortened past about
+/// two to one along its diagonal meets their sides more than thirty
+/// degrees off square: three such finders propose nothing together, and
+/// are left to propose in pairs.
 const FACING_MIDPOINT: f64 = 0.3;
 const FACING_DEGREES: f64 = 30.0;
 /// An outline the capstones propose is fitted only when its centre lies
@@ -1487,12 +1516,25 @@ pub fn decodes_as_found(image: &Luma, found: &Detection, params: &SampleParams) 
 /// fifteen bits lie within three of a Micro QR format word, so the bits
 /// beside a false finder name a version more often than not, and that
 /// version is the one then fitted there.
+///
+/// A name that reads as its word outright stands on less: on the fixed
+/// patterns alone reading that well, whatever the quiet zone does. A
+/// string of bits is a word outright once in a thousand, not once in
+/// two, and the fit reads the fixed modules and the quiet zone against
+/// one split of them all, which light the paper has and the symbol has
+/// not throws: in a dark photograph with a lamp's bright spot on the
+/// paper beside a version 7 symbol the split fell between the spot and
+/// everything else, and the placement whose version information and
+/// format word both read outright, with 97 fixed modules in a hundred
+/// right against their own split, was given a fit of 44 in a hundred and
+/// ranked below a version 6 symbol fitted to the same finders.
 type Rank = (i8, f64);
 
 fn rank(found: &Detection, fit: f64, trusted: Option<Prename>) -> Rank {
+    let fits = fit >= MIN_NAMED_FIT || (found.version_confirmed() && found.score() >= MIN_NAMED_FIT);
     let verdict = match (trusted, found.info.named_version) {
         (Some(p), _) if p.strong && p.version == found.version => 2,
-        (_, Some(named)) if named == found.version && fit >= MIN_NAMED_FIT => 1,
+        (_, Some(named)) if named == found.version && fits => 1,
         (_, Some(named)) if named == found.version => 0,
         (_, Some(_)) => -1,
         (_, None) => 0,
@@ -1505,15 +1547,15 @@ fn rank(found: &Detection, fit: f64, trusted: Option<Prename>) -> Rank {
 /// with repeats merged.
 fn collect_capstones(image: &Luma, rect: &Rectified, threshold: Option<f32>, family: Family) -> Vec<Capstone> {
     let max_module = rect.frame.size[0].min(rect.frame.size[1]) * max_module_fraction(family);
-    let candidates = scan_for_finders(rect, threshold, max_module);
-    let regions = region_candidates(rect, threshold, max_module, &candidates);
+    let mut candidates = scan_for_finders(rect, threshold, max_module);
+    let regions = region_candidates(rect, threshold, max_module, &mut candidates);
     let mut all: Vec<Capstone> = Vec::new();
     // Whole candidates first, then the half ones, which passed the
     // cross-check on one side only and come from the data as often as
     // from a torn finder, then the regions the scan did not propose.
-    let whole = candidates.iter().filter(|c| !c.half).take(MAX_CANDIDATES);
-    let half = candidates.iter().filter(|c| c.half).take(MAX_HALF_CANDIDATES);
-    for candidate in whole.chain(half).chain(regions.iter()) {
+    let whole = within_cap(candidates.iter().enumerate().filter(|(_, c)| !c.half), MAX_CANDIDATES);
+    let half = within_cap(candidates.iter().enumerate().filter(|(_, c)| c.half), MAX_HALF_CANDIDATES);
+    for candidate in whole.chain(half).map(|(_, c)| c).chain(regions.iter()) {
         let Some(capstone) = refine_capstone(image, rect, candidate, threshold) else { continue };
         merge_capstone(&mut all, rect, capstone);
     }
@@ -1539,6 +1581,20 @@ fn merge_capstone(all: &mut Vec<Capstone>, rect: &Rectified, capstone: Capstone)
     }
 }
 
+/// The candidates of the scan that are refined: the first `most` of them
+/// as they come, strongest first, and past those every one a region bore
+/// out. The cap is there for the candidates a busy frame throws up, lines
+/// of text and the grain of a table that read 1:1:3:1:1 along a row or
+/// two; a candidate with a region on it has read so along two lines
+/// across a quadrilateral of its own besides, and is as likely a finder
+/// as any the cap lets through. A finder turned well off the scan's axes
+/// polls few lines and ranks low, and on a sheet of symbols every upright
+/// finder ranks above it: three sheets of twenty, one of them turned,
+/// spent the whole cap on the upright forty.
+fn within_cap<'a>(candidates: impl Iterator<Item = (usize, &'a Candidate)>, most: usize) -> impl Iterator<Item = (usize, &'a Candidate)> {
+    candidates.enumerate().filter(move |(nth, (_, c))| *nth < most || c.quad.is_some()).map(|(_, numbered)| numbered)
+}
+
 /// With more candidates refined, more false patterns reach this far, and
 /// they are the partial ones: three quarters of a finder read in the
 /// data, at a fraction of a true finder's contrast. Those fainter than
@@ -1550,9 +1606,6 @@ fn drop_faint_partials(all: &mut Vec<Capstone>) {
     }
 }
 
-/// Most candidates the regions of the binarised image add to the scan's.
-const MAX_REGION_CANDIDATES: usize = 16;
-
 /// Finder candidates from the connected regions of the binarised image,
 /// as BoofCV finds position patterns: a quadrilateral fitted to each
 /// region and the 1:1:3:1:1 proportion read along two lines through it.
@@ -1560,10 +1613,31 @@ const MAX_REGION_CANDIDATES: usize = 16;
 /// the centre, which a finder scratched through both ways no longer has,
 /// and reads the runs square to the frame, which a finder seen steeply
 /// through a frame no outline rectified does not keep; a region keeps its
-/// shape through either. Regions within a module of a candidate the scan
-/// already made are left to it, and the template fit verifies the rest as
-/// it verifies the scan's.
-fn region_candidates(rect: &Rectified, threshold: Option<f32>, max_module: f64, scanned: &[Candidate]) -> Vec<Candidate> {
+/// shape through either.
+///
+/// A region within a module of a candidate the scan made is the same
+/// pattern seen a second way, and its quadrilateral is handed to that
+/// candidate, the strongest when several lie on it, for the template fit
+/// to start from besides the candidate's own starts
+/// ([`refine_capstone`]). Such a region was once dropped and the scan's
+/// candidate left to itself: the scan finds the centre of a finder turned
+/// thirty-seven degrees, or one foreshortened to a rhombus, along the few
+/// lines that still cross it in proportion, and the template, started
+/// square to the frame about that centre, cannot turn so far, so that a
+/// region which had the finder's four corners to the pixel was thrown
+/// away for a candidate that came to nothing. BoofCV has no such quarrel
+/// to settle: the polygon is the only start its position patterns have.
+/// The regions the scan made nothing of are returned as candidates of
+/// their own, and the template fit verifies those as it verifies the
+/// scan's.
+///
+/// Both readings of the image are labelled, the one against one threshold
+/// before the one that follows the lighting, and a region either shows is
+/// kept once, as the first shows it. None is turned away for there being
+/// too many: a region has already read as a finder along two lines of
+/// its own, which is BoofCV's whole test of a position pattern, and a
+/// sheet of sixty symbols has a hundred and eighty of them.
+fn region_candidates(rect: &Rectified, threshold: Option<f32>, max_module: f64, scanned: &mut [Candidate]) -> Vec<Candidate> {
     let global = threshold.unwrap_or_else(|| otsu(rect.data.iter().copied().filter(|v| v.is_finite())));
     let global_dark = |x: i64, y: i64| rect.at(x, y).map(|v| v < global);
     let local = LocalMean::new(rect);
@@ -1574,10 +1648,14 @@ fn region_candidates(rect: &Rectified, threshold: Option<f32>, max_module: f64, 
         for region in regions::finder_regions(rect.frame.width, rect.frame.height, dark, MIN_MODULE, max_module) {
             let module = (region.module[0] + region.module[1]) / 2.0;
             let near = |c: &Candidate| c.inverted == region.inverted && distance([c.x, c.y], [region.x, region.y]) < module.max(c.module_mean());
-            if scanned.iter().any(near) || out.iter().any(near) {
+            let quad = region.corners.map(|[x, y]| rect.frame.to_image.apply(x, y));
+            if let Some(candidate) = scanned.iter_mut().find(|c| near(c)) {
+                candidate.quad.get_or_insert(quad);
                 continue;
             }
-            let quad = region.corners.map(|[x, y]| rect.frame.to_image.apply(x, y));
+            if out.iter().any(near) {
+                continue;
+            }
             out.push(Candidate {
                 x: region.x,
                 y: region.y,
@@ -1586,10 +1664,10 @@ fn region_candidates(rect: &Rectified, threshold: Option<f32>, max_module: f64, 
                 votes: MIN_VOTES,
                 half: false,
                 quad: Some(quad),
+                scanned: false,
             });
         }
     }
-    out.truncate(MAX_REGION_CANDIDATES);
     out
 }
 
@@ -1893,9 +1971,14 @@ struct Candidate {
     /// it, and the template fit has the last word.
     half: bool,
     /// The outer quadrilateral of the pattern in photo pixels, top-left
-    /// first and clockwise, where a region proposed the candidate: it
-    /// carries the turn and the perspective the scan's runs do not.
+    /// first and clockwise, where a region shows the pattern: it carries
+    /// the turn and the perspective the scan's runs do not.
     quad: Option<[[f64; 2]; 4]>,
+    /// The scan made the candidate, and the quadrilateral it carries, if
+    /// any, is that of a region lying on it; false for a candidate a
+    /// region proposed where the scan made none. See [`refine_capstone`]
+    /// for what each starts its fit from.
+    scanned: bool,
 }
 
 impl Candidate {
@@ -2154,7 +2237,7 @@ fn scan(
                 // as likely as not, so they are not asked; the template
                 // fit has the last word.
                 if let Some(cy) = half_cross_check(|i| dark(column, i), y as i64, centre_dark, row_module, RATIO_TOLERANCE) {
-                    push(clusters, Candidate { x: cx, y: cy, module: [row_module, row_module], inverted: !centre_dark, votes: 1, half: true, quad: None });
+                    push(clusters, Candidate { x: cx, y: cy, module: [row_module, row_module], inverted: !centre_dark, votes: 1, half: true, quad: None, scanned: true });
                 }
                 continue;
             };
@@ -2186,7 +2269,7 @@ fn scan(
             if !module.iter().all(|m| (min_module..=max_module).contains(m)) {
                 continue;
             }
-            push(clusters, Candidate { x: cx, y: cy, module, inverted: !centre_dark, votes: 1, half: false, quad: None });
+            push(clusters, Candidate { x: cx, y: cy, module, inverted: !centre_dark, votes: 1, half: false, quad: None, scanned: true });
         }
     }
 }
@@ -2468,24 +2551,60 @@ fn refine_capstone(image: &Luma, rect: &Rectified, candidate: &Candidate, thresh
     // square root of two too long, which puts its corners that far out
     // along the axes.
     let offsets = [[[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]], [[0.0, -hy], [hx, 0.0], [0.0, hy], [-hx, 0.0]]];
-    let mut starts: Vec<([[f64; 2]; 4], bool)> = offsets
-        .into_iter()
-        .enumerate()
-        // A finder that is turned, and bloomed or torn besides, is not
-        // looked for: the turned start takes the plain fit alone.
-        .map(|(i, offsets)| (offsets.map(|[dx, dy]| rect.frame.to_image.apply(candidate.x + dx, candidate.y + dy)), i == 0))
-        .collect();
-    // A region's own quadrilateral already has the turn and the
-    // perspective of a finder seen steeply, as BoofCV fits its position
-    // patterns from the polygon it found: it is tried first.
-    if let Some(quad) = candidate.quad {
-        starts.insert(0, (quad, true));
+    let fit = |start: [[f64; 2]; 4], thorough: bool| refine_capstone_from(image, rect, candidate, threshold, start, thorough);
+    // A finder that is turned, and bloomed or torn besides, is not
+    // looked for: the turned start takes the plain fit alone.
+    let own = || {
+        offsets
+            .into_iter()
+            .enumerate()
+            .find_map(|(i, offsets)| fit(offsets.map(|[dx, dy]| rect.frame.to_image.apply(candidate.x + dx, candidate.y + dy)), i == 0))
+    };
+    let unfitted = || concentric_capstone(image, rect, candidate, threshold).or_else(|| line_capstone(image, rect, candidate, threshold));
+    match candidate.quad {
+        None => own().or_else(unfitted),
+        // A region's own quadrilateral already has the turn and the
+        // perspective of a finder seen steeply, as BoofCV fits its position
+        // patterns from the polygon it found: it is tried first.
+        Some(quad) if !candidate.scanned => fit(quad, true).or_else(own).or_else(unfitted),
+        // A candidate of the scan's with a region lying on it is fitted
+        // from its own starts and from the region's quadrilateral, and
+        // the scan's fit stands unless the region's is plainly the
+        // better ([`region_fit_stands`]); what the quadrilateral fits in
+        // part stands behind whatever the candidate would have had
+        // without it.
+        Some(quad) => {
+            let scan = own();
+            match fit(quad, true) {
+                Some(region) if region_fit_stands(scan.as_ref(), &region) => Some(region),
+                torn => scan.or_else(unfitted).or(torn),
+            }
+        }
     }
-    starts
-        .into_iter()
-        .find_map(|(start, thorough)| refine_capstone_from(image, rect, candidate, threshold, start, thorough))
-        .or_else(|| concentric_capstone(image, rect, candidate, threshold))
-        .or_else(|| line_capstone(image, rect, candidate, threshold))
+}
+
+/// How much more crisply the fit started from a region's quadrilateral
+/// must read than the one from the scan's own starts to stand in its
+/// place. Both descents climb the one score, the contrast across the
+/// finder's boundaries, and where both reach the pattern they settle a
+/// fraction of a pixel apart with the contrast between them alike to
+/// half a part in a hundred, now the one ahead and now the other: taking
+/// whichever was ahead moved a capstone a tenth of a pixel on two
+/// benchmark photographs of symbols four pixels a module, and with it
+/// the format word of one and the timing pattern of the other, which
+/// had read outright and no longer did. Where the scan's starts settle
+/// off the pattern, on a finder turned between them or foreshortened,
+/// the region's fit reads a third as crisply again or more.
+const REGION_FIT_GAIN: f64 = 1.1;
+
+/// Whether the fit of a candidate started from a region's quadrilateral
+/// stands before the fit `scan` from the candidate's own starts: when it
+/// is the whole pattern, and the scan's starts fitted nothing, or a
+/// pattern in part, or one that reads less crisply by
+/// [`REGION_FIT_GAIN`]. The scan's fit is the one every photo so far was
+/// read through, and stands wherever the two are one fit.
+fn region_fit_stands(scan: Option<&Capstone>, region: &Capstone) -> bool {
+    !region.partial && scan.is_none_or(|scan| scan.partial || region.contrast > REGION_FIT_GAIN * scan.contrast)
 }
 
 /// What a capstone read along lines alone is worth against a fitted one,
@@ -4046,6 +4165,80 @@ fn format_placements(image: &Luma, capstone: &Capstone, family: Family, threshol
     out
 }
 
+/// Whether a QR Code's format word reads outright beside the finders an
+/// assignment stands the capstones as, at `turns`: each bit through the
+/// corners of the capstone it lies beside ([`finder_map`]) and against
+/// that capstone's own dark and light, as BoofCV reads the word, through
+/// the corner position pattern's own square (`readFormatRegion0`) and,
+/// for the second copy, half through the right-hand pattern's and half
+/// through the lower one's (`readFormatRegion1`). The copy round the
+/// top-left finder lies whole beside that one capstone; the other is
+/// split, eight bits below the top-right finder and seven beside the
+/// bottom-left, and takes both.
+///
+/// The read needs no outline and no version, only which capstone is
+/// which finder and how the symbol is turned, and it says whether that
+/// is so: taken a quarter turn out, or about another finder, the bits
+/// read are data. That makes it the judge where the capstones stand as
+/// finders more ways than one ([`align_version`]).
+///
+/// Only a whole copy that is a word to the bit counts, and when both
+/// copies are whole, both spelling the one word. There are thirty-two
+/// words among the 2^15 strings of fifteen bits: bits that are no format
+/// word spell one outright once in a thousand reads, and lie within the
+/// three bits a word corrects more often than not, so that over the
+/// handful of placements asked a word with errors would nearly always
+/// be found somewhere, and say nothing. A word painted without its mask
+/// or with the other model's is not looked for, for the same reason: it
+/// would treble the words. A symbol seen from the back spells no word
+/// either, its bits running the other way round, and is placed as it
+/// was before this was asked.
+#[allow(clippy::too_many_arguments)]
+fn format_reads_beside(
+    image: &Luma,
+    func: &FunctionMap,
+    finders: &[&Site],
+    capstones: &[Capstone],
+    assignment: &[Option<usize>],
+    turns: u8,
+    inverted: bool,
+    threshold: Option<f32>,
+    band: f32,
+) -> bool {
+    // Each finder's own map and levels, where a capstone with measured
+    // corners stands as it.
+    let beside: Vec<Option<(Homography, f32, f32)>> = finders
+        .iter()
+        .zip(assignment)
+        .map(|(site, standing)| {
+            let capstone = &capstones[(*standing)?];
+            if capstone.line_only {
+                return None;
+            }
+            let (threshold, band_abs) = capstone_levels(image, capstone, threshold, band)?;
+            Some((finder_map(capstone, site, turns, false, func)?, threshold, band_abs))
+        })
+        .collect();
+    let words: Vec<u32> = bch::format_words(func.version).into_iter().map(|(_, word)| word).collect();
+    let mut spelt: Vec<u32> = Vec::new();
+    for copy in &func.format {
+        let read = bch::info_read_from(copy, |i| {
+            let at = [copy.bits[i].x as f64 + 0.5, copy.bits[i].y as f64 + 0.5];
+            let nearest = (0..finders.len()).min_by(|&a, &b| distance(finders[a].at, at).total_cmp(&distance(finders[b].at, at)))?;
+            let (map, threshold, band_abs) = beside[nearest].as_ref()?;
+            let value = sample_positions(image, map, &copy.bits[i..=i], INNER_FRACTION, POINTS)[0]?;
+            ((value - threshold).abs() >= *band_abs).then_some((value < *threshold) != inverted)
+        });
+        if read.known_count() == u32::from(read.len) {
+            if !words.contains(&read.bits) {
+                return false;
+            }
+            spelt.push(read.bits);
+        }
+    }
+    !spelt.is_empty() && spelt.iter().all(|&word| word == spelt[0])
+}
+
 /// The version the symbol's own bits name when read beside the finder
 /// patterns alone, if any, and how far it can be trusted. For QR Code the
 /// version information beside the top-right and bottom-left finders is
@@ -4195,8 +4388,13 @@ pub const COARSE_SIDE: f64 = 1024.0;
 /// scan could not make out at that size may be hiding beside them, so
 /// the next larger copy is searched as well. The scan makes out a finder
 /// pattern down to about two pixels a module, and a symbol found with
-/// less was found by luck.
-pub const COARSE_MIN_MODULE: f64 = 1.5;
+/// less was found by luck. It stood at a pixel and a half, the least
+/// the scan looks for at all ([`MIN_MODULE`]), which a finder square to
+/// the copy's rows can be read at and one turned cannot: of three sheets
+/// of twenty symbols in one photograph the copy showed the two upright
+/// ones at 1.7 pixels a module and nothing of the one turned
+/// thirty-seven degrees, and settled the search.
+pub const COARSE_MIN_MODULE: f64 = 2.0;
 
 /// [`find_symbols`] as `search` says to go about it.
 pub fn find_symbols_with(image: &Luma, family: Family, params: &SampleParams, search: &SearchParams) -> Vec<Detection> {
@@ -4216,7 +4414,8 @@ pub fn find_symbols_with(image: &Luma, family: Family, params: &SampleParams, se
 /// The families search each copy of the photo together before the next
 /// copy is made, the copy scanned for finder patterns once for all of
 /// them, and the search ends at the first copy that shows a symbol of
-/// any family and no finders of a symbol it could not fit: the renders
+/// any family, no finders of a symbol it could not fit, and no claim it
+/// may not rest on ([`doubtful_claims`]): the renders
 /// read off their pixels, then the shrunk copies when `search` asks for
 /// them, then the photo as it is and the ladder of transformed copies,
 /// each copy leaving alone the symbols the copies before it found. A
@@ -4293,8 +4492,9 @@ fn search_whole(
         return all;
     }
     let mut known: Vec<Detection> = Vec::new();
+    let mut doubts: Vec<[f64; 2]> = Vec::new();
     if search.coarse_to_fine {
-        let coarse = search_coarse(image, &pending, params, &mut taken, credible);
+        let coarse = search_coarse(image, &pending, params, &mut taken, &mut doubts, credible);
         // Only when no family shows anywhere, in a render or a shrunk
         // copy, is the photo searched at full size for every family; and
         // when the last copy shows finders of a symbol it could not fit,
@@ -4302,15 +4502,17 @@ fn search_whole(
         if !coarse.detections.is_empty() || !all.is_empty() {
             if coarse.more.is_empty() {
                 all.extend(coarse.detections);
+                drop_settled_claims(&mut all, &doubts);
                 return all;
             }
             pending = coarse.more;
         }
         known = coarse.detections;
     }
-    let fine = search_fine(image, &pending, params, &mut taken, &known, credible);
+    let fine = search_fine(image, &pending, params, &mut taken, &known, &mut doubts, credible);
     all.extend(known);
     all.extend(fine);
+    drop_settled_claims(&mut all, &doubts);
     all
 }
 
@@ -4321,6 +4523,63 @@ fn note(all: &mut Vec<Detection>, taken: &mut Vec<Detection>, family: Family, fo
         taken.extend(found.iter().filter(|d| credible(d)).cloned());
     }
     all.extend(found);
+}
+
+/// Where the finder pattern of a symbol that has one lies in the photo.
+fn lone_finder_centre(found: &Detection) -> Option<[f64; 2]> {
+    let (w, h) = (found.version.width() as f64, found.version.height() as f64);
+    Homography::rect_to_quad(w, h, found.corners).map(|map| map.apply(3.5, 3.5))
+}
+
+/// The claims among `found` that a search may not rest on: symbols of a
+/// family with one finder pattern that do not decode as found, each by
+/// where its finder lies in the photo.
+///
+/// Every finder pattern of a QR Code passes for the finder of a Micro QR
+/// or rMQR symbol of its own, and the modules beside it spell a format
+/// word of theirs within correction range more often than not. Where a
+/// copy shows the QR Code whole, its finders are withheld from the
+/// families after it; where it does not, a finder turned too far for
+/// that copy's fit or lost in a shadow, the one finder the copy does
+/// show is claimed as a symbol of its own, and a search that ended at
+/// the first copy to show any symbol ended there: a clean version 1
+/// symbol turned thirty-seven degrees, which a search for QR Codes
+/// alone read some rungs up the ladder, came back as a Micro QR symbol
+/// of version M4 with no block solved. Such a claim is what a reader's
+/// decode is the last word on, as ZXing, zxing-cpp and BoofCV return
+/// nothing that does not decode, so the decode is asked here: a claim
+/// that decodes is a symbol, and one that does not may be a part of one.
+fn doubtful_claims(image: &Luma, found: &[Detection], params: &SampleParams) -> Vec<[f64; 2]> {
+    found
+        .iter()
+        .filter(|d| !d.version.family().has_three_finders() && !work::cancelled() && !decodes_as_found(image, d, params))
+        .filter_map(lone_finder_centre)
+        .collect()
+}
+
+/// The families a search goes on looking for after a copy: those the
+/// copy's own search left [more](Found::more) of, and, while a
+/// [doubtful claim](doubtful_claims) stands on a finder that no symbol
+/// with three covers, the families with three finder patterns among
+/// those searched, whose finder it may be. The families with one are
+/// owed nothing by it: they have had the look they always had, and a QR
+/// photo does not go hunting Micro QR symbols up the ladder for a claim
+/// it has already made.
+fn still_wanted(more: &[Family], families: &[Family], doubts: &[[f64; 2]], found: &[Detection]) -> Vec<Family> {
+    let whole = |at: [f64; 2]| found.iter().any(|d| d.version.family().has_three_finders() && covers(d, at));
+    let owed = doubts.iter().any(|&at| !whole(at));
+    families.iter().copied().filter(|family| more.contains(family) || (owed && family.has_three_finders())).collect()
+}
+
+/// Drop the [doubtful claims](doubtful_claims) a symbol with three finder
+/// patterns, found since, lies over: the claim stood on one of its
+/// finders, which would have been withheld had the symbol shown first.
+fn drop_settled_claims(all: &mut Vec<Detection>, doubts: &[[f64; 2]]) {
+    let wholes: Vec<Detection> = all.iter().filter(|d| d.version.family().has_three_finders()).cloned().collect();
+    all.retain(|d| {
+        d.version.family().has_three_finders()
+            || !lone_finder_centre(d).is_some_and(|at| doubts.contains(&at) && wholes.iter().any(|whole| covers(whole, at)))
+    });
 }
 
 /// Every family's search of one copy of the photo, in the families'
@@ -4376,15 +4635,17 @@ fn coarse_factors(image: &Luma) -> Vec<u8> {
 /// The first copy whose symbols are all [`COARSE_MIN_MODULE`] a module or
 /// more, and which shows no finders of a symbol it could not fit, settles
 /// it; once a copy has shown a symbol, the copies after it are searched
-/// only for the families that have such finders left. No detections when
-/// no copy shows a symbol, or the photo is too small to shrink; `more`
-/// is the last copy's, the families to search the photo at full size
-/// for.
+/// only for the families that have such finders left, or are owed a look
+/// by a claim the search may not rest on ([`still_wanted`]), whose finder
+/// centres gather in `doubts`. No detections when no copy shows a
+/// symbol, or the photo is too small to shrink; `more` is the last
+/// copy's, the families to search the photo at full size for.
 fn search_coarse(
     image: &Luma,
     families: &[Family],
     params: &SampleParams,
     taken: &mut Vec<Detection>,
+    doubts: &mut Vec<[f64; 2]>,
     credible: &(dyn Fn(&Detection) -> bool + Sync),
 ) -> Searched {
     let mut all = Searched::default();
@@ -4397,8 +4658,10 @@ fn search_coarse(
         let found = search_view(&view, &wanted, params, taken, &all.detections, credible);
         // The modules in the copy's own pixels.
         let smallest = found.detections.iter().map(|d| module_size_of(d) / view.scale).fold(f64::INFINITY, f64::min);
+        let fresh = all.detections.len();
         all.detections.extend(found.detections.into_iter().map(|found| refine_found(image, found, params)));
-        all.more = found.more;
+        doubts.extend(doubtful_claims(image, &all.detections[fresh..], params));
+        all.more = still_wanted(&found.more, families, doubts, &all.detections);
         if all.detections.is_empty() {
             continue;
         }
@@ -4422,6 +4685,11 @@ fn search_coarse(
 /// copy finds by the copies after it: what comes back is what is new.
 /// Once any symbol is known, a copy is searched only for the families
 /// with such finders left: the others have had the look they always had.
+/// A claim of a family with one finder pattern that does not decode
+/// keeps the families with three wanted for as long as no symbol of
+/// theirs is found over its finder ([`still_wanted`]), up the whole
+/// ladder if need be; the centres of such finders gather in `doubts`,
+/// those of the shrunk copies' claims among them.
 ///
 /// The search ended at the first copy that showed any symbol, so that of
 /// two symbols in a photo, one in shadow, the copy that showed the one
@@ -4434,6 +4702,7 @@ fn search_fine(
     params: &SampleParams,
     taken: &mut Vec<Detection>,
     known: &[Detection],
+    doubts: &mut Vec<[f64; 2]>,
     credible: &(dyn Fn(&Detection) -> bool + Sync),
 ) -> Vec<Detection> {
     let mut all: Vec<Detection> = known.to_vec();
@@ -4479,10 +4748,11 @@ fn search_fine(
         let Some((found, withheld)) = shown else { return Vec::new() };
         *taken = withheld;
         all.extend(found.detections);
-        if found.more.is_empty() {
+        doubts.extend(doubtful_claims(image, &all, params));
+        wanted = still_wanted(&found.more, families, doubts, &all);
+        if wanted.is_empty() {
             return all;
         }
-        wanted = found.more;
     }
     for &step in &steps[climbed..] {
         if work::cancelled() {
@@ -4490,14 +4760,16 @@ fn search_fine(
         }
         let Some(view) = view_of(step, &wanted) else { continue };
         let found = search_view(&view, &wanted, params, taken, &all, credible);
+        let fresh = all.len();
         all.extend(found.detections);
         if all.is_empty() {
             continue;
         }
-        if found.more.is_empty() {
+        doubts.extend(doubtful_claims(image, &all[fresh..], params));
+        wanted = still_wanted(&found.more, families, doubts, &all);
+        if wanted.is_empty() {
             break;
         }
-        wanted = found.more;
     }
     all.split_off(known.len())
 }
@@ -4513,7 +4785,7 @@ pub fn find_symbols_coarse(image: &Luma, family: Family, params: &SampleParams, 
     if let Some(found) = detect_pure(image, family, whole, params) {
         return Some(vec![found]);
     }
-    let found = search_coarse(image, &[family], params, &mut taken.to_vec(), &|_| true).detections;
+    let found = search_coarse(image, &[family], params, &mut taken.to_vec(), &mut Vec::new(), &|_| true).detections;
     (!found.is_empty()).then_some(found)
 }
 
@@ -4527,7 +4799,7 @@ pub fn find_symbols_fine(image: &Luma, family: Family, params: &SampleParams, ta
     if let Some(found) = detect_pure(image, family, whole, params) {
         return vec![found];
     }
-    search_fine(image, &[family], params, &mut taken.to_vec(), &[], &|_| true)
+    search_fine(image, &[family], params, &mut taken.to_vec(), &[], &mut Vec::new(), &|_| true)
 }
 
 /// The size of a symbol's modules in the pixels its corners are in,
@@ -4548,16 +4820,14 @@ fn refine_found(image: &Luma, coarse: Detection, params: &SampleParams) -> Detec
     // unmirrored there, and report it so.
     // The outline the copy gave sets the threshold's reach at full size,
     // as any outline does: the coarse search runs no rung of the ladder.
-    match detect_candidates_in(image, coarse.version, clockwise(coarse.corners), params, false, None, MAX_RECTIFIED).into_iter().next() {
-        Some(fine) if vouched(image, &fine, params) => fine,
-        _ => coarse,
-    }
+    let fine = detect_candidates_in(image, coarse.version, clockwise(coarse.corners), params, false, None, MAX_RECTIFIED).into_iter().next();
+    fine.and_then(|fine| vouched(image, fine, params)).unwrap_or(coarse)
 }
 
-/// Whether a search of the whole photo offers a detection: its fixed
-/// patterns fit, with a little less asked of the fit when the symbol's
-/// own bits name the version fitted, and something of the symbol besides
-/// its finders reads.
+/// A detection as a search of the whole photo offers it, or `None` when
+/// it offers none: its fixed patterns fit, with a little less asked of
+/// the fit when the symbol's own bits name the version fitted, and
+/// something of the symbol besides its finders reads.
 ///
 /// The fit alone says little of a small symbol. Sixty-four of the
 /// eighty-two fixed modules of a Micro QR M4 symbol are its finder and
@@ -4573,16 +4843,59 @@ fn refine_found(image: &Luma, coarse: Detection, params: &SampleParams) -> Detec
 /// it and paper past the symbol's far edges, to "check that we are in
 /// fact not looking at a corner of a non-micro QRCode symbol", and of an
 /// rMQR finder the timing pattern along every edge.
-fn vouched(image: &Luma, found: &Detection, params: &SampleParams) -> bool {
+///
+/// The fit is asked two ways, and either will do. The detection's own
+/// score reads every fixed module against one split of them all, and a
+/// shadow that lies across the symbol defeats it: the paper in the shade
+/// is darker than the split, every light module there counts as wrong,
+/// and a version 2 symbol with a straight shadow over two fifths of it,
+/// found, timed and fitted, scored seven parts in ten and was not
+/// offered, at six pixels a module and at forty, though it read at once
+/// through an outline. So the fixed modules are counted again as a read
+/// will first read them, each against its own neighbourhood unless
+/// another rule is asked for, over every fixed module of the version, so
+/// that one off the photo counts against the fit as it does in the
+/// score; that is how the patterns beyond the finders have been asked
+/// all along. BoofCV reads every module against its position patterns'
+/// own thresholds, carried across the symbol, to the same end. What the
+/// second count lets through is a symbol in uneven light and nothing
+/// else: a module too faint to call counts against the fit, as bare
+/// paper and flat print read, the share asked is the same, and whatever
+/// fits must still be vouched for by a word of the symbol's own or by
+/// its patterns beyond the finders, which three marks in any light are
+/// not.
+///
+/// A detection the second count alone lets through comes back with that
+/// count as its agreement. Whoever lists the symbols of every family
+/// ranks two claims on one place by their scores and takes a symbol
+/// below three parts in four for no symbol; scored by the split the
+/// shadow defeats, the QR Code was offered and then dropped for a Micro
+/// QR symbol that fitted one of its finders better.
+fn vouched(image: &Luma, mut found: Detection, params: &SampleParams) -> Option<Detection> {
     let named = found.info.named_version == Some(found.version);
-    found.score() >= if named { MIN_NAMED_SCORE } else { MIN_FOUND_SCORE }
-        && (found.version_confirmed() || found.format_reads_outright() || reads_beyond_finders(image, found, params))
+    let floor = if named { MIN_NAMED_SCORE } else { MIN_FOUND_SCORE };
+    let worded = found.version_confirmed() || found.format_reads_outright();
+    if found.score() >= floor && worded {
+        return Some(found);
+    }
+    // Sampled once, as a read will sample it, for both the questions
+    // still open.
+    let func = FunctionMap::new(found.version);
+    let grid = grid_as_found(image, &func, &found, params)?;
+    if found.score() < floor {
+        let as_read = func.fixed_agreement(&grid).0;
+        if (as_read as f64) < floor * found.agreement.1.max(1) as f64 {
+            return None;
+        }
+        found.agreement.0 = as_read;
+    }
+    (worded || reads_beyond_finders(&func, &grid)).then_some(found)
 }
 
-/// Whether the patterns of a symbol that are none of its finders read as
-/// a detection places them, sampled as the symbol would be:
-/// [`MIN_BEYOND_FINDERS`] of their modules the right colour, a module too
-/// faint to call counting against, as blank paper reads. Both timing
+/// Whether the patterns of a symbol that are none of its finders read in
+/// `grid`, the symbol sampled through a detection as a read would sample
+/// it: [`MIN_BEYOND_FINDERS`] of their modules the right colour, a module
+/// too faint to call counting against, as blank paper reads. Both timing
 /// patterns of a Micro QR symbol are asked, each on its own: hung off a
 /// finder of a QR Code and turned to lie along that symbol's edge, one
 /// of the two lies on the QR Code's own timing pattern and reads without
@@ -4590,10 +4903,8 @@ fn vouched(image: &Luma, found: &Detection, params: &SampleParams) -> bool {
 /// are a QR Code's, whose alignment patterns will do in their place: a
 /// scratch along a timing pattern takes all of it, and the three finders
 /// of a QR Code already say more than the one of the other families.
-fn reads_beyond_finders(image: &Luma, found: &Detection, params: &SampleParams) -> bool {
-    let func = FunctionMap::new(found.version);
-    let Some(grid) = grid_as_found(image, &func, found, params) else { return false };
-    let family = found.version.family();
+fn reads_beyond_finders(func: &FunctionMap, grid: &ModuleGrid) -> bool {
+    let family = func.version.family();
     // (matching, all) of the timing modules, a Micro QR symbol's second
     // pattern apart from its first, and of the alignment patterns.
     let mut tally = [(0usize, 0usize); 3];
@@ -4680,8 +4991,8 @@ impl<'a> ScannedView<'a> {
         let threshold = fixed_threshold(params);
         let widest = families.iter().map(|&f| max_module_fraction(f)).fold(0.0, f64::max);
         let max_module = rect.frame.size[0].min(rect.frame.size[1]) * widest;
-        let candidates = scan_for_finders(&rect, threshold, max_module);
-        let regions = region_candidates(&rect, threshold, max_module, &candidates);
+        let mut candidates = scan_for_finders(&rect, threshold, max_module);
+        let regions = region_candidates(&rect, threshold, max_module, &mut candidates);
         let refined = [vec![OnceLock::new(); candidates.len()], vec![OnceLock::new(); regions.len()]];
         Some(Self { luma, origin, scale, step, local_radius, rect, threshold, candidates, regions, refined })
     }
@@ -4701,15 +5012,16 @@ impl<'a> ScannedView<'a> {
 
     /// The finder patterns of `family` verified against the copy, as
     /// [`collect_capstones`] gathers them: the scan's whole candidates
-    /// first, then its half ones, then the regions', each within the
-    /// family's cap on the module size, with repeats merged.
+    /// first, then its half ones, as many of each as [`within_cap`]
+    /// lets through, then the regions', each within the family's cap on
+    /// the module size, with repeats merged.
     fn capstones(&self, family: Family) -> Vec<Capstone> {
         let max_module = self.rect.frame.size[0].min(self.rect.frame.size[1]) * max_module_fraction(family);
         let within = |c: &Candidate| c.module.iter().all(|&m| m <= max_module);
         let scan = |half: bool, most: usize| {
-            (0..self.candidates.len()).filter(move |&i| self.candidates[i].half == half && within(&self.candidates[i])).take(most).map(|i| (0, i))
+            within_cap(self.candidates.iter().enumerate().filter(move |(_, c)| c.half == half && within(c)), most).map(|(i, _)| (0, i))
         };
-        let regions = (0..self.regions.len()).filter(|&i| within(&self.regions[i])).take(MAX_REGION_CANDIDATES).map(|i| (1, i));
+        let regions = (0..self.regions.len()).filter(|&i| within(&self.regions[i])).map(|i| (1, i));
         let mut all: Vec<Capstone> = Vec::new();
         for (source, i) in scan(false, MAX_SEARCH_CANDIDATES).chain(scan(true, MAX_HALF_CANDIDATES)).chain(regions) {
             let Some(capstone) = self.refined(source, i) else { continue };
@@ -4799,7 +5111,7 @@ impl<'a> ScannedView<'a> {
             detect_candidates_in(image, start, p.outline, params, false, self.local_radius, MAX_RECTIFIED)
                 .into_iter()
                 .next()
-                .filter(|d| vouched(image, d, params))
+                .and_then(|d| vouched(image, d, params))
         };
         // The proposals in their turn, until `most` have come to nothing,
         // each detected unless a symbol found by then lies where it does.
@@ -4814,8 +5126,10 @@ impl<'a> ScannedView<'a> {
         let detect_each = |proposals: &[Proposal], most: usize, found: &mut Vec<Detection>, unfitted: &mut Vec<Vec<usize>>| {
             let mut fits: Vec<Option<Option<Detection>>> = vec![None; proposals.len()];
             let mut failed = 0;
+            let mut reached = proposals.len();
             for (i, p) in proposals.iter().enumerate() {
                 if failed >= most || work::cancelled() {
+                    reached = i;
                     break;
                 }
                 if !stands(found.as_slice(), p) {
@@ -4842,6 +5156,14 @@ impl<'a> ScannedView<'a> {
                         }
                     }
                 }
+            }
+            // A proposal the budget ran out before, with a timing pattern
+            // between its capstones, is as much a symbol the copy shows
+            // and did not fit as one fitted to no avail: it was once
+            // passed over without a word, and the copy that had spent
+            // its dozen on other print settled the search.
+            for p in proposals[reached..].iter().filter(|p| p.timed && stands(found.as_slice(), p)) {
+                unfitted.push(p.members.clone());
             }
         };
         let mut found: Vec<Detection> = Vec::new();
@@ -4899,9 +5221,9 @@ struct Found {
     /// The symbols found, in the photo's pixels.
     detections: Vec<Detection>,
     /// The copy shows finders that stand as a symbol's, with a timing
-    /// pattern between them, on which no symbol was fitted: there is
-    /// more in the photo than was found, which another copy may show
-    /// better.
+    /// pattern between them, on which no symbol was fitted, or which
+    /// the search's budget of proposals ran out before: there is more
+    /// in the photo than was found, which another copy may show better.
     more: bool,
 }
 
@@ -6248,6 +6570,33 @@ fn align_version(
         }
         if near || fuller {
             chosen.push(i);
+        }
+    }
+    // Where the capstones stand as a QR Code's finders more ways than
+    // one, the symbol's own format word says which, when it reads
+    // outright beside the finders of some and not of others
+    // ([`format_reads_beside`]): those are fitted, and the others not.
+    // Two capstones stand as two of three finders at two turns alike,
+    // and three stand at every turn within the slack. The fits were all
+    // made and the best taken, and the fit reads the fixed modules and
+    // the quiet zone against one split of them: in a photo whose light
+    // failed toward one side the split of the right turn's modules
+    // called more than half the quiet zone dark, the split of a wrong
+    // turn's none of it, and a symbol with all three finders showing
+    // was placed a quarter turn out on two of them, its third standing
+    // where its data should be. The word is read beside the capstones
+    // themselves, each against its own dark and light, and does not
+    // hang on the fit or on the light; it misleads once in a thousand,
+    // and where it reads, three fits in four need not be made.
+    if matches!(func.version, SymbolVersion::Qr(_) | SymbolVersion::Model1(_)) && chosen.len() > 1 {
+        let site_refs: Vec<&Site> = finders.iter().map(|&i| &sites[i]).collect();
+        let worded: Vec<usize> = chosen
+            .iter()
+            .copied()
+            .filter(|&i| format_reads_beside(image, func, &site_refs, capstones, &matches[i].3, matches[i].1, inverted, threshold, band))
+            .collect();
+        if !worded.is_empty() {
+            chosen = worded;
         }
     }
     let mut out = Vec::new();
@@ -7665,6 +8014,213 @@ mod tests {
             let whole = [[0.0, 0.0], [turned.width as f64, 0.0], [turned.width as f64, turned.height as f64], [0.0, turned.height as f64]];
             let found = detect_pure(&turned, version.family(), whole, &SampleParams::default()).unwrap_or_else(|| panic!("{version}, turned"));
             assert_eq!((found.version, found.corners[0]), (version, [turned.width as f64 - at(0), at(0)]), "{version}, turned");
+        }
+    }
+
+    /// A detection of `version` placed at `corners`, with nothing else
+    /// said of it.
+    fn placed(version: SymbolVersion, corners: [[f64; 2]; 4]) -> Detection {
+        Detection {
+            corners,
+            version,
+            inverted: false,
+            mirrored: false,
+            mirrored_by_decode: false,
+            turns: 0,
+            anchors: Vec::new(),
+            agreement: (0, 0),
+            info: InfoEvidence::default(),
+            edged_corners: Vec::new(),
+            measured_corners: Vec::new(),
+            retry: None,
+            decodes: None,
+        }
+    }
+
+    #[test]
+    fn candidates_a_region_bears_out_are_refined_past_the_cap() {
+        let candidate = |i: usize, quad: bool| Candidate {
+            x: 10.0 * i as f64,
+            y: 0.0,
+            module: [3.0, 3.0],
+            inverted: false,
+            votes: MIN_VOTES,
+            half: false,
+            quad: quad.then_some([[0.0, 0.0], [21.0, 0.0], [21.0, 21.0], [0.0, 21.0]]),
+            scanned: true,
+        };
+        let candidates: Vec<Candidate> = (0..10).map(|i| candidate(i, i == 2 || i == 8)).collect();
+        let kept = |most: usize| within_cap(candidates.iter().enumerate(), most).map(|(i, _)| i).collect::<Vec<_>>();
+        // The first four as they come, and the one past them with a
+        // region on it; the one among them counts toward the four.
+        assert_eq!(kept(4), [0, 1, 2, 3, 8]);
+        assert_eq!(kept(0), [2, 8]);
+        assert_eq!(kept(10), (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_region_hands_its_quadrilateral_to_the_scans_candidate() {
+        // A version 1 symbol turned thirty-seven degrees, between the
+        // template's two starts: the scan finds the centre of each finder
+        // and a region its four corners, and the candidate that goes to
+        // the fit is the scan's with the region's corners on it, not the
+        // scan's alone.
+        let (version, centre, module_px, degrees) = (SymbolVersion::Qr(1), [150.0, 150.0], 7.0, 37.0);
+        let image = draw_turned(version, centre, module_px, degrees, (300, 300));
+        let whole = [[0.0, 0.0], [300.0, 0.0], [300.0, 300.0], [0.0, 300.0]];
+        let rect = Rectified::new(&image, whole).unwrap();
+        let max_module = rect.frame.size[0] * max_module_fraction(Family::Qr);
+        let mut candidates = scan_for_finders(&rect, None, max_module);
+        let regions = region_candidates(&rect, None, max_module, &mut candidates);
+        let (s, c) = degrees.to_radians().sin_cos();
+        for [mx, my] in [[-7.0, -7.0], [7.0, -7.0], [-7.0, 7.0]] {
+            let (dx, dy) = (mx * module_px, my * module_px);
+            let finder = [centre[0] + dx * c - dy * s, centre[1] + dx * s + dy * c];
+            let at = |candidate: &&Candidate| distance(rect.frame.to_image.apply(candidate.x, candidate.y), finder) < module_px;
+            let scanned: Vec<&Candidate> = candidates.iter().filter(at).collect();
+            assert!(!scanned.is_empty(), "the scan saw nothing at {finder:?}");
+            let borne: Vec<&&Candidate> = scanned.iter().filter(|candidate| candidate.quad.is_some()).collect();
+            assert_eq!(borne.len(), 1, "one candidate at {finder:?} takes the region's corners");
+            assert!(regions.iter().filter(at).count() == 0, "and the region proposes nothing of its own there");
+            // The corners are the finder's own, seven modules square.
+            let quad = borne[0].quad.unwrap();
+            for corner in quad {
+                let off = distance(corner, finder);
+                assert!((off - 3.5 * module_px * SQRT_2).abs() < 1.5, "a corner {off:.1} px from the centre of {finder:?}");
+            }
+            let capstone = refine_capstone(&image, &rect, borne[0], None).unwrap_or_else(|| panic!("no capstone at {finder:?}"));
+            assert!(capstone.measured && !capstone.partial, "{capstone:?}");
+            assert!(distance(capstone.center, finder) < 0.5, "{capstone:?}");
+            for corner in capstone.corners {
+                assert!(quad.iter().any(|&q| distance(corner, q) < module_px), "{capstone:?} against {quad:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_fit_from_a_region_stands_only_where_it_is_plainly_the_better() {
+        let frame = Frame::new([[0.0, 0.0], [400.0, 0.0], [400.0, 400.0], [0.0, 400.0]], MAX_RECTIFIED).unwrap();
+        let fitted = |contrast: f64, partial: bool| Capstone { contrast, partial, ..square_capstone([200.0, 200.0], 10.0, 37.0, &frame) };
+        // Nothing fitted from the scan's own starts, or a pattern in part.
+        assert!(region_fit_stands(None, &fitted(0.3, false)));
+        assert!(region_fit_stands(Some(&fitted(0.6, true)), &fitted(0.3, false)));
+        // One fit reached from two starts: the contrasts differ by a
+        // part in a thousand, either way, and the scan's stands.
+        assert!(!region_fit_stands(Some(&fitted(0.0738, false)), &fitted(0.0739, false)));
+        assert!(!region_fit_stands(Some(&fitted(0.3494, false)), &fitted(0.3488, false)));
+        // The scan's starts settled off the pattern.
+        assert!(region_fit_stands(Some(&fitted(0.525, false)), &fitted(0.772, false)));
+        // A pattern the region fits in part never stands before the
+        // scan's, whole or not.
+        assert!(!region_fit_stands(Some(&fitted(0.2, false)), &fitted(0.9, true)));
+        assert!(!region_fit_stands(Some(&fitted(0.2, true)), &fitted(0.9, true)));
+        assert!(!region_fit_stands(None, &fitted(0.9, true)));
+    }
+
+    #[test]
+    fn a_claim_that_does_not_decode_keeps_the_search_for_qr_codes_open() {
+        let square = |x: f64, y: f64, side: f64| [[x, y], [x + side, y], [x + side, y + side], [x, y + side]];
+        // A Micro QR symbol of version M4 claimed on the top-left finder
+        // of where a version 1 QR Code lies, ten pixels a module.
+        let claim = placed(SymbolVersion::Micro(4), square(100.0, 100.0, 170.0));
+        let finder = lone_finder_centre(&claim).unwrap();
+        assert!(distance(finder, [135.0, 135.0]) < 1e-9);
+        let families = [Family::Qr, Family::Micro, Family::Rmqr];
+        let doubts = [finder];
+        // The claim alone: QR Codes are owed a look, and the families
+        // with one finder are not.
+        let found = vec![claim.clone()];
+        assert_eq!(still_wanted(&[], &families, &doubts, &found), [Family::Qr]);
+        assert_eq!(still_wanted(&[Family::Rmqr], &families, &doubts, &found), [Family::Qr, Family::Rmqr]);
+        // A search that is not for QR Codes owes them nothing.
+        assert!(still_wanted(&[], &[Family::Micro, Family::Rmqr], &doubts, &found).is_empty());
+        // No claim in doubt, nothing owed.
+        assert!(still_wanted(&[], &families, &[], &found).is_empty());
+        assert_eq!(still_wanted(&[Family::Qr], &families, &[], &found), [Family::Qr]);
+        // A QR Code elsewhere in the photo settles nothing.
+        let elsewhere = placed(SymbolVersion::Qr(1), square(600.0, 600.0, 210.0));
+        let mut found = vec![claim.clone(), elsewhere.clone()];
+        assert_eq!(still_wanted(&[], &families, &doubts, &found), [Family::Qr]);
+        drop_settled_claims(&mut found, &doubts);
+        assert_eq!(found.len(), 2);
+        // The QR Code the finder belongs to does, and the claim goes.
+        let whole = placed(SymbolVersion::Qr(1), square(100.0, 100.0, 210.0));
+        let mut found = vec![claim.clone(), elsewhere, whole];
+        assert!(still_wanted(&[], &families, &doubts, &found).is_empty());
+        drop_settled_claims(&mut found, &doubts);
+        assert_eq!(found.iter().map(|d| d.version).collect::<Vec<_>>(), [SymbolVersion::Qr(1), SymbolVersion::Qr(1)]);
+        // A claim that was never in doubt, one that decoded, stands
+        // whatever lies over it.
+        let mut found = vec![claim, placed(SymbolVersion::Qr(1), square(100.0, 100.0, 210.0))];
+        drop_settled_claims(&mut found, &[]);
+        assert_eq!(found.len(), 2);
+    }
+
+    #[test]
+    fn a_version_word_read_outright_stands_on_the_fixed_patterns_alone() {
+        // A version 7 placement whose version information reads outright
+        // and whose fixed modules read 97 in a hundred right, given a fit
+        // of 44 by a quiet zone under a lamp's bright spot: it is named
+        // all the same, and ranks above a version 6 placement on the
+        // same finders that nothing names and that fits a little better.
+        let square = [[0.0, 0.0], [450.0, 0.0], [450.0, 450.0], [0.0, 450.0]];
+        let named = |mismatches: u32, agreement: (usize, usize)| {
+            let mut found = placed(SymbolVersion::Qr(7), square);
+            found.info.named_version = Some(SymbolVersion::Qr(7));
+            found.info.named_mismatches = Some(mismatches);
+            found.agreement = agreement;
+            found
+        };
+        let unnamed = placed(SymbolVersion::Qr(6), square);
+        assert_eq!(rank(&named(0, (378, 391)), 0.44, None), (1, 0.44));
+        assert!(rank(&named(0, (378, 391)), 0.44, None) > rank(&unnamed, 0.475, None));
+        // A word read with a bit corrected is one that half of all
+        // strings lie as near, and the fit must bear it out, as it had to.
+        assert_eq!(rank(&named(1, (378, 391)), 0.44, None), (0, 0.44));
+        assert_eq!(rank(&named(1, (378, 391)), 0.75, None), (1, 0.75));
+        // Fixed patterns that read no better than the fit bear out
+        // nothing, word or no word.
+        assert_eq!(rank(&named(0, (250, 391)), 0.44, None), (0, 0.44));
+        // And a word for another version counts against the placement
+        // however its patterns read.
+        let mut misnamed = named(0, (378, 391));
+        misnamed.info.named_version = Some(SymbolVersion::Qr(8));
+        assert_eq!(rank(&misnamed, 0.44, None), (-1, 0.44));
+    }
+
+    #[test]
+    fn the_finders_of_a_turned_symbol_are_not_crowded_out_by_a_sheet_of_upright_ones() {
+        // Forty-four symbols square to the photo and four turned
+        // thirty-seven degrees, of four pixels a module: the upright
+        // finders, a hundred and thirty-two of them, poll every line
+        // across their stones and fill the cap on the scan's candidates,
+        // and the turned ones, which poll a few, came after it.
+        let (version, module_px, pitch) = (SymbolVersion::Qr(1), 4.0, 126usize);
+        let tile = |degrees: f64| draw_turned(version, [pitch as f64 / 2.0; 2], module_px, degrees, (pitch, pitch));
+        let (upright, turned) = (tile(0.0), tile(37.0));
+        let (columns, rows) = (8usize, 6usize);
+        let (width, height) = (columns * pitch, rows * pitch);
+        let mut data = vec![0.92f32; width * height];
+        let is_turned = |i: usize| i >= 44;
+        for i in 0..columns * rows {
+            let (x, y) = ((i % columns) * pitch, (i / columns) * pitch);
+            let tile = if is_turned(i) { &turned } else { &upright };
+            for row in 0..pitch {
+                data[(y + row) * width + x..][..pitch].copy_from_slice(&tile.data[row * pitch..][..pitch]);
+            }
+        }
+        let image = Luma::new(width, height, data);
+        let view = ScannedView::of(&image, &SampleParams::default(), &[Family::Qr]).unwrap();
+        let capstones = view.capstones(Family::Qr);
+        let (s, c) = 37f64.to_radians().sin_cos();
+        for i in (0..columns * rows).filter(|&i| is_turned(i)) {
+            let centre = [((i % columns) * pitch + pitch / 2) as f64, ((i / columns) * pitch + pitch / 2) as f64];
+            for [mx, my] in [[-7.0, -7.0], [7.0, -7.0], [-7.0, 7.0]] {
+                let (dx, dy) = (mx * module_px, my * module_px);
+                let finder = [centre[0] + dx * c - dy * s, centre[1] + dx * s + dy * c];
+                let seen = capstones.iter().any(|capstone| !capstone.inverted && capstone.measured && distance(capstone.center, finder) < module_px);
+                assert!(seen, "no capstone at {finder:?}, of {} in all", capstones.len());
+            }
         }
     }
 

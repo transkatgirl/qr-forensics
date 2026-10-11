@@ -16,7 +16,8 @@ use super::gf256::{self, div, exp, mul, poly_degree, poly_eval, poly_mul};
 use crate::symbol::grid::CERTAIN;
 
 /// Confirming bits a solution needs before it counts as verified: one
-/// codeword of slack, or as many known bits reproduced.
+/// codeword of slack, or as many known bits reproduced, or errors located
+/// that as few blocks of noise would show ([`located_error_bits`]).
 pub const VERIFIED_BITS: u32 = 8;
 
 /// Spare equations a solution found by doubting bits must keep. Doubting
@@ -32,7 +33,9 @@ pub const DOUBT_SPARE_EQUATIONS: usize = 2 * VERIFIED_BITS as usize;
 /// noise passes once in 256 tries. So a doubted solution needs two
 /// codewords spare, or one and a byte's worth of agreement from the
 /// doubted codewords beyond chance, which codewords misread in a faint
-/// bit or two give and codewords of noise do not.
+/// bit or two give and codewords of noise do not, or as much from the
+/// errors it located among the codewords it did not doubt, once those
+/// have paid for the counts tried: a bit for each doubling of them.
 pub const DOUBT_CONFIRMING_BITS: u32 = 2 * VERIFIED_BITS;
 
 /// What a known bit of an erased codeword costs a solution that overturns
@@ -58,6 +61,45 @@ pub const OVERTURN_COST: u32 = 2;
 pub fn doubted_agreement(agreeing: u32, flipped: u32) -> u32 {
     let chance = (3.0 * f64::from(agreeing + flipped).sqrt()).ceil() as u32;
     agreeing.saturating_sub(flipped).saturating_sub(chance)
+}
+
+/// What the errors a solution located confirm of it, in bits, for a
+/// solution that corrects `errors` wrong codewords among the `read` it
+/// did not take as erased.
+///
+/// Filling an erasure confirms nothing: an erased codeword is given
+/// whatever value fits, so a solution that spends all its redundancy on
+/// erasures is one any block would have had. Locating an error is another
+/// matter. Each error spends two codewords of redundancy, and a solution
+/// with `l` of them exists only where the codewords read lie within `l`
+/// of a codeword of the code. About each codeword there are
+/// `C(read, l) · 255^l` such readings, and none of them lies as near
+/// another, since a decoder corrects no more than half of what tells two
+/// codewords apart; against the `256^(2l)` readings the redundancy spent
+/// tells apart, a block of noise, or one damaged past correcting, shows
+/// such a solution once in `256^(2l) / (C(read, l) · 255^l)`, which is
+/// near enough `256^l / C(read, l)`. McEliece and Swanson
+/// bound the chance that a Reed-Solomon decoder corrects to a wrong
+/// codeword so, which for a code of full length is the one in `l!` they
+/// are quoted for. The solutions of fewer errors, which noise shows as
+/// well, are counted in: at most a 254th part more.
+///
+/// It is little for one error and a great deal for many. One error among
+/// the 26 codewords of a version 1 symbol is found in a tenth of all
+/// blocks of noise, and confirms three bits; the nine a block of version
+/// 5-Q corrects, among its 33, are found in one in 10^14. ZXing and
+/// BoofCV take any solution their decoders reach, and the standard asks
+/// more only of the smallest symbols, where it reserves codewords against
+/// exactly this ([`RsSolution::within_standard`]).
+pub fn located_error_bits(read: usize, errors: usize) -> u32 {
+    // Past half the codewords read the fewer errors are no longer the
+    // lesser part, and no code corrects so many.
+    if errors == 0 || 2 * errors > read + 1 {
+        return 0;
+    }
+    let ways: f64 = (1..=errors).map(|i| ((read - errors + i) as f64 / i as f64).log2()).sum();
+    let bits = errors as f64 * (16.0 - 255f64.log2()) - ways - (255f64 / 254.0).log2();
+    bits.max(0.0).floor() as u32
 }
 
 /// One codeword as read from the symbol.
@@ -111,6 +153,12 @@ pub struct RsSolution {
     /// Known bits inside erased codewords that the solution overturned. Only
     /// ever non-zero when `slack > 0`.
     pub flipped_known_bits: u32,
+    /// What the errors the decoder located confirm of the solution
+    /// ([`located_error_bits`]), less what the tries of a solver that
+    /// made many to find it cost: a bit for each doubling of them, since
+    /// each try is a fresh chance for a block of noise to show errors
+    /// located.
+    pub located_bits: u32,
     /// EC codewords the standard reserves against misdecodes for this
     /// block: a solution that leaves fewer than this many unused has spent
     /// capacity the standard says is for detection only.
@@ -118,10 +166,25 @@ pub struct RsSolution {
 }
 
 impl RsSolution {
-    /// Rough count of independent bits confirming the solution. At zero, any
-    /// input would have "solved".
+    /// Rough count of independent bits confirming the solution: a byte
+    /// for each codeword of redundancy left unused, the known bits of
+    /// erased codewords it reproduced, and what the errors it located
+    /// confirm. A solution that only filled erasures, with nothing to
+    /// spare, has none, and any input would have "solved" so; one that
+    /// located errors with nothing to spare has what they confirm, which
+    /// at the limit of a block's error correction is a great deal.
     pub fn confidence_bits(&self) -> u32 {
-        8 * self.slack as u32 + self.check_bits
+        8 * self.slack as u32 + self.check_bits + self.located_bits
+    }
+
+    /// The solution as the pick of `tries` a solver made: what its
+    /// located errors confirm is less by the bits it takes to count the
+    /// tries. The slack and the known bits reproduced are left as they
+    /// are, and the solvers that try many times ask more of those
+    /// instead ([`DOUBT_CONFIRMING_BITS`], [`CHASE_MIN_SLACK`]).
+    fn among(mut self, tries: usize) -> Self {
+        self.located_bits = self.located_bits.saturating_sub(tries.max(1).next_power_of_two().trailing_zeros());
+        self
     }
 
     /// The solution stays inside the correction capacity the standard
@@ -352,6 +415,7 @@ fn rs_decode_doubted(
         slack,
         check_bits,
         flipped_known_bits,
+        located_bits: located_error_bits(n - f, l),
         reserved,
     })
 }
@@ -378,7 +442,7 @@ pub fn rs_decode_doubting(
 
     let mut best: Option<(usize, RsSolution)> = None;
     for k in 1..=doubtful.len() {
-        if let Ok(solution) = rs_decode_doubted(block, &doubtful[..k], ec_len, reserved)
+        if let Ok(solution) = rs_decode_doubted(block, &doubtful[..k], ec_len, reserved).map(|s| s.among(doubtful.len()))
             && solution.confidence_bits() >= DOUBT_CONFIRMING_BITS
             && solution.within_standard()
             && best.as_ref().is_none_or(|(_, b)| solution.confidence_bits() > b.confidence_bits())
@@ -415,8 +479,10 @@ pub const CHASE_MIN_SLACK: usize = 2;
 /// solution restated against the block as read: a flipped bit it kept is
 /// an erratum it found, and `errors` counts every codeword it changed.
 /// The slack stays that of the flipped block's decode, since the flipped
-/// bits were guessed, not located by the code. Bits that are pinned, and
-/// bits at [`CERTAIN`], are never flipped.
+/// bits were guessed, not located by the code, and so does what the
+/// errors that decode located confirm, less the cost of the patterns
+/// tried. Bits that are pinned, and bits at [`CERTAIN`], are never
+/// flipped.
 ///
 /// A block whose every EC codeword the standard reserves for detection,
 /// as M1's two are, is not chased at all: flipping bits until the check
@@ -449,6 +515,7 @@ pub fn rs_decode_chasing(
     doubtful.truncate(CHASE_BITS);
 
     let received: Vec<u8> = block.iter().map(|c| c.value & c.known).collect();
+    let patterns = (1usize << doubtful.len()) - 1;
     let mut best: Option<(usize, RsSolution)> = None;
     for pattern in 1u32..1 << doubtful.len() {
         let mut trial = block.to_vec();
@@ -457,7 +524,7 @@ pub fn rs_decode_chasing(
                 trial[i].value ^= 1 << b;
             }
         }
-        let Ok(mut solution) = rs_decode_doubted(&trial, &[], ec_len, reserved) else { continue };
+        let Ok(mut solution) = rs_decode_doubted(&trial, &[], ec_len, reserved).map(|s| s.among(patterns)) else { continue };
         // Sixty-odd trials are sixty-odd chances for a wrong codeword to
         // lie within reach of the flipped block, so a chased solution must
         // show more redundancy than one found at the first try, and must
@@ -1381,7 +1448,11 @@ mod tests {
         let (flipped, sol) = rs_decode_chasing(&read, &reliability, ec_len, 0).unwrap();
         assert_eq!(sol.corrected, block);
         assert_eq!((flipped, sol.errors, sol.erasures, sol.slack), (3, 7, 0, 2));
-        assert_eq!(sol.confidence_bits(), 16);
+        // Two codewords spare, and the four solid errors the code located
+        // among the forty read, less six bits for the sixty-three
+        // patterns of the six faintest bits that were tried.
+        assert_eq!(sol.located_bits, located_error_bits(40, 4) - 6);
+        assert_eq!(sol.confidence_bits(), 16 + 9);
         assert_eq!(sol.errata.len(), 7);
         for e in &sol.errata {
             assert!(!e.was_erasure && e.magnitude == read[e.index].value ^ block[e.index]);
@@ -1424,5 +1495,110 @@ mod tests {
         assert!(!rs_decode_reserving(&read, 7, 3).unwrap().within_standard());
         read[4] = CwRead::known(block[4]);
         assert!(rs_decode_reserving(&read, 7, 3).unwrap().within_standard());
+    }
+
+    #[test]
+    fn located_errors_confirm_a_solution_with_nothing_to_spare() {
+        // One error among 26 codewords is found in 26 of 257 readings,
+        // three bits; none confirms nothing, and one among 255 nothing
+        // either. The nine a 5-Q block corrects among its 33 codewords,
+        // and the eight of a 2-M block among its 44:
+        // 256^18 / (C(33, 9) · 255^9) is 2^46.8 and
+        // 256^16 / (C(44, 8) · 255^8) 2^36.6.
+        assert_eq!(located_error_bits(26, 0), 0);
+        assert_eq!(located_error_bits(26, 1), 3);
+        assert_eq!(located_error_bits(255, 1), 0);
+        assert_eq!(located_error_bits(26, 3), 12);
+        assert_eq!(located_error_bits(33, 9), 46);
+        assert_eq!(located_error_bits(44, 8), 36);
+        // More errors than half the codewords read is no decoder's claim.
+        assert_eq!(located_error_bits(8, 5), 0);
+
+        // A 5-Q block wrong in nine codewords, which is all its eighteen
+        // of error correction correct: solved with nothing to spare, and
+        // confirmed by the nine it found.
+        let mut rng = Rng(0x10CA7E);
+        let ec_len = 18;
+        let block = codeword(&mut rng, 15, ec_len);
+        let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+        let wrong = rng.distinct(10, block.len());
+        for &i in &wrong[..9] {
+            read[i].value ^= rng.nonzero();
+        }
+        let sol = rs_decode(&read, ec_len).unwrap();
+        assert_eq!((sol.errors, sol.erasures, sol.slack, sol.corrected == block), (9, 0, 0, true));
+        assert_eq!((sol.check_bits, sol.located_bits, sol.confidence_bits()), (0, 46, 46));
+        assert!(sol.within_standard());
+        // One more is past the code, and no solution.
+        read[wrong[9]].value ^= rng.nonzero();
+        assert!(rs_decode(&read, ec_len).is_err());
+
+        // Eighteen unknown codewords are filled with nothing to spare
+        // too, and that any block would have allowed: nothing confirms it.
+        let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+        for &i in &rng.distinct(18, block.len()) {
+            read[i] = CwRead::unknown();
+        }
+        let sol = rs_decode(&read, ec_len).unwrap();
+        assert_eq!((sol.errors, sol.erasures, sol.slack, sol.confidence_bits()), (0, 18, 0, 0));
+        // Sixteen unknown and one wrong: the one error is found among the
+        // seventeen codewords read, which noise shows once in fifteen
+        // blocks, and confirms three bits.
+        let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+        let picked = rng.distinct(17, block.len());
+        for &i in &picked[..16] {
+            read[i] = CwRead::unknown();
+        }
+        read[picked[16]].value ^= rng.nonzero();
+        let sol = rs_decode(&read, ec_len).unwrap();
+        assert_eq!((sol.errors, sol.erasures, sol.slack, sol.corrected == block), (1, 16, 0, true));
+        assert_eq!(sol.confidence_bits(), located_error_bits(17, 1));
+        assert_eq!(sol.confidence_bits(), 3);
+
+        // Reserved codewords are reserved whatever was located: a 2-L
+        // block wrong in five codewords solves by spending the two the
+        // standard keeps for detection, and is beyond it.
+        let block = codeword(&mut rng, 34, 10);
+        let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+        for &i in &rng.distinct(5, block.len()) {
+            read[i].value ^= rng.nonzero();
+        }
+        let sol = rs_decode_reserving(&read, 10, 2).unwrap();
+        assert_eq!((sol.errors, sol.slack, sol.corrected == block), (5, 0, true));
+        assert!(sol.confidence_bits() >= VERIFIED_BITS && !sol.within_standard());
+    }
+
+    #[test]
+    fn blocks_of_noise_pass_no_oftener_than_their_confidence_says() {
+        // The count behind [`located_error_bits`], made: blocks of
+        // noise, decoded, and those that "solve" counted by the
+        // confidence the solution claims. A claim of `c` bits is that at
+        // most one block of noise in `2^c` gets so far.
+        let mut rng = Rng(0x0153);
+        for (len, ec_len, blocks) in [(12usize, 4usize, 200_000u32), (20, 2, 20_000), (16, 6, 400_000)] {
+            // How many solved, by the bits claimed.
+            let mut claimed = [0u32; 64];
+            let mut solved_at_the_limit = 0;
+            for _ in 0..blocks {
+                let read: Vec<CwRead> = (0..len).map(|_| CwRead::known(rng.byte())).collect();
+                if let Ok(sol) = rs_decode(&read, ec_len) {
+                    claimed[sol.confidence_bits().min(63) as usize] += 1;
+                    solved_at_the_limit += u32::from(sol.slack == 0 && 2 * sol.errors == ec_len);
+                }
+            }
+            for bits in 1..64 {
+                let at_least: u32 = claimed[bits..].iter().sum();
+                // Twice the expected count allows for chance, where the
+                // expected count is more than a few.
+                let allowed = (2.0 * f64::from(blocks) / 2f64.powi(bits as i32)).ceil() as u32 + 3;
+                assert!(at_least <= allowed, "{len} codewords, {ec_len} EC: {at_least} of {blocks} claim {bits} bits or more");
+            }
+            // And the claim is no gross understatement: solutions at the
+            // limit of the code do turn up in noise, about as often as
+            // the count says.
+            let located = located_error_bits(len, ec_len / 2);
+            let expected = f64::from(blocks) / 2f64.powi(located as i32 + 1);
+            assert!(f64::from(solved_at_the_limit) >= expected / 2.0, "{len} codewords, {ec_len} EC: {solved_at_the_limit} at the limit, {expected} expected");
+        }
     }
 }
