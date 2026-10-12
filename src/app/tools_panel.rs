@@ -540,6 +540,28 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
             }
         });
     }
+    if !app.leads.is_empty() {
+        ui.label(format!("Finder patterns with no symbol fitted ({}):", app.leads.len()));
+        for (i, lead) in app.leads.iter().enumerate() {
+            let text = format!("{}. {}, {} finder patterns", i + 1, lead.family.label(), lead.finders.len());
+            if ui
+                .add_enabled(!busy, egui::Button::new(text))
+                .on_hover_text(
+                    "The search found these finder patterns standing as one symbol's, with a format word reading outright \
+                     beside them, and could fit no symbol to them. Put the outline about them, as the search proposed it; \
+                     set it right by hand if it is not, and press Find in outline, which tries more than a search of the \
+                     whole photo does.",
+                )
+                .on_disabled_hover_text(BUSY_HINT)
+                .clicked()
+            {
+                actions.push(Action::UseLead(i));
+            }
+        }
+        if app.proposals.is_none() && ui.small_button("Clear the list").clicked() {
+            actions.push(Action::ClearProposals);
+        }
+    }
     if let Some(guesses) = &app.guesses {
         for guess in guesses.iter().take(4) {
             let polarity = if guess.inverted { ", inverted" } else { "" };

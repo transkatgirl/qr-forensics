@@ -101,15 +101,21 @@ const MIN_QUAD_SHARE: f64 = 0.7;
 const MODULE_SLACK: (f64, f64) = (0.8, 1.25);
 /// The two mean side lengths of the quadrilateral may differ by this
 /// factor at most: a square in perspective is foreshortened, but not into
-/// a bar. Three to one is a finder seen seventy degrees off the square,
-/// past which its modules are too thin along one axis to read. The
-/// factor was one and a half, forty-eight degrees, and the finders of a
-/// symbol photographed from low across a table, two to one and more,
-/// were turned away here with their four corners found: the scan sees
-/// such a finder along a line or two if at all, and no template started
-/// square to the frame settles on it. At two, and at two and a half, one
-/// photograph of five so taken was still found only up the ladder.
-const MAX_SIDE_RATIO: f64 = 3.0;
+/// a bar. Four to one is a finder seen seventy-five degrees off the
+/// square, past which its modules are too thin along one axis to read.
+/// The factor was one and a half, forty-eight degrees, and the finders
+/// of a symbol photographed from low across a table, two to one and
+/// more, were turned away here with their four corners found: the scan
+/// sees such a finder along a line or two if at all, and no template
+/// started square to the frame settles on it. At two, and at two and a
+/// half, one photograph of five so taken was still found only up the
+/// ladder. At three, a sign photographed from far along its wall showed
+/// two of its finders and not the third, the farthest and thinnest, a
+/// hair past the cut, in two photographs of BoofCV's benchmark, which
+/// BoofCV, cutting nowhere, placed in one; both read at four. The
+/// modules of each side are still asked to be as large as any the scan
+/// looks for.
+const MAX_SIDE_RATIO: f64 = 4.0;
 /// How far beyond the quadrilateral each line is sampled, as a share of
 /// its length: about half a module, enough that the outer ring is measured
 /// whole when the quadrilateral falls a little short of it, and little
@@ -956,8 +962,12 @@ mod tests {
         for (corner, truth) in c.corners.iter().zip([[10.0, 10.0], [66.0, 10.0], [66.0, 32.4], [10.0, 32.4]]) {
             assert!(distance(*corner, truth) < 1.0, "{c:?}");
         }
-        // Three and a half to one is past what a finder is read at.
-        assert!(steep(2.3).find(2.0, 10.0).is_empty());
+        // Three and a half to one, a sign seen from far along its wall,
+        // is a finder still, and so is one a little short of four; four
+        // and a half to one is a bar.
+        assert_eq!(steep(2.3).find(2.0, 10.0).len(), 1);
+        assert_eq!(steep(2.1).find(1.5, 10.0).len(), 1);
+        assert!(steep(1.8).find(1.5, 10.0).is_empty());
     }
 
     #[test]

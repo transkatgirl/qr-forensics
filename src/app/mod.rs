@@ -24,8 +24,8 @@ use qr_forensics::imaging::adjust::{Adjust, Enlarge, LENS_MIN_PAIRS, estimate_k1
 use qr_forensics::imaging::photo::{crop_box, flatten_alpha};
 use qr_forensics::imaging::resize::resize;
 use qr_forensics::imaging::detect::{
-    Anchor, AnchorKind, Detection, SEARCH_SIDE, SearchParams, anchor_sites, decodes_as_found, find_symbols_of_families,
-    find_symbols_with, refine_anchors, settle_loose_corners,
+    Anchor, AnchorKind, Detection, Lead, SEARCH_SIDE, SearchParams, anchor_sites, decodes_as_found, refine_anchors,
+    search_for_families, settle_loose_corners,
 };
 use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline};
 use qr_forensics::imaging::refine::{Refinement, refine_corners, refine_corners_holding};
@@ -134,6 +134,9 @@ pub(crate) enum Action {
     FindSymbols,
     /// Adopt one of the symbols found: its version, outline and anchors.
     UseProposal(usize),
+    /// Put the outline about finder patterns the search could fit no
+    /// symbol to.
+    UseLead(usize),
     ClearProposals,
     /// Call off the search of the whole photo that is under way.
     CancelSearch,
@@ -186,7 +189,7 @@ pub(crate) struct BruteResults {
 struct PendingSearch {
     /// The photo, at the lens setting, the search was started for.
     generation: u64,
-    receiver: std::sync::mpsc::Receiver<Vec<Detection>>,
+    receiver: std::sync::mpsc::Receiver<Sought>,
     /// The photo's Invert setting when the search began.
     photo_inverted: bool,
     /// The one family searched for, when the search is not of every
@@ -341,6 +344,9 @@ pub struct App {
     /// Symbols a search of the whole photo found, on offer until the list
     /// is cleared or the photo, or its lens setting, changes.
     proposals: Option<Proposals>,
+    /// Finder patterns the last search of the whole photo could fit no
+    /// symbol to, on offer for as long as its list of symbols is.
+    leads: Vec<Lead>,
     /// A search of the whole photo still running on its own thread.
     search: Option<PendingSearch>,
     /// A step of the alignment still running on its own thread.
@@ -461,6 +467,7 @@ impl App {
             preview: None,
             detection: None,
             proposals: None,
+            leads: Vec::new(),
             search: None,
             job: None,
             photo_generation: 0,
@@ -669,6 +676,7 @@ impl App {
         self.guesses = None;
         self.detection = None;
         self.proposals = None;
+        self.leads.clear();
         self.search = None;
         self.job = None;
         self.photo_generation += 1;
@@ -865,6 +873,12 @@ impl App {
                 reads.results.iter_mut().flatten().for_each(|read| carry(&mut read.detection));
             }
         }
+        for lead in &mut self.leads {
+            lead.outline = lead.outline.map(|c| [c[0] * scale[0], c[1] * scale[1]]);
+            for finder in &mut lead.finders {
+                *finder = [finder[0] * scale[0], finder[1] * scale[1]];
+            }
+        }
         // The photo stays where it was on the canvas, and as large.
         let view = &mut self.view.align_view;
         view.center = egui::vec2(view.center.x * scale[0] as f32, view.center.y * scale[1] as f32);
@@ -906,8 +920,13 @@ impl App {
         self.photo_generation += 1;
         self.detection = None;
         let mut dropped = Vec::new();
+        // The finder patterns no symbol was fitted to go with the symbols
+        // found, or alone where none was.
+        let leads = !std::mem::take(&mut self.leads).is_empty();
         if self.proposals.take().is_some() {
             dropped.push("the symbols found were taken off the list".to_owned());
+        } else if leads {
+            dropped.push("the finder patterns found were taken off the list".to_owned());
         }
         dropped.extend(self.abandon_work());
         (!dropped.is_empty()).then(|| {
@@ -1361,26 +1380,26 @@ impl App {
         let search = self.view.search;
         let family = self.view.own_family_only.then(|| self.doc.version.family());
         self.start_search(ctx, photo_inverted, family, move || match family {
-            Some(family) => find_symbols_of_family(&luma, family, &params, &search),
-            None => find_symbols_of_every_family(&luma, &params, &search),
+            Some(family) => search_for_family(&luma, family, &params, &search),
+            None => search_for_every_family(&luma, &params, &search),
         });
     }
 
     /// Run `work`, a search of the photo, on a thread of its own;
     /// [`Self::poll_search`] takes in what it finds when it arrives. The
     /// caller has checked that no search is running.
-    fn start_search(
+    fn start_search<S: Into<Sought> + Send + 'static>(
         &mut self,
         ctx: &egui::Context,
         photo_inverted: bool,
         family: Option<Family>,
-        work: impl FnOnce() -> Vec<Detection> + Send + 'static,
+        work: impl FnOnce() -> S + Send + 'static,
     ) {
         let (sender, receiver) = std::sync::mpsc::channel();
         let cancel = Cancel::new();
         let (ctx, request) = (ctx.clone(), cancel.clone());
         std::thread::spawn(move || {
-            let found = request.scope(work);
+            let found: Sought = request.scope(work).into();
             // The window may have closed meanwhile, or the search been
             // called off; nothing to do then.
             let _ = sender.send(found);
@@ -1419,12 +1438,24 @@ impl App {
         if search.generation != self.photo_generation || self.photo.is_none() {
             return;
         }
-        self.finish_search(found, search.photo_inverted, search.family);
+        self.leads = found.leads;
+        self.finish_search(found.found, search.photo_inverted, search.family);
     }
 
     /// Offer what a search of the whole photo found. `family` is the one
     /// family it looked for, when it did not look for every one.
     fn finish_search(&mut self, found: Vec<Detection>, photo_inverted: bool, family: Option<Family>) {
+        if found.is_empty() && !self.leads.is_empty() {
+            // Nothing fitted, and finders to say so of: listed, with no
+            // symbols above them.
+            self.proposals = None;
+            self.view.stage = Stage::Align;
+            let places = if self.leads.len() == 1 { "1 place".to_owned() } else { format!("{} places", self.leads.len()) };
+            self.fail(format!(
+                "No symbol was found in the photo, but finder patterns that stand as a symbol's were, in {places}, and                  no symbol could be fitted to them. They are listed under Alignment: pick one to put the outline                  about it, set the outline right by hand if it is not, and press Find in outline."
+            ));
+            return;
+        }
         if found.is_empty() {
             self.proposals = None;
             self.fail(match family {
@@ -1453,7 +1484,13 @@ impl App {
         let what = if count == 1 { "Found 1 symbol".to_owned() } else { format!("Found {count} symbols") };
         let how = "outlined on the photo. Pick one under Alignment, or click its outline, to place the corners on it; \
                    or press Read all to read every one through to its message.";
-        self.notify(format!("{what}, {how}"));
+        let beside = match self.leads.len() {
+            0 => String::new(),
+            1 => " Finder patterns in 1 other place stand as a symbol's with none fitted to them, and are listed below the symbols."
+                .to_owned(),
+            n => format!(" Finder patterns in {n} other places stand as a symbol's with none fitted to them, and are listed below the symbols."),
+        };
+        self.notify(format!("{what}, {how}{beside}"));
     }
 
     /// Read every symbol the search found through to its message, each
@@ -1797,6 +1834,7 @@ impl App {
                 self.guesses = None;
                 self.detection = None;
                 self.proposals = None;
+                self.leads.clear();
                 self.search = None;
                 self.job = None;
                 self.photo_generation += 1;
@@ -2043,7 +2081,27 @@ impl App {
                 }
                 self.adopt_proposal(ctx, found, photo_inverted);
             }
-            Action::ClearProposals => self.proposals = None,
+            Action::UseLead(i) => {
+                let Some(lead) = self.leads.get(i).cloned() else {
+                    self.fail("Those finder patterns are no longer in the list; press Search whole photo again.");
+                    return;
+                };
+                self.checkpoint();
+                self.doc.corners = lead.outline;
+                self.doc.anchors.clear();
+                self.detection = None;
+                self.view.stage = Stage::Align;
+                self.notify(format!(
+                    "The outline is about {} finder patterns the search took for a {} symbol's and could fit none to. Set it \
+                     right by hand if it is not, and press Find in outline.",
+                    lead.finders.len(),
+                    lead.family.label()
+                ));
+            }
+            Action::ClearProposals => {
+                self.proposals = None;
+                self.leads.clear();
+            }
             Action::CancelSearch => {
                 // Dropping the search calls it off: its thread stops at
                 // the next turn of its loop.
@@ -2861,19 +2919,38 @@ const CREDIBLE_SCORE: f64 = 0.75;
 /// inside a larger, credible one is dropped as a part of it; and two
 /// detections of about the same size and place are the same symbol,
 /// listed once under the better claim.
-pub(crate) fn find_symbols_of_every_family(luma: &Luma, params: &SampleParams, search: &SearchParams) -> Vec<Detection> {
-    listed(luma, find_symbols_of_families(luma, &Family::SEARCHED, params, search, &credible), params)
+///
+/// Beside what it lists come the finder patterns the search could fit no
+/// symbol to ([`Lead`]).
+pub(crate) fn search_for_every_family(luma: &Luma, params: &SampleParams, search: &SearchParams) -> Sought {
+    let sought = search_for_families(luma, &Family::SEARCHED, params, search, &credible);
+    Sought { found: listed(luma, sought.detections, params), leads: sought.leads }
+}
+
+/// What a search of the whole photo has to offer: the symbols it found,
+/// listed, and the finder patterns it could fit no symbol to
+/// ([`Lead`]).
+pub(crate) struct Sought {
+    pub found: Vec<Detection>,
+    pub leads: Vec<Lead>,
+}
+
+impl From<Vec<Detection>> for Sought {
+    fn from(found: Vec<Detection>) -> Self {
+        Self { found, leads: Vec::new() }
+    }
 }
 
 /// What a search of the whole photo finds of one family alone, listed as
-/// [`find_symbols_of_every_family`] lists what it finds. The families
+/// [`search_for_every_family`] lists what it finds. The families
 /// with one finder pattern are searched from every finder the photo
 /// shows, a QR Code's among them: it is for the user who knows which
 /// family the symbol is of, and above all for a damaged QR Code, whose
 /// leftover finders the search of every family spends most of its time
 /// taking for Micro QR and rMQR symbols.
-pub(crate) fn find_symbols_of_family(luma: &Luma, family: Family, params: &SampleParams, search: &SearchParams) -> Vec<Detection> {
-    listed(luma, find_symbols_with(luma, family, params, search), params)
+pub(crate) fn search_for_family(luma: &Luma, family: Family, params: &SampleParams, search: &SearchParams) -> Sought {
+    let sought = search_for_families(luma, &[family], params, search, &|_| true);
+    Sought { found: listed(luma, sought.detections, params), leads: sought.leads }
 }
 
 /// Detections as a search lists them: the decode asked of each as found,
@@ -2943,7 +3020,7 @@ fn texture_size(width: usize, height: usize, limit: usize) -> (usize, usize) {
 /// The detections of every family as one list, what decodes first and
 /// then the best fit: parts of a larger, credible detection dropped, and
 /// two detections of one symbol listed once, as
-/// [`find_symbols_of_every_family`] describes.
+/// [`search_for_every_family`] describes.
 fn merge_detections(mut all: Vec<Detection>) -> Vec<Detection> {
     let quality =
         |found: &Detection| (found.decodes == Some(true), found.score(), found.info.named_version == Some(found.version));
@@ -3074,19 +3151,19 @@ mod tests {
         // Micro QR or rMQR symbol when those families are searched: they
         // are the QR Code's, and nothing is made of them, neither inside
         // it nor hung off its corners over the quiet zone.
-        let found = find_symbols_of_every_family(&load("zxing_qrcode-3_01.png"), &params, &SearchParams::default());
+        let found = search_for_every_family(&load("zxing_qrcode-3_01.png"), &params, &SearchParams::default()).found;
         let first = found.first().expect("the QR Code is found");
         assert_eq!(first.version.family(), Family::Qr, "{:?}", found.iter().map(|f| f.version).collect::<Vec<_>>());
         assert!(first.score() > 0.95);
         assert_eq!(first.decodes, Some(true));
         assert_eq!(found.len(), 1, "{:?}", found.iter().map(|f| (f.version, f.score())).collect::<Vec<_>>());
         // A Micro QR, with QR Code selected as it would be by default.
-        let found = find_symbols_of_every_family(&load("cpp_micro_1.png"), &params, &SearchParams::default());
+        let found = search_for_every_family(&load("cpp_micro_1.png"), &params, &SearchParams::default()).found;
         let first = found.first().expect("the Micro QR is found");
         assert_eq!(first.version, SymbolVersion::Micro(3));
         assert!(!first.inverted);
         // A light-on-dark rMQR: found, and known to be inverted.
-        let found = find_symbols_of_every_family(&load("cpp_rmqr_R7x43-H_inverted.png"), &params, &SearchParams::default());
+        let found = search_for_every_family(&load("cpp_rmqr_R7x43-H_inverted.png"), &params, &SearchParams::default()).found;
         let first = found.first().expect("the rMQR is found");
         assert_eq!(first.version.family(), Family::Rmqr);
         assert!(first.inverted);
@@ -3095,7 +3172,7 @@ mod tests {
     #[test]
     fn detections_of_one_symbol_are_listed_once() {
         let params = SampleParams::default();
-        let found = find_symbols_of_every_family(&load("cpp_micro_1.png"), &params, &SearchParams::default());
+        let found = search_for_every_family(&load("cpp_micro_1.png"), &params, &SearchParams::default()).found;
         for (i, a) in found.iter().enumerate() {
             for b in &found[i + 1..] {
                 assert!(!same_symbol(a, b), "{} and {} outline the same symbol", a.version, b.version);
@@ -4340,7 +4417,7 @@ mod tests {
         let notice = bench.notice();
         assert!(notice.is_error, "{}", notice.text);
         assert!(notice.text.starts_with("Refining the corners and anchors stopped on an internal error"), "{}", notice.text);
-        bench.app.start_search(&ctx, false, None, die);
+        bench.app.start_search(&ctx, false, None, die::<Vec<Detection>>);
         bench.settle();
         let notice = bench.notice();
         assert!(notice.is_error, "{}", notice.text);
@@ -4479,6 +4556,27 @@ mod tests {
         let notice = bench.notice();
         assert!(notice.is_error && notice.text.starts_with("No Micro QR symbol was found"), "{}", notice.text);
         assert!(notice.text.contains("untick Only look for Micro QR"), "{}", notice.text);
+        // Finding none, and finder patterns no symbol could be fitted
+        // to, says so and lists them; picking one puts the outline about
+        // it, to be undone like any move of the corners.
+        let outline = [[30.0, 40.0], [130.0, 42.0], [128.0, 141.0], [29.0, 139.0]];
+        bench.app.leads = vec![Lead { family: Family::Qr, outline, finders: vec![[50.0, 60.0], [110.0, 61.0]] }];
+        bench.app.finish_search(Vec::new(), false, None);
+        let notice = bench.notice();
+        assert!(notice.is_error && notice.text.starts_with("No symbol was found in the photo, but finder patterns"), "{}", notice.text);
+        bench.step();
+        assert!(bench.texts().iter().any(|text| text == "Finder patterns with no symbol fitted (1):"), "{:?}", bench.texts());
+        let before = bench.app.doc.corners;
+        assert_ne!(before, outline);
+        bench.act(Action::UseLead(0));
+        assert_eq!(bench.app.doc.corners, outline);
+        assert!(bench.notice().text.starts_with("The outline is about 2 finder patterns"), "{}", bench.notice().text);
+        bench.act(Action::Undo);
+        assert_eq!(bench.app.doc.corners, before);
+        bench.act(Action::UseLead(3));
+        assert!(bench.notice().is_error, "{}", bench.notice().text);
+        bench.act(Action::ClearProposals);
+        assert!(bench.app.leads.is_empty());
         // The render's QR Code, looked for as that and nothing else.
         bench.act(Action::SetVersion(SymbolVersion::Qr(2)));
         bench.act(Action::FindSymbols);

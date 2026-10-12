@@ -48,7 +48,13 @@
 //! `--partial` prints the symbols that did not decode beside those that
 //! did, where they are otherwise printed only when none did: BoofCV
 //! returns its failures beside its detections for the same reason, that
-//! a damaged symbol among sound ones is still a symbol.
+//! a damaged symbol among sound ones is still a symbol. With them go the
+//! finder patterns a search of the whole photo found standing as one
+//! symbol's, its format word reading outright beside them, and could fit
+//! no symbol to, a line for each set: the family they were taken for,
+//! how many, `no symbol fitted`, and the outline the search proposed
+//! about them, which `--outline` takes as it is. A read through an
+//! outline tries more than a search of the whole photo does.
 //!
 //! `--surface` reads every symbol first against one threshold that lies
 //! as a smooth surface across it, the window's Threshold surface, where
@@ -143,7 +149,7 @@ use qr_forensics::decode::pipeline::DecodeOptions;
 use qr_forensics::decode::sequence::{ParityCheck, Part, Sequence};
 use qr_forensics::decode::text::Charset;
 use qr_forensics::imaging::Luma;
-use qr_forensics::imaging::detect::{SearchParams, find_symbols_with};
+use qr_forensics::imaging::detect::{Lead, SearchParams, search_for_families};
 use qr_forensics::imaging::enhance::{Enhance, Sharpen};
 use qr_forensics::imaging::photo;
 use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline};
@@ -409,6 +415,15 @@ fn describe(path: &Path, result: &ReadResult, options: &Options) -> String {
     format!("{line}: {message}")
 }
 
+/// A line for finder patterns the search could fit no symbol to: the
+/// family they were taken for, how many there are, and the outline the
+/// search proposed about them, always, since where they lie is all there
+/// is to say of them, in the form `--outline` takes it back.
+fn describe_lead(path: &Path, lead: &Lead) -> String {
+    let at: Vec<String> = lead.outline.iter().flat_map(|c| [c[0], c[1]]).map(|v| format!("{v:.1}")).collect();
+    format!("{}: {}: {} finder patterns, no symbol fitted: at {}", path.display(), lead.family.label(), lead.finders.len(), at.join(","))
+}
+
 /// The messages the parts make up, one sequence for each count and
 /// parity the parts' headers claim, as ZBar groups them: parts of two
 /// messages photographed together are not parts of one.
@@ -495,6 +510,9 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
                 continue;
             }
         };
+        // The finder patterns a search fitted no symbol to: an outline
+        // given is read, and nothing is searched for.
+        let mut leads: Vec<Lead> = Vec::new();
         let results: Vec<ReadResult> = match options.outline {
             // A family named is the one family the outline is read as;
             // with none named it is read as Find in outline reads one, as a
@@ -508,8 +526,16 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
             },
             None => {
                 let found = match options.family {
-                    Some(family) => find_symbols_with(&luma, family, &params, &options.search),
-                    None => crate::app::find_symbols_of_every_family(&luma, &params, &options.search),
+                    Some(family) => {
+                        let sought = search_for_families(&luma, &[family], &params, &options.search, &|_| true);
+                        leads = sought.leads;
+                        sought.detections
+                    }
+                    None => {
+                        let sought = crate::app::search_for_every_family(&luma, &params, &options.search);
+                        leads = sought.leads;
+                        sought.found
+                    }
                 };
                 found.into_iter().filter_map(|detection| read_detection(&luma, detection, &params, &opts)).collect()
             }
@@ -518,6 +544,11 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
             status = status.max(1);
             if writeln!(out, "{}: no symbol found", path.display()).is_err() {
                 return status;
+            }
+            for lead in &leads {
+                if writeln!(out, "{}", describe_lead(path, lead)).is_err() {
+                    return status;
+                }
             }
             continue;
         }
@@ -535,6 +566,13 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
                         return status;
                     }
                 }
+            }
+        }
+        // What the search found the finders of and fitted no symbol to
+        // goes with the symbols that did not decode.
+        for lead in leads.iter().filter(|_| !any_read || options.partial) {
+            if writeln!(out, "{}", describe_lead(path, lead)).is_err() {
+                return status;
             }
         }
         // The parts of a message spread over several symbols, joined: of

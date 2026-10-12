@@ -204,7 +204,7 @@ fn align_stage(
     painter: &egui::Painter,
     actions: &mut Vec<Action>,
 ) {
-    let App { photo, view, derived, preview, doc, history, model, proposals, job, .. } = app;
+    let App { photo, view, derived, preview, doc, history, model, proposals, leads, job, .. } = app;
     let photo = photo.as_mut().expect("align stage needs a photo");
     // Holding H shows the photo and nothing over it, as in the Edit
     // stage: no grid, no handles, no symbols found, and the photo itself
@@ -442,6 +442,20 @@ fn align_stage(
         }
     }
 
+    // Finder patterns the search could fit no symbol to: the outline it
+    // proposed about them, thinner than a symbol's and numbered with a
+    // question mark, as the list under Alignment numbers them.
+    if !peek {
+        for (i, lead) in leads.iter().enumerate() {
+            let points: Vec<Pos2> = lead.outline.iter().map(|&c| to_screen(c)).collect();
+            let middle = pos2(points.iter().map(|p| p.x).sum::<f32>() / 4.0, points.iter().map(|p| p.y).sum::<f32>() / 4.0);
+            painter.add(Shape::closed_line(points, Line::new(1.0, PROPOSAL)));
+            let text = format!("{}?", i + 1);
+            let font = egui::FontId::proportional(14.0);
+            painter.text(middle + vec2(1.0, 1.0), egui::Align2::CENTER_CENTER, &text, font.clone(), Color32::BLACK);
+            painter.text(middle, egui::Align2::CENTER_CENTER, &text, font, PROPOSAL);
+        }
+    }
     // Symbols a search of the whole photo found: outlined and numbered as
     // the list under Alignment numbers them, but for the one the outline
     // has been put on, which the grid's own outline shows.
