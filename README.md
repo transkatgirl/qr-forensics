@@ -158,6 +158,11 @@ its unknown codewords, plus twice its wrong ones, fit inside its
 error-correction count, so a wrong guess costs twice what an honest blank
 does.
 
+When you can half tell, tick **Paint as a guess**. Dark and light then go in
+at the lowest reliability, like a module sampled right on its threshold, and
+the decoder may doubt them when a block fails (see **Decoding**, below).
+Paint over a module again with the box unticked to make it certain.
+
 **Lock fixed patterns** keeps finder, timing and alignment patterns at the
 colours the standard gives them. If the grid was painted inverted, mirrored
 or turned, the Paint section says so and offers the fix as a button; the
@@ -170,7 +175,7 @@ Overlays colour the grid by what the decoder knows:
 | Module roles | Finder, timing, alignment, format and version modules, each in its own colour |
 | RS blocks | Which Reed-Solomon block each module belongs to, with unsolved blocks marked red |
 | Corrections | Each module as error correction has it: green rim where it was unknown, red where it was painted otherwise |
-| Reliability | Red where a module was sampled close to its threshold |
+| Reliability | Red where a module was sampled close to its threshold, or painted as a guess |
 | Mask pattern | Where the mask in effect swaps dark and light |
 | Unmasked data | The data bits themselves, with the mask taken off |
 | Codeword status | Green: corrected or filled in. Amber: read but unconfirmed. Red: unknown. Violet rim: doubted to solve the block |
@@ -218,7 +223,8 @@ short of solving.
 The **Decoding** section on the left sets what is tried on a block that
 fails: solving unknown bits one by one, and doubting the least reliable
 sampled modules as whole codewords, as single bits, or by flipping the
-faintest. Modules painted by hand are never doubted.
+faintest. Modules painted by hand are never doubted, unless they were
+painted as a guess.
 
 ### 8. Take the result out
 

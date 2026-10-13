@@ -912,6 +912,12 @@ fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         });
     });
     ui.weak("Left button paints the ink; right button paints the other of dark and light; Shift paints unknown.");
+    ui.checkbox(&mut app.view.paint_as_guess, "Paint as a guess").on_hover_text(
+        "Dark and light are painted as guesses: no surer than a module sampled right on its threshold, so that Doubt \
+         the least reliable modules, under Decoding, may take them as unknown or flip them when a block fails. \
+         Unticked, a module painted is certain and never doubted. Paint over a module again, in the colour it has, \
+         to change which it is. From photo and Unknown are painted as they always are.",
+    );
     ui.checkbox(&mut app.view.lock_fixed, "Lock fixed patterns")
         .on_hover_text("Finders, timing and alignment patterns keep the colours the standard gives them");
     ui.horizontal(|ui| {
@@ -990,9 +996,10 @@ fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     );
     ui.checkbox(&mut opts.reliability, "Doubt the least reliable modules").on_hover_text(
         "When a block fails, treat its codewords with the faintest sampled modules as unknown, a few at a \
-         time, until it solves with something to spare. Modules painted by hand are never doubted. The three \
-         ways of doubting below are each tried, and the solution with the most to confirm it kept; Blocks says \
-         which solved a block, and its Show outlines the modules that were doubted.",
+         time, until it solves with something to spare. Modules painted by hand are never doubted, but for \
+         those painted as a guess, which are among the first doubted. The three ways of doubting below are \
+         each tried, and the solution with the most to confirm it kept; Blocks says which solved a block, and \
+         its Show outlines the modules that were doubted.",
     );
     ui.indent("doubting", |ui| {
         ui.add_enabled_ui(opts.reliability, |ui| {
@@ -1017,6 +1024,6 @@ fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         actions.push(Action::SetDecodeOptions(opts));
     }
     if opts.reliability && !app.doc.grid.has_reliability() {
-        ui.weak("Takes effect once modules are sampled from a photo.");
+        ui.weak("Takes effect once modules are sampled from a photo, or painted as a guess.");
     }
 }

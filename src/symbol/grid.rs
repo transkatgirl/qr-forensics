@@ -32,7 +32,8 @@ impl Module {
 }
 
 /// Reliability of a module that was painted by hand, filled from the
-/// standard, or settled by error correction. Sampled modules score below it.
+/// standard, or settled by error correction. Sampled modules score below
+/// it, and so do those painted as a guess.
 pub const CERTAIN: u8 = 255;
 
 /// A reflection of the grid: what a symbol looks like seen from the back.
@@ -156,7 +157,8 @@ pub struct ModuleGrid {
     cells: Vec<Module>,
     /// How sure each module's colour is: [`CERTAIN`] unless it was sampled
     /// from a photo, in which case its distance from the threshold on a
-    /// scale of 0..=254. `None` until something is sampled.
+    /// scale of 0..=254, or painted as a guess, which is 0. `None` until
+    /// something is sampled or guessed.
     reliability: Option<Vec<u8>>,
 }
 
@@ -203,13 +205,21 @@ impl ModuleGrid {
             reliability.min(CERTAIN - 1);
     }
 
-    /// How sure the module's colour is; [`CERTAIN`] unless it was sampled.
+    /// Set a module painted as a guess: no surer than one sampled on its
+    /// threshold, and so among the first to be doubted.
+    pub fn set_guessed(&mut self, x: usize, y: usize, module: Module) {
+        self.set_sampled(x, y, module, 0);
+    }
+
+    /// How sure the module's colour is; [`CERTAIN`] unless it was sampled
+    /// or guessed.
     #[inline]
     pub fn reliability(&self, x: usize, y: usize) -> u8 {
         self.reliability.as_ref().map_or(CERTAIN, |r| r[y * self.width + x])
     }
 
-    /// True once any module has been sampled rather than painted.
+    /// True once any module has been sampled, or painted as a guess,
+    /// rather than painted as certain.
     pub fn has_reliability(&self) -> bool {
         self.reliability.is_some()
     }
@@ -443,6 +453,12 @@ mod tests {
         assert_eq!(grid.reliability(1, 1), CERTAIN);
         // Painting over a sampled module makes it certain again.
         grid.set(2, 1, Module::Light);
+        assert_eq!(grid.reliability(2, 1), CERTAIN);
+        // A guess is as unsure as a module can be, until it is painted
+        // over as certain.
+        grid.set_guessed(2, 1, Module::Dark);
+        assert_eq!((grid.get(2, 1), grid.reliability(2, 1)), (Module::Dark, 0));
+        grid.set(2, 1, Module::Dark);
         assert_eq!(grid.reliability(2, 1), CERTAIN);
         grid.set_sampled(2, 1, Module::Dark, 40);
         assert_eq!(grid.rotated_cw().reliability(0, 2), 40);

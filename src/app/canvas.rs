@@ -120,7 +120,7 @@ fn toolbar(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                 });
                 if app.view.overlay == Overlay::Reliability {
                     ui.weak(format!(
-                        "Red: sampled close to the threshold, fading out by a margin of {:.2}; painted modules untinted",
+                        "Red: painted as a guess, or sampled close to the threshold, fading out by a margin of {:.2}; other painted modules untinted",
                         RELIABILITY_FADE as f32 / (CERTAIN - 1) as f32
                     ));
                 } else if app.view.overlay == Overlay::Photo && app.preview.is_none() {
@@ -982,8 +982,9 @@ fn edit_stage(ui: &mut egui::Ui, app: &mut App, response: &egui::Response, paint
         Overlay::None => {}
         Overlay::Reliability => {
             // Red where a sampled module sat near its threshold, fading
-            // with the margin; painted modules are certain and unknown
-            // ones are shown as they are.
+            // with the margin, and where a module was painted as a guess,
+            // which has no margin at all; other painted modules are
+            // certain and unknown ones are shown as they are.
             if grid.has_reliability() {
                 let mut mesh = egui::Mesh::default();
                 for y in y_range.clone() {
@@ -1359,7 +1360,11 @@ pub(super) fn describe_module(derived: &Derived, doc: &Document, x: usize, y: us
     let mut text = format!("({x}, {y})  {}  ·  {painted}", role.label());
     let reliability = doc.grid.reliability(x, y);
     if reliability < CERTAIN && doc.grid.get(x, y) != Module::Unknown {
-        text.push_str(&format!("  ·  sampled, margin {:.2}", reliability as f32 / (CERTAIN - 1) as f32));
+        match reliability {
+            // Nothing tells a guess from a module read right on its threshold.
+            0 => text.push_str("  ·  a guess, or sampled on its threshold"),
+            _ => text.push_str(&format!("  ·  sampled, margin {:.2}", reliability as f32 / (CERTAIN - 1) as f32)),
+        }
     }
     match role {
         Role::Format { copy, bit } => text.push_str(&format!("  ·  copy {} bit {bit}", copy + 1)),

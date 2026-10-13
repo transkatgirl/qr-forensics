@@ -831,6 +831,10 @@ pub struct ViewState {
     pub grid_lines: bool,
     /// Keep fixed patterns at their specified colours.
     pub lock_fixed: bool,
+    /// Paint dark and light as guesses, at a reliability of 0, to be
+    /// doubted as a module sampled on its threshold is, where a module
+    /// painted otherwise is certain.
+    pub paint_as_guess: bool,
     pub align_view: PanZoom,
     pub edit_view: PanZoom,
     pub selected: Option<CwId>,
@@ -956,6 +960,7 @@ impl Default for ViewState {
             grid_opacity: 0.6,
             grid_lines: true,
             lock_fixed: true,
+            paint_as_guess: false,
             align_view: PanZoom::default(),
             edit_view: PanZoom::default(),
             selected: None,

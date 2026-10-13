@@ -598,7 +598,11 @@ impl App {
     /// the reliability it reads it at and with no unsure band, whatever
     /// Sampling has for one: the colour the module falls on, however
     /// near its threshold. Nothing is read where there is no sample of
-    /// the photo to go by.
+    /// the photo to go by. A colour is certain, or a guess while Paint as
+    /// a guess holds, and a module of that colour already is painted all
+    /// the same: how sure it is goes with the paint, so that a guess is
+    /// made certain, or a module sampled or certain made a guess, by
+    /// painting over it.
     fn paint(&mut self, x: i32, y: i32, ink: Ink) {
         let func = &self.derived.func;
         if x < 0 || y < 0 || x as usize >= func.width || y as usize >= func.height {
@@ -611,8 +615,8 @@ impl App {
         let grid = &mut self.doc.grid;
         let before = (grid.get(x, y), grid.reliability(x, y));
         match ink {
-            Ink::Module(module) if module != before.0 => grid.set(x, y, module),
-            Ink::Module(_) => {}
+            Ink::Module(module) if self.view.paint_as_guess && module != Module::Unknown => grid.set_guessed(x, y, module),
+            Ink::Module(module) => grid.set(x, y, module),
             Ink::Photo => {
                 let sampled = self.preview.as_ref().map(|preview| &preview.classified);
                 let Some(sampled) = sampled.filter(|sampled| sampled.modules.len() == func.width * func.height) else { return };
@@ -6453,5 +6457,71 @@ mod tests {
         assert!(!bench.app.opts.reliability && !bench.app.opts.flip_bits && bench.app.opts.doubt_bits);
         bench.click(bench.text_at("Single bits"), egui::PointerButton::Primary);
         assert!(bench.app.opts.doubt_bits, "a switch that is greyed out takes no click");
+    }
+
+    #[test]
+    fn a_module_painted_as_a_guess_is_doubted_and_one_painted_certain_is_not() {
+        let mut bench = Bench::new();
+        bench.size = egui::vec2(1440.0, 3000.0);
+        bench.act(Action::ClosePhoto);
+        let text = "https://example.com/q?id=7Q2M-XK4P-99AD";
+        let clean = symbol_of(text);
+        bench.hold(clean.clone());
+        let layout = bench.app.derived.layout.clone();
+        // Eight codewords wrong, one more than the block corrects, each
+        // by a module painted as certain: nothing is there to doubt.
+        bench.hold(with_wrong(&clean, &layout, 2..=9));
+        assert_eq!(bench.app.derived.report.blocks_solved(), 0);
+        assert!(!bench.app.doc.grid.has_reliability());
+        bench.app.view.stage = Stage::Edit;
+        bench.step();
+        let texts = bench.texts();
+        assert!(texts.iter().any(|text| text == "Takes effect once modules are sampled from a photo, or painted as a guess."), "{texts:?}");
+        let wrong: Vec<(usize, usize)> = (2..=9)
+            .map(|i| layout.codeword_modules(layout.data_stream[i])[3])
+            .map(|module| (module.x as usize, module.y as usize))
+            .collect();
+        // Each painted over in the colour it has, the wrong one still,
+        // with either button.
+        let repaint = |bench: &mut Bench| {
+            let cell = bench.cells();
+            for (n, &(x, y)) in wrong.iter().enumerate() {
+                let module = bench.app.doc.grid.get(x, y);
+                let (ink, button) = if n % 2 == 0 {
+                    (module, egui::PointerButton::Primary)
+                } else {
+                    (module.inverted(), egui::PointerButton::Secondary)
+                };
+                bench.app.view.ink = Ink::Module(ink);
+                bench.click(cell(x, y), button);
+                assert_eq!(bench.app.doc.grid.get(x, y), module, "({x}, {y})");
+            }
+            bench.step();
+        };
+        // As guesses, they are the first modules doubted, and as unknown
+        // the eight codewords are well within what the block takes.
+        bench.click(bench.text_at("Paint as a guess"), egui::PointerButton::Primary);
+        assert!(bench.app.view.paint_as_guess);
+        repaint(&mut bench);
+        assert!(wrong.iter().all(|&(x, y)| bench.app.doc.grid.reliability(x, y) == 0));
+        assert!(bench.app.derived.report.is_trustworthy());
+        assert_eq!(bench.app.derived.report.text.plain(), text);
+        let texts = bench.texts();
+        assert!(!texts.iter().any(|text| text.starts_with("Takes effect once")), "{texts:?}");
+        // Unknown is no guess: it has nothing to be unsure of.
+        let (x, y) = wrong[0];
+        let cell = bench.cells();
+        bench.app.view.ink = Ink::Module(Module::Unknown);
+        bench.click(cell(x, y), egui::PointerButton::Primary);
+        assert_eq!((bench.app.doc.grid.get(x, y), bench.app.doc.grid.reliability(x, y)), (Module::Unknown, CERTAIN));
+        bench.act(Action::Undo);
+        assert_eq!(bench.app.doc.grid.reliability(x, y), 0, "one undo takes the stroke back, and the guess is a guess again");
+        // Painted over once more with the box unticked they are certain,
+        // and the block is as far from solving as it was.
+        bench.click(bench.text_at("Paint as a guess"), egui::PointerButton::Primary);
+        assert!(!bench.app.view.paint_as_guess);
+        repaint(&mut bench);
+        assert!(wrong.iter().all(|&(x, y)| bench.app.doc.grid.reliability(x, y) == CERTAIN));
+        assert_eq!(bench.app.derived.report.blocks_solved(), 0);
     }
 }
