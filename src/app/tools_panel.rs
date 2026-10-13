@@ -906,7 +906,8 @@ fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                     "4 — each module as sampling reads it off the photo, as Sample all reads the whole grid, but with no \
                      unsure band: a module near its threshold is painted the colour it falls on, at the reliability it \
                      read at, where Sample all would leave it unknown. Brush over a part of the grid, or drag a \
-                     rectangle about it, to sample that part alone",
+                     rectangle about it, to sample that part alone. With Paint as a guess ticked, each goes in at the \
+                     lowest reliability instead",
                 )
                 .on_disabled_hover_text("Load a photo and place the corners to paint modules from it");
         });
@@ -916,7 +917,8 @@ fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         "Dark and light are painted as guesses: no surer than a module sampled right on its threshold, so that Doubt \
          the least reliable modules, under Decoding, may take them as unknown or flip them when a block fails. \
          Unticked, a module painted is certain and never doubted. Paint over a module again, in the colour it has, \
-         to change which it is. From photo and Unknown are painted as they always are.",
+         to change which it is. From photo paints a guess as well, the colour the module falls on at the lowest \
+         reliability in place of the one it read at. Unknown is painted as it always is.",
     );
     ui.checkbox(&mut app.view.lock_fixed, "Lock fixed patterns")
         .on_hover_text("Finders, timing and alignment patterns keep the colours the standard gives them");

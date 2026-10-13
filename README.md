@@ -158,10 +158,11 @@ its unknown codewords, plus twice its wrong ones, fit inside its
 error-correction count, so a wrong guess costs twice what an honest blank
 does.
 
-When you can half tell, tick **Paint as a guess**. Dark and light then go in
-at the lowest reliability, like a module sampled right on its threshold, and
-the decoder may doubt them when a block fails (see **Decoding**, below).
-Paint over a module again with the box unticked to make it certain.
+When you can half tell, tick **Paint as a guess**. Dark, light and From photo
+then go in at the lowest reliability, like a module sampled right on its
+threshold, and the decoder may doubt them when a block fails (see
+**Decoding**, below). Paint over a module again in dark or light with the
+box unticked to make it certain.
 
 **Lock fixed patterns** keeps finder, timing and alignment patterns at the
 colours the standard gives them. If the grid was painted inverted, mirrored

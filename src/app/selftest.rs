@@ -36,7 +36,8 @@
 //!                             are sampled
 //! tool brush|rect|inspect
 //! ink dark|light|unknown|photo
-//! guess on|off                paint dark and light as guesses
+//! guess on|off                paint dark, light and the From photo ink as
+//!                             guesses
 //! enlarge <n>                 the photo's Enlarge: n times its own size,
 //!                             0.25, 0.5 or a whole number, as far as its
 //!                             size allows; the outline goes with it

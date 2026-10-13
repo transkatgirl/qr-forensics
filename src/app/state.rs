@@ -833,7 +833,8 @@ pub struct ViewState {
     pub lock_fixed: bool,
     /// Paint dark and light as guesses, at a reliability of 0, to be
     /// doubted as a module sampled on its threshold is, where a module
-    /// painted otherwise is certain.
+    /// painted otherwise is certain. What the From photo ink reads goes
+    /// in at 0 as well, in place of the reliability it read at.
     pub paint_as_guess: bool,
     pub align_view: PanZoom,
     pub edit_view: PanZoom,

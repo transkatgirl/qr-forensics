@@ -602,9 +602,10 @@ impl App {
     /// a guess holds, and a module of that colour already is painted all
     /// the same: how sure it is goes with the paint, so that a guess is
     /// made certain, or a module sampled or certain made a guess, by
-    /// painting over it. Unknown is neither, and on a module unknown
-    /// already it paints nothing: there is no colour there to be sure of,
-    /// and the press is no edit.
+    /// painting over it. What is read off the photo is a guess too while
+    /// Paint as a guess holds, whatever reliability it read at. Unknown
+    /// is neither, and on a module unknown already it paints nothing:
+    /// there is no colour there to be sure of, and the press is no edit.
     fn paint(&mut self, x: i32, y: i32, ink: Ink) {
         let func = &self.derived.func;
         if x < 0 || y < 0 || x as usize >= func.width || y as usize >= func.height {
@@ -624,7 +625,11 @@ impl App {
                 let sampled = self.preview.as_ref().map(|preview| &preview.classified);
                 let Some(sampled) = sampled.filter(|sampled| sampled.modules.len() == func.width * func.height) else { return };
                 let i = y * func.width + x;
-                grid.set_sampled(x, y, sampled.decided[i], sampled.reliability[i]);
+                if self.view.paint_as_guess {
+                    grid.set_guessed(x, y, sampled.decided[i]);
+                } else {
+                    grid.set_sampled(x, y, sampled.decided[i], sampled.reliability[i]);
+                }
             }
         }
         self.dirty |= before != (grid.get(x, y), grid.reliability(x, y));
@@ -6144,6 +6149,34 @@ mod tests {
         // Sample all keeps the band, and leaves them unknown.
         bench.act(Action::Sample { only_unknown: false, scope: SampleScope::All });
         assert_eq!(bench.app.doc.grid.get(10, 10), Module::Unknown);
+    }
+
+    #[test]
+    fn the_photos_ink_paints_a_guess_while_paint_as_a_guess_holds() {
+        let mut bench = Bench::new();
+        bench.app.doc.corners = STRAIGHT;
+        bench.app.update_preview();
+        let truth = painted_grid();
+        let read: Vec<u8> = {
+            let sampled = &bench.app.preview.as_ref().expect("a sample to go by").classified;
+            [(10, 10), (11, 10), (12, 11)].iter().map(|&(x, y): &(usize, usize)| sampled.reliability[y * truth.width() + x]).collect()
+        };
+        assert!(read.iter().all(|&reliability| reliability > 0), "{read:?}: a clean photo reads well clear of its threshold");
+        // As a guess, each module is the colour it falls on still, and no
+        // surer than one read right on its threshold.
+        bench.app.view.paint_as_guess = true;
+        for (x, y) in [(10, 10), (11, 10), (12, 11)] {
+            bench.app.paint(x, y, Ink::Photo);
+            assert_eq!(bench.app.doc.grid.get(x as usize, y as usize), truth.get(x as usize, y as usize), "({x}, {y})");
+            assert_eq!(bench.app.doc.grid.reliability(x as usize, y as usize), 0, "({x}, {y})");
+        }
+        // Painted over with the box unticked, each has the reliability it
+        // read at again.
+        bench.app.view.paint_as_guess = false;
+        for (&(x, y), &reliability) in [(10, 10), (11, 10), (12, 11)].iter().zip(&read) {
+            bench.app.paint(x, y, Ink::Photo);
+            assert_eq!(bench.app.doc.grid.reliability(x as usize, y as usize), reliability.min(CERTAIN - 1), "({x}, {y})");
+        }
     }
 
     #[test]
