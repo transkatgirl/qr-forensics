@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use eframe::egui;
 use qr_forensics::decode::codewords::Pins;
-use qr_forensics::decode::padding::PadCandidate;
-use qr_forensics::decode::pipeline::{DecodeReport, GridAnalysis};
+use qr_forensics::decode::padding::{Filler, PadCandidate};
+use qr_forensics::decode::pipeline::{DecodeReport, GridAnalysis, Orientation};
 use qr_forensics::decode::sequence::Sequence;
 use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::adjust::{Adjust, Enlarge};
@@ -14,7 +14,7 @@ use qr_forensics::imaging::detect::{Anchor, AnchorKind, Detection};
 use qr_forensics::imaging::projection::{ControlPoint, Projection};
 use qr_forensics::imaging::detect::SearchParams;
 use qr_forensics::imaging::read::ReadResult;
-use qr_forensics::imaging::sample::{Classified, SampleParams};
+use qr_forensics::imaging::sample::{Classified, SampleParams, Sharpening};
 use qr_forensics::symbol::function_map::FunctionMap;
 use qr_forensics::symbol::grid::{Mirror, Module, ModuleGrid};
 use qr_forensics::symbol::layout::{CwId, SymbolLayout};
@@ -74,7 +74,9 @@ pub struct Proposals {
     /// where a click meant for the grid would put the outline back as
     /// found, over whatever was placed by hand since.
     pub adopted: Option<usize>,
-    /// What Read all made of them, once it has run.
+    /// What Read all made of them, once it has run: each symbol in the
+    /// list then says how its read stands, and one that decoded is
+    /// loaded into the grid when it is picked, while reads are loaded.
     pub reads: Option<FoundReads>,
 }
 
@@ -91,6 +93,21 @@ pub struct FoundReads {
     /// a copy of the photo enlarged again was made at so many times
     /// this, whatever the photo has been set to since.
     pub enlarge: Enlarge,
+}
+
+/// The placements of the symbol inside the outline the detector ranks,
+/// best first, on offer as the symbols a search found are: the first is
+/// what Find in outline tries first, and the others are what it falls
+/// back on with nothing said of them.
+pub struct Placements {
+    pub found: Vec<Detection>,
+    /// The photo's Invert setting when they were made, as
+    /// [`Proposals::photo_inverted`].
+    pub photo_inverted: bool,
+    /// The one of them last picked to put the outline on, as
+    /// [`Proposals::adopted`]: the placements lie over one another, so
+    /// where the outline lies does not say which of them it was put on.
+    pub adopted: Option<usize>,
 }
 
 /// How the EC level and mask are chosen.
@@ -496,6 +513,14 @@ pub struct SamplePreview {
     pub classified: Classified,
     /// (matching, known) against the version's fixed patterns.
     pub fixed: (usize, usize),
+    /// How far the modules were sharpened against their neighbours once
+    /// they were read.
+    pub sharpening: Sharpening,
+    /// The turn or reflection under which the fixed patterns, as sampled,
+    /// fit the grid, when they fit it poorly as it lies: a sampling of
+    /// the whole grid then leaves them as sampled, locked or not, so that
+    /// the grid shows it.
+    pub turned: Option<Orientation>,
 }
 
 /// Everything the sample preview depends on.
@@ -546,6 +571,26 @@ pub enum Tool {
     Inspect,
 }
 
+/// What the Brush and the Rectangle put into a module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ink {
+    /// A colour, or unknown.
+    Module(Module),
+    /// What sampling reads off the photo there, as things stand, with no
+    /// unsure band: the ink is put where a colour is wanted, so a module
+    /// near its threshold is the colour it falls on, at the reliability
+    /// it read at, where a sampling of the grid would leave it unknown.
+    Photo,
+}
+
+/// Which modules a sampling of the photo writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SampleScope {
+    All,
+    /// The modules of one block's codewords.
+    Block(usize),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Overlay {
     None,
@@ -554,11 +599,34 @@ pub enum Overlay {
     Corrections,
     /// How far each sampled module was from its threshold.
     Reliability,
+    /// Where the mask in effect swaps dark and light.
+    Mask,
+    /// The data modules with the mask taken off: the bits themselves.
+    Unmasked,
+    /// How each codeword stands after error correction.
+    Status,
+    /// Which segment of the message each data module belongs to.
+    Segments,
+    /// The modules of pinned bits, by where the pin came from.
+    Pins,
+    /// Where the grid differs from what sampling reads off the photo.
+    Photo,
 }
 
 impl Overlay {
-    pub const ALL: [Overlay; 5] =
-        [Overlay::None, Overlay::Roles, Overlay::Blocks, Overlay::Corrections, Overlay::Reliability];
+    pub const ALL: [Overlay; 11] = [
+        Overlay::None,
+        Overlay::Roles,
+        Overlay::Blocks,
+        Overlay::Corrections,
+        Overlay::Reliability,
+        Overlay::Mask,
+        Overlay::Unmasked,
+        Overlay::Status,
+        Overlay::Segments,
+        Overlay::Pins,
+        Overlay::Photo,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -567,6 +635,27 @@ impl Overlay {
             Overlay::Blocks => "RS blocks",
             Overlay::Corrections => "Corrections",
             Overlay::Reliability => "Reliability",
+            Overlay::Mask => "Mask pattern",
+            Overlay::Unmasked => "Unmasked data",
+            Overlay::Status => "Codeword status",
+            Overlay::Segments => "Segments",
+            Overlay::Pins => "Pins",
+            Overlay::Photo => "Differs from photo",
+        }
+    }
+
+    /// What the overlay's colours mean, for the toolbar; nothing where
+    /// the name says it all or the colours are too many to list.
+    pub fn legend(self) -> &'static str {
+        match self {
+            Overlay::None | Overlay::Roles | Overlay::Blocks | Overlay::Reliability => "",
+            Overlay::Corrections => "Each module as error correction has it: green rim where it was unknown, red where it was painted otherwise",
+            Overlay::Mask => "Blue: the mask swaps dark and light there",
+            Overlay::Unmasked => "Data modules as their bits read once the mask is taken off: dark for 1, light for 0",
+            Overlay::Status => "Green: corrected or filled in · amber: read, unconfirmed · red: unknown · violet rim: doubted to solve the block",
+            Overlay::Segments => "A hue to each segment, its header the stronger · grey: terminator and padding",
+            Overlay::Pins => "Yellow: by hand · green: known text · grey: padding · blue: terminator · violet: header",
+            Overlay::Photo => "Red rim: the photo reads the other colour · green rim: the photo reads a module left unknown",
         }
     }
 }
@@ -667,13 +756,10 @@ pub enum InnerList {
     Blocks,
     Codewords,
     SequenceText,
-    /// The messages of the symbols Read all read.
-    Reads,
 }
 
 impl InnerList {
-    const ALL: [InnerList; 5] =
-        [InnerList::ResultText, InnerList::Blocks, InnerList::Codewords, InnerList::SequenceText, InnerList::Reads];
+    const ALL: [InnerList; 4] = [InnerList::ResultText, InnerList::Blocks, InnerList::Codewords, InnerList::SequenceText];
 }
 
 /// Which of the inspector's lists the wheel belongs to, if any. A list
@@ -684,7 +770,7 @@ impl InnerList {
 #[derive(Default)]
 pub struct WheelLatch {
     /// Where each list lay on the last frame, by [`InnerList`]'s order.
-    rects: [Option<egui::Rect>; 5],
+    rects: [Option<egui::Rect>; 4],
     owner: Option<InnerList>,
     /// Where the pointer was when `owner` was last settled.
     settled_at: Option<egui::Pos2>,
@@ -728,7 +814,7 @@ impl WheelLatch {
 /// A brush stroke or rectangle drag in progress.
 #[derive(Clone, Copy, Debug)]
 pub struct Stroke {
-    pub ink: Module,
+    pub ink: Ink,
     pub start: (i32, i32),
     pub last: (i32, i32),
 }
@@ -736,7 +822,7 @@ pub struct Stroke {
 pub struct ViewState {
     pub stage: Stage,
     pub tool: Tool,
-    pub ink: Module,
+    pub ink: Ink,
     pub overlay: Overlay,
     pub align_overlay: AlignOverlay,
     pub layers: Layers,
@@ -750,7 +836,8 @@ pub struct ViewState {
     pub selected: Option<CwId>,
     /// Scroll the codeword table to the selection on the next frame.
     pub reveal_selected: bool,
-    /// Block whose unresolved codewords are outlined on the canvas.
+    /// Block whose unresolved codewords, or the bits doubted to solve it,
+    /// are outlined on the canvas.
     pub highlight_block: Option<usize>,
     pub hover: Option<(usize, usize)>,
     pub active_corner: usize,
@@ -798,6 +885,29 @@ pub struct ViewState {
     /// The character of the message, counted from 0, whose modules are
     /// outlined on the grid: the one last clicked in the result.
     pub picked_char: Option<usize>,
+    /// The segment of the message whose modules are outlined on the grid:
+    /// the one last clicked under Segments.
+    pub picked_segment: Option<usize>,
+    /// Lists the inspector and the tools cut short, shown whole.
+    pub all_format_candidates: bool,
+    pub all_attempts: bool,
+    pub all_guesses: bool,
+    /// Where padding set by hand starts, a message byte counted from 0,
+    /// and what it is. The start follows what the decode makes of the
+    /// padding until it is set here, and again once it has been pinned
+    /// from, or the grid is another symbol's: a start given for one
+    /// symbol says nothing of the next.
+    pub pad_from: Option<usize>,
+    pub pad_filler: Filler,
+    /// The placement in the list under Alignment the pointer is on, whose
+    /// outline the canvas shows.
+    pub hover_placement: Option<usize>,
+    /// Load a read that decodes into the grid of itself: what Find in
+    /// outline reads inside the outline, what is read of a symbol found
+    /// or of a placement when it is picked, and of the symbol a search
+    /// of the whole photo or Read all picks of itself. A read that does
+    /// not decode is never loaded.
+    pub load_reads: bool,
     /// Text the user knows the message to hold, to be pinned.
     pub known_text: String,
     /// Where it stands: at the start of the message under a header of
@@ -815,7 +925,7 @@ impl Default for ViewState {
         Self {
             stage: Stage::Edit,
             tool: Tool::Brush,
-            ink: Module::Dark,
+            ink: Ink::Module(Module::Dark),
             overlay: Overlay::None,
             align_overlay: AlignOverlay::FixedPatterns,
             layers: Layers::Both,
@@ -848,6 +958,14 @@ impl Default for ViewState {
             wheel: WheelLatch::default(),
             own_family_only: false,
             picked_char: None,
+            picked_segment: None,
+            all_format_candidates: false,
+            all_attempts: false,
+            all_guesses: false,
+            pad_from: None,
+            pad_filler: Filler::Standard,
+            hover_placement: None,
+            load_reads: true,
             known_text: String::new(),
             known_from_start: false,
             known_at: 0,

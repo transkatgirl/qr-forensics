@@ -565,6 +565,41 @@ pub fn recover_padding_after(
     })
 }
 
+/// What can be read where the padding would lie were it `filler` from
+/// stream codeword `first_pad` on: for saying how well a start and a
+/// filler given by hand fit before they are pinned. The start is held to
+/// the data codewords the symbol has.
+pub fn padding_at(layout: &SymbolLayout, report: &DecodeReport, first_pad: usize, filler: Filler) -> PadCandidate {
+    let first_pad = first_pad.min(layout.data_stream.len().saturating_sub(1));
+    Scanner::new(layout, report).candidate(first_pad, filler)
+}
+
+/// Pin the padding where it is said to start, as the filler it is said
+/// to be: for a symbol whose padding [`detect_padding`] does not find,
+/// too little of it being readable or its headers too damaged to say
+/// where the data ends, when the user can say. The pins are `pins` with
+/// what padding recovery placed taken away, and every pad codeword from
+/// stream codeword `first_pad` on pinned at the filler's value. Pins made
+/// by hand are left alone, and so is the terminator, whose place only the
+/// headers give. Returns the pins and how many codewords were pinned.
+pub fn pin_padding_at(layout: &SymbolLayout, first_pad: usize, filler: Filler, pins: &Pins) -> (Pins, usize) {
+    let count = layout.data_stream.len();
+    let first_pad = first_pad.min(count);
+    let mut new_pins = pins.clone();
+    clear_padding_pins(&mut new_pins);
+    let candidate = PadCandidate {
+        first_pad_codeword: first_pad,
+        pad_codewords: count - first_pad,
+        filler,
+        end_bit: None,
+        header_certainty: None,
+        matches: 0,
+        mismatches: 0,
+    };
+    let added = pad_pins(layout, &candidate, &mut new_pins);
+    (new_pins, added)
+}
+
 /// The filler the padding pins of a decode hold: what
 /// [`recover_padding`] settled on, read back from the pins it left and
 /// from where the segment headers of `report`, the decode made under

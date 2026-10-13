@@ -212,6 +212,45 @@ pub fn sample_modules_with(
     height: usize,
     kernel: Kernel,
 ) -> Sampled {
+    sample_modules_noting(image, map, width, height, kernel, true).0
+}
+
+/// How far a reading's modules were sharpened against their neighbours
+/// after they were read ([`sample_modules_noting`]): the share of the
+/// difference between each module and the mean of its four neighbours
+/// that was added back, under each of the two rules. Nothing under
+/// either for a reading left as it was read.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Sharpening {
+    /// For modules under [`SHARPEN_BELOW_PX`] pixels across.
+    pub for_size: f32,
+    /// For a reading whose luminances separated poorly.
+    pub for_separation: f32,
+    /// The size of a module in the photo, in pixels, as the first rule
+    /// reckons it: at the middle of the symbol.
+    pub module_px: f32,
+}
+
+impl Sharpening {
+    /// Whether the reading was sharpened at all.
+    pub fn any(&self) -> bool {
+        self.for_size > 0.0 || self.for_separation > 0.0
+    }
+}
+
+/// [`sample_modules_with`], sharpened as it sharpens only when `sharpen`
+/// says so, and with what the sharpening came to: a reading is otherwise
+/// sharpened with nothing to show that it was, and one that reads worse
+/// for it, as specks in a clean print read once they are set against
+/// their neighbours, cannot be had as it was read.
+pub fn sample_modules_noting(
+    image: &Luma,
+    map: &impl Project,
+    width: usize,
+    height: usize,
+    kernel: Kernel,
+    sharpen: bool,
+) -> (Sampled, Sharpening) {
     let luma = (0..height)
         .flat_map(|my| (0..width).map(move |mx| (mx, my)))
         .map(|(mx, my)| kernel.sample(image, map, mx, my))
@@ -228,12 +267,19 @@ pub fn sample_modules_with(
         ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt()
     };
     let module_px = (step(1.0, 0.0) + step(0.0, 1.0)) / 2.0;
+    let mut done = Sharpening { module_px: module_px as f32, ..Sharpening::default() };
+    if !sharpen {
+        return (sampled, done);
+    }
     let sampled = if module_px < SHARPEN_BELOW_PX {
-        sampled.sharpened(SHARPEN_GAIN * (1.0 - module_px / SHARPEN_BELOW_PX) as f32)
+        done.for_size = SHARPEN_GAIN * (1.0 - module_px / SHARPEN_BELOW_PX) as f32;
+        sampled.sharpened(done.for_size)
     } else {
         sampled
     };
-    sampled.sharpened_for_separation()
+    let (sampled, gain) = sampled.sharpened_for_separation_by();
+    done.for_separation = gain;
+    (sampled, done)
 }
 
 /// [`sample_modules_with`] off the photo as `params` ask for it: with
@@ -249,10 +295,10 @@ pub fn sample_modules_as(image: &Luma, map: &impl Project, width: usize, height:
         let (w, h) = (width as f64, height as f64);
         let outline = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]].map(|[x, y]| map.apply(x, y));
         if let Some(view) = Enhanced::around(image, outline, params.enhance) {
-            return sample_modules_with(&view.luma, &view.through(map), width, height, params.kernel);
+            return sample_modules_noting(&view.luma, &view.through(map), width, height, params.kernel, params.sharpen_modules).0;
         }
     }
-    sample_modules_with(image, map, width, height, params.kernel)
+    sample_modules_noting(image, map, width, height, params.kernel, params.sharpen_modules).0
 }
 
 /// Below this separability of a reading's luminances, a sharpened reading
@@ -283,23 +329,29 @@ impl Sampled {
     /// that straddles module boundaries reads grey too, and sharpening
     /// does not place it.
     pub fn sharpened_for_separation(self) -> Self {
+        self.sharpened_for_separation_by().0
+    }
+
+    /// [`Self::sharpened_for_separation`], with the gain of the
+    /// sharpening kept: zero for a reading returned as it is.
+    pub fn sharpened_for_separation_by(self) -> (Self, f32) {
         let before = self.separability();
         if before >= SHARPEN_FOR_SEPARABILITY {
-            return self;
+            return (self, 0.0);
         }
-        let mut best: Option<(f32, Sampled)> = None;
+        let mut best: Option<(f32, f32, Sampled)> = None;
         for &gain in &SHARPEN_TRIAL_GAINS {
             let trial = self.sharpened(gain);
             let after = trial.separability();
             if after >= before + SHARPEN_SEPARATION_GAIN
-                && best.as_ref().is_none_or(|(b, _)| after > *b)
+                && best.as_ref().is_none_or(|(b, _, _)| after > *b)
             {
-                best = Some((after, trial));
+                best = Some((after, gain, trial));
             }
         }
         match best {
-            Some((_, trial)) => trial,
-            None => self,
+            Some((_, gain, trial)) => (trial, gain),
+            None => (self, 0.0),
         }
     }
 
@@ -378,6 +430,10 @@ pub struct SampleParams {
     /// does not decode tries the others of itself
     /// ([`super::read::read_outline`]).
     pub enhance: Enhance,
+    /// Sharpen the modules against their neighbours once they are read,
+    /// where they are small or their luminances separate poorly
+    /// ([`sample_modules_noting`]). On, unless it is turned off by hand.
+    pub sharpen_modules: bool,
 }
 
 impl Default for SampleParams {
@@ -390,6 +446,7 @@ impl Default for SampleParams {
             surface: false,
             kernel: Kernel::Vote,
             enhance: Enhance::NONE,
+            sharpen_modules: true,
         }
     }
 }
@@ -454,6 +511,12 @@ const MIN_LOCAL_COUNT: usize = 6;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Classified {
     pub modules: Vec<Module>,
+    /// Each module as it falls about its threshold with no unsure band
+    /// left around that: what `modules` is at a band of nothing, the
+    /// colour of every module that was read at all, however near its
+    /// threshold. Unknown only where a module could not be sampled or
+    /// its neighbourhood had no contrast.
+    pub decided: Vec<Module>,
     /// How far each module is from its threshold as a share of the local
     /// contrast, on a scale of 0..=254; zero where the module could not be
     /// sampled or its neighbourhood had no contrast.
@@ -748,12 +811,14 @@ pub fn classify(sampled: &Sampled, params: &SampleParams) -> Classified {
         .then(|| ThresholdSurface::new(sampled, (global, global_half), flat_range));
 
     let mut modules = Vec::with_capacity(w * h);
+    let mut decided = Vec::with_capacity(w * h);
     let mut reliability = Vec::with_capacity(w * h);
     let mut flat = 0;
     let mut neighbourhood: Vec<f32> = Vec::new();
     for i in 0..w * h {
         let Some(value) = sampled.luma[i] else {
             modules.push(Module::Unknown);
+            decided.push(Module::Unknown);
             reliability.push(0);
             continue;
         };
@@ -775,6 +840,7 @@ pub fn classify(sampled: &Sampled, params: &SampleParams) -> Classified {
                 if high - low < flat_range {
                     // Nothing around here has contrast: no evidence either way.
                     modules.push(Module::Unknown);
+                    decided.push(Module::Unknown);
                     reliability.push(0);
                     flat += 1;
                     continue;
@@ -789,15 +855,14 @@ pub fn classify(sampled: &Sampled, params: &SampleParams) -> Classified {
             (global, global_half)
         };
         let margin = (value - threshold).abs() / half;
-        modules.push(if margin < params.band {
-            Module::Unknown
-        } else {
-            Module::from_dark(value < threshold)
-        });
+        let side = Module::from_dark(value < threshold);
+        modules.push(if margin < params.band { Module::Unknown } else { side });
+        decided.push(side);
         reliability.push(quantize(margin));
     }
     Classified {
         modules,
+        decided,
         reliability,
         threshold: global,
         separability,
@@ -926,6 +991,11 @@ mod tests {
                 Module::Light
             ]
         );
+        // With no band about the threshold, the module inside it is the
+        // colour it falls on, as it is at a band of nothing; the one that
+        // could not be sampled stays unknown.
+        assert_eq!(out.decided, [Module::Dark, Module::Dark, Module::Light, Module::Unknown, Module::Light]);
+        assert_eq!(out.decided, classify(&sampled, &SampleParams { band: 0.0, ..global }).modules);
         // Groups mean 0.285 and 0.725: a margin of 0.03 is about a seventh
         // of the half-contrast of 0.22, a margin of 0.05 about a quarter.
         assert_eq!(out.reliability[0], 254);
@@ -1304,5 +1374,41 @@ mod tests {
             "{before} -> {after}"
         );
         assert_eq!(wrong(&sharpened), 0, "{} wrong before", wrong(&smeared));
+    }
+
+    #[test]
+    fn modules_are_left_as_read_when_asked_and_a_sharpening_is_told_of() {
+        // Modules two pixels across, under the size at which a reading
+        // is sharpened against its neighbours.
+        let (mw, mh) = (4usize, 2usize);
+        let pattern = [true, false, false, true, false, true, true, false];
+        let photo = |px: usize| {
+            let data = (0..mw * px * mh * px).map(|i| if pattern[(i / (mw * px) / px) * mw + i % (mw * px) / px] { 0.2 } else { 0.8 }).collect();
+            let (w, h) = ((mw * px) as f64, (mh * px) as f64);
+            (Luma::new(mw * px, mh * px, data), Homography::rect_to_quad(mw as f64, mh as f64, [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]]).unwrap())
+        };
+        let (small, map) = photo(2);
+        let (plain, none) = sample_modules_noting(&small, &map, mw, mh, Kernel::Area, false);
+        assert_eq!(none, Sharpening { module_px: 2.0, ..Sharpening::default() });
+        assert!(!none.any());
+        for (i, value) in plain.luma.iter().enumerate() {
+            assert_eq!(*value, Kernel::Area.sample(&small, &map, i % mw, i / mw), "module {i} is as the kernel read it");
+        }
+        // Sharpened, as it is unless that is turned off, and by how much
+        // is told: half the strength a vanishing module is given.
+        let (sharpened, done) = sample_modules_noting(&small, &map, mw, mh, Kernel::Area, true);
+        assert!(done.any() && (done.for_size - 0.4).abs() < 1e-6 && done.for_separation == 0.0, "{done:?}");
+        assert_eq!(sharpened, plain.sharpened(done.for_size));
+        assert_ne!(sharpened, plain);
+        assert_eq!(sample_modules_with(&small, &map, mw, mh, Kernel::Area), sharpened);
+        // The parameters say which a sampling by them is.
+        let off = SampleParams { kernel: Kernel::Area, sharpen_modules: false, ..SampleParams::default() };
+        assert_eq!(sample_modules_as(&small, &map, mw, mh, &off), plain);
+        assert_eq!(sample_modules_as(&small, &map, mw, mh, &SampleParams { sharpen_modules: true, ..off }), sharpened);
+        // Modules large enough, which separate, are not sharpened at all.
+        let (large, map) = photo(10);
+        let (read, done) = sample_modules_noting(&large, &map, mw, mh, Kernel::Area, true);
+        assert_eq!(done, Sharpening { module_px: 10.0, ..Sharpening::default() });
+        assert_eq!(read, sample_modules_noting(&large, &map, mw, mh, Kernel::Area, false).0);
     }
 }

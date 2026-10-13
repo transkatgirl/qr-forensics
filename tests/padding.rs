@@ -7,7 +7,10 @@ mod common;
 use common::*;
 use qr_forensics::decode::bitstream::{Certainty, EndOfData, LostReason};
 use qr_forensics::decode::codewords::{PinSource, Pins};
-use qr_forensics::decode::padding::{Filler, check_tail, clear_padding_pins, detect_padding, pad_tail, pinned_filler, recover_padding};
+use qr_forensics::decode::codewords::Pin;
+use qr_forensics::decode::padding::{
+    Filler, check_tail, clear_padding_pins, detect_padding, pad_tail, padding_at, pin_padding_at, pinned_filler, recover_padding,
+};
 use qr_forensics::decode::pipeline::{BlockOutcome, DecodeOptions, SolveMethod, decode};
 use qr_forensics::decode::repair::render_rgba;
 use qr_forensics::imaging::Luma;
@@ -433,6 +436,59 @@ fn a_filler_found_without_headers_is_fitted_to_them_once_they_read() {
             assert_eq!(got.final_value, want.final_value, "{what} codeword {cw}");
         }
     }
+}
+
+#[test]
+fn padding_is_pinned_where_it_is_said_to_start() {
+    // Two characters in a symbol with room for fifty-three: all but four
+    // data codewords are padding. With every one of them torn away there
+    // is far more gone than error correction restores, the header that
+    // says where the data ends is unconfirmed, and no padding is left to
+    // show itself: nothing is found.
+    let (version, ec, mask) = (SymbolVersion::Qr(3), EcLevel::L, 2);
+    let layout = layout(version, ec);
+    let clean = encode(version, ec, Some(mask), &[Segment::bytes("hi")]).unwrap();
+    let count = layout.data_stream.len();
+    let first = pad_tail(&layout, 4 + 8 + 16).first_pad_codeword;
+    assert_eq!((first, count), (4, 55));
+    let mut grid = clean.clone();
+    for &cw in &layout.data_stream[first..] {
+        erase_codeword(&mut grid, &layout, cw);
+    }
+    let before = decode_plain(&grid, &layout, mask);
+    assert!(!before.blocks[0].is_solved());
+    assert_eq!(detect_padding(&layout, &before), None);
+    assert!(recover(&grid, &layout, mask).is_none());
+    // Said by hand, the start is pinned from as recovery would pin it,
+    // and the block solves.
+    let (pins, added) = pin_padding_at(&layout, first, Filler::Standard, &Pins::new());
+    assert_eq!((added, pins.len()), (count - first, count - first));
+    assert!(pins.values().all(|pin| pin.source == PinSource::Padding));
+    let report = decode(&grid, &layout, mask, &pins, &DecodeOptions::default());
+    assert!(report.is_trustworthy());
+    assert_eq!(report.text.plain(), "hi");
+    assert_eq!(pinned_filler(&layout, &report, &pins), Some(Filler::Standard));
+    // Said again from further on, the pins before the new start go, and
+    // a pin made by hand stays as it was made.
+    let by_hand = Pin::full(0x5A, PinSource::Manual);
+    let mut held = pins.clone();
+    held.insert(layout.data_stream[10], by_hand);
+    let (later, added) = pin_padding_at(&layout, first + 2, Filler::Standard, &held);
+    assert_eq!(added, count - first - 3);
+    assert!(!later.contains_key(&layout.data_stream[first]) && !later.contains_key(&layout.data_stream[first + 1]));
+    assert_eq!(later[&layout.data_stream[10]], by_hand);
+    // A start past the last data codeword pins nothing.
+    assert_eq!(pin_padding_at(&layout, count + 3, Filler::Standard, &Pins::new()).1, 0);
+    // What can be read says how well a start and a filler fit: on the
+    // symbol as printed the padding matches bit for bit where it starts
+    // and as what it is, and neither a codeword early nor as zeros.
+    let whole = decode_plain(&clean, &layout, mask);
+    let fit = padding_at(&layout, &whole, first, Filler::Standard);
+    assert_eq!((fit.pad_codewords, fit.matches, fit.mismatches), (count - first, 8 * (count - first) as u32, 0));
+    assert!(padding_at(&layout, &whole, first - 1, Filler::Standard).mismatches > 0);
+    assert!(padding_at(&layout, &whole, first, Filler::Zeros).mismatches > 100);
+    // A start past the end is held to the last data codeword.
+    assert_eq!(padding_at(&layout, &whole, count + 3, Filler::Standard).first_pad_codeword, count - 1);
 }
 
 #[test]

@@ -255,6 +255,12 @@ pub struct BinarizeParams {
     /// One threshold for the region instead, Otsu's split of its
     /// luminance, the other way the scan reads the outline.
     pub global: bool,
+    /// The half-width, in pixels, of the window each pixel is judged
+    /// against the mean of instead ([`window_dark`]), the third way the
+    /// scan reads the outline, at each of [`WINDOW_RADII`] narrower than
+    /// its neighbourhood. Neither `radius` nor `global` is looked at
+    /// while one is given.
+    pub window: Option<usize>,
     /// The photo pixels the scan looks at, `[x0, y0, x1, y1]` with the far
     /// sides exclusive: the outline with the search's margin around it.
     /// The whole photo when `None`.
@@ -286,7 +292,7 @@ impl BinarizeParams {
         } else {
             None
         };
-        Self { radius: radius.clamp(Self::MIN_RADIUS, Self::MAX_RADIUS), global: false, region }
+        Self { radius: radius.clamp(Self::MIN_RADIUS, Self::MAX_RADIUS), global: false, window: None, region }
     }
 }
 
@@ -294,21 +300,26 @@ impl Default for BinarizeParams {
     /// For a symbol about four hundred pixels across, the whole photo
     /// being its region.
     fn default() -> Self {
-        Self { radius: 64, global: false, region: None }
+        Self { radius: 64, global: false, window: None, region: None }
     }
 }
 
 /// The photo thresholded as the scan thresholds the outline: 0.0 where a
 /// pixel reads dark, 1.0 elsewhere. Against the blocks around each pixel,
 /// with the flat floor set by the region's spread as the scan sets it, or,
-/// with `global`, against Otsu's split of the region's luminance.
+/// with `global`, against Otsu's split of the region's luminance, or,
+/// with a `window`, against the mean of that window about each pixel,
+/// less the share of the region's spread the scan takes off it.
 pub fn binarize(luma: &Luma, params: &BinarizeParams) -> Luma {
     let (width, height) = (luma.width, luma.height);
     if width == 0 || height == 0 {
         return Luma::new(width, height, Vec::new());
     }
     let [x0, y0, x1, y1] = params.region.map_or([0, 0, width, height], |r| [r[0].min(width), r[1].min(height), r[2].min(width), r[3].min(height)]);
-    let dark: Vec<bool> = if params.global {
+    let dark: Vec<bool> = if let Some(radius) = params.window {
+        let spread = robust_spread((y0..y1).flat_map(|y| (x0..x1).map(move |x| luma.data[y * width + x])).filter(|v| v.is_finite()));
+        window_dark(&luma.data, width, height, radius, WINDOW_BIAS * spread).into_iter().map(|kind| kind == 1).collect()
+    } else if params.global {
         let threshold = otsu((y0..y1).flat_map(|y| (x0..x1).map(move |x| luma.data[y * width + x])));
         luma.data.iter().map(|&v| v < threshold).collect()
     } else {
@@ -344,7 +355,7 @@ mod tests {
     #[test]
     fn flat_fields_read_light() {
         for level in [0.0, 0.3, 1.0] {
-            let out = binarize(&image(40, 30, |_, _| level), &BinarizeParams { radius: 16, global: false, region: None });
+            let out = binarize(&image(40, 30, |_, _| level), &BinarizeParams { radius: 16, global: false, window: None, region: None });
             assert!(out.data.iter().all(|&v| v == 1.0), "level {level}");
         }
         assert!(binarize(&image(0, 0, |_, _| 0.0), &BinarizeParams::default()).data.is_empty());
@@ -360,7 +371,7 @@ mod tests {
         let dim = image(64, 64, |x, y| if inside(x, y) { 0.004 } else { 0.06 });
         let blocks = BlockMean::new(&dim.data, 64, 64, 16.0);
         assert!((blocks.min_range() - NOISE_RANGE).abs() < 1e-6, "{}", blocks.min_range());
-        let out = binarize(&dim, &BinarizeParams { radius: 16, global: false, region: None });
+        let out = binarize(&dim, &BinarizeParams { radius: 16, global: false, window: None, region: None });
         assert_eq!(out.data[32 * 64 + 32], 0.0);
         assert_eq!(out.data[5 * 64 + 5], 1.0);
         // On a photo that spans the scale the floor is ZXing's tenth or
@@ -379,7 +390,7 @@ mod tests {
         let part = BlockMean::within(&mixed.data, 64, 64, 16.0, Some([0, 0, 48, 64]));
         assert!((part.min_range() - NOISE_RANGE).abs() < 1e-6, "{}", part.min_range());
         assert!(part.is_dark(0.004, 32, 32));
-        let region = BinarizeParams { radius: 16, global: false, region: Some([0, 0, 48, 64]) };
+        let region = BinarizeParams { radius: 16, global: false, window: None, region: Some([0, 0, 48, 64]) };
         assert_eq!(binarize(&mixed, &region).data[32 * 64 + 32], 0.0);
         assert_eq!(binarize(&mixed, &BinarizeParams { region: None, ..region }).data[32 * 64 + 32], 1.0);
     }
@@ -388,7 +399,7 @@ mod tests {
     fn a_small_dark_square_reads_dark_and_a_large_one_hollow() {
         let inside = |x: usize, y: usize| (27..37).contains(&x) && (27..37).contains(&y);
         let photo = image(64, 64, |x, y| if inside(x, y) { 0.0 } else { 1.0 });
-        let out = binarize(&photo, &BinarizeParams { radius: 16, global: false, region: None });
+        let out = binarize(&photo, &BinarizeParams { radius: 16, global: false, window: None, region: None });
         for y in 0..64 {
             for x in 0..64 {
                 let expected = if inside(x, y) { 0.0 } else { 1.0 };
@@ -401,16 +412,16 @@ mod tests {
         // split reads it whole.
         let big = |x: usize, y: usize| (40..160).contains(&x) && (40..160).contains(&y);
         let photo = image(200, 200, |x, y| if big(x, y) { 0.0 } else { 1.0 });
-        let local = binarize(&photo, &BinarizeParams { radius: 32, global: false, region: None });
+        let local = binarize(&photo, &BinarizeParams { radius: 32, global: false, window: None, region: None });
         assert_eq!(local.data[44 * 200 + 100], 0.0, "just inside the edge");
         assert_eq!(local.data[100 * 200 + 100], 1.0, "the flat middle");
-        let global = binarize(&photo, &BinarizeParams { radius: 32, global: true, region: None });
+        let global = binarize(&photo, &BinarizeParams { radius: 32, global: true, window: None, region: None });
         assert_eq!(global.data[100 * 200 + 100], 0.0);
         assert_eq!(global.data[10 * 200 + 10], 1.0);
         // The region bounds the global split: inside a box of paper alone,
         // the split falls where it may, and the paper still reads light
         // where the square is darker than it.
-        let boxed = binarize(&photo, &BinarizeParams { radius: 32, global: true, region: Some([0, 0, 30, 200]) });
+        let boxed = binarize(&photo, &BinarizeParams { radius: 32, global: true, window: None, region: Some([0, 0, 30, 200]) });
         assert_eq!(boxed.data[100 * 200 + 100], 0.0);
     }
 
@@ -535,5 +546,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_view_shows_the_window_rule_as_the_scan_reads_it() {
+        // Paper that darkens from left to right, with a square of ink in
+        // the middle no darker than the paper is at its far side: one
+        // threshold cannot have the square without the paper, and the
+        // mean of a window a few pixels about each pixel can.
+        let (side, radius) = (64, 4);
+        let inked = |x: usize, y: usize| (28..36).contains(&x) && (28..36).contains(&y);
+        let photo = image(side, side, |x, y| if inked(x, y) { 0.45 } else { 0.9 - 0.4 * x as f32 / side as f32 });
+        let params = BinarizeParams { window: Some(radius), ..BinarizeParams::default() };
+        let out = binarize(&photo, &params);
+        assert_eq!(out.data[32 * side + 32], 0.0, "the ink reads dark");
+        assert_eq!(out.data[32 * side + 8], 1.0, "the paper reads light where it is light");
+        assert_eq!(out.data[8 * side + 60], 1.0, "and where it is as dark as the ink");
+        let global = binarize(&photo, &BinarizeParams { global: true, ..BinarizeParams::default() });
+        assert_eq!(global.data[8 * side + 60], 0.0, "one threshold takes the dark paper with the ink");
+        // It is the scan's own mask, with the bias the scan takes off.
+        let bias = WINDOW_BIAS * robust_spread(photo.data.iter().copied());
+        let mask = window_dark(&photo.data, side, side, radius, bias);
+        assert!(out.data.iter().zip(&mask).all(|(&value, &kind)| (value == 0.0) == (kind == 1)));
+        // A window given is the rule, whatever else is set beside it.
+        assert_eq!(binarize(&photo, &BinarizeParams { global: true, ..params }), out);
     }
 }

@@ -2,9 +2,9 @@
 
 use eframe::egui;
 use qr_forensics::imaging::adjust::{Adjust, Channel, Enlarge, Filter, LENS_MIN_PAIRS, MAX_ENLARGED_SIDE};
-use qr_forensics::imaging::binarize::BinarizeParams;
-use qr_forensics::imaging::detect::{AnchorKind, anchor_sites};
-use qr_forensics::imaging::sample::Kernel;
+use qr_forensics::imaging::binarize::{BinarizeParams, WINDOW_RADII};
+use qr_forensics::imaging::detect::{AnchorKind, Detection, anchor_sites};
+use qr_forensics::imaging::sample::{Kernel, POOR_SEPARABILITY, SHARPEN_BELOW_PX};
 use qr_forensics::symbol::function_map::looks_inverted;
 use qr_forensics::symbol::grid::Module;
 use qr_forensics::symbol::{Family, SymbolVersion};
@@ -14,6 +14,9 @@ use super::{Action, App, JobKind, Transform};
 
 /// Why a button is disabled while a job runs.
 const BUSY_HINT: &str = "Wait for the step under way to finish";
+/// How many of the versions Suggest version ranks are listed until the
+/// rest are asked for.
+const GUESSES_SHOWN: usize = 4;
 
 pub(super) fn show(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     symbol_section(ui, app, actions);
@@ -314,8 +317,9 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     }
     ui.add_space(4.0);
     ui.weak("Binarised view").on_hover_text(
-        "The photo in black and white, as the search for finder patterns sees it. The search reads it both ways, \
-         local and global, and pools what it finds.",
+        "The photo in black and white, as the search for finder patterns sees it. The search reads it three ways, \
+         against the lighting around each pixel, against one threshold for the outline, and against the mean of a small \
+         window about each pixel at each of a few widths, and pools what it finds.",
     );
     let defaults = BinarizeParams::for_outline(app.doc.corners, width, height);
     if app.view.binarize_auto {
@@ -324,30 +328,82 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     let mut changed = false;
     let params = &mut app.view.binarize;
     egui::Grid::new("binarize").num_columns(2).show(ui, |ui| {
-        ui.label("Radius");
-        changed |= ui
-            .add(egui::DragValue::new(&mut params.radius).range(BinarizeParams::MIN_RADIUS..=BinarizeParams::MAX_RADIUS).speed(2.0).suffix(" px"))
-            .on_hover_text(
-                "How far around each pixel the local threshold looks, in photo pixels. Automatically a sixth of \
-                 the outline's shorter side, wider than a finder pattern.",
-            )
-            .changed();
-        ui.end_row();
         ui.label("Threshold");
-        changed |= ui
-            .checkbox(&mut params.global, "Global")
-            .on_hover_text(
-                "One threshold for the whole outline and its margin (Otsu's), instead of the local one",
-            )
-            .changed();
+        ui.horizontal(|ui| {
+            let local = !params.global && params.window.is_none();
+            if ui
+                .selectable_label(local, "Local")
+                .on_hover_text("Each pixel against the lighting around it, the mean of the blocks of pixels within the radius")
+                .clicked()
+                && !local
+            {
+                (params.global, params.window) = (false, None);
+                changed = true;
+            }
+            let global = params.global && params.window.is_none();
+            if ui
+                .selectable_label(global, "Global")
+                .on_hover_text("One threshold for the whole outline and its margin (Otsu's), instead of the local one")
+                .clicked()
+                && !global
+            {
+                (params.global, params.window) = (true, None);
+                changed = true;
+            }
+            if ui
+                .selectable_label(params.window.is_some(), "Window")
+                .on_hover_text(
+                    "Each pixel against the mean of a window a few pixels about it: the third way the search reads the \
+                     outline, which tells the rings of a finder pattern apart where blur has run them together until \
+                     neither of the other two does.",
+                )
+                .clicked()
+                && params.window.is_none()
+            {
+                params.window = Some(WINDOW_RADII[1]);
+                changed = true;
+            }
+        });
         ui.end_row();
+        match params.window {
+            Some(window) => {
+                ui.label("Half-width");
+                ui.horizontal(|ui| {
+                    for radius in WINDOW_RADII {
+                        if ui.selectable_label(window == radius, format!("{radius} px")).clicked() && window != radius {
+                            params.window = Some(radius);
+                            changed = true;
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "How far either side of each pixel the window reaches. A width serves modules from a third of it to \
+                     about the whole of it across; the search reads the outline at each of these that is no wider than \
+                     its local radius.",
+                );
+                ui.end_row();
+            }
+            None if !params.global => {
+                ui.label("Radius");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut params.radius).range(BinarizeParams::MIN_RADIUS..=BinarizeParams::MAX_RADIUS).speed(2.0).suffix(" px"))
+                    .on_hover_text(
+                        "How far around each pixel the local threshold looks, in photo pixels. Automatically a sixth of \
+                         the outline's shorter side, wider than a finder pattern.",
+                    )
+                    .changed();
+                ui.end_row();
+            }
+            None => {}
+        }
     });
     if changed {
         app.view.binarize_auto = false;
     }
     if ui
         .add_enabled(!app.view.binarize_auto, egui::Button::new("Reset to automatic"))
-        .on_hover_text("Set both from the outline again, as the search does")
+        .on_hover_text("The local threshold again, its radius set from the outline as the search sets it")
         .clicked()
     {
         app.view.binarize = defaults;
@@ -437,7 +493,9 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
             .add_enabled(!busy, egui::Button::new(label))
             .on_hover_text(
                 "Find the symbol inside the outline and move the corners and anchors onto it. The outline only has \
-                 to be roughly around the symbol, and may be a quarter turn out. Also picks the version that fits.",
+                 to be roughly around the symbol, and may be a quarter turn out. Also picks the version that fits. \
+                 The symbol is read through to its message on the way, and a read that decodes is written into the \
+                 grid while Load reads that decode is ticked.",
             )
             .on_disabled_hover_text(BUSY_HINT)
             .clicked()
@@ -465,6 +523,19 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
         {
             actions.push(Action::SuggestVersions);
         }
+        let label = if running == Some(JobKind::Placements) { "Ranking…" } else { "Other placements" };
+        if ui
+            .add_enabled(!busy, egui::Button::new(label))
+            .on_hover_text(
+                "List every placement of the symbol inside the outline that the detector ranks, best first: the one Find \
+                 in outline starts from, and the runners-up it falls back on, another version or another reading of the \
+                 finder patterns. Pick one to put the corners and anchors on it. Looks for the family chosen under Symbol.",
+            )
+            .on_disabled_hover_text(BUSY_HINT)
+            .clicked()
+        {
+            actions.push(Action::ListPlacements);
+        }
         if app.search.is_some() {
             if ui.button("Stop searching").on_hover_text("Call the search of the photo off").clicked() {
                 actions.push(Action::CancelSearch);
@@ -476,7 +547,8 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
                  a few seconds, and longer on a damaged symbol, whose finder patterns are tried every way; it can be \
                  stopped. A photo over 4096 pixels on a side is searched in a copy reduced to that, and what is found \
                  is placed and read in the photo's own pixels; a symbol too small to show in the copy is found by \
-                 Find in outline, which looks at the photo itself.",
+                 Find in outline, which looks at the photo itself. While Load reads that decode is ticked, a symbol \
+                 that decodes as found is read through and written into the grid.",
             )
             .clicked()
         {
@@ -492,41 +564,88 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
          other families are otherwise looked for from every finder pattern the first search leaves over, which on a \
          damaged QR Code is most of the time a search takes.",
     );
+    ui.checkbox(&mut app.view.load_reads, "Load reads that decode").on_hover_text(
+        "When a symbol is read through to its message, write the grid as it was read, with its fixed patterns filled in \
+         and the pins it was read under: a new grid of the symbol's version, in place of the one there is (undoable). \
+         Find in outline loads what it reads inside the outline. Search whole photo and Read all load one of the \
+         symbols found: the one the outline is on, when it is on one and that decodes, and otherwise the first that \
+         does. A symbol or a placement picked from a list is read through and loaded the same way. Off, only the \
+         outline and the anchors are placed, and the grid is left to be sampled. A read that does not decode never \
+         replaces the grid.",
+    );
     ui.checkbox(&mut app.view.search.coarse_to_fine, "Search a small copy first").on_hover_text(
         "Search a copy of the photo shrunk to a thousand pixels first, and the photo at the full size a search goes \
          to, 4096 pixels on its longer side, in full only if that shows nothing, and otherwise only for the finder \
          patterns its regions show beside the symbols found. Much faster on a large photo. Turn off for a symbol \
          only a few pixels a module, which the copy may lose.",
     );
+    app.view.hover_placement = None;
+    if let Some(placements) = &app.placements {
+        let in_use = super::placement_in_use(placements, &app.doc.corners);
+        ui.label(format!("Placements inside the outline ({}):", placements.found.len()));
+        for (i, found) in placements.found.iter().enumerate() {
+            let placed = in_use == Some(i);
+            let reads = if app.view.load_reads {
+                " It is read through on the way, and a read that decodes is written into the grid (undoable)."
+            } else {
+                ""
+            };
+            let hint = format!(
+                "Place the corners and anchors on the symbol as this placement has it: {} anchors, {} of {} fixed \
+                 modules reading right. It is outlined on the photo while the pointer is here.{reads}{}",
+                found.anchors.len(),
+                found.agreement.0,
+                found.agreement.1,
+                super::new_grid_note(found, app.doc.version)
+            );
+            let response = detection_row(ui, i, found, None, placed, busy, hint);
+            if response.hovered() {
+                app.view.hover_placement = Some(i);
+            }
+            if response.clicked() {
+                actions.push(Action::UsePlacement(i));
+            }
+        }
+        if ui.small_button("Clear the list").clicked() {
+            actions.push(Action::ClearPlacements);
+        }
+    }
     if let Some(proposals) = &app.proposals {
         let in_use = super::proposal_in_use(proposals, &app.doc.corners);
         ui.label(format!("Found in the photo ({}):", proposals.found.len()));
         for (i, found) in proposals.found.iter().enumerate() {
-            let decodes = if found.decodes == Some(true) { ", decodes" } else { "" };
-            let confirmed = if found.version_confirmed() { ", version confirmed" } else { "" };
-            let polarity = if found.inverted { ", light on dark" } else { "" };
-            let retry = found.retry.map_or(String::new(), |r| format!(", with {r}"));
-            let text = format!(
-                "{}. {} {}  —  {:.0}% fixed{decodes}{confirmed}{polarity}{retry}",
-                i + 1,
-                found.version.family().label(),
-                found.version,
-                100.0 * found.score()
-            );
             let placed = in_use == Some(i);
-            if ui
-                .add_enabled(!busy, egui::Button::selectable(placed, text))
-                .on_hover_text(if placed {
+            // Once Read all has run, how the symbol's read stands, and
+            // whether picking it loads that read.
+            let read = proposals.reads.as_ref().and_then(|reads| reads.results.get(i));
+            let standing = read.map(|read| read.as_ref().map_or_else(|| "could not be sampled".to_owned(), crate::cli::standing));
+            let loads = app.view.load_reads && read.and_then(Option::as_ref).is_some_and(|read| read.is_trustworthy());
+            // Not read yet, it is read when it is picked, where reads
+            // are loaded.
+            let reads = app.view.load_reads && proposals.reads.is_none();
+            let hint = match (loads, placed) {
+                _ if reads => format!(
+                    "Place the corners and anchors on this symbol and read it through to its message: a read that decodes \
+                     is written into the grid, with the pins it was read under (undoable). Its outline on the photo can be \
+                     clicked too.{}",
+                    super::new_grid_note(found, app.doc.version)
+                ),
+                (true, true) => "The outline is on this symbol. Click to write the grid again as it was read, with the pins \
+                                 it was read under (undoable)."
+                    .to_owned(),
+                (true, false) => "Put the outline and anchors on this symbol and write the grid as it was read, with the \
+                                  pins it was read under: a new grid of the symbol's version (undoable). Its outline on \
+                                  the photo can be clicked too."
+                    .to_owned(),
+                (false, true) => {
                     "The outline is on this symbol. Click to place the corners and anchors on it again, as found.".to_owned()
-                } else {
-                    format!(
-                        "Place the corners and anchors on this symbol; its outline on the photo can be clicked too.{}",
-                        super::new_grid_note(found, app.doc.version)
-                    )
-                })
-                .on_disabled_hover_text(BUSY_HINT)
-                .clicked()
-            {
+                }
+                (false, false) => format!(
+                    "Place the corners and anchors on this symbol; its outline on the photo can be clicked too.{}",
+                    super::new_grid_note(found, app.doc.version)
+                ),
+            };
+            if detection_row(ui, i, found, standing, placed, busy, hint).clicked() {
                 actions.push(Action::UseProposal(i));
             }
         }
@@ -535,9 +654,10 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
             if ui
                 .add_enabled(!busy, egui::Button::new(label))
                 .on_hover_text(
-                    "Read every symbol found through to its message, as the command line reads a photo. The messages \
-                     are listed under Symbols read, where each can be copied or loaded into the grid, and the parts \
-                     of a structured append message go into the sequence.",
+                    "Read every symbol found through to its message, as the command line reads a photo. Each symbol \
+                     in the list then says how its read stands, and the parts of a structured append message go into \
+                     the sequence. While Load reads that decode is ticked, one that decoded is written into the grid, \
+                     and picking another writes that one.",
                 )
                 .on_disabled_hover_text(BUSY_HINT)
                 .clicked()
@@ -572,7 +692,8 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
         }
     }
     if let Some(guesses) = &app.guesses {
-        for guess in guesses.iter().take(4) {
+        let shown = if app.view.all_guesses { guesses.len() } else { GUESSES_SHOWN };
+        for guess in guesses.iter().take(shown) {
             let polarity = if guess.inverted { ", inverted" } else { "" };
             let text = format!("{}  —  {:.0}%{polarity}", guess.version, 100.0 * guess.score());
             let response = ui.selectable_label(guess.version == app.doc.version, text);
@@ -586,7 +707,43 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
                 );
             }
         }
+        let hint = "Every version of the family, as ranked on these corners";
+        ui.horizontal(|ui| {
+            super::show_all_button(ui, &mut app.view.all_guesses, guesses.len(), GUESSES_SHOWN, hint);
+            if ui.small_button("Clear the list").clicked() {
+                actions.push(Action::ClearGuesses);
+            }
+        });
     }
+}
+
+/// A symbol the detector placed, as a row of a list to pick it from: its
+/// place in the list, what it is, how well it fits, and how a read of it
+/// stands, as `standing` has it, once one has been made. `placed` marks
+/// the one the outline is on, and `hint` says what picking it does.
+fn detection_row(
+    ui: &mut egui::Ui,
+    i: usize,
+    found: &Detection,
+    standing: Option<String>,
+    placed: bool,
+    busy: bool,
+    hint: String,
+) -> egui::Response {
+    let decodes = if found.decodes == Some(true) { ", decodes" } else { "" };
+    let confirmed = if found.version_confirmed() { ", version confirmed" } else { "" };
+    let polarity = if found.inverted { ", light on dark" } else { "" };
+    let mirrored = if found.mirrored { ", mirrored" } else { "" };
+    let retry = found.retry.map_or(String::new(), |r| format!(", with {r}"));
+    let standing = standing.map_or(String::new(), |standing| format!("  ·  {standing}"));
+    let text = format!(
+        "{}. {} {}  —  {:.0}% fixed{decodes}{confirmed}{polarity}{mirrored}{retry}{standing}",
+        i + 1,
+        found.version.family().label(),
+        found.version,
+        100.0 * found.score()
+    );
+    ui.add_enabled(!busy, egui::Button::selectable(placed, text)).on_hover_text(hint).on_disabled_hover_text(BUSY_HINT)
 }
 
 fn sampling_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
@@ -645,7 +802,25 @@ fn sampling_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
         "How each module's luminance is read. Find in outline tries every kernel, under every threshold rule, and \
          keeps what decodes.",
     );
+    ui.checkbox(&mut params.sharpen_modules, "Sharpen small or blurred modules").on_hover_text(format!(
+        "Once the modules are read, set each against its four neighbours and put back some of what blur took from it: \
+         where a module is under {SHARPEN_BELOW_PX} pixels across, the more the smaller, and wherever the luminances \
+         read do not separate into dark and light. The line below says when it has been done. Off, the modules are \
+         taken as they were read, which suits a clean print with specks in it, each of which sharpening sets off.",
+    ));
     if let Some(preview) = &app.preview {
+        let sharpening = preview.sharpening;
+        if sharpening.any() {
+            let mut why = Vec::new();
+            if sharpening.for_size > 0.0 {
+                why.push(format!("they are {:.1} px across (by {:.2})", sharpening.module_px, sharpening.for_size));
+            }
+            if sharpening.for_separation > 0.0 {
+                why.push(format!("they separated poorly (by {:.2})", sharpening.for_separation));
+            }
+            ui.weak(format!("The modules were sharpened against their neighbours: {}.", why.join(", and again because ")))
+                .on_hover_text("The share of the difference between each module and the mean of its neighbours that was added back");
+        }
         let unknown = preview.classified.modules.iter().filter(|&&m| m == Module::Unknown).count();
         let flat = preview.classified.flat;
         let mut text = format!("{unknown} of {} modules would be left unknown", preview.classified.modules.len());
@@ -653,14 +828,23 @@ fn sampling_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
             text.push_str(&format!(", {flat} of them in patches with no contrast"));
         }
         ui.weak(text);
-        if preview.classified.is_poorly_separated() {
+        // One line, which turns to a warning where the two do not split.
+        let separates = format!("Dark and light separate {:.2}", preview.classified.separability);
+        let line = if preview.classified.is_poorly_separated() {
             ui.colored_label(
                 ui.visuals().warn_fg_color,
-                "The module luminances do not split into dark and light: the outline may be off the symbol, or \
-                 the photo too washed out to read.",
+                format!("{separates}, too little to tell them apart: the outline may be off the symbol, or the photo too washed out to read."),
             )
-            .on_hover_text("A grid that straddles module boundaries averages dark with light into greys");
-        }
+        } else {
+            ui.weak(separates)
+        };
+        line.on_hover_text(format!(
+            "How clearly the module luminances fall into two groups, from 0 to 1: how empty the valley is between the \
+             dark modules and the light. A well placed outline on a readable symbol scores near 1, and under \
+             {POOR_SEPARABILITY} the two groups are not to be believed: a grid that straddles module boundaries averages \
+             dark with light into greys. Watch it while moving a corner or a setting: it rises as the grid comes onto \
+             the modules.",
+        ));
     }
     ui.checkbox(&mut app.view.auto_invert, "Invert photo automatically when sampling")
         .on_hover_text(
@@ -669,12 +853,19 @@ fn sampling_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
         );
     ui.horizontal(|ui| {
         if ui.button("Sample all").on_hover_text("Replace the grid with what the photo shows").clicked() {
-            actions.push(Action::Sample { only_unknown: false });
+            actions.push(Action::Sample { only_unknown: false, scope: SampleScope::All });
         }
         if ui.button("Sample unknown only").on_hover_text("Keep everything already painted").clicked() {
-            actions.push(Action::Sample { only_unknown: true });
+            actions.push(Action::Sample { only_unknown: true, scope: SampleScope::All });
         }
     });
+    if let (Some(all), Some(unknown)) = (app.sample_would_change(false), app.sample_would_change(true)) {
+        ui.weak(format!("Sample all would change {all} modules of the grid as it stands, and unknown only {unknown}."))
+            .on_hover_text(
+                "The Differs from photo overlay of the Edit stage shows which. To sample a part of the grid alone, paint \
+                 it with the From photo ink under Paint, or press Sample on a block under Blocks.",
+            );
+    }
 }
 
 fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
@@ -686,9 +877,19 @@ fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
             .on_hover_text("I — click a module to select its codeword");
     });
     ui.horizontal(|ui| {
-        ui.selectable_value(&mut app.view.ink, Module::Dark, "Dark").on_hover_text("1");
-        ui.selectable_value(&mut app.view.ink, Module::Light, "Light").on_hover_text("2");
-        ui.selectable_value(&mut app.view.ink, Module::Unknown, "Unknown").on_hover_text("3");
+        ui.selectable_value(&mut app.view.ink, Ink::Module(Module::Dark), "Dark").on_hover_text("1");
+        ui.selectable_value(&mut app.view.ink, Ink::Module(Module::Light), "Light").on_hover_text("2");
+        ui.selectable_value(&mut app.view.ink, Ink::Module(Module::Unknown), "Unknown").on_hover_text("3");
+        ui.add_enabled_ui(app.preview.is_some(), |ui| {
+            ui.selectable_value(&mut app.view.ink, Ink::Photo, "From photo")
+                .on_hover_text(
+                    "4 — each module as sampling reads it off the photo, as Sample all reads the whole grid, but with no \
+                     unsure band: a module near its threshold is painted the colour it falls on, at the reliability it \
+                     read at, where Sample all would leave it unknown. Brush over a part of the grid, or drag a \
+                     rectangle about it, to sample that part alone",
+                )
+                .on_disabled_hover_text("Load a photo and place the corners to paint modules from it");
+        });
     });
     ui.weak("Left button paints the ink; right button paints the other of dark and light; Shift paints unknown.");
     ui.checkbox(&mut app.view.lock_fixed, "Lock fixed patterns")
@@ -762,29 +963,40 @@ fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
 
     ui.separator();
     ui.heading("Decoding");
-    let mut bit_level = app.opts.bit_level;
-    if ui
-        .checkbox(&mut bit_level, "Solve unknown bits individually")
-        .on_hover_text(
-            "When a block has more unknown codewords than Reed-Solomon can restore, solve for the unknown \
-             modules one by one instead. Assumes every painted module is right.",
-        )
-        .changed()
-    {
-        actions.push(Action::SetBitLevel(bit_level));
+    let mut opts = app.opts;
+    ui.checkbox(&mut opts.bit_level, "Solve unknown bits individually").on_hover_text(
+        "When a block has more unknown codewords than Reed-Solomon can restore, solve for the unknown \
+         modules one by one instead. Assumes every painted module is right.",
+    );
+    ui.checkbox(&mut opts.reliability, "Doubt the least reliable modules").on_hover_text(
+        "When a block fails, treat its codewords with the faintest sampled modules as unknown, a few at a \
+         time, until it solves with something to spare. Modules painted by hand are never doubted. The three \
+         ways of doubting below are each tried, and the solution with the most to confirm it kept; Blocks says \
+         which solved a block, and its Show outlines the modules that were doubted.",
+    );
+    ui.indent("doubting", |ui| {
+        ui.add_enabled_ui(opts.reliability, |ui| {
+            ui.checkbox(&mut opts.doubt_codewords, "Whole codewords").on_hover_text(
+                "Take the least reliable codewords as unknown, one more at a time: each costs one error correction \
+                 codeword, where a wrong one that is not doubted costs two.",
+            );
+            ui.add_enabled(opts.bit_level, egui::Checkbox::new(&mut opts.doubt_bits, "Single bits"))
+                .on_hover_text(
+                    "Take the least reliable modules as unknown one by one and solve bit by bit: reaches damage spread \
+                     a faint module to a codeword over more codewords than doubting them whole can take.",
+                )
+                .on_disabled_hover_text("Needs Solve unknown bits individually");
+            ui.checkbox(&mut opts.flip_bits, "Flip the faintest bits").on_hover_text(
+                "Flip the few least reliable modules every way and decode each: reaches a block wrong in a little more \
+                 than its error correction takes. Many tries are many chances of a wrong answer, so every pattern that \
+                 solves must agree; turn this off where a solution it reached looks wrong.",
+            );
+        });
+    });
+    if opts != app.opts {
+        actions.push(Action::SetDecodeOptions(opts));
     }
-    let mut reliability = app.opts.reliability;
-    if ui
-        .checkbox(&mut reliability, "Doubt the least reliable modules")
-        .on_hover_text(
-            "When a block fails, treat its codewords with the faintest sampled modules as unknown, a few at a \
-             time, until it solves with something to spare. Modules painted by hand are never doubted.",
-        )
-        .changed()
-    {
-        actions.push(Action::SetReliability(reliability));
-    }
-    if reliability && !app.doc.grid.has_reliability() {
+    if opts.reliability && !app.doc.grid.has_reliability() {
         ui.weak("Takes effect once modules are sampled from a photo.");
     }
 }

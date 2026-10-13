@@ -5,7 +5,7 @@ use qr_forensics::decode::bch::InfoRead;
 use qr_forensics::decode::bitstream::{Certainty, EndOfData, LostReason, SegmentContent};
 use qr_forensics::decode::codewords::PinSource;
 use qr_forensics::decode::known::{Place, TextPinError, text_pins};
-use qr_forensics::decode::padding::Filler;
+use qr_forensics::decode::padding::{Filler, padding_at};
 use qr_forensics::decode::pipeline::{BlockOutcome, BlockReport, CodewordReport, CwStatus, SolveMethod};
 use qr_forensics::decode::rs::RsFailure;
 use qr_forensics::decode::sequence::ParityCheck;
@@ -18,15 +18,16 @@ use super::state::*;
 use super::{Action, App, ExportFormat, Transform, ec_name};
 
 const GOOD: Color32 = Color32::from_rgb(40, 170, 80);
+/// How many of the readings of the format bits, and of the attempts of a
+/// brute force, are listed until the rest are asked for.
+const CANDIDATES_SHOWN: usize = 4;
+const ATTEMPTS_SHOWN: usize = 6;
 
 pub(super) fn show(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     app.view.wheel.follow(ui.input(|i| i.pointer.hover_pos()));
     result_section(ui, app, actions);
-    if app.proposals.as_ref().is_some_and(|proposals| proposals.reads.is_some()) {
-        section(ui, "Symbols read", true, |ui| reads_section(ui, app, actions));
-    }
     section(ui, "Format and version", true, |ui| format_section(ui, app, actions));
-    section(ui, "Blocks", true, |ui| blocks_section(ui, app));
+    section(ui, "Blocks", true, |ui| blocks_section(ui, app, actions));
     section(ui, "Codewords", true, |ui| codewords_section(ui, app, actions));
     section(ui, "Known text", true, |ui| known_text_section(ui, app, actions));
     section(ui, "Padding recovery and pins", true, |ui| padding_section(ui, app, actions));
@@ -261,6 +262,12 @@ fn result_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     for note in &report.text.notes {
         ui.small(note);
     }
+    if let Some(gs1) = &report.text.gs1 {
+        for problem in &gs1.problems {
+            ui.small(RichText::new(format!("GS1: {problem}.")).color(visuals.warn_fg_color))
+                .on_hover_text("The message says it is GS1 element strings and does not read as them here: a sign of a wrong read");
+        }
+    }
     if report.parse.segments.iter().any(|s| matches!(s.content, SegmentContent::StructuredAppend { .. }))
         && ui
             .button("Add to sequence")
@@ -372,61 +379,6 @@ fn picked_line(app: &App, at: usize) -> String {
         if names.len() == 1 { "" } else { "s" },
         names.join(", ")
     )
-}
-
-/// The symbols a search found, as Read all read them: each with how its
-/// read stands and its message, to copy, or to load into the grid.
-fn reads_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
-    let Some(reads) = app.proposals.as_ref().and_then(|proposals| proposals.reads.as_ref()) else { return };
-    let visuals = ui.visuals().clone();
-    let busy = app.job.is_some();
-    let area = egui::ScrollArea::vertical().id_salt("reads").max_height(260.0);
-    let shown = latched(area, &app.view.wheel, InnerList::Reads).show(ui, |ui| {
-        for (i, read) in reads.results.iter().enumerate() {
-            let Some(read) = read else {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(format!("{}.", i + 1)).strong());
-                    ui.colored_label(visuals.error_fg_color, "could not be sampled where it was found");
-                });
-                continue;
-            };
-            let version = read.version();
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(format!("{}. {} {version}", i + 1, version.family().label())).strong());
-                let color = if read.is_trustworthy() { GOOD } else { visuals.error_fg_color };
-                ui.colored_label(color, crate::cli::standing(read));
-                if ui.add_enabled(!read.report.text.is_empty(), egui::Button::new("Copy").small()).clicked() {
-                    ui.ctx().copy_text(read.text());
-                }
-                if ui
-                    .add_enabled(!busy, egui::Button::new("Load").small())
-                    .on_hover_text(
-                        "Put the outline and anchors on this symbol and write the grid as it was read, with the pins \
-                         it was read under: a new grid of the symbol's version (undoable).",
-                    )
-                    .on_disabled_hover_text("Wait for the step under way to finish")
-                    .clicked()
-                {
-                    actions.push(Action::LoadRead(i));
-                }
-            });
-            if !read.report.text.is_empty() {
-                ui.label(text_job(ui, &read.report.text, None));
-            }
-        }
-    });
-    app.view.wheel.place(InnerList::Reads, laid_out(&shown));
-    let decoded: Vec<String> = reads.results.iter().flatten().filter(|read| read.is_trustworthy()).map(|read| read.text()).collect();
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(!decoded.is_empty(), egui::Button::new("Copy every message"))
-            .on_hover_text("The messages that decoded, one to a line, in the order of the list")
-            .clicked()
-        {
-            ui.ctx().copy_text(decoded.join("\n"));
-        }
-        ui.weak(format!("{} of {} decoded", decoded.len(), reads.results.len()));
-    });
 }
 
 /// Text the user knows the message to hold, and where: pinned, it costs
@@ -739,7 +691,8 @@ fn format_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
             );
             ui.weak("");
             ui.end_row();
-            for candidate in analysis.candidates.iter().take(4) {
+            let shown = if app.view.all_format_candidates { analysis.candidates.len() } else { CANDIDATES_SHOWN };
+            for candidate in analysis.candidates.iter().take(shown) {
                 let mut name = if candidate.fits_grid {
                     format!("{} / mask {}", ec_name(version, candidate.fields.ec), candidate.fields.mask)
                 } else {
@@ -778,6 +731,8 @@ fn format_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                 ui.end_row();
             }
         });
+        let hint = "Every format word the bits were set against, nearest first";
+        super::show_all_button(ui, &mut app.view.all_format_candidates, analysis.candidates.len(), CANDIDATES_SHOWN, hint);
     }
     if let Some(stray) = analysis.candidates.iter().find(|c| !c.fits_grid && !c.unmasked && c.compared > 0)
         && analysis.best().is_none_or(|best| stray.best_mismatches + 2 < best.best_mismatches)
@@ -817,12 +772,13 @@ fn format_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         }
     });
     if let Some(brute) = &app.brute {
-        egui::Grid::new("brute").num_columns(5).striped(true).show(ui, |ui| {
-            for heading in ["EC", "Mask", "Blocks", "Text", ""] {
+        let shown = if app.view.all_attempts { brute.attempts.len() } else { ATTEMPTS_SHOWN };
+        egui::Grid::new("brute").num_columns(6).striped(true).show(ui, |ui| {
+            for heading in ["EC", "Mask", "Blocks", "Format", "Text", ""] {
                 ui.weak(heading);
             }
             ui.end_row();
-            for attempt in brute.attempts.iter().take(6) {
+            for attempt in brute.attempts.iter().take(shown) {
                 let report = &attempt.report;
                 let current = attempt.ec == derived.ec && attempt.mask == derived.mask;
                 let color = if report.is_trustworthy() { GOOD } else { ui.visuals().text_color() };
@@ -830,6 +786,10 @@ fn format_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                 ui.colored_label(color, attempt.mask.to_string());
                 ui.colored_label(color, format!("{}/{}", report.blocks_verified(), report.blocks.len()))
                     .on_hover_text("Blocks solved and confirmed");
+                ui.label(format!("{} off", attempt.format_mismatches)).on_hover_text(
+                    "Bits of the format word for this level and mask that differ from the format bits as read: between \
+                     two attempts that decode alike, the one the format bits lie nearer is the likelier",
+                );
                 let preview: String = displayable(&report.text.plain()).chars().take(14).collect();
                 let stream = if report.score.stream_valid { "" } else { " (does not parse)" };
                 ui.label(mono(format!("{preview}{stream}")));
@@ -841,6 +801,7 @@ fn format_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                 ui.end_row();
             }
         });
+        super::show_all_button(ui, &mut app.view.all_attempts, brute.attempts.len(), ATTEMPTS_SHOWN, "Every EC level and mask tried, best first");
     }
 }
 
@@ -880,12 +841,22 @@ fn outcome_text(block: &BlockReport) -> (String, bool) {
             (text, true)
         }
         BlockOutcome::Failed(failure) => {
+            // What there is to do about it: the ways the decoder has of
+            // finding too much wrong all call for the same, and are said
+            // apart by [`failure_detail`].
             let mut text = match failure {
                 RsFailure::TooManyErasures { erasures, capacity } => {
                     format!("{erasures} unknown codewords, limit {capacity}: resolve {} more", erasures - capacity)
                 }
+                RsFailure::BudgetExceeded
+                | RsFailure::LocatorDegree
+                | RsFailure::RootCount { .. }
+                | RsFailure::ZeroDerivative
+                | RsFailure::ResidualSyndrome => "too many wrong modules, or the wrong EC level or mask".to_owned(),
                 RsFailure::PinConflict { .. } => "the only solution contradicts a pin".to_owned(),
-                _ => "too many wrong modules, or the wrong EC level or mask".to_owned(),
+                RsFailure::KnownBitConflict { .. } => {
+                    "the only solution overturns modules read as known, with too little to spare to bear it out".to_owned()
+                }
             };
             if block.inferred_bits > 0 {
                 text.push_str(&format!("; {} of {} unknown bits inferred", block.inferred_bits, block.unknown_bits));
@@ -895,8 +866,26 @@ fn outcome_text(block: &BlockReport) -> (String, bool) {
     }
 }
 
-fn blocks_section(ui: &mut egui::Ui, app: &mut App) {
+/// How the decoder came to find too much wrong in a block, for the hover
+/// of a row that says only that it did; nothing for a failure the row
+/// says outright.
+fn failure_detail(failure: RsFailure) -> Option<String> {
+    match failure {
+        RsFailure::BudgetExceeded | RsFailure::LocatorDegree => {
+            Some("More codewords are wrong than its error correction has left for them after the unknown ones.".to_owned())
+        }
+        RsFailure::RootCount { want, got } => Some(format!(
+            "Its error correction makes out {want} wrong codewords and can place only {got} of them: more are wrong than it takes."
+        )),
+        RsFailure::ZeroDerivative | RsFailure::ResidualSyndrome => Some("No solution holds together.".to_owned()),
+        RsFailure::TooManyErasures { .. } | RsFailure::PinConflict { .. } | RsFailure::KnownBitConflict { .. } => None,
+    }
+}
+
+fn blocks_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     let report = &app.derived.report;
+    let layout = &app.derived.layout;
+    let has_photo = app.photo.is_some();
     let error = ui.visuals().error_fg_color;
     let warn = ui.visuals().warn_fg_color;
     // Wrapping rows rather than a table: the result text is long and the
@@ -915,17 +904,49 @@ fn blocks_section(ui: &mut egui::Ui, app: &mut App) {
                     (true, false) => warn,
                     _ => error,
                 };
-                ui.colored_label(color, text);
-                let mut shown = app.view.highlight_block == Some(b);
-                if block.erased_codewords > 0
-                    && !solved
-                    && ui
-                        .toggle_value(&mut shown, "Show")
-                        .on_hover_text("Outline this block's unknown codewords on the grid")
-                        .changed()
+                let label = ui.colored_label(color, text);
+                if let BlockOutcome::Failed(failure) = block.outcome
+                    && let Some(detail) = failure_detail(failure)
                 {
+                    label.on_hover_text(detail);
+                }
+                // The codeword a failed solution contradicts, to go to.
+                if let BlockOutcome::Failed(RsFailure::PinConflict { index } | RsFailure::KnownBitConflict { index }) = block.outcome
+                    && let Some(&cw) = layout.blocks[b].codewords.get(index)
+                    && ui
+                        .small_button(format!("Go to codeword {cw}"))
+                        .on_hover_text(
+                            "Select this codeword, on the grid and in the table. Its pin, or the modules of it that were \
+                             painted or sampled, are what the solution cannot be squared with: one of the two is wrong.",
+                        )
+                        .clicked()
+                {
+                    app.view.selected = Some(cw);
+                    app.view.reveal_selected = true;
+                    app.view.stage = Stage::Edit;
+                }
+                let mut shown = app.view.highlight_block == Some(b);
+                let doubted = layout.blocks[b].codewords.iter().any(|&cw| report.codewords[cw].doubted != 0);
+                let hint = if doubted {
+                    "Outline on the grid the modules that were doubted to solve this block"
+                } else {
+                    "Outline this block's unknown codewords on the grid"
+                };
+                if ((block.erased_codewords > 0 && !solved) || doubted) && ui.toggle_value(&mut shown, "Show").on_hover_text(hint).changed() {
                     app.view.highlight_block = shown.then_some(b);
                     app.view.stage = Stage::Edit;
+                }
+                if has_photo
+                    && !block.is_verified()
+                    && ui
+                        .small_button("Sample")
+                        .on_hover_text(
+                            "Read this block's modules from the photo again, with the outline and Sampling as they now \
+                             stand, and leave the rest of the grid as it is (undoable).",
+                        )
+                        .clicked()
+                {
+                    actions.push(Action::Sample { only_unknown: false, scope: SampleScope::Block(b) });
                 }
             });
         }
@@ -1023,8 +1044,9 @@ fn codewords_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
                 Some(PinSource::Header) => " hdr",
                 None => "",
             };
+            let doubted = if item.doubted != 0 { " doubted" } else { "" };
             let text = format!(
-                "{cw:>4}  B{:<2} {kind}{index:<3}  {:<8}  {value}  {}{pin}",
+                "{cw:>4}  B{:<2} {kind}{index:<3}  {:<8}  {value}  {}{pin}{doubted}",
                 span.block + 1,
                 read_bits(item, span),
                 status_label(item.status),
@@ -1076,6 +1098,44 @@ fn codewords_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
         }
         if item.pin.is_some() && ui.button("Unpin").clicked() {
             actions.push(Action::Unpin(cw));
+        }
+    });
+    // Bit by bit: a pin holds any of a codeword's bits, and what is known
+    // of a message often ends partway through one, as a mode indicator
+    // does.
+    ui.horizontal(|ui| {
+        ui.label("Pin bits");
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let (mask, value) = item.pin.map_or((0, 0), |pin| (pin.mask, pin.value));
+        let exists = span.module_mask();
+        for i in 0..8u8 {
+            let bit = 0x80u8 >> i;
+            let pinned = (mask & bit != 0).then_some(value & bit != 0);
+            let label = match pinned {
+                Some(true) => "1",
+                Some(false) => "0",
+                None => "·",
+            };
+            let button = egui::Button::selectable(pinned.is_some(), mono(label));
+            let response = ui
+                .add_enabled(exists & bit != 0, button)
+                .on_hover_text(format!(
+                    "Bit {} of the codeword, as it stands in the data once the mask is off. Click to pin it as it reads, \
+                     again to pin it the other way, and again to let it go.",
+                    7 - i
+                ))
+                .on_disabled_hover_text("The symbol has no module for this bit");
+            if response.clicked() {
+                // As it reads on the grid, whatever a pin has made of it
+                // since, so that the three clicks come round.
+                let read = item.known & bit != 0 && item.read & bit != 0;
+                let (mask, value) = match pinned {
+                    None => (mask | bit, if read { value | bit } else { value & !bit }),
+                    Some(now) if now == read => (mask, value ^ bit),
+                    Some(_) => (mask & !bit, value & !bit),
+                };
+                actions.push(Action::PinBits { cw, mask, value });
+            }
         }
     });
 }
@@ -1147,6 +1207,53 @@ fn padding_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) 
             actions.push(Action::ClearAllPins);
         }
     });
+
+    // By hand, for padding that is not found: too little of it readable,
+    // or a filler that is looked for only where the headers say the data
+    // ends, with headers too damaged to say.
+    ui.add_space(4.0);
+    let last = derived.layout.data_stream.len().saturating_sub(1);
+    let found = derived.padding.map(|candidate| candidate.first_pad_codeword).or(derived.report.tail.map(|tail| tail.first_pad_codeword));
+    let mut first = app.view.pad_from.or(found).unwrap_or(last).min(last);
+    ui.horizontal_wrapped(|ui| {
+        ui.label("By hand: padding from message byte");
+        if ui
+            .add(egui::DragValue::new(&mut first).range(0..=last).speed(0.2))
+            .on_hover_text(
+                "The first data codeword that is padding, counted from 0 as the Data codewords list counts them: the one \
+                 after the terminator. It follows what the decode makes of the padding until it is set here, and \
+                 again once the padding is pinned from it or the grid is another symbol's.",
+            )
+            .changed()
+        {
+            app.view.pad_from = Some(first);
+        }
+        ui.label("as");
+        egui::ComboBox::from_id_salt("pad_filler").selected_text(app.view.pad_filler.label()).show_ui(ui, |ui| {
+            for filler in Filler::ALL {
+                ui.selectable_value(&mut app.view.pad_filler, filler, filler.label());
+            }
+        });
+    });
+    let filler = app.view.pad_filler;
+    let fit = padding_at(&derived.layout, &derived.report, first, filler);
+    let readable = fit.matches + fit.mismatches;
+    let text = format!("{} codewords from there; {} of {readable} readable bits match that filler.", fit.pad_codewords, fit.matches);
+    if fit.mismatches * 4 > fit.matches {
+        ui.colored_label(warn, text).on_hover_text("Data agrees with a filler in half its bits by chance: this start, or this filler, looks wrong");
+    } else {
+        ui.small(text);
+    }
+    if ui
+        .button("Pin from there")
+        .on_hover_text(
+            "Pin every data codeword from that byte on at the filler's value, in place of any padding pins there are. \
+             Nothing checks a start given by hand but the blocks, which solve with it or do not. Undoable.",
+        )
+        .clicked()
+    {
+        actions.push(Action::PinPaddingAt { first, filler });
+    }
 }
 
 fn segments_section(ui: &mut egui::Ui, app: &mut App) {
@@ -1155,7 +1262,8 @@ fn segments_section(ui: &mut egui::Ui, app: &mut App) {
     if report.parse.segments.is_empty() {
         ui.weak("No segments read.");
     }
-    for segment in &report.parse.segments {
+    let picked = app.view.picked_segment.filter(|&at| at < report.parse.segments.len());
+    for (i, segment) in report.parse.segments.iter().enumerate() {
         let detail = match &segment.content {
             SegmentContent::Chars(cells) => {
                 let text: String = cells.iter().map(|c| c.value.unwrap_or('?')).take(28).collect();
@@ -1178,17 +1286,68 @@ fn segments_section(ui: &mut egui::Ui, app: &mut App) {
             SegmentContent::Fnc1Second(indicator) => format!("application indicator {indicator}"),
             SegmentContent::Unreadable => "unreadable".into(),
         };
+        let inferred = if segment.header_inferred { " · header inferred" } else { "" };
         let text = format!(
-            "{} · bits {} to {} · {detail}",
+            "{} · bits {} to {} · {detail}{inferred}",
             segment.mode.label(),
             segment.header.start,
             segment.payload.end
         );
-        if segment.damaged || segment.truncated || segment.header_certainty != Certainty::Verified {
-            ui.colored_label(warn, text).on_hover_text("Header not confirmed, or contents invalid");
+        let doubtful = segment.damaged || segment.truncated || segment.header_certainty != Certainty::Verified;
+        let text = if doubtful { RichText::new(text).color(warn) } else { RichText::new(text) };
+        let why = if segment.header_inferred {
+            "The header has unreadable bits, and this is the one reading of them under which the message parses: a guess \
+             the rest of the message bears out, not a read. "
+        } else if segment.truncated {
+            "The header promises more data than the symbol holds. "
+        } else if segment.damaged {
+            "Some of its bits make no valid value: a wrong read, or the wrong EC level or mask. "
+        } else if doubtful {
+            "The header is not confirmed by error correction. "
         } else {
-            ui.label(text);
+            ""
+        };
+        if ui
+            .selectable_label(picked == Some(i), text)
+            .on_hover_text(format!("{why}Click to outline its modules on the grid, the header in yellow; Esc clears it."))
+            .clicked()
+        {
+            // A second click on the segment lets go of it.
+            app.view.picked_segment = (picked != Some(i)).then_some(i);
+            if app.view.picked_segment.is_some() {
+                app.view.stage = Stage::Edit;
+            }
         }
+    }
+    if report.parse.preamble_damaged {
+        ui.colored_label(warn, "A bit of the zeros a Model 1 message begins with reads as one: a wrong read, or the wrong EC level or mask.");
+    }
+    // What the parser made of a header it could not read, which is
+    // otherwise seen only in what Pin the padding then pins.
+    if let Some(inference) = &report.parse.header_inference {
+        let guessed = inference.guessed_bits;
+        let bits = if guessed == 1 { "1 bit".to_owned() } else { format!("{guessed} bits") };
+        let text = match (inference.complete, inference.candidates) {
+            (false, found) => format!(
+                "A segment header has unreadable bits, and the search for readings of them under which the message parses \
+                 ran out of tries, at {bits} guessed, with {found} found: nothing is inferred. Paint or pin the header to \
+                 settle it."
+            ),
+            (true, 0) => format!(
+                "A segment header has unreadable bits, and no reading of them makes the message parse, with up to {bits} \
+                 guessed: the stream is wrong somewhere besides."
+            ),
+            (true, 1) => format!(
+                "A segment header has unreadable bits, and one reading of them alone makes the message parse, guessing \
+                 {bits}: it is the one shown, and Pin the padding pins those bits."
+            ),
+            (true, found) => format!(
+                "A segment header has unreadable bits, and {found} readings of them make the message parse, each guessing \
+                 {bits}: they agree on {} of the unreadable bits, which Pin the padding pins, and the header stays unread.",
+                inference.inferred.len()
+            ),
+        };
+        ui.colored_label(warn, text);
     }
     match report.parse.end {
         EndOfData::At { bit, certainty } => {

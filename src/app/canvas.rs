@@ -3,6 +3,8 @@
 //! photo rectified underneath.
 
 use eframe::egui::{self, Color32, Pos2, Rect, Shape, Stroke as Line, StrokeKind, Vec2, pos2, vec2};
+use qr_forensics::decode::bitstream::EndOfData;
+use qr_forensics::decode::codewords::PinSource;
 use qr_forensics::decode::pipeline::CwStatus;
 use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::binarize::{BinarizeParams, binarize};
@@ -16,9 +18,9 @@ use super::state::*;
 use super::{Action, App};
 
 const HANDLE_NAMES: [&str; 4] = ["TL", "TR", "BR", "BL"];
-const ACCENT: Color32 = Color32::from_rgb(0, 150, 255);
-const SELECT: Color32 = Color32::from_rgb(255, 210, 0);
-const GOOD: Color32 = Color32::from_rgb(40, 190, 90);
+pub(super) const ACCENT: Color32 = Color32::from_rgb(0, 150, 255);
+pub(super) const SELECT: Color32 = Color32::from_rgb(255, 210, 0);
+pub(super) const GOOD: Color32 = Color32::from_rgb(40, 190, 90);
 const BAD: Color32 = Color32::from_rgb(235, 60, 60);
 const UNKNOWN_TINT: Color32 = Color32::from_rgb(240, 150, 40);
 const ALIGNMENT: Color32 = Color32::from_rgb(150, 90, 255);
@@ -34,6 +36,8 @@ const PROPOSAL: Color32 = Color32::from_rgb(255, 120, 200);
 /// The modules of the character picked in the result, and that character
 /// in the result's text.
 pub(super) const PICKED: Color32 = Color32::from_rgb(160, 235, 0);
+/// Modules whose bits a block's solution was reached by doubting.
+const DOUBTED: Color32 = Color32::from_rgb(190, 110, 255);
 /// Modules of photo shown around the symbol in the Edit stage.
 const MARGIN: i32 = 2;
 /// Half-size of an anchor handle's hit area, in screen points.
@@ -119,6 +123,16 @@ fn toolbar(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                         "Red: sampled close to the threshold, fading out by a margin of {:.2}; painted modules untinted",
                         RELIABILITY_FADE as f32 / (CERTAIN - 1) as f32
                     ));
+                } else if app.view.overlay == Overlay::Photo && app.preview.is_none() {
+                    ui.weak("Load a photo and place the corners to compare the grid with it");
+                } else if app.view.overlay == Overlay::Photo
+                    && let Some(note) = app.inverted_note()
+                {
+                    // Nothing inverts the photo for the comparison, as
+                    // Sample all does for itself: every module differs.
+                    ui.colored_label(ui.visuals().warn_fg_color, format!("The grid is compared with the photo as it is. {note}"));
+                } else if !app.view.overlay.legend().is_empty() {
+                    ui.weak(app.view.overlay.legend());
                 }
             }
         }
@@ -206,7 +220,7 @@ fn align_stage(
     painter: &egui::Painter,
     actions: &mut Vec<Action>,
 ) {
-    let App { photo, view, derived, preview, doc, history, model, proposals, leads, job, .. } = app;
+    let App { photo, view, derived, preview, doc, history, model, proposals, leads, placements, job, .. } = app;
     let photo = photo.as_mut().expect("align stage needs a photo");
     // Holding H shows the photo and nothing over it, as in the Edit
     // stage: no grid, no handles, no symbols found, and the photo itself
@@ -543,8 +557,17 @@ fn align_stage(
             }
             let polarity = if found.inverted { ", light on dark" } else { "" };
             let decodes = if found.decodes == Some(true) { ", and it decodes as found" } else { "" };
+            // Read through to a message by Read all, it is loaded as it
+            // was read, where reads are; not read yet, it is read then.
+            let read = proposals.reads.as_ref().and_then(|reads| reads.results.get(i)?.as_ref());
             let how = if busy {
                 "Wait for the step under way to finish before placing the corners on it.".to_owned()
+            } else if view.load_reads && read.is_some_and(|read| read.is_trustworthy()) {
+                "Click to place the corners and anchors on it and write the grid as it was read (undoable).".to_owned()
+            } else if view.load_reads && proposals.reads.is_none() {
+                "Click to place the corners and anchors on it and read it through: a read that decodes is written into the \
+                 grid (undoable)."
+                    .to_owned()
             } else {
                 format!("Click to place the corners and anchors on it.{}", super::new_grid_note(found, doc.version))
             };
@@ -556,6 +579,20 @@ fn align_stage(
                 100.0 * found.score()
             ));
         }
+    }
+
+    // The placement the pointer is on in the list under Alignment: its
+    // outline and where it has its anchors, so that one placement is told
+    // from the next before either is taken.
+    if let Some(found) = placements.as_ref().zip(view.hover_placement).and_then(|(placements, i)| placements.found.get(i)).filter(|_| !peek) {
+        let points: Vec<Pos2> = found.corners.iter().map(|&c| to_screen(c)).collect();
+        for (width, color) in [(5.0, Color32::from_black_alpha(160)), (2.5, PROPOSAL)] {
+            painter.add(Shape::closed_line(points.clone(), Line::new(width, color)));
+        }
+        for anchor in &found.anchors {
+            painter.circle_filled(to_screen(anchor.center), 3.5, PROPOSAL);
+        }
+        painter.text(points[0] + vec2(-8.0, -8.0), egui::Align2::RIGHT_BOTTOM, "TL", egui::FontId::proportional(13.0), PROPOSAL);
     }
 
     // The corner handles: a ring about the corner and four ticks towards
@@ -1019,6 +1056,127 @@ fn edit_stage(ui: &mut egui::Ui, app: &mut App, response: &egui::Response, paint
                 }
             }
         }
+        Overlay::Mask => {
+            let mut mesh = egui::Mesh::default();
+            for y in y_range.clone() {
+                for x in x_range.clone() {
+                    let masked = matches!(derived.func.role(x, y), Role::Data { .. } | Role::Remainder { .. });
+                    if masked && mask_bit(derived.func.version, derived.mask, x, y) {
+                        mesh.add_colored_rect(module_rect(x, y), ACCENT.gamma_multiply(0.5));
+                    }
+                }
+            }
+            painter.add(mesh);
+        }
+        Overlay::Unmasked => {
+            // Each data module as the bit it holds: what the codewords
+            // are read from, where the grid shows the bit under the mask.
+            let mut mesh = egui::Mesh::default();
+            for y in y_range.clone() {
+                for x in x_range.clone() {
+                    if !matches!(derived.func.role(x, y), Role::Data { .. } | Role::Remainder { .. }) {
+                        continue;
+                    }
+                    let Some(dark) = grid.get(x, y).as_dark() else { continue };
+                    let one = dark != mask_bit(derived.func.version, derived.mask, x, y);
+                    mesh.add_colored_rect(module_rect(x, y), if one { Color32::BLACK } else { Color32::WHITE });
+                }
+            }
+            painter.add(mesh);
+        }
+        Overlay::Status => {
+            let mut mesh = egui::Mesh::default();
+            let mut doubted = Vec::new();
+            for y in y_range.clone() {
+                for x in x_range.clone() {
+                    let Some((cw, bit)) = derived.layout.module_codeword(x, y) else { continue };
+                    let report = &derived.report.codewords[cw];
+                    let tint = match report.status {
+                        CwStatus::Clean => None,
+                        CwStatus::Corrected | CwStatus::Filled => Some(GOOD),
+                        CwStatus::Unverified | CwStatus::Inferred => Some(UNKNOWN_TINT),
+                        CwStatus::Unresolved => Some(BAD),
+                    };
+                    if let Some(tint) = tint {
+                        mesh.add_colored_rect(module_rect(x, y), tint.gamma_multiply(0.5));
+                    }
+                    if report.doubted & (0x80 >> bit) != 0 {
+                        doubted.push(module_rect(x, y));
+                    }
+                }
+            }
+            painter.add(mesh);
+            for rect in doubted {
+                painter.rect_stroke(rect, 0.0, Line::new((px * 0.12).clamp(1.5, 3.0), DOUBTED), StrokeKind::Inside);
+            }
+        }
+        Overlay::Segments => {
+            // The stream cut up as it parsed: each segment's header and
+            // payload, and from the end of the data on, the terminator
+            // and the padding. The parts lie in the stream's order.
+            let parse = &derived.report.parse;
+            let mut parts: Vec<(std::ops::Range<usize>, Color32)> = Vec::new();
+            for (i, segment) in parse.segments.iter().enumerate() {
+                parts.push((segment.header.clone(), block_color(i).gamma_multiply(0.8)));
+                parts.push((segment.payload.clone(), block_color(i).gamma_multiply(0.4)));
+            }
+            if let EndOfData::At { bit, .. } = parse.end {
+                parts.push((bit..derived.layout.data_bits, Color32::from_gray(128).gamma_multiply(0.6)));
+            }
+            parts.retain(|(bits, _)| !bits.is_empty());
+            let mut mesh = egui::Mesh::default();
+            for y in y_range.clone() {
+                for x in x_range.clone() {
+                    let Some((cw, place)) = derived.layout.module_codeword(x, y) else { continue };
+                    let Some(index) = derived.layout.stream_index(cw) else { continue };
+                    let bit = 8 * index + usize::from(place);
+                    let part = parts.partition_point(|(bits, _)| bits.end <= bit);
+                    if let Some((_, color)) = parts.get(part).filter(|(bits, _)| bits.contains(&bit)) {
+                        mesh.add_colored_rect(module_rect(x, y), *color);
+                    }
+                }
+            }
+            painter.add(mesh);
+        }
+        Overlay::Pins => {
+            let mut mesh = egui::Mesh::default();
+            for (cw, report) in derived.report.codewords.iter().enumerate() {
+                let Some(pin) = report.pin else { continue };
+                let color = match pin.source {
+                    PinSource::Manual => SELECT,
+                    PinSource::Text => GOOD,
+                    PinSource::Padding => Color32::from_gray(128),
+                    PinSource::Terminator => ACCENT,
+                    PinSource::Header => DOUBTED,
+                };
+                let offset = derived.layout.codewords[cw].bit_offset as usize;
+                for (i, pos) in derived.layout.codeword_modules(cw).iter().enumerate() {
+                    let (x, y) = (pos.x as usize, pos.y as usize);
+                    if pin.mask & (0x80 >> (offset + i)) != 0 && x_range.contains(&x) && y_range.contains(&y) {
+                        mesh.add_colored_rect(module_rect(x, y), color.gamma_multiply(0.6));
+                    }
+                }
+            }
+            painter.add(mesh);
+        }
+        Overlay::Photo => {
+            // What sampling reads off the photo as things stand, where
+            // the grid has it otherwise: what Sample all would change,
+            // but that the fixed patterns are shown as the photo has
+            // them whether or not they are locked.
+            if let Some(preview) = app.preview.as_ref().filter(|p| p.classified.modules.len() == gw * gh) {
+                for y in y_range.clone() {
+                    for x in x_range.clone() {
+                        let (sampled, painted) = (preview.classified.modules[y * gw + x], grid.get(x, y));
+                        let Some(dark) = sampled.as_dark().filter(|_| sampled != painted) else { continue };
+                        let rect = module_rect(x, y);
+                        painter.rect_filled(rect.shrink(px * 0.22), 0.0, if dark { Color32::BLACK } else { Color32::WHITE });
+                        let color = if painted == Module::Unknown { GOOD } else { BAD };
+                        painter.rect_stroke(rect.shrink(1.0), 0.0, Line::new((px * 0.12).clamp(1.0, 3.0), color), StrokeKind::Inside);
+                    }
+                }
+            }
+        }
     }
 
     if app.view.grid_lines && px >= 6.0 {
@@ -1032,13 +1190,18 @@ fn edit_stage(ui: &mut egui::Ui, app: &mut App, response: &egui::Response, paint
     }
     painter.rect_stroke(Rect::from_min_max(at(0.0, 0.0), at(gw as f32, gh as f32)), 0.0, Line::new(1.5, ACCENT), StrokeKind::Outside);
 
-    // Unresolved codewords of the block the inspector asked about.
+    // Unresolved codewords of the block the inspector asked about, and
+    // the bits its solution was reached by doubting.
     if let Some(block) = app.view.highlight_block {
         for &cw in &derived.layout.blocks[block].codewords {
-            if matches!(derived.report.codewords[cw].status, CwStatus::Unresolved) {
-                for pos in derived.layout.codeword_modules(cw) {
-                    let rect = module_rect(pos.x as usize, pos.y as usize);
+            let report = &derived.report.codewords[cw];
+            let offset = derived.layout.codewords[cw].bit_offset as usize;
+            for (i, pos) in derived.layout.codeword_modules(cw).iter().enumerate() {
+                let rect = module_rect(pos.x as usize, pos.y as usize);
+                if matches!(report.status, CwStatus::Unresolved) {
                     painter.rect_stroke(rect, 0.0, Line::new(2.0, UNKNOWN_TINT), StrokeKind::Inside);
+                } else if report.doubted & (0x80 >> (offset + i)) != 0 {
+                    painter.rect_stroke(rect, 0.0, Line::new(2.0, DOUBTED), StrokeKind::Inside);
                 }
             }
         }
@@ -1073,6 +1236,23 @@ fn edit_stage(ui: &mut egui::Ui, app: &mut App, response: &egui::Response, paint
         }
     }
 
+    // The modules of the segment picked under Segments: its header in the
+    // colour of a selection, and what it carries in the colour a picked
+    // character's modules have.
+    if let Some(segment) = app.view.picked_segment.and_then(|at| derived.report.parse.segments.get(at)) {
+        for (bits, color) in [(segment.payload.clone(), PICKED), (segment.header.clone(), SELECT)] {
+            for bit in bits {
+                let Some((cw, place)) = derived.layout.stream_bit_location(bit) else { continue };
+                let span = derived.layout.codewords[cw];
+                let Some(i) = usize::from(place).checked_sub(usize::from(span.bit_offset)).filter(|&i| i < usize::from(span.nbits)) else {
+                    continue;
+                };
+                let pos = derived.layout.codeword_modules(cw)[i];
+                painter.rect_stroke(module_rect(pos.x as usize, pos.y as usize), 0.0, Line::new(2.0, color), StrokeKind::Inside);
+            }
+        }
+    }
+
     // Pointer.
     let cell_at = |pos: Pos2| {
         let w = pz.to_world(canvas, pos);
@@ -1090,14 +1270,14 @@ fn edit_stage(ui: &mut egui::Ui, app: &mut App, response: &egui::Response, paint
     let pressed = !panning && response.is_pointer_button_down_on() && (primary || secondary);
     let cell = pointer.map(cell_at);
     let ink = if shift {
-        Module::Unknown
+        Ink::Module(Module::Unknown)
     } else if primary {
         app.view.ink
     } else {
-        match app.view.ink {
-            Module::Dark => Module::Light,
+        Ink::Module(match app.view.ink {
+            Ink::Module(Module::Dark) => Module::Light,
             _ => Module::Dark,
-        }
+        })
     };
 
     match app.view.tool {
@@ -1107,6 +1287,9 @@ fn edit_stage(ui: &mut egui::Ui, app: &mut App, response: &egui::Response, paint
                     Some(stroke) => stroke,
                     None => {
                         app.history.checkpoint(&app.doc);
+                        if ink == Ink::Photo {
+                            app.warn_if_painted_inverted();
+                        }
                         Stroke { ink, start: cell, last: cell }
                     }
                 };
@@ -1132,9 +1315,10 @@ fn edit_stage(ui: &mut egui::Ui, app: &mut App, response: &egui::Response, paint
                     at(a.0.max(b.0) as f32 + 1.0, a.1.max(b.1) as f32 + 1.0),
                 );
                 let fill = match stroke.ink {
-                    Module::Dark => Color32::from_black_alpha(110),
-                    Module::Light => Color32::from_white_alpha(110),
-                    Module::Unknown => UNKNOWN_TINT.gamma_multiply(0.45),
+                    Ink::Module(Module::Dark) => Color32::from_black_alpha(110),
+                    Ink::Module(Module::Light) => Color32::from_white_alpha(110),
+                    Ink::Module(Module::Unknown) => UNKNOWN_TINT.gamma_multiply(0.45),
+                    Ink::Photo => ACCENT.gamma_multiply(0.25),
                 };
                 painter.rect_filled(rect, 0.0, fill);
                 painter.rect_stroke(rect, 0.0, Line::new(1.5, SELECT), StrokeKind::Inside);
@@ -1147,6 +1331,9 @@ fn edit_stage(ui: &mut egui::Ui, app: &mut App, response: &egui::Response, paint
                         for x in a.0.min(b.0)..=a.0.max(b.0) {
                             app.paint(x, y, stroke.ink);
                         }
+                    }
+                    if stroke.ink == Ink::Photo {
+                        app.warn_if_painted_inverted();
                     }
                 }
             }
@@ -1199,6 +1386,9 @@ pub(super) fn describe_module(derived: &Derived, doc: &Document, x: usize, y: us
                 }
                 if let Some(value) = derived.report.codewords[cw].final_value {
                     text.push_str(&format!("  ·  corrected {}", value >> (7 - bit) & 1));
+                }
+                if derived.report.codewords[cw].doubted & (0x80 >> bit) != 0 {
+                    text.push_str("  ·  doubted to solve the block");
                 }
             }
         }

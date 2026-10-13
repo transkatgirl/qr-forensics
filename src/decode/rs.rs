@@ -537,6 +537,19 @@ pub fn rs_decode_chasing(
     ec_len: usize,
     reserved: usize,
 ) -> Option<(usize, RsSolution)> {
+    let (flipped, solution) = rs_decode_chasing_bits(block, bit_reliability, ec_len, reserved)?;
+    Some((flipped.iter().map(|bits| bits.count_ones() as usize).sum(), solution))
+}
+
+/// [`rs_decode_chasing`], with the bits of each codeword the best
+/// solution's pattern flipped in place of their count: for showing which
+/// they were.
+pub fn rs_decode_chasing_bits(
+    block: &[CwRead],
+    bit_reliability: &[[u8; 8]],
+    ec_len: usize,
+    reserved: usize,
+) -> Option<(Vec<u8>, RsSolution)> {
     assert_eq!(block.len(), bit_reliability.len());
     if reserved >= ec_len {
         return None;
@@ -558,7 +571,7 @@ pub fn rs_decode_chasing(
 
     let received: Vec<u8> = block.iter().map(|c| c.value & c.known).collect();
     let patterns = (1usize << doubtful.len()) - 1;
-    let mut best: Option<(usize, RsSolution)> = None;
+    let mut best: Option<(u32, RsSolution)> = None;
     for pattern in 1u32..1 << doubtful.len() {
         let mut trial = block.to_vec();
         for (k, &(_, i, b)) in doubtful.iter().enumerate() {
@@ -588,10 +601,17 @@ pub fn rs_decode_chasing(
             .collect();
         solution.errors = solution.errata.iter().filter(|e| !e.was_erasure).count();
         if best.as_ref().is_none_or(|(_, b)| solution.confidence_bits() > b.confidence_bits()) {
-            best = Some((pattern.count_ones() as usize, solution));
+            best = Some((pattern, solution));
         }
     }
-    best
+    let (pattern, solution) = best?;
+    let mut flipped = vec![0u8; block.len()];
+    for (k, &(_, i, b)) in doubtful.iter().enumerate() {
+        if pattern >> k & 1 != 0 {
+            flipped[i] |= 1 << b;
+        }
+    }
+    Some((flipped, solution))
 }
 
 /// A block solved by doubting single bits.

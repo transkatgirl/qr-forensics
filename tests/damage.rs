@@ -541,6 +541,39 @@ fn doubting_recovers_from_misread_sampled_modules() {
             assert_eq!(got.final_value, want.final_value, "{what}");
         }
         assert_eq!(report.codewords.iter().filter(|c| c.status == CwStatus::Corrected).count(), wrong, "{what}");
+        // Which modules were doubted is told with the solution: the
+        // codewords erased whole, or the bits taken as unknown or
+        // flipped, as many as the method counts. A clean read doubts
+        // none.
+        let doubted_codewords = report.codewords.iter().filter(|c| c.doubted != 0).count();
+        let doubted_bits: usize = report.codewords.iter().map(|c| c.doubted.count_ones() as usize).sum();
+        match report.blocks[0].outcome {
+            BlockOutcome::Solved { method: SolveMethod::Reliability { doubted }, .. } => assert_eq!(doubted_codewords, doubted, "{what}"),
+            BlockOutcome::Solved { method: SolveMethod::BitReliability { doubted_bits: bits }, .. } => assert_eq!(doubted_bits, bits, "{what}"),
+            BlockOutcome::Solved { method: SolveMethod::Chase { flipped_bits }, .. } => assert_eq!(doubted_bits, flipped_bits, "{what}"),
+            other => panic!("{what}: {other:?}"),
+        }
+        assert!(truth.codewords.iter().all(|c| c.doubted == 0), "{what}");
+        // Each of the three ways is left out by itself: with none of
+        // them the block fails as it does with doubting off, and with
+        // one alone it solves that way or not at all.
+        let none = DecodeOptions { doubt_codewords: false, doubt_bits: false, flip_bits: false, ..Default::default() };
+        assert!(!decode(&grid, &layout, mask, &Pins::new(), &none).blocks[0].is_solved(), "{what}");
+        let alone = [
+            DecodeOptions { doubt_codewords: true, ..none },
+            DecodeOptions { doubt_bits: true, ..none },
+            DecodeOptions { flip_bits: true, ..none },
+        ];
+        for (way, only) in alone.iter().enumerate() {
+            let own = match decode(&grid, &layout, mask, &Pins::new(), only).blocks[0].outcome {
+                BlockOutcome::Solved { method: SolveMethod::Reliability { .. }, .. } => 0,
+                BlockOutcome::Solved { method: SolveMethod::BitReliability { .. }, .. } => 1,
+                BlockOutcome::Solved { method: SolveMethod::Chase { .. }, .. } => 2,
+                BlockOutcome::Solved { method, .. } => panic!("{what}: {method:?}"),
+                BlockOutcome::Failed(_) => continue,
+            };
+            assert_eq!(own, way, "{what}");
+        }
     }
     // A certain module is never doubted, so painting a wrong module by hand
     // keeps the failure.

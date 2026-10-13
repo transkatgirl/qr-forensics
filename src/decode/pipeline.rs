@@ -8,7 +8,7 @@ use super::bitstream::{self, Certainty, EndOfData, ParseReport, StreamBits};
 use super::codewords::{Pin, Pins, apply_pins, codeword_bit_mask, read_codewords};
 use super::padding::{self, TailCheck};
 use super::rs::{
-    AIDED_VERIFIED_BITS, CwRead, RsFailure, VERIFIED_BITS, rs_decode_chasing, rs_decode_doubting, rs_decode_reserving,
+    AIDED_VERIFIED_BITS, CwRead, RsFailure, VERIFIED_BITS, rs_decode_chasing_bits, rs_decode_doubting, rs_decode_reserving,
     solve_bit_erasures, solve_bit_erasures_doubting,
 };
 use super::text::{self, Charset, TextReport};
@@ -29,11 +29,21 @@ pub struct DecodeOptions {
     /// least reliable bits every way. Only modules sampled from a photo
     /// are ever doubted.
     pub reliability: bool,
+    /// While `reliability` holds, doubt the least reliable codewords
+    /// ([`SolveMethod::Reliability`]): the first of the three ways it
+    /// names, each of which may be left out by itself.
+    pub doubt_codewords: bool,
+    /// While `reliability` and `bit_level` hold, doubt the least reliable
+    /// bits ([`SolveMethod::BitReliability`]).
+    pub doubt_bits: bool,
+    /// While `reliability` holds, flip the least reliable bits every way
+    /// ([`SolveMethod::Chase`]).
+    pub flip_bits: bool,
 }
 
 impl Default for DecodeOptions {
     fn default() -> Self {
-        Self { charset: Charset::Auto, bit_level: true, reliability: true }
+        Self { charset: Charset::Auto, bit_level: true, reliability: true, doubt_codewords: true, doubt_bits: true, flip_bits: true }
     }
 }
 
@@ -194,6 +204,12 @@ pub struct CodewordReport {
     pub inferred_known: u8,
     /// Value after error correction, when the block solved.
     pub final_value: Option<u8>,
+    /// Bits read as known that the solution of the codeword's block was
+    /// reached by doubting: all eight of a codeword erased as one of the
+    /// block's least reliable, the single bits treated as unknown where
+    /// the block solved bit by bit, and the bits flipped where it solved
+    /// by flipping. None under any other solution, or under none.
+    pub doubted: u8,
     pub status: CwStatus,
 }
 
@@ -290,12 +306,15 @@ struct BlockSolve {
     /// When the block did not solve: bits settled anyway, as (value, mask)
     /// per codeword.
     inferred: Vec<(u8, u8)>,
+    /// The bits of each codeword the solution was reached by doubting
+    /// ([`CodewordReport::doubted`]); empty when it doubted none.
+    doubted: Vec<u8>,
 }
 
 impl BlockSolve {
-    fn solved(outcome: BlockOutcome, corrected: Vec<u8>) -> Self {
+    fn solved(outcome: BlockOutcome, corrected: Vec<u8>, doubted: Vec<u8>) -> Self {
         let inferred = vec![(0, 0); corrected.len()];
-        Self { outcome, corrected: Some(corrected), inferred }
+        Self { outcome, corrected: Some(corrected), inferred, doubted }
     }
 }
 
@@ -329,10 +348,13 @@ fn solve_block(
     reserved: usize,
     opts: &DecodeOptions,
 ) -> BlockSolve {
-    let mut best: Option<(BlockOutcome, Vec<u8>)> = None;
-    fn consider(best: &mut Option<(BlockOutcome, Vec<u8>)>, outcome: BlockOutcome, corrected: Vec<u8>) {
-        if best.as_ref().is_none_or(|(b, _)| solve_rank(&outcome) > solve_rank(b)) {
-            *best = Some((outcome, corrected));
+    // A solution, the block as it corrected it, and the bits of each
+    // codeword it was reached by doubting, none for most.
+    type Kept = (BlockOutcome, Vec<u8>, Vec<u8>);
+    let mut best: Option<Kept> = None;
+    fn consider(best: &mut Option<Kept>, outcome: BlockOutcome, corrected: Vec<u8>, doubted: Vec<u8>) {
+        if best.as_ref().is_none_or(|(b, _, _)| solve_rank(&outcome) > solve_rank(b)) {
+            *best = Some((outcome, corrected, doubted));
         }
     }
 
@@ -347,9 +369,9 @@ fn solve_block(
                 beyond_standard: !solution.within_standard(),
             };
             if solve_rank(&outcome).0 {
-                return BlockSolve::solved(outcome, solution.corrected);
+                return BlockSolve::solved(outcome, solution.corrected, Vec::new());
             }
-            consider(&mut best, outcome, solution.corrected);
+            consider(&mut best, outcome, solution.corrected, Vec::new());
             RsFailure::BudgetExceeded
         }
         Err(failure) => failure,
@@ -369,7 +391,7 @@ fn solve_block(
                     // Spare equations stand in for unused codewords.
                     beyond_standard: solution.spare_equations < 8 * reserved,
                 };
-                consider(&mut best, outcome, solution.corrected);
+                consider(&mut best, outcome, solution.corrected, Vec::new());
             }
             Ok(solution) => partial = Some(solution),
             Err(_) => {}
@@ -377,6 +399,7 @@ fn solve_block(
     }
 
     if opts.reliability
+        && opts.doubt_codewords
         && let Some((doubted, solution)) = rs_decode_doubting(block, reliability, ec_len, reserved)
     {
         let outcome = BlockOutcome::Solved {
@@ -387,7 +410,13 @@ fn solve_block(
             confidence_bits: solution.confidence_bits(),
             beyond_standard: !solution.within_standard(),
         };
-        consider(&mut best, outcome, solution.corrected);
+        // The codewords doubted are those the solution took as erased
+        // that were read in full.
+        let mut which = vec![0u8; block.len()];
+        for erratum in solution.errata.iter().filter(|e| e.was_erasure && !block[e.index].is_erasure()) {
+            which[erratum.index] = 0xFF;
+        }
+        consider(&mut best, outcome, solution.corrected, which);
     }
 
     // Doubting bits rather than codewords reaches damage spread over more
@@ -397,6 +426,7 @@ fn solve_block(
     // it, which a wrong codeword passes once in a few hundred tries, and
     // the bit solution, when there is one, has every spare equation.
     if opts.reliability
+        && opts.doubt_bits
         && opts.bit_level
         && let Some(doubt) = solve_bit_erasures_doubting(block, bit_reliability, ec_len)
     {
@@ -408,7 +438,7 @@ fn solve_block(
             confidence_bits: doubt.confidence_bits(),
             beyond_standard: doubt.solution.spare_equations < 8 * reserved,
         };
-        consider(&mut best, outcome, doubt.solution.corrected);
+        consider(&mut best, outcome, doubt.solution.corrected, doubt.doubted);
     }
 
     // Flipping the faintest bits outright costs no redundancy where
@@ -418,17 +448,18 @@ fn solve_block(
     // out of erasures. Every pattern that solves must agree, since many
     // tries are many chances of a misdecode.
     if opts.reliability
-        && let Some((flipped_bits, solution)) = rs_decode_chasing(block, bit_reliability, ec_len, reserved)
+        && opts.flip_bits
+        && let Some((flipped, solution)) = rs_decode_chasing_bits(block, bit_reliability, ec_len, reserved)
     {
         let outcome = BlockOutcome::Solved {
-            method: SolveMethod::Chase { flipped_bits },
+            method: SolveMethod::Chase { flipped_bits: flipped.iter().map(|bits| bits.count_ones() as usize).sum() },
             errors: solution.errors,
             erasures: solution.erasures,
             slack: solution.slack,
             confidence_bits: solution.confidence_bits(),
             beyond_standard: !solution.within_standard(),
         };
-        consider(&mut best, outcome, solution.corrected);
+        consider(&mut best, outcome, solution.corrected, flipped);
     }
 
     // With enough pinned codewords the block is determined by pins alone,
@@ -447,18 +478,18 @@ fn solve_block(
                 confidence_bits: solution.confidence_bits(),
                 beyond_standard: !solution.within_standard(),
             };
-            consider(&mut best, outcome, solution.corrected);
+            consider(&mut best, outcome, solution.corrected, Vec::new());
         }
     }
 
-    if let Some((outcome, corrected)) = best {
-        return BlockSolve::solved(outcome, corrected);
+    if let Some((outcome, corrected, doubted)) = best {
+        return BlockSolve::solved(outcome, corrected, doubted);
     }
     let inferred = match partial {
         Some(solution) => solution.corrected.iter().zip(&solution.solved).map(|(&v, &m)| (v & m, m)).collect(),
         None => vec![(0, 0); block.len()],
     };
-    BlockSolve { outcome: BlockOutcome::Failed(failure), corrected: None, inferred }
+    BlockSolve { outcome: BlockOutcome::Failed(failure), corrected: None, inferred, doubted: Vec::new() }
 }
 
 pub fn decode(
@@ -497,6 +528,7 @@ pub fn decode(
             inferred_value: 0,
             inferred_known: 0,
             final_value: None,
+            doubted: 0,
             status: CwStatus::Unresolved,
         })
         .collect();
@@ -535,6 +567,7 @@ pub fn decode(
             match &solve.corrected {
                 Some(values) => {
                     report.final_value = Some(values[i]);
+                    report.doubted = solve.doubted.get(i).copied().unwrap_or(0) & exists;
                     report.status = if !read_in_full {
                         CwStatus::Filled
                     } else if (values[i] ^ raw[cw].value) & exists != 0 {
@@ -709,6 +742,15 @@ fn suggest_orientation(grid: &ModuleGrid, func: &FunctionMap, fixed: (usize, usi
         }
     }
     best
+}
+
+/// The [`GridAnalysis::orientation`] of `grid` alone, as [`analyze`]
+/// makes it, for a caller with no use for the rest of an analysis: none
+/// for a grid that reads inverted, which is judged once its colours are
+/// right.
+pub fn orientation_of(grid: &ModuleGrid, func: &FunctionMap) -> Option<Orientation> {
+    let fixed = func.fixed_agreement(grid);
+    if looks_inverted(fixed) { None } else { suggest_orientation(grid, func, fixed) }
 }
 
 pub fn analyze(grid: &ModuleGrid, func: &FunctionMap) -> GridAnalysis {

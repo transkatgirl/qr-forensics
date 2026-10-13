@@ -127,7 +127,7 @@ use super::detect::{
 use super::enhance::{Enhance, Enhanced};
 use super::projection::{ControlPoint, Project, Projection};
 use super::refine::{MOVES, Scorer, Shifted, Template, Warp, descend_by, fixed_threshold, refine_corners_holding};
-use super::sample::{Kernel, Rule, SampleParams, classify, sample_modules_with};
+use super::sample::{Kernel, Rule, SampleParams, classify, sample_modules_noting};
 use super::{Luma, rotate_outline_cw, unrotate_point_cw};
 use crate::decode::bch::{FormatAnalysis, FormatCandidate};
 use crate::decode::codewords::Pins;
@@ -174,6 +174,11 @@ pub struct ReadResult {
     /// and sampled through the same ([`super::sample::sample_modules_as`])
     /// gives this grid again.
     pub enhance: Enhance,
+    /// Whether the modules were sharpened against their neighbours as
+    /// they were read ([`SampleParams::sharpen_modules`]), as was asked
+    /// for: with the kernel and the rule, what a sampling must be made
+    /// with to give this grid again.
+    pub sharpen_modules: bool,
 }
 
 impl ReadResult {
@@ -618,7 +623,7 @@ fn consider(best: &mut Option<ReadResult>, result: ReadResult) -> bool {
 fn seat(image: &Luma, found: Detection, params: &SampleParams) -> Detection {
     let func = FunctionMap::new(found.version);
     let Some(projection) = found.projection() else { return found };
-    let sampled = sample_modules_with(image, &projection, func.width, func.height, params.kernel);
+    let sampled = sample_modules_noting(image, &projection, func.width, func.height, params.kernel, params.sharpen_modules).0;
     let mut grid = classify(&sampled, params).to_grid(func.width, func.height);
     if found.inverted {
         grid = grid.inverted();
@@ -684,7 +689,7 @@ fn read_prepared(
     let func = Arc::new(FunctionMap::new(found.version));
     let projection = found.projection()?;
     let sampling = SampleParams { kernel, ..params.under(rule) };
-    let sampled = sample_modules_with(image, &projection, func.width, func.height, kernel);
+    let sampled = sample_modules_noting(image, &projection, func.width, func.height, kernel, params.sharpen_modules).0;
     let mut grid = classify(&sampled, &sampling).to_grid(func.width, func.height);
     if found.inverted {
         grid = grid.inverted();
@@ -724,6 +729,7 @@ fn read_prepared(
         pins,
         reinterpreted,
         enhance: Enhance::NONE,
+        sharpen_modules: params.sharpen_modules,
     };
     Some(if result.is_trustworthy() || work::cancelled() { result } else { refit_by_decode(image, result, &sampling, opts) })
 }
@@ -866,7 +872,7 @@ fn feedback_round(image: &Luma, current: &ReadResult, params: &SampleParams, opt
     // settled.
     let controls: Vec<ControlPoint> = anchors.iter().map(|a| a.control_point()).collect();
     let projection = Projection::new(func.width, func.height, corners, &controls)?;
-    let sampled = sample_modules_with(image, &projection, func.width, func.height, current.kernel);
+    let sampled = sample_modules_noting(image, &projection, func.width, func.height, current.kernel, params.sharpen_modules).0;
     let mut grid = classify(&sampled, params).to_grid(func.width, func.height);
     if found.inverted {
         grid = grid.inverted();
@@ -892,6 +898,7 @@ fn feedback_round(image: &Luma, current: &ReadResult, params: &SampleParams, opt
         pins,
         reinterpreted: current.reinterpreted,
         enhance: current.enhance,
+        sharpen_modules: current.sharpen_modules,
     })
 }
 
