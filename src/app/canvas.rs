@@ -7,7 +7,7 @@ use qr_forensics::decode::pipeline::CwStatus;
 use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::binarize::{BinarizeParams, binarize};
 use qr_forensics::imaging::detect::{Anchor, AnchorKind, anchor_sites, edge_sites};
-use qr_forensics::imaging::projection::{Project, Projection};
+use qr_forensics::imaging::projection::{CORNER_CLEARANCE, Project, Projection};
 use qr_forensics::symbol::function_map::Role;
 use qr_forensics::symbol::grid::{CERTAIN, Module};
 use qr_forensics::symbol::mask::mask_bit;
@@ -25,8 +25,10 @@ const ALIGNMENT: Color32 = Color32::from_rgb(150, 90, 255);
 /// Timing anchors, in the tint the Edit-stage role overlay gives timing
 /// patterns, so that the two views agree on what is what.
 const TIMING: Color32 = Color32::from_rgb(0, 200, 200);
-/// Edge points traced along a bowed edge.
+/// Edge points traced along the symbol's edge.
 const EDGE: Color32 = Color32::from_rgb(235, 150, 40);
+/// Anchors set by hand on modules where no pattern is.
+const CUSTOM: Color32 = Color32::from_rgb(240, 240, 240);
 /// Outlines of symbols a search of the whole photo found.
 const PROPOSAL: Color32 = Color32::from_rgb(255, 120, 200);
 /// The modules of the character picked in the result, and that character
@@ -339,6 +341,63 @@ fn align_stage(
         // hollow where the projection merely predicts the pattern. Drag a
         // handle to set an anchor by hand; right-click to drop one.
         if view.show_anchors {
+            // The grid itself may be taken hold of anywhere, to bend it
+            // where it has no pattern to be anchored on: a drag begun on
+            // a module of it, clear of every handle, sets a custom anchor
+            // on that module, and the anchor goes as far as the pointer
+            // does from there. The anchor stands for the middle of the
+            // module whatever point of it was under the pointer, as
+            // every other anchor stands for the middle of its pattern,
+            // and starts where the grid has that middle, so that nothing
+            // moves until the pointer does. A module a pattern is
+            // centred on is that pattern's site, and an anchor set on
+            // the module already is the one moved. The handles lie over
+            // the canvas, so a drag begun on one is that handle's and
+            // never comes here; with Space held the drag moves the view.
+            // Within reach of a corner the map yields to the corner
+            // ([`CORNER_CLEARANCE`]) and an anchor there would bend
+            // nothing, so none is set.
+            let sites = anchor_sites(&derived.func);
+            let graspable = |px: [f64; 2]| -> Option<[f64; 2]> {
+                let (w, h) = (gw as f64, gh as f64);
+                let at = model.module_at(px)?;
+                let at = [at[0].floor().min(w - 1.0) + 0.5, at[1].floor().min(h - 1.0) + 0.5];
+                let near_corner = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]].iter().any(|c| (c[0] - at[0]).hypot(c[1] - at[1]) < CORNER_CLEARANCE);
+                (!near_corner).then_some(at)
+            };
+            let world = |p: Pos2| {
+                let at = pz.to_world(canvas, p);
+                [at.x as f64, at.y as f64]
+            };
+            if view.use_anchors && !panning {
+                if response.drag_started_by(egui::PointerButton::Primary)
+                    && let Some(pressed) = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos())
+                    && let Some(at) = graspable(world(pressed))
+                {
+                    history.checkpoint(doc);
+                    let existing = doc.anchor_at(at).map(|a| a.anchor);
+                    let site = sites.iter().find(|s| (s.at[0] - at[0]).abs() < 1e-6 && (s.at[1] - at[1]).abs() < 1e-6);
+                    let kind = site.map(|s| s.kind).or(existing.map(|a| a.kind)).unwrap_or(AnchorKind::Custom);
+                    let from = existing.map_or_else(|| model.projection.apply(at[0], at[1]), |a| a.center);
+                    let pressed = world(pressed);
+                    let lead = [from[0] - pressed[0], from[1] - pressed[1]];
+                    view.grasped = Some(Grasp { kind, at, partial: existing.is_some_and(|a| a.partial), lead });
+                }
+                if response.hovered() && pointer.is_some_and(|p| graspable(world(p)).is_some()) {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                }
+            }
+            match view.grasped {
+                Some(Grasp { kind, at, partial, lead }) if response.dragged_by(egui::PointerButton::Primary) => {
+                    if let Some(p) = response.interact_pointer_pos() {
+                        let p = world(p);
+                        let anchor = Anchor { kind, at, center: [p[0] + lead[0], p[1] + lead[1]], partial, inferred: false };
+                        doc.set_anchor(anchor, AnchorSource::Manual);
+                    }
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                }
+                _ => view.grasped = None,
+            }
             // The handle under the pointer, whose intensity profile is shown.
             let mut profile = None;
             // The sites the version has; the places along each edge where
@@ -346,13 +405,15 @@ fn align_stage(
             // less any an edge point already traced by a detection sits
             // on; and those traced edge points, which have no site of
             // their own.
-            let mut handles: Vec<(AnchorKind, [f64; 2])> = anchor_sites(&derived.func).into_iter().map(|s| (s.kind, s.at)).collect();
+            let mut handles: Vec<(AnchorKind, [f64; 2])> = sites.iter().map(|s| (s.kind, s.at)).collect();
             let traced: Vec<[f64; 2]> =
                 doc.anchors.iter().filter(|a| a.anchor.kind == AnchorKind::Edge).map(|a| a.anchor.at).collect();
             let near_traced = |at: [f64; 2]| traced.iter().any(|t| (t[0] - at[0]).hypot(t[1] - at[1]) < 1.0);
             handles.extend(edge_sites(&derived.func).into_iter().filter(|s| doc.anchor_at(s.at).is_some() || !near_traced(s.at)).map(|s| (s.kind, s.at)));
             let placed: Vec<[f64; 2]> = handles.iter().map(|h| h.1).collect();
             handles.extend(traced.iter().filter(|&&at| !placed.contains(&at)).map(|&at| (AnchorKind::Edge, at)));
+            // The custom anchors, each of which is a handle of its own.
+            handles.extend(doc.anchors.iter().filter(|a| a.anchor.kind == AnchorKind::Custom).map(|a| (AnchorKind::Custom, a.anchor.at)));
             for (kind, at) in handles {
                 let existing = doc.anchor_at(at).copied();
                 let position = match &existing {
@@ -391,13 +452,14 @@ fn align_stage(
                     AnchorKind::Alignment => ALIGNMENT,
                     AnchorKind::Timing => TIMING,
                     AnchorKind::Edge => EDGE,
+                    AnchorKind::Custom => CUSTOM,
                 };
                 let hovered = handle.hovered() || handle.dragged();
                 // Timing sites are many, a dozen or more on a large
                 // symbol, and each marks a single module: their handles
                 // are drawn smaller so the patterns stay visible between
                 // them, though they take the same hit area.
-                let base = if matches!(kind, AnchorKind::Timing | AnchorKind::Edge) { 4.0 } else { 5.5 };
+                let base = if matches!(kind, AnchorKind::Timing | AnchorKind::Edge | AnchorKind::Custom) { 4.0 } else { 5.5 };
                 let radius = if hovered { base + 1.5 } else { base };
                 painter.circle_stroke(center, radius, Line::new(3.0, Color32::from_black_alpha(140)));
                 match existing {

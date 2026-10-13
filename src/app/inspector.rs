@@ -868,7 +868,7 @@ fn outcome_text(block: &BlockReport) -> (String, bool) {
                      and this solution spent them",
                     block.reserved
                 ));
-            } else if confidence_bits < 8 {
+            } else if !block.is_verified() {
                 text.push_str(" — unconfirmed");
             }
             if block.half_padded_with_ones {

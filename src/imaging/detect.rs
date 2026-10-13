@@ -49,7 +49,13 @@
 //! follows the curve, as ZBar extrapolates each alignment pattern from its
 //! neighbours. An anchor is doubted only against what its neighbours
 //! predict for it, never against a plane the whole symbol is assumed to
-//! lie in. The map is upgraded from a similarity through an affine
+//! lie in. A QR Code's alignment patterns make a grid, and with all three
+//! finders standing each is looked for first where the plane puts it
+//! moved by the offsets at which its neighbours in the grid were found,
+//! as BoofCV carries each pattern's offset on to the next; one whose
+//! template reads whole stands as a finder does, and is doubted by no
+//! fit, and one that does not is looked for again once more of its
+//! neighbours and the corner beside it are placed. The map is upgraded from a similarity through an affine
 //! transform to a full perspective one as the anchors spread out.
 //!
 //! A corner a finder stands at is the capstone's own, measured to a
@@ -58,7 +64,15 @@
 //! traced there, as ZBar traces it: profiles across the predicted edge find
 //! where the paper turns to ink, a line is fitted to those crossings, or a
 //! bend where the paper has curled, as OpenCV fits a spline to each side
-//! of a curved symbol, and the corner is where two such lines meet.
+//! of a curved symbol, and the corner is where two such lines meet. The
+//! trace sees an edge only within half a module of where it is looked
+//! for, so where the edges do not trace from where the fit puts the
+//! corner, or trace with no paper beyond them, as a row of modules a
+//! step inside the symbol has none, they are traced from other places:
+//! where the outer sides of the finders beside the corner cross, as
+//! BoofCV and OpenCV's `QRCodeDetectorAruco` place it, where the other
+//! three corners complete a parallelogram, as wechat_qrcode guesses it,
+//! and a module further out.
 //! Without a quiet zone, or where the trace fails, the corner is placed
 //! where the fixed modules of its own quarter read best and the data
 //! modules there read crisply dark or light rather than grey.
@@ -131,11 +145,13 @@
 //! version found says its modules need, where the first pass enlarges
 //! only by what the family's smallest symbol would need.
 //!
-//! Where an edge of the symbol bows, a few points along it anchor the
-//! map as well, each where the paper turns to ink: on a bottle or a
-//! curled receipt the side of the symbol farthest from any fixed pattern
-//! is otherwise placed by the corners and the spline's guess alone, and
-//! the bowed edge says where its rows really run.
+//! Where an edge of the symbol bows, or the anchors inside the symbol
+//! bend the map at a straight one, a few points along it anchor the map
+//! as well, each where the paper turns to ink: on a bottle or a curled
+//! receipt the side of the symbol farthest from any fixed pattern is
+//! otherwise placed by the corners and the spline's guess alone, and
+//! the edge says where its rows really run. They hold the map across the
+//! edge and leave it free along it, where the trace has nothing to say.
 //!
 //! [`find_symbols`] runs the same machinery with no outline at all: the
 //! whole photo is scanned for finder patterns, which are grouped into
@@ -372,6 +388,28 @@ const MAX_PROFILES: usize = 30;
 /// root-mean-square distance in modules.
 const MIN_CROSSINGS: usize = 3;
 const MAX_EDGE_RMS: f64 = 0.2;
+/// What must read as paper beyond the line or bend fitted to an edge, for
+/// the fit to be clear of the symbol and not a row of modules inside it:
+/// the strip between these many modules out from the fit, read against
+/// the paper a little further out ([`BEYOND_PAPER`], the nearer and the
+/// further of it). A sample of the strip darker than that paper by
+/// [`BEYOND_DROP`] of the symbol's contrast is ink: the fit lies where a
+/// blurred edge is halfway from paper to ink, so half a module beyond a
+/// true edge no blur takes a sample half the contrast down, and a dark
+/// module of the symbol's own border, when the fit runs a row inside it,
+/// is all of it down. The strip is read at the profiles that found no
+/// crossing of their own, within [`BEYOND_NEAR`] modules of the corner
+/// the edge is traced from or a third of the edge if that is more: a
+/// profile with a crossing started from paper, and it is at the corner
+/// that a fit run on from the far end of the edge goes astray. At most
+/// [`BEYOND_INKED`] of those profiles may show ink, which of fewer than
+/// ten is none of them: a line a row inside the symbol shows it at every
+/// dark module of the border.
+const BEYOND_STRIP: [f64; 2] = [0.5, 1.0];
+const BEYOND_PAPER: [f64; 2] = [1.2, 1.6];
+const BEYOND_DROP: f32 = 0.5;
+const BEYOND_NEAR: f64 = 8.0;
+const BEYOND_INKED: f64 = 0.1;
 /// Fewest crossings to fit a bend to an edge instead, and the most an
 /// edge may bow from straight, in modules, for the bend to be believed:
 /// paper curls gently, and a sharper bend is the crossings of other print.
@@ -439,9 +477,10 @@ const MAX_PAIR_PROPOSALS: usize = 6;
 /// Of those, the proposals that come to nothing with nothing in the
 /// photo to speak for them but the capstones they stand on: three with
 /// no timing pattern between any two and no format word beside them, two
-/// that lie as the ends of a symbol's diagonal, a lone finder with
-/// neither a word nor a timing pattern running from it. After so many,
-/// no more of their kind are fitted in that copy of the photo.
+/// that lie as the ends of a symbol's diagonal or face each other along
+/// a side with none between them, a lone finder with neither a word nor
+/// a timing pattern running from it. After so many, no more of their
+/// kind are fitted in that copy of the photo.
 ///
 /// BoofCV fits nothing to such. It reads a candidate's format word
 /// through the corner position pattern's own square, then its version
@@ -555,6 +594,20 @@ const MAX_CORNER_TILT: f64 = 60.0;
 /// from below, whose top finders are drawn three fifths the size of its
 /// bottom one.
 const SIZE_RATIO: f64 = 1.75;
+/// And by this ratio where their own squares say they are one symbol's
+/// ([`stands_by_squares`]), seen so steeply that its near corner is
+/// drawn at more than [`SIZE_RATIO`] times the size of its far ones.
+/// The ratio alone once ended it. A symbol seen from over its top-left
+/// corner, the far corner drawn in to seven tenths of the way to the
+/// middle, shows that finder at thirteen pixels a module and the other
+/// two at six: all three were found, whole, with their corners
+/// measured, and proposed nothing, no triple and no pair, so that every
+/// rung of the ladder was climbed and a version 1 and a version 5 symbol
+/// that both read through an outline came back as no symbol found.
+/// What such a symbol's finders have in common is not their size in the
+/// photo's pixels but the modules each leg measures in the squares at
+/// its two ends, which is what the squares are asked.
+const STEEP_SIZE_RATIO: f64 = 3.0;
 /// How far beyond the finder centres a proposed outline reaches, in
 /// modules: the symbol's edge lies three and a half modules past them, and
 /// two more take in the quiet zone, which the detector wants a loose
@@ -720,13 +773,20 @@ pub enum AnchorKind {
     /// along its sides and zxing-cpp refines a Micro QR symbol's transform
     /// by the ends of its timing patterns.
     Timing,
-    /// A point of the symbol's edge, where the paper turns to ink along
-    /// an edge that bows. On paper that curls, a side of the symbol with
-    /// no fixed pattern of its own is placed by the corners and the
-    /// spline's guess at what lies between them; the bowed edge says
-    /// where its rows really run, as OpenCV fits a curve to each side of
-    /// a bent symbol and straightens it by them.
+    /// A point of the symbol's edge, where the paper turns to ink. On
+    /// paper that curls, a side of the symbol with no fixed pattern of
+    /// its own is placed by the corners and the spline's guess at what
+    /// lies between them; the edge says where its rows really run, as
+    /// OpenCV fits a curve to each side of a bent symbol and straightens
+    /// it by them. It holds the map across the edge only
+    /// ([`super::projection`]).
     Edge,
+    /// The middle of a module where no pattern is, set by hand: whoever
+    /// sees in the photo where a module of the data lies may say so, and
+    /// the map bends through it as through any anchor. No search places
+    /// one and no refinement moves one, there being nothing at it to
+    /// look for.
+    Custom,
 }
 
 impl AnchorKind {
@@ -737,6 +797,7 @@ impl AnchorKind {
             AnchorKind::FinderSub => "finder sub-pattern",
             AnchorKind::Timing => "timing module",
             AnchorKind::Edge => "edge point",
+            AnchorKind::Custom => "custom anchor",
         }
     }
 }
@@ -1016,7 +1077,8 @@ impl Detection {
     /// gone to, and one that lands where the version has no pattern of
     /// its kind goes, as a finder pattern turned into the corner without
     /// one does: it has nothing there to be refined against. A point
-    /// traced along an edge is on the edge wherever the turn takes it.
+    /// traced along an edge is on the edge wherever the turn takes it,
+    /// and one set by hand where no pattern is stands on its module.
     /// The information bits are as they were read here, for the caller
     /// to read again.
     fn turned(&self, symmetry: Symmetry) -> Detection {
@@ -1034,7 +1096,7 @@ impl Detection {
             .iter()
             .filter_map(|anchor| {
                 let at = symmetry.map_point(func.width, func.height, anchor.at);
-                let sited = anchor.kind == AnchorKind::Edge
+                let sited = matches!(anchor.kind, AnchorKind::Edge | AnchorKind::Custom)
                     || sites.iter().any(|site| site.kind == anchor.kind && (site.at[0] - at[0]).abs() < 1e-6 && (site.at[1] - at[1]).abs() < 1e-6);
                 sited.then_some(Anchor { at, ..*anchor })
             })
@@ -1730,8 +1792,11 @@ fn collect_capstones(image: &Luma, rect: &Rectified, threshold: Option<f32>, fam
     // from a torn finder, then the regions the scan did not propose.
     let whole = within_cap(candidates.iter().enumerate().filter(|(_, c)| !c.half), MAX_CANDIDATES);
     let half = within_cap(candidates.iter().enumerate().filter(|(_, c)| c.half), MAX_HALF_CANDIDATES);
-    for candidate in whole.chain(half).map(|(_, c)| c).chain(regions.iter()) {
-        let Some(capstone) = refine_capstone(image, rect, candidate, threshold) else { continue };
+    // Each fitted on a core to spare, where there are any, and gathered
+    // in its turn: the fits take nothing from one another, and are
+    // nearly all the time a search takes.
+    let in_turn: Vec<&Candidate> = whole.chain(half).map(|(_, c)| c).chain(regions.iter()).collect();
+    for capstone in work::map(&in_turn, |candidate| refine_capstone(image, rect, candidate, threshold)).into_iter().flatten() {
         merge_capstone(&mut all, rect, capstone);
     }
     drop_faint_partials(&mut all);
@@ -2328,26 +2393,108 @@ fn half_cross_check(
     None
 }
 
-/// Merge a hit into the cluster it belongs to, or start a new one.
-fn merge(clusters: &mut Vec<Candidate>, hit: Candidate) {
-    let size = (hit.module[0] + hit.module[1]) / 2.0;
-    for c in clusters.iter_mut() {
-        let own = (c.module[0] + c.module[1]) / 2.0;
-        if c.inverted == hit.inverted
-            && (c.x - hit.x).abs() <= own
-            && (c.y - hit.y).abs() <= own
-            && (own - size).abs() <= 0.5 * own.max(size)
-        {
-            let n = c.votes as f64;
-            c.x = (c.x * n + hit.x) / (n + 1.0);
-            c.y = (c.y * n + hit.y) / (n + 1.0);
-            c.module = [(c.module[0] * n + hit.module[0]) / (n + 1.0), (c.module[1] * n + hit.module[1]) / (n + 1.0)];
-            c.votes += 1;
-            c.half &= hit.half;
+/// The side, in rectified pixels, of the cells [`Clusters`] files its
+/// clusters under.
+const CLUSTER_CELL: f64 = 8.0;
+
+/// The clusters the hits of a scan gather into, in the order they were
+/// started, each filed under the cell of [`CLUSTER_CELL`] pixels its
+/// centre lies in.
+///
+/// A hit joins the first cluster it belongs to, and was once held
+/// against every cluster in turn to find it. On a sound photo there are
+/// a few dozen. A frame of grain starts one for nearly every hit, tens
+/// of thousands of them, and the scan of a twelve-megapixel photograph
+/// of four symbols on a noisy ground, which reads all four, had not
+/// finished gathering after six minutes. A cluster a hit belongs to has
+/// a module of at most twice the hit's and lies within that module of it
+/// along each axis, so only the clusters filed that near are asked, and
+/// the first of them in the order they were started is the one every
+/// cluster in turn would have come to.
+struct Clusters {
+    all: Vec<Candidate>,
+    /// Indices into `all` by cell, the cells row by row.
+    cells: Vec<Vec<u32>>,
+    across: usize,
+    down: usize,
+}
+
+impl Clusters {
+    /// No clusters yet, for the hits of scans of a `width` × `height`
+    /// image.
+    fn new(width: usize, height: usize) -> Self {
+        let across = (width as f64 / CLUSTER_CELL).ceil().max(1.0) as usize;
+        let down = (height as f64 / CLUSTER_CELL).ceil().max(1.0) as usize;
+        Clusters { all: Vec::new(), cells: vec![Vec::new(); across * down], across, down }
+    }
+
+    /// The cell a point is filed under: the one it lies in, or the
+    /// nearest for a point off the image.
+    fn cell(&self, x: f64, y: f64) -> (usize, usize) {
+        let along = |v: f64, cells: usize| (v / CLUSTER_CELL).floor().clamp(0.0, (cells - 1) as f64) as usize;
+        (along(x, self.across), along(y, self.down))
+    }
+
+    /// Merge a hit into the cluster it belongs to, or start a new one.
+    fn merge(&mut self, hit: Candidate) {
+        let size = (hit.module[0] + hit.module[1]) / 2.0;
+        let belongs = |c: &Candidate| {
+            let own = (c.module[0] + c.module[1]) / 2.0;
+            c.inverted == hit.inverted
+                && (c.x - hit.x).abs() <= own
+                && (c.y - hit.y).abs() <= own
+                && (own - size).abs() <= 0.5 * own.max(size)
+        };
+        // The last of those tests holds a cluster's module to twice the
+        // hit's, and the two before it hold the cluster within its own
+        // module of the hit.
+        let reach = 2.0 * size + 1e-6;
+        let (x0, y0) = self.cell(hit.x - reach, hit.y - reach);
+        let (x1, y1) = self.cell(hit.x + reach, hit.y + reach);
+        // A large finder among few clusters has more cells within reach
+        // than there are clusters to ask.
+        let first = if (x1 - x0 + 1) * (y1 - y0 + 1) >= self.all.len() {
+            self.all.iter().position(belongs)
+        } else {
+            let mut first: Option<u32> = None;
+            for row in y0..=y1 {
+                for filed in &self.cells[row * self.across + x0..=row * self.across + x1] {
+                    for &i in filed {
+                        if first.is_none_or(|earlier| i < earlier) && belongs(&self.all[i as usize]) {
+                            first = Some(i);
+                        }
+                    }
+                }
+            }
+            first.map(|i| i as usize)
+        };
+        let Some(i) = first else {
+            let (x, y) = self.cell(hit.x, hit.y);
+            self.cells[y * self.across + x].push(self.all.len() as u32);
+            self.all.push(hit);
             return;
+        };
+        let before = self.cell(self.all[i].x, self.all[i].y);
+        let c = &mut self.all[i];
+        let n = c.votes as f64;
+        c.x = (c.x * n + hit.x) / (n + 1.0);
+        c.y = (c.y * n + hit.y) / (n + 1.0);
+        c.module = [(c.module[0] * n + hit.module[0]) / (n + 1.0), (c.module[1] * n + hit.module[1]) / (n + 1.0)];
+        c.votes += 1;
+        c.half &= hit.half;
+        let after = self.cell(self.all[i].x, self.all[i].y);
+        if after != before {
+            self.cells[before.1 * self.across + before.0].retain(|&filed| filed as usize != i);
+            self.cells[after.1 * self.across + after.0].push(i as u32);
         }
     }
-    clusters.push(hit);
+
+    /// The clusters enough lines agreed on ([`quorate`]), in the order
+    /// they were started.
+    fn quorate(mut self) -> Vec<Candidate> {
+        self.all.retain(quorate);
+        self.all
+    }
 }
 
 /// Scan every line of a `width` × `height` image along its first axis,
@@ -2364,16 +2511,16 @@ fn scan(
     dark: &dyn Fn(i64, i64) -> Option<bool>,
     min_module: f64,
     max_module: f64,
-    clusters: &mut Vec<Candidate>,
+    clusters: &mut Clusters,
     transposed: bool,
 ) {
-    let push = |clusters: &mut Vec<Candidate>, hit: Candidate| {
+    let push = |clusters: &mut Clusters, hit: Candidate| {
         let hit = if transposed {
             Candidate { x: hit.y, y: hit.x, module: [hit.module[1], hit.module[0]], ..hit }
         } else {
             hit
         };
-        merge(clusters, hit);
+        clusters.merge(hit);
     };
     // (start, length, kind): 0 light, 1 dark, 2 no pixel.
     let mut runs: Vec<(usize, usize, u8)> = Vec::new();
@@ -2520,7 +2667,7 @@ fn quorate(c: &Candidate) -> bool {
 fn scan_thresholds(rect: &Rectified, threshold: Option<f32>, max_module: f64) -> Vec<Candidate> {
     let global = threshold.unwrap_or_else(|| otsu(rect.data.iter().copied().filter(|v| v.is_finite())));
     let (w, h) = (rect.frame.width, rect.frame.height);
-    let mut clusters = Vec::new();
+    let mut clusters = Clusters::new(w, h);
     let global_dark = |x: i64, y: i64| rect.at(x, y).map(|v| v < global);
     scan(w, h, &global_dark, MIN_MODULE, max_module, &mut clusters, false);
     scan(h, w, &|x, y| global_dark(y, x), MIN_MODULE, max_module, &mut clusters, true);
@@ -2528,8 +2675,7 @@ fn scan_thresholds(rect: &Rectified, threshold: Option<f32>, max_module: f64) ->
     let local_dark = |x: i64, y: i64| local.dark(rect, x, y);
     scan(w, h, &local_dark, MIN_MODULE, max_module, &mut clusters, false);
     scan(h, w, &|x, y| local_dark(y, x), MIN_MODULE, max_module, &mut clusters, true);
-    clusters.retain(quorate);
-    clusters
+    clusters.quorate()
 }
 
 /// The candidates of the scans against the mean of a window a few
@@ -2539,7 +2685,7 @@ fn scan_thresholds(rect: &Rectified, threshold: Option<f32>, max_module: f64) ->
 /// lies right beside them. See [`super::binarize`].
 fn scan_windows(rect: &Rectified, max_module: f64) -> Vec<Candidate> {
     let (w, h) = (rect.frame.width, rect.frame.height);
-    let mut clusters = Vec::new();
+    let mut clusters = Clusters::new(w, h);
     let bias = WINDOW_BIAS * rect.spread;
     for radius in WINDOW_RADII.into_iter().filter(|&radius| radius as f64 <= rect.local_radius) {
         let mask = window_dark(&rect.data, w, h, radius, bias);
@@ -2555,8 +2701,7 @@ fn scan_windows(rect: &Rectified, max_module: f64) -> Vec<Candidate> {
         scan(w, h, &window, MIN_MODULE, max_module, &mut clusters, false);
         scan(h, w, &|x, y| window(y, x), MIN_MODULE, max_module, &mut clusters, true);
     }
-    clusters.retain(quorate);
-    clusters
+    clusters.quorate()
 }
 
 /// A finder pattern verified against the photo.
@@ -2587,11 +2732,25 @@ struct Capstone {
     /// where they were put square to the frame about a centre read along
     /// lines or rays, and say nothing of the turn.
     measured: bool,
+    /// A region of the binarised image lies on the candidate this was
+    /// fitted to ([`region_candidates`]): a ring of dark closed on
+    /// itself about a middle of its own, which a finder pattern is and
+    /// a run of 1:1:3:1:1 across a symbol's data is not. See
+    /// [`passed_over`].
+    regioned: bool,
 }
 
 impl Capstone {
     fn module_mean(&self) -> f64 {
         (self.module[0] + self.module[1]) / 2.0
+    }
+
+    /// The capstone is a finder pattern in its own right wherever it
+    /// lies, on another symbol as much as on bare paper: a region bears
+    /// it out, the whole of it read, and its corners were fitted. See
+    /// [`passed_over`].
+    fn stands_alone(&self) -> bool {
+        self.regioned && !self.partial && self.measured
     }
 
     /// The same finder pattern as seen in another frame: its corners in
@@ -2858,6 +3017,7 @@ fn line_capstone(image: &Luma, rect: &Rectified, candidate: &Candidate, threshol
         threshold: threshold.unwrap_or(own),
         line_only: true,
         measured: false,
+        regioned: candidate.quad.is_some(),
     })
 }
 
@@ -2955,6 +3115,7 @@ fn concentric_capstone(image: &Luma, rect: &Rectified, candidate: &Candidate, th
         threshold,
         line_only: false,
         measured: false,
+        regioned: candidate.quad.is_some(),
     })
 }
 
@@ -3090,7 +3251,19 @@ fn refine_capstone_from(
         (distance(r[0], r[3]) + distance(r[1], r[2])) / 14.0,
     ];
     let threshold = threshold.or_else(|| finder_threshold(image, corners)).unwrap_or(0.5);
-    Some(Capstone { corners, center, unit: rect.unit(center), module, contrast, inverted: candidate.inverted, partial, threshold, line_only: false, measured: true })
+    Some(Capstone {
+        corners,
+        center,
+        unit: rect.unit(center),
+        module,
+        contrast,
+        inverted: candidate.inverted,
+        partial,
+        threshold,
+        line_only: false,
+        measured: true,
+        regioned: candidate.quad.is_some(),
+    })
 }
 
 /// The symbol's extent in modules along the frame's two axes, and
@@ -3933,6 +4106,20 @@ fn search_site(
 struct Placed {
     anchor: Anchor,
     pairs: Vec<Pair>,
+    /// A QR Code's alignment pattern whose template read whole where it
+    /// was looked for. It stands as a finder's capstone does, whatever
+    /// the plane through the other anchors makes of it: on a bottle the
+    /// plane is a module and more out at every pattern away from the
+    /// finders, and BoofCV, which has no plane to judge its alignment
+    /// patterns by, carries the offset each was found at on to the next
+    /// instead ([`carried_offset`]). While the patterns beside it bear
+    /// it out ([`agrees_with_neighbours`]) the plane is still fitted
+    /// through it with the rest: fitted without the patterns that lie
+    /// off it, as it was when they were dropped, the plane placed the
+    /// patterns after them worse over renders of bottles, though no
+    /// plane fits a bottle. With no pattern beside it, it is taken off
+    /// the plane where the plane cannot explain it ([`fit_anchors`]).
+    firm: bool,
 }
 
 fn anchors_of(placed: &[Placed]) -> Vec<Anchor> {
@@ -4004,16 +4191,32 @@ fn module_size_at(map: &impl Project, at: [f64; 2]) -> f64 {
 /// against the fit of all the others, bent through them; the allowance
 /// grows with its distance from its nearest neighbour. Finder capstones
 /// are never doubted: a nine-module template pinned them down, and they
-/// carry the geometry. Under an affine fit the far side of a tilted
-/// symbol is off for want of perspective, not for being wrong, so only a
-/// perspective fit of the others may condemn an anchor.
-fn worst_outlier(placed: &[Placed]) -> Option<usize> {
+/// carry the geometry. Nor is an alignment pattern that stands firm
+/// ([`Placed::firm`]) while its neighbours in the grid bear it out
+/// ([`agrees_with_neighbours`]): its template of twenty-five modules
+/// read whole, within the window it was looked for in, and on curled
+/// paper it is the plane that is out and not the pattern. Under an affine fit the far side of a
+/// tilted symbol is off for want of perspective, not for being wrong, so
+/// only a perspective fit of the others may condemn an anchor.
+fn worst_outlier(placed: &[Placed], grid: Option<&AlignmentGrid>) -> Option<usize> {
     if placed.len() < OUTLIER_MIN_ANCHORS {
         return None;
     }
+    // The plane through every anchor, which the offsets of the patterns
+    // standing firm are taken from.
+    let plane = grid.and_then(|_| Homography::fit(choose_model(&anchors_of(placed), pairs_of(placed).len()), &pairs_of(placed)));
     let mut worst: Option<(usize, f64)> = None;
     for k in 0..placed.len() {
         if placed[k].anchor.kind == AnchorKind::Finder {
+            continue;
+        }
+        // A pattern standing firm is not doubted while the patterns
+        // beside it bear it out, nor once it has been taken off the
+        // plane ([`fit_anchors`]).
+        if placed[k].firm
+            && let (Some(grid), Some(plane)) = (grid, &plane)
+            && (placed[k].pairs.is_empty() || (has_pattern_beside(grid, placed, placed[k].anchor.at) && agrees_with_neighbours(grid, plane, placed, k)))
+        {
             continue;
         }
         let others: Vec<&Placed> = placed.iter().enumerate().filter(|(i, _)| *i != k).map(|(_, p)| p).collect();
@@ -4024,7 +4227,7 @@ fn worst_outlier(placed: &[Placed]) -> Option<usize> {
             continue;
         }
         let Some(base) = Homography::fit(model, &pairs) else { continue };
-        let others_placed: Vec<Placed> = others.iter().map(|p| Placed { anchor: p.anchor, pairs: Vec::new() }).collect();
+        let others_placed: Vec<Placed> = others.iter().map(|p| Placed { anchor: p.anchor, pairs: Vec::new(), firm: p.firm }).collect();
         let map = LocalPrediction::new(base, &others_placed);
         let at = placed[k].anchor.at;
         let predicted = map.apply(at[0], at[1]);
@@ -4041,14 +4244,21 @@ fn worst_outlier(placed: &[Placed]) -> Option<usize> {
 
 /// The map the anchors support, with anchors their neighbours cannot
 /// explain dropped one at a time, worst first, and the map refitted
-/// without them.
-fn fit_anchors(placed: &mut Vec<Placed>) -> Option<(Homography, Model)> {
+/// without them. An alignment pattern standing firm with no other
+/// beside it ([`Placed::firm`]) is not dropped but taken off the plane:
+/// its pairs are emptied, the plane is fitted without it, as it was
+/// when such a pattern was dropped, and the map still bends through it.
+/// Left in the plane it drew the plane to itself, and the corner beyond
+/// it, which the plane places, came out a module short on two symbols
+/// that read with the corner where the plane without it puts it.
+fn fit_anchors(placed: &mut Vec<Placed>, grid: Option<&AlignmentGrid>) -> Option<(Homography, Model)> {
     loop {
         let anchors = anchors_of(placed);
         let pairs = pairs_of(placed);
         let model = choose_model(&anchors, pairs.len());
         let map = Homography::fit(model, &pairs)?;
-        match worst_outlier(placed) {
+        match worst_outlier(placed, grid) {
+            Some(k) if placed[k].firm && grid.is_some_and(|grid| !has_pattern_beside(grid, placed, placed[k].anchor.at)) => placed[k].pairs.clear(),
             Some(k) => {
                 placed.remove(k);
             }
@@ -4607,7 +4817,8 @@ pub fn find_symbols_with(image: &Luma, family: Family, params: &SampleParams, se
 /// may not rest on ([`doubtful_claims`]): the renders
 /// read off their pixels, then the shrunk copies when `search` asks for
 /// them, then the photo as it is and the ladder of transformed copies,
-/// each copy leaving alone the symbols the copies before it found. A
+/// each copy leaving alone the symbols the copies before it found, and
+/// not what is set within one that is no part of it ([`passed_over`]). A
 /// search of each family on its own scanned every copy once a family
 /// and, finding nothing of one family, climbed the whole ladder for it:
 /// a photo of a QR Code took four seconds to search for QR Codes and a
@@ -4725,11 +4936,24 @@ fn search_whole(
     let mut taken: Vec<Detection> = Vec::new();
     // A screenshot or a file an encoder wrote holds one symbol, pixel for
     // pixel, and is read off its pixels; the families it does not read
-    // as search the photo.
+    // as search the photo. So does the family of a QR Code so read: the
+    // box its ink fills is the symbol, and whatever else the file holds
+    // is set within it, a second symbol where a logo might be, whose
+    // finders the search tells from the first symbol's own
+    // ([`passed_over`]).
     let mut pending: Vec<Family> = Vec::new();
+    // A symbol read off the pixels may have another set within it.
+    let mut render = false;
     for &family in families {
         match detect_pure(image, family, whole, params) {
-            Some(found) => note(&mut all, &mut taken, family, vec![found], credible),
+            Some(found) => {
+                let before = taken.len();
+                note(&mut all, &mut taken, family, vec![found], credible);
+                if taken.len() > before {
+                    render = true;
+                    pending.push(family);
+                }
+            }
             None => pending.push(family),
         }
     }
@@ -4749,11 +4973,14 @@ fn search_whole(
         if !coarse.detections.is_empty() || !all.is_empty() {
             if coarse.more.is_empty() {
                 // What the copies showed, and what the photo at its own
-                // size shows beside it that they did not.
+                // size shows beside it that they did not. Within a symbol
+                // read off the pixels it is asked whatever the copies
+                // showed, and where there were none: a symbol set within
+                // another is the smaller of the two.
                 let shown = !coarse.detections.is_empty();
                 all.extend(coarse.detections);
-                if let Some(shrunk) = coarse.shrunk.filter(|_| shown && !work::cancelled()) {
-                    let beside = search_beside(image, &pending, params, &mut taken, &all, shrunk, &mut doubts, credible, leads);
+                if (render || (shown && coarse.shrunk.is_some())) && !work::cancelled() {
+                    let beside = search_beside(image, &pending, params, &mut taken, &all, coarse.shrunk, &mut doubts, credible, leads);
                     all.extend(beside);
                 }
                 drop_settled_claims(&mut all, &doubts);
@@ -4930,7 +5157,10 @@ fn search_coarse(
         // The modules in the copy's own pixels.
         let smallest = found.detections.iter().map(|d| module_size_of(d) / view.scale).fold(f64::INFINITY, f64::min);
         let fresh = all.detections.len();
-        all.detections.extend(found.detections.into_iter().map(|found| refine_found(image, found, params)));
+        // Each symbol the copy shows is found again in the photo's own
+        // pixels side by side with the rest: a sheet of sixty waited a
+        // second and a half for each in turn.
+        all.detections.extend(work::map(&found.detections, |found| refine_found(image, found.clone(), params)));
         doubts.extend(doubtful_claims(image, &all.detections[fresh..], params));
         all.more = still_wanted(&found.more, families, doubts, &all.detections);
         if all.detections.is_empty() {
@@ -4958,7 +5188,10 @@ fn search_coarse(
 /// symbols its regions' finder patterns propose ([`ScannedView::beside`]),
 /// and, where those leave finders of a symbol they could not fit, what
 /// the fine search of the families that have them makes of the photo,
-/// as it would had a copy left them.
+/// as it would had a copy left them. `shrunk` is how many times the
+/// last copy searched was shrunk, and `None` where the photo was too
+/// small to have any, and the symbols known were read off its pixels:
+/// every region is then asked.
 ///
 /// A copy says what it shows and nothing of what it does not. The search
 /// ended at the first copy whose symbols were all of two pixels a module
@@ -4975,10 +5208,10 @@ fn search_coarse(
 /// its position patterns are the squares among the contours of one
 /// binarisation, and a twelve-megapixel photograph costs it a tenth of a
 /// second. The regions here are that pass, and they alone are asked,
-/// those lying on a symbol already found left out, and those of a module
-/// the last copy searched, shrunk `shrunk` times, will have shown
-/// ([`COARSE_SHOWN_MODULE`]), so that the look costs what the finders
-/// the copies missed cost and no more.
+/// those that are the finders of a symbol already found left out, and
+/// those of a module the last copy searched, shrunk `shrunk` times,
+/// will have shown ([`COARSE_SHOWN_MODULE`]), so that the look costs
+/// what the finders the copies missed cost and no more.
 #[allow(clippy::too_many_arguments)]
 fn search_beside(
     image: &Luma,
@@ -4986,12 +5219,13 @@ fn search_beside(
     params: &SampleParams,
     taken: &mut Vec<Detection>,
     known: &[Detection],
-    shrunk: u8,
+    shrunk: Option<u8>,
     doubts: &mut Vec<[f64; 2]>,
     credible: &(dyn Fn(&Detection) -> bool + Sync),
     leads: &mut Vec<Lead>,
 ) -> Vec<Detection> {
-    let Some(view) = ScannedView::beside(image, params, families, known, COARSE_SHOWN_MODULE * f64::from(shrunk)) else { return Vec::new() };
+    let shown = shrunk.map_or(f64::INFINITY, |shrunk| COARSE_SHOWN_MODULE * f64::from(shrunk));
+    let Some(view) = ScannedView::beside(image, params, families, known, shown) else { return Vec::new() };
     if view.regions.is_empty() {
         return Vec::new();
     }
@@ -5317,9 +5551,11 @@ impl<'a> ScannedView<'a> {
     /// of them grain, and are what a search of a large photo at its own
     /// size spends its time refining. The finders of a symbol with one
     /// finder pattern are kept: one may have been claimed off a finder
-    /// of a QR Code no copy showed whole. Those of `shown` photo pixels
-    /// a module or more are left out with those on a symbol: the copies
-    /// have shown them, and made of them what there is to make.
+    /// of a QR Code no copy showed whole. So is a region that lies on a
+    /// symbol and on none of its finders, which may be the finder of
+    /// another set within it ([`passed_over`]). Those of `shown` photo
+    /// pixels a module or more are left out with those on a symbol: the
+    /// copies have shown them, and made of them what there is to make.
     fn beside(image: &'a Luma, params: &SampleParams, families: &[Family], known: &[Detection], shown: f64) -> Option<Self> {
         let mut view = Self::new(Cow::Borrowed(image), [0.0, 0.0], 1.0, None, None, params, families, false)?;
         let frame = view.rect.frame;
@@ -5327,7 +5563,7 @@ impl<'a> ScannedView<'a> {
         let scale = frame.size[0] / image.width.max(1) as f64;
         view.regions.retain(|region| {
             let [x, y] = frame.to_image.apply(region.x, region.y);
-            region.module_mean() < shown * scale && !known.iter().any(|found| found.version.family().has_three_finders() && covers(found, [x, y]))
+            region.module_mean() < shown * scale && !known.iter().any(|found| found.version.family().has_three_finders() && passed_over(found, [x, y], true))
         });
         view.refined[1] = vec![OnceLock::new(); view.regions.len()];
         Some(view)
@@ -5374,17 +5610,46 @@ impl<'a> ScannedView<'a> {
     /// first, then its half ones, as many of each as [`within_cap`]
     /// lets through, then the regions', each within the family's cap on
     /// the module size, with repeats merged.
-    fn capstones(&self, family: Family) -> Vec<Capstone> {
+    ///
+    /// `settled` says of a candidate, and the point of the photo it lies
+    /// at, that it lies within a symbol already found and is one the
+    /// caller will not offer again. Such a candidate is not refined, where
+    /// that changes nothing of what the caller is left with: every copy
+    /// after the one that found a symbol fitted a template again to each
+    /// of its finders and to every pattern in its data that passed for
+    /// one, a third to a half of the candidates of a sheet of sixty
+    /// symbols half found, and then dropped the lot. One thing a
+    /// capstone that is to be dropped still decides is which partial
+    /// ones are too faint beside it to keep ([`drop_faint_partials`]),
+    /// so where a partial capstone would stand for want of anything
+    /// stronger among those refined, every candidate is refined after
+    /// all, as they all once were.
+    fn capstones(&self, family: Family, settled: &dyn Fn(&Candidate, [f64; 2]) -> bool) -> Vec<Capstone> {
         let max_module = self.rect.frame.size[0].min(self.rect.frame.size[1]) * max_module_fraction(family);
         let within = |c: &Candidate| c.module.iter().all(|&m| m <= max_module);
         let scan = |half: bool, most: usize| {
             within_cap(self.candidates.iter().enumerate().filter(move |(_, c)| c.half == half && within(c)), most).map(|(i, _)| (0, i))
         };
         let regions = (0..self.regions.len()).filter(|&i| within(&self.regions[i])).map(|i| (1, i));
-        let mut all: Vec<Capstone> = Vec::new();
-        for (source, i) in scan(false, MAX_SEARCH_CANDIDATES).chain(scan(true, MAX_HALF_CANDIDATES)).chain(regions) {
-            let Some(capstone) = self.refined(source, i) else { continue };
-            merge_capstone(&mut all, &self.rect, capstone);
+        let in_turn: Vec<(usize, usize)> = scan(false, MAX_SEARCH_CANDIDATES).chain(scan(true, MAX_HALF_CANDIDATES)).chain(regions).collect();
+        let spared = |source: usize, i: usize| {
+            let candidate = if source == 0 { &self.candidates[i] } else { &self.regions[i] };
+            settled(candidate, self.to_photo(self.rect.frame.to_image.apply(candidate.x, candidate.y)))
+        };
+        // The candidates are fitted side by side on the cores to spare,
+        // each fit being its own, and gathered in their turn.
+        let gather = |spare: bool| {
+            let wanted: Vec<(usize, usize)> = in_turn.iter().copied().filter(|&(source, i)| !(spare && spared(source, i))).collect();
+            let mut all: Vec<Capstone> = Vec::new();
+            for capstone in work::map(&wanted, |&(source, i)| self.refined(source, i)).into_iter().flatten() {
+                merge_capstone(&mut all, &self.rect, capstone);
+            }
+            all
+        };
+        let mut all = gather(true);
+        let strongest = all.iter().filter(|c| !c.partial).map(|c| c.contrast).fold(f64::NEG_INFINITY, f64::max);
+        if all.iter().any(|c| c.partial && !(c.contrast < PARTIAL_CONTRAST_SHARE * strongest)) {
+            all = gather(false);
         }
         drop_faint_partials(&mut all);
         all
@@ -5400,29 +5665,53 @@ impl<'a> ScannedView<'a> {
     ///
     /// Three capstones propose a QR Code first, best triple first, and a
     /// proposal that stands on a finder of a symbol found since, or lies
-    /// over one, is passed by: on a sheet of symbols most triples are
-    /// three finders of three neighbours, and finding the neighbours
-    /// disposes of them. Then the capstones no symbol was found on
-    /// propose in pairs, as they do inside an outline, for the symbol
-    /// with a finder torn off, cut by the edge of the photo, or missed:
-    /// two along a side with the timing pattern between them, or two
-    /// across the diagonal that lie turned as a symbol's would. OpenCV's
-    /// detectors and BoofCV's want all three finders; the pairs are the
-    /// outline search's own, and without them a symbol that read in a
-    /// loose outline was not found in the photo around it.
+    /// where one does ([`lies_at`]), is passed by: on a sheet of symbols
+    /// most triples are three finders of three neighbours, and finding
+    /// the neighbours disposes of them. Then the capstones no symbol was
+    /// found on propose in pairs, as they do inside an outline, for the
+    /// symbol with a finder torn off, cut by the edge of the photo, or
+    /// missed: two along a side with the timing pattern between them, or
+    /// two across the diagonal that lie turned as a symbol's would.
+    /// OpenCV's detectors and BoofCV's want all three finders; the pairs
+    /// are the outline search's own, and without them a symbol that read
+    /// in a loose outline was not found in the photo around it.
+    ///
+    /// Two along a side with no timing pattern read between them propose
+    /// too, where they face each other as the finders along a side do
+    /// ([`finders_face`]), among the proposals nothing speaks for. They
+    /// once proposed nothing, and a copy that showed one symbol whole
+    /// and two finders of another was the last the search looked at: no
+    /// triple, no pair, so nothing fitted in vain, and nothing to say
+    /// there was [more](Found::more). A version 5 symbol turned thirty
+    /// degrees and blurred by six tenths of a module, which a search
+    /// read where it lay alone, some rungs up the ladder, was not found
+    /// beside a crisp version 4: the photo as it was showed the crisp
+    /// one, and two finders of the other with a timing pattern too
+    /// blurred to count between them. BoofCV joins two position patterns
+    /// on how they face and nothing else, and reads what lies between
+    /// afterwards; the fit of the pair's outline looks for the third
+    /// finder at the outline's own scale, as a hand-drawn outline would
+    /// have it looked for, and found it. On the photographs of BoofCV's
+    /// benchmark two symbols are found so that were not found at all.
     fn find(&self, family: Family, params: &SampleParams, taken: &[Detection], known: &[Detection]) -> Found {
         let image: &Luma = &self.luma;
         let threshold = self.threshold;
-        let mut capstones = self.capstones(family);
         // The finders of a symbol already found are not offered again, as
         // those of a symbol found here are not below. A symbol with one
         // finder may have been claimed off a finder of a QR Code no copy
         // has yet shown whole, so a search for QR Codes leaves alone only
         // the finders of the QR Codes known.
         let theirs = |d: &&Detection| !family.has_three_finders() || d.version.family().has_three_finders();
+        let settled = || taken.iter().chain(known.iter().filter(theirs));
+        // Not offered, so not refined either, where the scan has them
+        // within the symbol's own outline: the fit moves a candidate a
+        // fraction of a module, and a symbol found covers two modules
+        // about itself. The finder of another symbol set within one
+        // found is offered, and so refined ([`passed_over`]).
+        let mut capstones = self.capstones(family, &|candidate, at| settled().any(|d| holds(d, at) && passed_over(d, at, candidate.quad.is_some())));
         capstones.retain(|c| {
             let at = self.to_photo(c.center);
-            !taken.iter().chain(known.iter().filter(theirs)).any(|d| covers(d, at))
+            !settled().any(|d| passed_over(d, at, c.stands_alone()))
         });
         /// An outline to detect, the capstones it stands on, and what
         /// the photo shows of a symbol there beyond them.
@@ -5487,11 +5776,24 @@ impl<'a> ScannedView<'a> {
             Family::Rmqr => SymbolVersion::Rmqr(11),
             Family::Model1 => SymbolVersion::Model1(2),
         };
+        // Whether a capstone is one of a symbol's found here, or lies on
+        // one and is passed over for it.
+        let spent = |found: &[Detection], m: usize| found.iter().any(|d| passed_over(d, capstones[m].center, capstones[m].stands_alone()));
+        // A capstone kept on a symbol already found is the finder of a
+        // symbol set within it or of none: an outline that stands on one
+        // and lies where the symbol found does is that symbol's own,
+        // proposed again by a finder the symbol's corners put more than
+        // a separator's width from where it lies.
+        let lodged: Vec<bool> = capstones.iter().map(|c| settled().any(|d| covers(d, self.to_photo(c.center)))).collect();
+        let stale = |p: &Proposal| {
+            p.members.iter().any(|&m| lodged[m]) && {
+                let outline = p.outline.map(|c| self.to_photo(c));
+                p.members.iter().any(|&m| settled().any(|d| covers(d, self.to_photo(capstones[m].center)) && lies_at(d, &outline)))
+            }
+        };
         // Whether a proposal is still worth detecting: no symbol found
         // lies where it does, or stands on a capstone it stands on.
-        let stands = |found: &[Detection], p: &Proposal| {
-            !found.iter().any(|d| covers(d, quad_centre(p.outline)) || p.members.iter().any(|&m| covers(d, capstones[m].center)))
-        };
+        let stands = |found: &[Detection], p: &Proposal| !found.iter().any(|d| lies_at(d, &p.outline)) && !p.members.iter().any(|&m| spent(found, m)) && !stale(p);
         // The proposal is already square to the symbol: no other frame
         // is asked for, and the ladder is the caller's. The placement the
         // fit ranks best is the one judged. Its runners-up were judged
@@ -5550,7 +5852,7 @@ impl<'a> ScannedView<'a> {
                         fits[j] = Some(fitted);
                     }
                 }
-                let detection = fits[i].take().flatten().filter(|d| !found.iter().any(|f| covers(f, quad_centre(d.corners))));
+                let detection = fits[i].take().flatten().filter(|d| !found.iter().any(|f| lies_at(f, &d.corners)));
                 match detection {
                     Some(detection) => found.push(detection),
                     None => {
@@ -5585,23 +5887,31 @@ impl<'a> ScannedView<'a> {
             // capstone's centre is placed by three quarters of it, and a
             // pair's outline hangs on both centres.
             let left: Vec<usize> = (0..capstones.len())
-                .filter(|&i| !capstones[i].partial && capstones[i].measured && !found.iter().any(|d| covers(d, capstones[i].center)))
+                .filter(|&i| !capstones[i].partial && capstones[i].measured && !spent(&found, i))
                 .collect();
             let spare: Vec<Capstone> = left.iter().map(|&i| capstones[i]).collect();
-            let mut pairs: Vec<Proposal> = qr_pairs(image, &self.rect.frame, &spare)
+            let proposed = qr_pairs(image, &self.rect.frame, &spare);
+            // The timing pattern between two along a side lies on the
+            // symbol's side of them and says which that is. Where none
+            // reads on either, each side is proposed for two that face
+            // each other, with nothing to speak for it.
+            let timed: Vec<[usize; 2]> = proposed.iter().filter(|p| matches!(p.kind, PairKind::Side { timed: true })).map(|p| p.members).collect();
+            let mut pairs: Vec<Proposal> = proposed
                 .into_iter()
                 .filter(|p| match p.kind {
-                    PairKind::Side { timed } => timed,
+                    PairKind::Side { timed: true } => true,
+                    PairKind::Side { timed: false } => !timed.contains(&p.members) && finders_face(&spare[p.members[0]], &spare[p.members[1]], &self.rect.frame),
                     PairKind::Diagonal => finders_lie_diagonal(&spare[p.members[0]], &spare[p.members[1]]),
                 })
                 .map(|p| {
-                    let timed = matches!(p.kind, PairKind::Side { .. });
+                    let timed = matches!(p.kind, PairKind::Side { timed: true });
+                    let side = matches!(p.kind, PairKind::Side { .. });
                     // Two along a side are the top-left finder and
                     // another, either way about, and the word's first
                     // copy lies whole beside the top-left one; two at the
                     // ends of the diagonal have its second between them.
                     let (a, b) = (left[p.members[0]], left[p.members[1]]);
-                    let worded = if timed {
+                    let worded = if side {
                         [[Some(a), Some(b), None], [Some(b), Some(a), None]].into_iter().any(&worded)
                     } else {
                         [[None, Some(a), Some(b)], [None, Some(b), Some(a)]].into_iter().any(&worded)
@@ -5615,7 +5925,7 @@ impl<'a> ScannedView<'a> {
         // Capstones with a timing pattern between them and no symbol
         // found on any of them: a symbol this copy shows and could not
         // fit, which another copy may.
-        let loose = |u: &Unfitted| u.members.iter().all(|&m| !found.iter().any(|d| covers(d, capstones[m].center)));
+        let loose = |u: &Unfitted| u.members.iter().all(|&m| !spent(&found, m));
         let more = unfitted.iter().any(|u| u.timed && loose(u));
         // And what is left to say of them should no copy fit them: where
         // those lie that a format word spoke for, each set of finders
@@ -5626,7 +5936,7 @@ impl<'a> ScannedView<'a> {
         // photographs of BoofCV's benchmark three were a symbol's.
         let mut leads: Vec<Lead> = Vec::new();
         let mut led: Vec<usize> = Vec::new();
-        for u in unfitted.iter().filter(|u| u.worded && loose(u) && !found.iter().any(|d| covers(d, quad_centre(u.outline)))) {
+        for u in unfitted.iter().filter(|u| u.worded && loose(u) && !found.iter().any(|d| lies_at(d, &u.outline))) {
             if u.members.iter().any(|m| led.contains(m)) {
                 continue;
             }
@@ -5731,6 +6041,83 @@ fn covers(found: &Detection, point: [f64; 2]) -> bool {
     (-2.0..=w + 2.0).contains(&x) && (-2.0..=h + 2.0).contains(&y)
 }
 
+/// Whether a photo point lies within the outline of a symbol found:
+/// [`covers`] without the two modules about the symbol.
+fn holds(found: &Detection, point: [f64; 2]) -> bool {
+    let (w, h) = (found.version.width() as f64, found.version.height() as f64);
+    let Some(inverse) = Homography::rect_to_quad(w, h, found.corners).and_then(|m| m.inverse()) else { return false };
+    let [x, y] = inverse.apply(point[0], point[1]);
+    (0.0..=w).contains(&x) && (0.0..=h).contains(&y)
+}
+
+/// Whether a photo point lies on a finder pattern of a symbol found, or
+/// on the separator about it: within four and a half modules of the
+/// pattern's centre along each of the symbol's axes.
+fn on_own_finder(found: &Detection, point: [f64; 2]) -> bool {
+    let (w, h) = (found.version.width() as f64, found.version.height() as f64);
+    let Some(inverse) = Homography::rect_to_quad(w, h, found.corners).and_then(|m| m.inverse()) else { return false };
+    let [x, y] = inverse.apply(point[0], point[1]);
+    let near = |[fx, fy]: [f64; 2]| (x - fx).abs() <= 4.5 && (y - fy).abs() <= 4.5;
+    near([3.5, 3.5]) || (found.version.family().has_three_finders() && (near([w - 3.5, 3.5]) || near([3.5, h - 3.5])))
+}
+
+/// Whether a candidate at a photo point is passed over for a symbol
+/// found: it lies on the symbol, or just around it ([`covers`]), and is
+/// the symbol's own, as far as can be told. `regioned` is whether a
+/// region of the binarised image bears the candidate out, as a whole
+/// pattern with measured corners where it has been fitted
+/// ([`Capstone::stands_alone`]).
+///
+/// Everything on a symbol found was once passed over, and most of it is
+/// the symbol's: its three finders, and the runs across its data that
+/// read 1:1:3:1:1 along a row or two, which every large symbol has a
+/// dozen of and which cost a fit apiece to make nothing of. But a symbol
+/// may be set within another, as a logo is, and its finders went the
+/// same way: a version 1 symbol printed in the middle of a version 7
+/// read through an outline and was never found, with nothing said.
+/// OpenCV's detectors take from the pool only the three patterns of the
+/// symbol they have chosen, and WeChat's tells two detections apart by
+/// their corners alone, so both find the two. Here the finder of a
+/// symbol set within another is told from the outer symbol's data by
+/// what BoofCV asks of a position pattern before anything else: a ring
+/// of dark closed on itself about a middle of its own. Such a candidate
+/// is kept wherever it lies, unless it is one of the found symbol's own
+/// three, and the rest are passed over as before.
+fn passed_over(found: &Detection, point: [f64; 2], regioned: bool) -> bool {
+    covers(found, point) && !(regioned && !on_own_finder(found, point))
+}
+
+/// The most of a symbol's area that an outline set within it may have,
+/// for the two to be two symbols and not two readings of one. Two
+/// readings of one symbol have areas within a factor of two of each
+/// other, as the list of what a search found has it.
+const SET_WITHIN_AREA: f64 = 0.5;
+
+/// Whether a symbol found lies where an outline does, so that the
+/// outline has nothing more to give: the outline's centre is on the
+/// symbol, and neither is set within the other, every corner on it and
+/// under [`SET_WITHIN_AREA`] of its area. See [`passed_over`].
+fn lies_at(found: &Detection, outline: &[[f64; 2]; 4]) -> bool {
+    let (drawn, symbol) = (quad_area(outline), quad_area(&found.corners));
+    let within = drawn < SET_WITHIN_AREA * symbol && outline.iter().all(|&corner| covers(found, corner));
+    let about = symbol < SET_WITHIN_AREA * drawn && found.corners.iter().all(|&corner| quad_holds(outline, corner));
+    covers(found, quad_centre(*outline)) && !within && !about
+}
+
+fn quad_area(quad: &[[f64; 2]; 4]) -> f64 {
+    (0..4).map(|i| quad[i][0] * quad[(i + 1) % 4][1] - quad[(i + 1) % 4][0] * quad[i][1]).sum::<f64>().abs() / 2.0
+}
+
+/// Whether a point lies within a convex quadrilateral, whichever way
+/// round its corners run.
+fn quad_holds(quad: &[[f64; 2]; 4], point: [f64; 2]) -> bool {
+    let side = |i: usize| {
+        let (a, b) = (quad[i], quad[(i + 1) % 4]);
+        (b[0] - a[0]) * (point[1] - a[1]) - (b[1] - a[1]) * (point[0] - a[0])
+    };
+    (0..4).all(|i| side(i) >= 0.0) || (0..4).all(|i| side(i) <= 0.0)
+}
+
 /// An outline three capstones propose for a QR symbol.
 #[derive(Clone, Copy, Debug)]
 struct TripleProposal {
@@ -5769,9 +6156,12 @@ fn qr_triples(image: &Luma, frame: &Frame, capstones: &[Capstone]) -> Vec<Triple
                 let sizes = trio.map(Capstone::module_mean);
                 let lo = sizes.iter().copied().fold(f64::INFINITY, f64::min);
                 let hi = sizes.iter().copied().fold(0.0, f64::max);
-                if hi > SIZE_RATIO * lo {
+                if hi > STEEP_SIZE_RATIO * lo {
                     continue;
                 }
+                // Finders this unlike in size are one symbol's only if
+                // it is seen steeply, which their squares must say.
+                let steep = hi > SIZE_RATIO * lo;
                 // How the three stand as one symbol's finders: by the
                 // triangle their centres make in the frame's pixels, and
                 // where that says no, by the finders' own squares, which
@@ -5779,9 +6169,8 @@ fn qr_triples(image: &Luma, frame: &Frame, capstones: &[Capstone]) -> Vec<Triple
                 // ([`stands_by_squares`]).
                 let p = trio.map(|c| frame.to_rectified(c.center));
                 let module = sizes.iter().sum::<f64>() / 3.0;
-                let Some(TripleShape { tl, distortion, spacing, fourth }) =
-                    stands_by_pixels(&trio, &p, frame, module).or_else(|| stands_by_squares(&trio, &p, frame))
-                else {
+                let by_pixels = if steep { None } else { stands_by_pixels(&trio, &p, frame, module) };
+                let Some(TripleShape { tl, distortion, spacing, fourth }) = by_pixels.or_else(|| stands_by_squares(&trio, &p, frame)) else {
                     continue;
                 };
                 // The other two are told apart by the handedness of the
@@ -5831,11 +6220,15 @@ fn qr_triples(image: &Luma, frame: &Frame, capstones: &[Capstone]) -> Vec<Triple
                 // fit nothing, and one that cuts a corner off costs it
                 // the symbol. The squares of a symbol of two pixels a
                 // module point where its edges run to within a few
-                // modules, short as often as long.
+                // modules, short as often as long. A symbol seen steeply
+                // takes the squares' outline alone: the parallelogram
+                // puts its far corner as far again from the middle as
+                // it lies, and the fit, made square to an outline so
+                // drawn, read a version 5 symbol as a version 8.
                 let middle = [(r[0] + l[0]) / 2.0, (r[1] + l[1]) / 2.0];
                 let outline = fourth
                     .and_then(|f| outline_through([t, r, f, l], spacing[tr], spacing[bl]))
-                    .map(|closed| std::array::from_fn(|c| if distance(closed[c], middle) > distance(parallelogram[c], middle) { closed[c] } else { parallelogram[c] }))
+                    .map(|closed| if steep { closed } else { std::array::from_fn(|c| if distance(closed[c], middle) > distance(parallelogram[c], middle) { closed[c] } else { parallelogram[c] }) })
                     .filter(convex)
                     .unwrap_or(parallelogram);
                 let badness = distortion + (hi / lo - 1.0) + faintness + TIMING_PENALTY * unread;
@@ -6530,7 +6923,12 @@ impl Line {
     }
 
     fn distance(&self, p: [f64; 2]) -> f64 {
-        ((p[0] - self.point[0]) * self.dir[1] - (p[1] - self.point[1]) * self.dir[0]).abs()
+        self.side(p).abs()
+    }
+
+    /// How far `p` lies from the line, signed by the side it lies on.
+    fn side(&self, p: [f64; 2]) -> f64 {
+        (p[0] - self.point[0]) * self.dir[1] - (p[1] - self.point[1]) * self.dir[0]
     }
 
     fn intersect(&self, other: &Line) -> Option<[f64; 2]> {
@@ -6596,12 +6994,16 @@ fn edges_at(i: usize, w: f64, h: f64) -> [EdgeFrame; 2] {
 
 /// What tracing one edge found: the line through the crossings, or, on
 /// an edge that bows, the tangent at the corner to the bend fitted to
-/// them; whether it was a bend; and the crossings the fit kept, each as
+/// them; whether it was a bend; whether paper lies beyond the fit near
+/// the corner ([`BEYOND_STRIP`]); and the crossings the fit kept, each as
 /// the point of the symbol's edge it lies on, in module coordinates, with
-/// where the paper turned to ink there in the photo.
+/// where the paper turned to ink there in the photo, set on the fit: one
+/// crossing is read to a fifth of a module, and the fit through thirty of
+/// them far better.
 struct Traced {
     line: Line,
     bent: bool,
+    clear: bool,
     crossings: Vec<ControlPoint>,
 }
 
@@ -6613,6 +7015,20 @@ struct Traced {
 /// no quiet zone, too few border modules are dark, or the crossings do not
 /// line up. `contrast` is the symbol's own, which the floor on a border
 /// module's contrast is a share of.
+///
+/// A profile sees the edge only within about half a module of where the
+/// map predicts it. Where the prediction runs from a corner placed right
+/// to one placed a module inside the symbol, the profiles near the first
+/// find the edge and those near the second the boundary between the
+/// border row, where its module is light, and the row within, where that
+/// one is dark: both turn from light to dark, a line fits the lot within
+/// the tolerance, slanting from the edge to a row inside it, and the
+/// corner its crossing with the other edge gives is a module short. Such
+/// a fit has the dark modules of the symbol's border beyond it, and the
+/// trace says whether its fit is clear of them ([`Traced::clear`]). It
+/// is not refused for them: on a label round a bottle a true edge bulges
+/// past the line fitted to the rest of it, over a few modules, and the
+/// line still crosses the other edge at the corner.
 fn trace_edge(
     image: &Luma,
     map: &impl Project,
@@ -6645,6 +7061,8 @@ fn trace_edge(
     // The point of the symbol's edge each crossing lies on, in module
     // coordinates: where the map should put the crossing.
     let mut sites: Vec<[f64; 2]> = Vec::new();
+    // The profiles a crossing was found in.
+    let mut crossed: Vec<usize> = Vec::new();
     for &k in &positions {
         let s = k as f64 + 0.5;
         let profile: Vec<Option<f32>> = (0..=steps).map(|j| sample(s, -PROFILE_REACH + j as f64 * PROFILE_STEP)).collect();
@@ -6689,21 +7107,61 @@ fn trace_edge(
         ];
         crossings.push(map.apply(x, y));
         sites.push([edge.corner[0] + edge.along[0] * s, edge.corner[1] + edge.along[1] * s]);
+        crossed.push(k);
     }
     if (quiet as f64) < QUIET_SHARE * probes as f64 || crossings.len() < MIN_CROSSINGS {
         return None;
     }
     let module = module_size_at(map, [edge.corner[0] + edge.along[0] * 2.0, edge.corner[1] + edge.along[1] * 2.0]);
     let limit = MAX_EDGE_RMS * module;
-    // The crossings within reach of what was fitted through them, as
-    // control points; the rest are stray print.
-    let kept = |near: &dyn Fn([f64; 2]) -> f64| -> Vec<ControlPoint> {
+    // The crossings within reach of what was fitted through them, each
+    // set on the fit, as control points; the rest are stray print.
+    let kept = |near: &dyn Fn([f64; 2]) -> f64, onto: &dyn Fn([f64; 2]) -> [f64; 2]| -> Vec<ControlPoint> {
         crossings
             .iter()
             .zip(&sites)
             .filter(|(p, _)| near(**p) <= 2.0 * limit)
-            .map(|(p, at)| ControlPoint { at: *at, px: *p })
+            .map(|(p, at)| ControlPoint { at: *at, px: onto(*p) })
             .collect()
+    };
+    // Whether paper lies beyond a fit near the corner. `across` is how
+    // far a point of the photo lies from the fit, signed by its side.
+    let ink_drop = (BEYOND_DROP * contrast).max(NOISE_RANGE);
+    let near = (edge.length / 3.0).max(BEYOND_NEAR);
+    let clear = |across: &dyn Fn([f64; 2]) -> f64| -> bool {
+        let at = |s: f64, t: f64| {
+            map.apply(edge.corner[0] + edge.along[0] * s + edge.inward[0] * t, edge.corner[1] + edge.along[1] * s + edge.inward[1] * t)
+        };
+        let (mut read, mut inked) = (0usize, 0usize);
+        for &k in positions.iter().filter(|k| !crossed.contains(k)) {
+            let s = k as f64 + 0.5;
+            if s > near {
+                continue;
+            }
+            // Where the fit crosses this profile, from how far two points
+            // of the profile lie from it.
+            let (outside, inside) = (across(at(s, -1.0)), across(at(s, 1.0)));
+            if (inside - outside).abs() < 1e-9 {
+                continue;
+            }
+            let t = -1.0 - 2.0 * outside / (inside - outside);
+            let read_at = |out: f64| sample(s, t - out);
+            let strip: Option<Vec<f32>> =
+                (0..=5).map(|j| read_at(BEYOND_STRIP[0] + (BEYOND_STRIP[1] - BEYOND_STRIP[0]) * j as f64 / 5.0)).collect();
+            let Some(strip) = strip else { continue };
+            // The paper further out, the lightest of it; off the photo,
+            // the threshold says what is ink.
+            let further: Option<Vec<f32>> =
+                (0..=2).map(|j| read_at(BEYOND_PAPER[0] + (BEYOND_PAPER[1] - BEYOND_PAPER[0]) * j as f64 / 2.0)).collect();
+            let paper = further.map(|f| f.into_iter().fold(f32::NEG_INFINITY, |m, v| m.max(sign as f32 * v)));
+            let ink = |v: f32| match paper {
+                Some(paper) => paper - sign as f32 * v >= ink_drop,
+                None => !is_quiet(v),
+            };
+            read += 1;
+            inked += usize::from(strip.into_iter().any(ink));
+        }
+        inked as f64 <= BEYOND_INKED * read as f64
     };
     // A straight edge: every crossing lies on one line.
     let straight = Line::fit(&crossings)?;
@@ -6723,15 +7181,20 @@ fn trace_edge(
         && rms_curve < CURVE_GAIN * rms_all
         && bow >= MIN_EDGE_SAGITTA * module
     {
-        return Some(Traced { line: tangent, bent: true, crossings: kept(&|p| curve.residual(p).abs()) });
+        let crossings = kept(&|p| curve.residual(p).abs(), &|p| curve.project(p));
+        return Some(Traced { line: tangent, bent: true, clear: clear(&|p| curve.residual(p)), crossings });
     }
     if rms_all <= limit {
-        return Some(Traced { line: straight, bent: false, crossings: kept(&|p| straight.distance(p)) });
+        let crossings = kept(&|p| straight.distance(p), &|p| straight.project(p));
+        return Some(Traced { line: straight, bent: false, clear: clear(&|p| straight.side(p)), crossings });
     }
     // Otherwise the worst crossings are stray print, and are left out.
-    robust_line(&crossings)
-        .filter(|(_, rms, kept)| *kept >= MIN_CROSSINGS && *rms <= limit)
-        .map(|(line, _, _)| Traced { line, bent: false, crossings: kept(&|p| line.distance(p)) })
+    robust_line(&crossings).filter(|(_, rms, kept)| *kept >= MIN_CROSSINGS && *rms <= limit).map(|(line, _, _)| Traced {
+        line,
+        bent: false,
+        clear: clear(&|p| line.side(p)),
+        crossings: kept(&|p| line.distance(p), &|p| line.project(p)),
+    })
 }
 
 /// A gentle bend fitted to points in photo pixels: a quadratic across the
@@ -6748,6 +7211,12 @@ impl Curve {
         let s = (p[0] - self.axis.point[0]) * self.axis.dir[0] + (p[1] - self.axis.point[1]) * self.axis.dir[1];
         let t = (p[0] - self.axis.point[0]) * self.normal[0] + (p[1] - self.axis.point[1]) * self.normal[1];
         t - (self.c[0] + self.c[1] * s + self.c[2] * s * s)
+    }
+
+    /// The point of the bend straight across it from `p`.
+    fn project(&self, p: [f64; 2]) -> [f64; 2] {
+        let r = self.residual(p);
+        [p[0] - r * self.normal[0], p[1] - r * self.normal[1]]
     }
 }
 
@@ -6913,18 +7382,46 @@ fn edge_levels(image: &Luma, func: &FunctionMap, map: &impl Project, threshold: 
 
 /// Most crossings of one edge kept as anchors: enough to draw its bow.
 const EDGE_ANCHORS_PER_EDGE: usize = 5;
+/// How far, in modules, the anchors inside the symbol must bend the map
+/// from the plane through its corners, somewhere along a straight edge,
+/// for that edge to be given points of its own.
+const EDGE_BENT_BY: f64 = 0.25;
+/// The least depth of a module across a straight edge, in photo pixels,
+/// for the edge to be given points: a crossing is read to a fraction of
+/// a pixel, which of a module a pixel or two deep, as a symbol seen from
+/// far to one side has them, is too large a share to put into the map.
+const EDGE_MIN_DEPTH: f64 = 3.0;
 /// How far from a corner, in modules, an edge anchor must lie: nearer, it
 /// says nothing the corner does not, and the projection drops it anyway.
 const EDGE_ANCHOR_CLEARANCE: f64 = 2.5;
 
-/// Anchors along the edges of the symbol that bow, for paper that curls:
-/// each of the four edges is traced against the quiet zone through the
-/// map the corners and `anchors` make, and where the crossings fit a
-/// bend rather than a line, a few of them, spread along the edge, become
-/// anchors of their own, the crossing in the photo standing for the
-/// point of the symbol's edge it was traced from. A straight edge adds
-/// nothing the corners do not say, and an edge without a quiet zone
-/// cannot be traced.
+/// Anchors along the edges of the symbol, for paper that curls: each of
+/// the four edges is traced against the quiet zone through the map the
+/// corners and `anchors` make, and a few of the crossings, spread along
+/// the edge, become anchors of their own, the crossing in the photo
+/// standing for the point of the symbol's edge it was traced from. An
+/// edge without a quiet zone cannot be traced, and a straight line that
+/// is not clear of the symbol near the corner it was traced from
+/// ([`Traced::clear`]) may be a row of modules inside it, and gives no
+/// points; a bend is taken as it always was.
+///
+/// A straight edge is kept as a bowed one is where the map bends at it.
+/// Between the corners alone a straight edge says nothing the corners do
+/// not, and its points, each read to a fraction of a module, would only
+/// add what they are out by: a symbol seen from so far to one side that
+/// its modules were three pixels deep read without them and not with
+/// them. But the map inside the outline bends through every alignment
+/// pattern and timing module found, and on a bottle those bends run on
+/// to the edge and past it, where nothing but the two corners at its
+/// ends would hold them: the columns beside a straight side of a symbol
+/// on a cylinder came out most of a module wide of it. So a straight
+/// edge gives points where the anchors bend the map by
+/// [`EDGE_BENT_BY`] modules somewhere along it and its modules are
+/// [`EDGE_MIN_DEPTH`] pixels deep across it. The points hold the map
+/// across the edge only ([`super::projection`]), since the trace cannot
+/// say which point of the edge a crossing is. Returns the points of the
+/// bowed edges and those of the straight ones, which the caller keeps
+/// only where the symbol reads no worse for them.
 fn edge_anchors(
     image: &Luma,
     func: &FunctionMap,
@@ -6932,18 +7429,28 @@ fn edge_anchors(
     anchors: &[Anchor],
     sign: f64,
     threshold: Option<f32>,
-) -> Vec<Anchor> {
+) -> (Vec<Anchor>, Vec<Anchor>) {
     let (w, h) = (func.width as f64, func.height as f64);
     let controls: Vec<ControlPoint> = anchors.iter().map(Anchor::control_point).collect();
-    let Some(map) = Projection::new(func.width, func.height, corners, &controls) else { return Vec::new() };
+    let Some(map) = Projection::new(func.width, func.height, corners, &controls) else { return (Vec::new(), Vec::new()) };
     let (level, contrast) = edge_levels(image, func, &map, threshold);
     let outline = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]];
-    let mut out = Vec::new();
+    let (mut bowed, mut straight) = (Vec::new(), Vec::new());
     // The top and left edges from the top-left corner, the bottom and
     // right from the bottom-right.
     for edge in edges_at(0, w, h).iter().chain(edges_at(2, w, h).iter()) {
         let Some(traced) = trace_edge(image, &map, edge, sign, level, contrast) else { continue };
-        if !traced.bent {
+        // A straight edge gives points only where the anchors inside
+        // the symbol bend the map at it, and its modules are deep enough
+        // across it for a crossing to say where it runs.
+        let bends = |c: &ControlPoint| {
+            let [dx, dy] = map.displacement(c.at[0], c.at[1]);
+            distance([0.0, 0.0], [dx, dy]) >= EDGE_BENT_BY * module_size_at(&map, c.at)
+        };
+        let deep = |c: &ControlPoint| {
+            distance(map.apply(c.at[0], c.at[1]), map.apply(c.at[0] + edge.inward[0], c.at[1] + edge.inward[1])) >= EDGE_MIN_DEPTH
+        };
+        if !(traced.bent || (traced.clear && traced.crossings.iter().any(bends) && traced.crossings.iter().all(deep))) {
             continue;
         }
         let clear: Vec<&ControlPoint> =
@@ -6953,35 +7460,136 @@ fn edge_anchors(
         }
         let stride = clear.len().div_ceil(EDGE_ANCHORS_PER_EDGE).max(1);
         for c in clear.iter().step_by(stride) {
-            out.push(Anchor { kind: AnchorKind::Edge, at: c.at, center: c.px, partial: false, inferred: false });
+            let point = Anchor { kind: AnchorKind::Edge, at: c.at, center: c.px, partial: false, inferred: false };
+            if traced.bent { bowed.push(point) } else { straight.push(point) }
         }
     }
-    out
+    (bowed, straight)
+}
+
+/// A corner traced from a start other than where the map puts it must
+/// come out within this many modules of that start, and each of its edges
+/// must have been seen within [`CORNER_SEEN_WITHIN`] modules of the
+/// corner. A profile sees an edge only half a module or so from where the
+/// outline through the start runs, so edges truly traced up to the corner
+/// cross near the start; a crossing further off was run on to from the
+/// far ends of the edges, where every start sees them, and on a symbol
+/// whose edges bow that lands modules out, with paper beyond it all the
+/// same.
+const STARTED_WITHIN: f64 = 1.0;
+const CORNER_SEEN_WITHIN: f64 = 5.0;
+/// How much further out than the corner as traced from where the map
+/// puts it a corner traced from another start must lie, in modules, to
+/// be taken for it: nearer, the two are one corner read twice.
+const OUTER_CORNER: f64 = 0.5;
+
+/// Where the two edges that meet at corner `i` cross, when both trace
+/// against the quiet zone ([`trace_edge`]). The edges are traced from
+/// the corner as it stands, and the crossing stands when both are clear
+/// of the symbol there, with paper beyond them. Where they are not, or
+/// do not both trace, they are traced from each of `starts` in turn,
+/// other places the corner may be, and from the corner as it stands
+/// moved a module out along either edge and along both: a profile sees
+/// an edge only within half a module or so of where the outline through
+/// the start runs, and a start a module inside the symbol sees none, or
+/// sees a row of modules for it. The first of those starts from which
+/// both edges trace clear, and are seen near the corner, and cross
+/// beside the start ([`STARTED_WITHIN`]), places a corner that did not
+/// trace as it stood. With `fourth`, for the corner of a QR Code whose
+/// other three finders measured, it also takes the place of a crossing
+/// that was not clear, when it lies further out than that by
+/// [`OUTER_CORNER`] modules: a line with paper beyond it does not run
+/// inside the symbol, and what lies short of it does. Otherwise the
+/// crossing from the corner as it stands is kept, clear or not, as it
+/// always was: a placement on two finders of three has the third where
+/// it takes a corner to be, with nothing clear about it, and a label
+/// photographed round a bottle read only through such a placement.
+/// `reach` is how far, in modules, the crossing may lie from the corner
+/// as it stands.
+#[allow(clippy::too_many_arguments)]
+fn traced_corner(
+    image: &Luma,
+    func: &FunctionMap,
+    corners: &[[f64; 2]; 4],
+    i: usize,
+    sign: f64,
+    threshold: Option<f32>,
+    starts: &[[f64; 2]],
+    fourth: bool,
+    reach: f64,
+) -> Option<[f64; 2]> {
+    let (w, h) = (func.width as f64, func.height as f64);
+    let [cx, cy] = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]][i];
+    // The crossing, whether both edges are clear, and the size of a
+    // module there. `own` for the corner as it stands.
+    let trace = |start: [f64; 2], own: bool| -> Option<([f64; 2], bool, f64)> {
+        let mut outline = *corners;
+        outline[i] = start;
+        if !own && !convex(&outline) {
+            return None;
+        }
+        let map = Homography::rect_to_quad(w, h, outline)?;
+        let (level, contrast) = edge_levels(image, func, &map, threshold);
+        let traced: Vec<Traced> = edges_at(i, w, h).iter().filter_map(|e| trace_edge(image, &map, e, sign, level, contrast)).collect();
+        let [a, b] = traced.as_slice() else { return None };
+        let p = a.line.intersect(&b.line)?;
+        let seen = |t: &Traced| t.crossings.iter().any(|c| distance(c.at, [cx, cy]) <= CORNER_SEEN_WITHIN);
+        let clear = a.clear && b.clear;
+        if !own && !(clear && seen(a) && seen(b)) {
+            return None;
+        }
+        let module = module_size_at(&map, [cx, cy]);
+        let reach = if own { reach } else { STARTED_WITHIN };
+        (distance(p, start) <= reach * module).then_some((p, clear, module))
+    };
+    let own = trace(corners[i], true);
+    if let Some((p, clear, _)) = own
+        && (clear || !fourth)
+    {
+        return Some(p);
+    }
+    // The other starts, and outwards from the corner in the symbol's own
+    // modules.
+    let outwards = Homography::rect_to_quad(w, h, *corners).map(|map| {
+        let (ox, oy) = (if cx > 0.0 { 1.0 } else { -1.0 }, if cy > 0.0 { 1.0 } else { -1.0 });
+        [(ox, 0.0), (0.0, oy), (ox, oy)].map(|(dx, dy)| map.apply(cx + dx, cy + dy))
+    });
+    let other = starts.iter().chain(outwards.iter().flatten()).find_map(|&start| trace(start, false));
+    let out = |p: [f64; 2]| distance(p, corners[(i + 2) % 4]);
+    match (own, other) {
+        (Some((p, _, module)), Some((q, _, _))) => Some(if out(q) > out(p) + OUTER_CORNER * module { q } else { p }),
+        (Some((p, _, _)), None) => Some(p),
+        (None, other) => other.map(|(q, _, _)| q),
+    }
 }
 
 /// Move corner `i` of an outline that an anchor holds, an alignment
 /// pattern or a timing module some modules in from it, to where its two
-/// edges meet, when both trace against the quiet zone. The map through
+/// edges meet, when both trace against the quiet zone from the corner as
+/// it stands or from one of `starts` ([`traced_corner`]). The map through
 /// the anchor runs on to the corner as the paper lies between them,
 /// which on curled paper is not where the edge goes, and on a blurred
 /// photo the anchor itself is read to a few tenths of a module; the
 /// edges, traced over many modules, place the corner better either way.
 /// Returns whether the corner was moved.
-fn settle_traced_corner(image: &Luma, func: &FunctionMap, corners: &mut [[f64; 2]; 4], i: usize, sign: f64, threshold: Option<f32>) -> bool {
+#[allow(clippy::too_many_arguments)]
+fn settle_traced_corner(
+    image: &Luma,
+    func: &FunctionMap,
+    corners: &mut [[f64; 2]; 4],
+    i: usize,
+    sign: f64,
+    threshold: Option<f32>,
+    starts: &[[f64; 2]],
+    fourth: bool,
+) -> bool {
     let (w, h) = (func.width as f64, func.height as f64);
-    let Some(map) = Homography::rect_to_quad(w, h, *corners) else { return false };
-    let (edge_threshold, contrast) = edge_levels(image, func, &map, threshold);
-    let traced: Vec<Line> =
-        edges_at(i, w, h).iter().filter_map(|e| trace_edge(image, &map, e, sign, edge_threshold, contrast).map(|t| t.line)).collect();
-    let [a, b] = traced.as_slice() else { return false };
-    let Some(p) = a.intersect(b) else { return false };
-    let [cx, cy] = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]][i];
     // No further than a bend could carry it: beyond that the trace has
     // found other print.
-    if distance(p, corners[i]) > MAX_EDGE_SAGITTA * module_size_at(&map, [cx, cy]) {
-        return false;
-    }
+    let Some(p) = traced_corner(image, func, corners, i, sign, threshold, starts, fourth, MAX_EDGE_SAGITTA) else { return false };
     corners[i] = p;
+    let Some(map) = Homography::rect_to_quad(w, h, *corners) else { return true };
+    let [cx, cy] = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]][i];
     polish_corner_by_data(image, func, corners, i, sign, threshold);
     if distance(corners[i], p) > POLISH_LIMIT * module_size_at(&map, [cx, cy]) {
         corners[i] = p;
@@ -6992,19 +7600,27 @@ fn settle_traced_corner(image: &Luma, func: &FunctionMap, corners: &mut [[f64; 2
 /// Move corner `i` of the outline to where its quarter of the symbol reads
 /// best, by the symbol's edge where there is a quiet zone to trace it
 /// against, and otherwise by the fixed and data modules of the quarter
-/// alone. Returns whether the edge was traced on both sides.
-fn settle_corner(image: &Luma, func: &FunctionMap, corners: &mut [[f64; 2]; 4], i: usize, sign: f64, threshold: Option<f32>) -> bool {
+/// alone. The edges are traced from the corner as it stands and from each
+/// of `starts`, other places it may be, `fourth` saying whether it is a
+/// QR Code's fourth corner ([`traced_corner`]). Returns whether the edge
+/// was traced on both sides.
+#[allow(clippy::too_many_arguments)]
+fn settle_corner(
+    image: &Luma,
+    func: &FunctionMap,
+    corners: &mut [[f64; 2]; 4],
+    i: usize,
+    sign: f64,
+    threshold: Option<f32>,
+    starts: &[[f64; 2]],
+    fourth: bool,
+) -> bool {
     let (w, h) = (func.width as f64, func.height as f64);
     let Some(map) = Homography::rect_to_quad(w, h, *corners) else { return false };
     let Some(scorer) = CornerScorer::new(image, func, *corners, i, threshold) else { return false };
     let [cx, cy] = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]][i];
 
-    let (edge_threshold, contrast) = edge_levels(image, func, &map, threshold);
-    let lines: Vec<Line> =
-        edges_at(i, w, h).iter().filter_map(|e| trace_edge(image, &map, e, sign, edge_threshold, contrast).map(|t| t.line)).collect();
-    if let [a, b] = lines.as_slice()
-        && let Some(p) = a.intersect(b)
-    {
+    if let Some(p) = traced_corner(image, func, corners, i, sign, threshold, starts, fourth, f64::INFINITY) {
         // Two traced edges fix the corner outright: their crossing is a
         // measurement, where the search below is only a preference. The
         // profiles that found the edges stepped a tenth of a module, and
@@ -7019,6 +7635,9 @@ fn settle_corner(image: &Luma, func: &FunctionMap, corners: &mut [[f64; 2]; 4], 
         }
         return true;
     }
+    let (edge_threshold, contrast) = edge_levels(image, func, &map, threshold);
+    let lines: Vec<Line> =
+        edges_at(i, w, h).iter().filter_map(|e| trace_edge(image, &map, e, sign, edge_threshold, contrast).map(|t| t.line)).collect();
     let (start, half_width) = match lines.as_slice() {
         [a] => (a.project(corners[i]), CORNER_SEARCH_EDGED),
         _ => (corners[i], if scorer.has_fixed() { CORNER_SEARCH } else { CORNER_SEARCH_CRISP }),
@@ -7179,13 +7798,172 @@ fn finder_capstone_levels(
     Some((split, contrast))
 }
 
+/// The offset, in modules along the symbol's own axes, at which the point
+/// `at` of the symbol was found, at `found` in the photo, from where `map`
+/// puts it.
+fn offset_in_modules(map: &Homography, at: [f64; 2], found: [f64; 2]) -> Option<[f64; 2]> {
+    let [x, y] = at;
+    let o = map.apply(x, y);
+    let (ex, ey) = (map.apply(x + 1.0, y), map.apply(x, y + 1.0));
+    let (ex, ey) = ([ex[0] - o[0], ex[1] - o[1]], [ey[0] - o[0], ey[1] - o[1]]);
+    let d = [found[0] - o[0], found[1] - o[1]];
+    let det = ex[0] * ey[1] - ex[1] * ey[0];
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    Some([(d[0] * ey[1] - d[1] * ey[0]) / det, (ex[0] * d[1] - ex[1] * d[0]) / det])
+}
+
+/// A QR Code version's alignment patterns as the grid they make: the
+/// module coordinate of each of its columns, which are its rows' too.
+/// The first and last of them cross at the three finders, where no
+/// alignment pattern is.
+struct AlignmentGrid {
+    centers: Vec<usize>,
+    width: f64,
+    height: f64,
+}
+
+impl AlignmentGrid {
+    /// `None` for a version with no alignment pattern, and for the other
+    /// families: an rMQR symbol's alignment patterns lie along its edges
+    /// and make no grid.
+    fn of(func: &FunctionMap) -> Option<Self> {
+        let SymbolVersion::Qr(v) = func.version else { return None };
+        let centers = tables::qr_alignment_centers(v);
+        (centers.len() >= 2).then_some(Self { centers, width: func.width as f64, height: func.height as f64 })
+    }
+
+    /// The column and row of the grid that a pattern centred at `at`
+    /// stands in.
+    fn place(&self, at: [f64; 2]) -> Option<(usize, usize)> {
+        let index = |c: f64| self.centers.iter().position(|&k| (k as f64 + 0.5 - c).abs() < 1e-6);
+        Some((index(at[0])?, index(at[1])?))
+    }
+
+    /// What stands at column `i`, row `j`: an alignment pattern and its
+    /// centre, or, in three of the corners, the finder there and its.
+    fn stands_at(&self, i: usize, j: usize) -> (AnchorKind, [f64; 2]) {
+        let last = self.centers.len() - 1;
+        if (i == 0 && j == 0) || (i == last && j == 0) || (i == 0 && j == last) {
+            (AnchorKind::Finder, [if i == 0 { 3.5 } else { self.width - 3.5 }, if j == 0 { 3.5 } else { self.height - 3.5 }])
+        } else {
+            (AnchorKind::Alignment, [self.centers[i] as f64 + 0.5, self.centers[j] as f64 + 0.5])
+        }
+    }
+}
+
+/// The offset an alignment pattern is looked for at, in modules from
+/// where `plane` puts it: the mean of the offsets at which its neighbours
+/// in the grid, along its row and down its column, were found from where
+/// the same plane puts them. This is BoofCV's
+/// `QrCodeAlignmentPatternLocator`, which takes the patterns row by row
+/// and starts each from its place under the homography through the
+/// position patterns, moved by what the pattern to its left was found
+/// off by across and the pattern above it down: paper that curls carries
+/// a pattern much as far as it carried the pattern beside it, and a
+/// plane cannot follow it at all. BoofCV carries one coordinate from each
+/// of two neighbours, which over the geometry of symbols on cylinders
+/// left the worst-placed pattern as far from its prediction as no carry
+/// did; the mean of both coordinates over every neighbour that stands,
+/// the finders among them at next to nothing, left it nearer than
+/// either. The search here takes
+/// its sites nearest what is known first, not row by row, so a neighbour
+/// on any of the four sides may stand already. Only a neighbour standing
+/// firm ([`Placed::firm`]) is carried from, and `None` is returned when
+/// no alignment pattern beside this one does: the finders' offsets alone
+/// say what the plane already says.
+fn carried_offset(grid: &AlignmentGrid, site: &Site, plane: &Homography, placed: &[Placed]) -> Option<[f64; 2]> {
+    let (i, j) = grid.place(site.at)?;
+    let last = grid.centers.len() - 1;
+    let mut sum = [0.0, 0.0];
+    let (mut standing, mut patterns) = (0usize, 0usize);
+    for (ni, nj) in [(i.wrapping_sub(1), j), (i + 1, j), (i, j.wrapping_sub(1)), (i, j + 1)] {
+        if ni > last || nj > last {
+            continue;
+        }
+        let (kind, at) = grid.stands_at(ni, nj);
+        let Some(found) = placed.iter().find(|p| p.anchor.kind == kind && distance(p.anchor.at, at) < 1e-6 && (p.firm || kind == AnchorKind::Finder))
+        else {
+            continue;
+        };
+        let Some(offset) = offset_in_modules(plane, found.anchor.at, found.anchor.center) else { continue };
+        sum = [sum[0] + offset[0], sum[1] + offset[1]];
+        standing += 1;
+        patterns += usize::from(kind == AnchorKind::Alignment);
+    }
+    (patterns > 0).then(|| [sum[0] / standing as f64, sum[1] / standing as f64])
+}
+
+/// Whether the offset at which an alignment pattern standing firm was
+/// found from `plane` is what its neighbours in the grid would have it:
+/// within the allowance any anchor has of where its neighbours predict
+/// it, over the grid's own spacing. Along its row, and down its column,
+/// the neighbours say: the mean of the two beside it where both stand;
+/// the one beside it run on by its difference from the one beyond,
+/// where two stand on one side, since paper round a bottle carries each
+/// pattern a little further than the last; or the one beside it alone.
+/// A finder stands for a neighbour in its corner of the grid. With no
+/// alignment pattern standing beside it there is nothing to ask, and it
+/// agrees: the one pattern of versions 2 to 6 has only its template to
+/// speak for it. On flat paper the neighbours of a patch of data that
+/// reads as a pattern, a module off the true one's place, all stand
+/// where the plane has them, and it does not agree, and is doubted
+/// against the plane as any anchor is; round a bottle every pattern is
+/// off the plane, each much as its neighbours are.
+fn agrees_with_neighbours(grid: &AlignmentGrid, plane: &Homography, placed: &[Placed], k: usize) -> bool {
+    let Some((i, j)) = grid.place(placed[k].anchor.at) else { return true };
+    let last = grid.centers.len() as i64 - 1;
+    // The offset of what stands `steps` along the row or down the
+    // column, and whether it is an alignment pattern.
+    let stands = |di: i64, dj: i64| -> Option<([f64; 2], bool)> {
+        let (ni, nj) = (i as i64 + di, j as i64 + dj);
+        if ni < 0 || nj < 0 || ni > last || nj > last {
+            return None;
+        }
+        let (kind, at) = grid.stands_at(ni as usize, nj as usize);
+        let found = placed.iter().find(|p| p.anchor.kind == kind && distance(p.anchor.at, at) < 1e-6 && (p.firm || kind == AnchorKind::Finder))?;
+        Some((offset_in_modules(plane, found.anchor.at, found.anchor.center)?, kind == AnchorKind::Alignment))
+    };
+    let mut said: Vec<[f64; 2]> = Vec::new();
+    let mut patterns = false;
+    for (di, dj) in [(1, 0), (0, 1)] {
+        let (before, after) = (stands(-di, -dj), stands(di, dj));
+        let run_on = |near: ([f64; 2], bool), sign: i64| match stands(2 * sign * di, 2 * sign * dj) {
+            Some((far, _)) => [2.0 * near.0[0] - far[0], 2.0 * near.0[1] - far[1]],
+            None => near.0,
+        };
+        patterns |= before.is_some_and(|b| b.1) || after.is_some_and(|a| a.1);
+        match (before, after) {
+            (Some(b), Some(a)) => said.push([(a.0[0] + b.0[0]) / 2.0, (a.0[1] + b.0[1]) / 2.0]),
+            (Some(b), None) => said.push(run_on(b, -1)),
+            (None, Some(a)) => said.push(run_on(a, 1)),
+            (None, None) => {}
+        }
+    }
+    if !patterns || said.is_empty() {
+        return true;
+    }
+    let Some(own) = offset_in_modules(plane, placed[k].anchor.at, placed[k].anchor.center) else { return true };
+    let n = said.len() as f64;
+    let expected = [said.iter().map(|o| o[0]).sum::<f64>() / n, said.iter().map(|o| o[1]).sum::<f64>() / n];
+    let step = (0..2)
+        .map(|axis| {
+            let c = [i, j][axis];
+            let beside = if c > 0 { c - 1 } else { c + 1 };
+            grid.centers[c].abs_diff(grid.centers[beside]) as f64
+        })
+        .fold(f64::INFINITY, f64::min);
+    distance(own, expected) <= OUTLIER_MODULES.max(OUTLIER_BASE + OUTLIER_RATE * step)
+}
+
 /// Where a QR Code's alignment pattern lies when the template cannot be
 /// fitted to it, by the mean shift BoofCV's `QrCodeAlignmentPatternLocator`
 /// places every one of its alignment patterns with. The pattern is looked
 /// for about where `map`, the fit through the anchors found so far bent
-/// through the nearest of them, predicts it, as BoofCV starts from each
-/// pattern's place corrected by the offsets at which its neighbours were
-/// found. The shift works in module coordinates through the map, so that
+/// through the nearest of them, predicts it; the template has by then
+/// been tried there and where the pattern's neighbours carry it to
+/// ([`carried_offset`]). The shift works in module coordinates through the map, so that
 /// perspective and scale cost nothing: over eight samples by eight across
 /// three modules, a sample within half a module of the centre weighs by
 /// how dark it reads and one beyond by how light, the guess moves to their
@@ -7294,6 +8072,211 @@ fn locate_alignment_by_meanshift(
         }
     }
     (best_score >= LOCATOR_MIN_RING_CONTRAST * contrast).then(|| map.apply(best[0], best[1]))
+}
+
+/// Other places the corner `i` of the symbol may lie than where the fit
+/// through the anchors puts it, for its edges to be traced from
+/// ([`traced_corner`]): the fit is a plane, which on a creased or curled
+/// symbol runs the corner no finder stands at a module and more inside it
+/// or outside it, and every reader has its own way to that corner, none
+/// of them right every time.
+///
+/// - Where the outer sides of the finders at the two corners beside it
+///   cross, each side run on through the corners its own capstone
+///   measured: BoofCV's `QrCodeDecoderImage` and OpenCV's
+///   `QRCodeDetectorAruco` place the fourth corner so. Right for a crease
+///   or a curl that leaves those two sides straight, and out where the
+///   paper turns between a finder and the corner.
+/// - Where the three other corners complete a parallelogram, once
+///   finders have measured all three: ZXing's guess, which wechat_qrcode
+///   keeps. Right for a symbol seen square on however it is creased, and
+///   out by the foreshortening of one seen steeply.
+/// - The fit moved by the offset at which an alignment pattern standing
+///   firm within [`ANCHORED_WITHIN`] modules of the corner was found
+///   from it, the nearest such, as [`carried_offset`] moves a pattern by
+///   its neighbours'.
+fn corner_starts(
+    placed: &[Placed],
+    plane: &Homography,
+    corners: &[[f64; 2]; 4],
+    measured: &[usize],
+    outline: [[f64; 2]; 4],
+    i: usize,
+) -> Vec<[f64; 2]> {
+    let mut starts = Vec::new();
+    let beside = [(i + 1) % 4, (i + 3) % 4];
+    // The side of the finder at corner `j` that lies along the symbol's
+    // edge from there to corner `i`: the two corners of its patch on it.
+    let side = |j: usize| -> Option<Line> {
+        let axis = if (outline[j][0] - outline[i][0]).abs() < 1e-9 { 0 } else { 1 };
+        let finder = placed.iter().find(|p| p.anchor.kind == AnchorKind::Finder && p.pairs.iter().any(|(at, _)| distance(*at, outline[j]) < 1e-9))?;
+        let on: Vec<[f64; 2]> = finder.pairs.iter().filter(|(at, _)| (at[axis] - outline[i][axis]).abs() < 1e-9).map(|(_, px)| *px).collect();
+        let [a, b] = on.as_slice() else { return None };
+        let length = distance(*a, *b);
+        (length > 0.0).then(|| Line { point: *a, dir: [(b[0] - a[0]) / length, (b[1] - a[1]) / length] })
+    };
+    if let (Some(a), Some(b)) = (side(beside[0]), side(beside[1]))
+        && let Some(p) = a.intersect(&b)
+    {
+        starts.push(p);
+    }
+    if [beside[0], beside[1], (i + 2) % 4].iter().all(|j| measured.contains(j)) {
+        starts.push(std::array::from_fn(|axis| corners[beside[0]][axis] + corners[beside[1]][axis] - corners[(i + 2) % 4][axis]));
+    }
+    let firm = placed
+        .iter()
+        .filter(|p| p.firm && distance(p.anchor.at, outline[i]) <= ANCHORED_WITHIN)
+        .min_by(|a, b| distance(a.anchor.at, outline[i]).total_cmp(&distance(b.anchor.at, outline[i])));
+    if let Some(firm) = firm
+        && let Some([dx, dy]) = offset_in_modules(plane, firm.anchor.at, firm.anchor.center)
+    {
+        starts.push(plane.apply(outline[i][0] + dx, outline[i][1] + dy));
+    }
+    starts
+}
+
+/// How far about a lone alignment pattern, in modules each way, the data
+/// modules are read to say whether it is the pattern, and how many rows
+/// and columns in from the symbol's edges they are read to say whether
+/// the points of a straight edge help.
+const LONE_REACH: f64 = 6.0;
+const EDGE_REACH: usize = 4;
+
+/// Whether an alignment pattern standing firm lies beside `at` in the
+/// grid, along its row or down its column.
+fn has_pattern_beside(grid: &AlignmentGrid, placed: &[Placed], at: [f64; 2]) -> bool {
+    let Some((i, j)) = grid.place(at) else { return false };
+    let last = grid.centers.len() - 1;
+    [(i.wrapping_sub(1), j), (i + 1, j), (i, j.wrapping_sub(1)), (i, j + 1)].into_iter().any(|(ni, nj)| {
+        ni <= last && nj <= last && {
+            let (kind, beside) = grid.stands_at(ni, nj);
+            kind == AnchorKind::Alignment && placed.iter().any(|p| p.firm && distance(p.anchor.at, beside) < 1e-6)
+        }
+    })
+}
+
+/// How crisply the data modules of the symbol that `wanted` picks read
+/// through `map`: the mean distance of their samples from the split
+/// between dark and light, as the corner search judges a quarter of the
+/// symbol. A map a fraction of a module out samples the boundaries
+/// between modules, which read grey. `None` with fewer than eight of
+/// them on the photo.
+fn crispness(image: &Luma, func: &FunctionMap, map: &impl Project, wanted: impl Fn(usize, usize) -> bool, threshold: Option<f32>) -> Option<f64> {
+    let positions: Vec<Pos> = (0..func.height)
+        .flat_map(|y| (0..func.width).map(move |x| (x, y)))
+        .filter(|&(x, y)| func.expected(x, y).is_none() && wanted(x, y))
+        .map(|(x, y)| Pos::new(x, y))
+        .collect();
+    let values: Vec<f32> = sample_positions(image, map, &positions, INNER_FRACTION, 3).into_iter().flatten().collect();
+    if values.len() < 8 {
+        return None;
+    }
+    let split = threshold.unwrap_or_else(|| otsu(values.iter().copied()));
+    Some(values.iter().map(|v| f64::from((v - split).abs())).sum::<f64>() / values.len() as f64)
+}
+
+/// Most rounds of [`look_again_for_alignment`]: BoofCV's ten steps.
+const ALIGNMENT_ROUNDS: usize = 10;
+/// A corner of the symbol within this many modules of an alignment
+/// pattern is carried from as a neighbour in the grid is: the pattern in
+/// the corner with no finder lies nine modules from that corner.
+const CORNER_CARRIES: f64 = 10.0;
+
+/// A second look for each of a QR Code's alignment patterns that does not
+/// stand firm, missed or placed by its rings alone, once the first pass
+/// over the sites is done and the corners are settled. On curled paper
+/// the first look is from the wrong side: the sites are taken outwards
+/// from the finders, each predicted from what lies behind it, and the
+/// pattern furthest out, which the paper has carried furthest, is looked
+/// for from the plane alone when it is the only one the version has. By
+/// now there may be patterns standing firm on its other sides, and a
+/// corner of the symbol beside it that its two edges or a finder placed;
+/// each is a seed, the plane moved by the offsets the pattern's
+/// neighbours carry ([`carried_offset`]) or by the corner's own, and the
+/// template is looked for about each within the window any site is
+/// searched in. A pattern found stands firm and takes the place of what
+/// stood for it, and its own neighbours are looked for again, for at
+/// most [`ALIGNMENT_ROUNDS`] rounds: BoofCV walks its guess to the
+/// pattern in ten steps of a module or less along the gradient of nine
+/// samples, which is not taken here for what
+/// [`locate_alignment_by_meanshift`] says of it, and the walk here is
+/// from pattern to pattern instead, each step checked by a template of
+/// twenty-five modules. Returns whether any pattern was found.
+#[allow(clippy::too_many_arguments)]
+fn look_again_for_alignment(
+    image: &Luma,
+    func: &FunctionMap,
+    grid: &AlignmentGrid,
+    sites: &[Site],
+    plane: &Homography,
+    corners: [[f64; 2]; 4],
+    held: &[usize],
+    placed: &mut Vec<Placed>,
+    inverted: bool,
+    threshold: Option<f32>,
+) -> bool {
+    let outline = [[0.0, 0.0], [grid.width, 0.0], [grid.width, grid.height], [0.0, grid.height]];
+    let window = |far: f64| (0.5 + 0.03 * far).clamp(0.75, WINDOW_PROJECTIVE);
+    let mut any = false;
+    // The patterns found in the round before: only their neighbours have
+    // anything new to be looked for by. `None` in the first round, when
+    // every site has.
+    let mut fresh: Option<Vec<(usize, usize)>> = None;
+    for _ in 0..ALIGNMENT_ROUNDS {
+        let mut found_now = Vec::new();
+        for site in sites.iter().filter(|s| s.kind == AnchorKind::Alignment) {
+            let stands = |p: &Placed| p.anchor.kind == AnchorKind::Alignment && distance(p.anchor.at, site.at) < 1e-6;
+            if placed.iter().any(|p| stands(p) && p.firm) {
+                continue;
+            }
+            let Some((i, j)) = grid.place(site.at) else { continue };
+            let beside = |&(fi, fj): &(usize, usize)| fi.abs_diff(i) + fj.abs_diff(j) == 1;
+            let mut seeds: Vec<([f64; 2], f64)> = Vec::new();
+            if fresh.as_ref().is_none_or(|fresh| fresh.iter().any(beside))
+                && let Some(offset) = carried_offset(grid, site, plane, placed)
+            {
+                let step = |a: usize, b: usize| grid.centers[a.max(b)] - grid.centers[a.min(b)];
+                let far = step(i, if i > 0 { i - 1 } else { i + 1 }).min(step(j, if j > 0 { j - 1 } else { j + 1 }));
+                seeds.push((offset, far as f64));
+            }
+            if fresh.is_none() {
+                for &k in held {
+                    let far = distance(outline[k], site.at);
+                    if far <= CORNER_CARRIES
+                        && let Some(offset) = offset_in_modules(plane, outline[k], corners[k])
+                    {
+                        seeds.push((offset, far));
+                    }
+                }
+            }
+            for ([dx, dy], far) in seeds {
+                let moved = super::refine::Shifted { map: plane, dx, dy };
+                if let Some((anchor, pairs)) = search_site(image, func, site, &moved, window(far), inverted, threshold)
+                    && !anchor.partial
+                {
+                    // Only where its neighbours bear it out: a patch of
+                    // data that reads as a pattern, dropped in the first
+                    // pass for lying where no neighbour has it, is found
+                    // here a second time.
+                    placed.push(Placed { anchor, pairs, firm: true });
+                    let agrees = agrees_with_neighbours(grid, plane, placed, placed.len() - 1);
+                    let found = placed.pop().expect("just pushed");
+                    if agrees {
+                        placed.retain(|p| !stands(p));
+                        placed.push(found);
+                        found_now.push((i, j));
+                        break;
+                    }
+                }
+            }
+        }
+        if found_now.is_empty() {
+            break;
+        }
+        any = true;
+        fresh = Some(found_now);
+    }
+    any
 }
 
 /// Place one version's outline from the capstones: match them to its
@@ -7437,6 +8420,7 @@ fn align_assignment(
             placed.push(Placed {
                 anchor: Anchor { kind: AnchorKind::Finder, at: site.at, center: capstones[c].center, partial: capstones[c].partial, inferred: false },
                 pairs,
+                firm: false,
             });
             todo.retain(|&i| i != site_index);
         }
@@ -7453,9 +8437,15 @@ fn align_assignment(
         SymbolVersion::Qr(_) => finder_capstone_levels(image, capstones, assignment, threshold),
         _ => None,
     };
+    // Only with all three finders standing: the plane through fewer runs
+    // modules out on the side where one is missing, there is nothing
+    // there for a pattern read to be near, and a patch of data that reads
+    // as a pattern, kept, bends the map to itself and carries its offset
+    // on to its neighbours' search.
+    let grid = AlignmentGrid::of(func).filter(|_| assignment.iter().flatten().count() == 3);
     let mut missed: Vec<Site> = Vec::new();
     while !todo.is_empty() {
-        let (map, model) = fit_anchors(&mut placed)?;
+        let (map, model) = fit_anchors(&mut placed, grid.as_ref())?;
         let anchors = anchors_of(&placed);
         let (k, far) = todo
             .iter()
@@ -7468,8 +8458,24 @@ fn align_assignment(
         let (rate, widest) = if model == Model::Projective { (0.03, WINDOW_PROJECTIVE) } else { (0.08, WINDOW_AFFINE) };
         let window = (0.5 + rate * far).clamp(0.75, widest);
         let local = local_map(map, &placed);
-        if let Some((anchor, pairs)) = search_site(image, func, &site, &local, window, inverted, threshold) {
-            placed.push(Placed { anchor, pairs });
+        // A QR Code's alignment pattern is looked for first where its
+        // neighbours in the grid carry it to, and then, should its
+        // template not read whole there, where the fit bent through
+        // every anchor puts it, as every other site is.
+        let carried = match &grid {
+            Some(grid) if site.kind == AnchorKind::Alignment => carried_offset(grid, &site, &map, &placed),
+            _ => None,
+        };
+        let mut found = carried.and_then(|[dx, dy]| search_site(image, func, &site, &super::refine::Shifted { map: &map, dx, dy }, window, inverted, threshold));
+        if found.as_ref().is_none_or(|(anchor, _)| anchor.partial) {
+            let plain = search_site(image, func, &site, &local, window, inverted, threshold);
+            if found.is_none() || plain.as_ref().is_some_and(|(anchor, _)| !anchor.partial) {
+                found = plain;
+            }
+        }
+        if let Some((anchor, pairs)) = found {
+            let firm = grid.is_some() && site.kind == AnchorKind::Alignment && !anchor.partial;
+            placed.push(Placed { anchor, pairs, firm });
         } else if site.kind == AnchorKind::Alignment {
             // A QR Code's alignment pattern the template does not fit is
             // looked for once more by its rings alone, as BoofCV looks
@@ -7481,6 +8487,7 @@ fn align_assignment(
                 Some(center) => placed.push(Placed {
                     anchor: Anchor { kind: AnchorKind::Alignment, at: site.at, center, partial: false, inferred: false },
                     pairs: vec![(site.at, center)],
+                    firm: false,
                 }),
                 None => missed.push(site),
             }
@@ -7496,11 +8503,11 @@ fn align_assignment(
     for site in missed {
         if let Some(center) = neighbours_crossing(&site, &anchors_of(&placed)) {
             let anchor = Anchor { kind: AnchorKind::Alignment, at: site.at, center, partial: false, inferred: true };
-            placed.push(Placed { anchor, pairs: vec![(site.at, center)] });
+            placed.push(Placed { anchor, pairs: vec![(site.at, center)], firm: false });
         }
     }
 
-    let (mut map, _) = fit_anchors(&mut placed)?;
+    let (mut map, _) = fit_anchors(&mut placed, grid.as_ref())?;
     // A timing anchor off the bend its line-mates trace has read a row of
     // data or a smudge: it is dropped, and the map refitted without it.
     let strays = timing_line_strays(&anchors_of(&placed), &map);
@@ -7510,7 +8517,7 @@ fn align_assignment(
         for i in drop {
             placed.remove(i);
         }
-        map = fit_anchors(&mut placed)?.0;
+        map = fit_anchors(&mut placed, grid.as_ref())?.0;
     }
     let mut anchors = anchors_of(&placed);
     let outline = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]];
@@ -7543,6 +8550,9 @@ fn align_assignment(
     }
 
     let sign = if inverted { -1.0 } else { 1.0 };
+    // The one corner of a QR Code that no finder stands at, the other
+    // three measured.
+    let fourth = matches!(func.version, SymbolVersion::Qr(_) | SymbolVersion::Model1(_)) && measured_corners.len() == 3;
     let mut loose: Vec<usize> = (0..4).filter(|&i| nearest(&anchors, outline[i]) > ANCHORED_WITHIN).collect();
     loose.sort_by(|&a, &b| nearest(&anchors, outline[a]).total_cmp(&nearest(&anchors, outline[b])));
     let mut edged_corners = Vec::new();
@@ -7551,7 +8561,8 @@ fn align_assignment(
     // place it instead. First, so that a loose corner beside it starts
     // from the better place.
     for i in (0..4).filter(|i| !measured_corners.contains(i) && !loose.contains(i)) {
-        if settle_traced_corner(image, func, &mut corners, i, sign, threshold) {
+        let starts = corner_starts(&placed, &map, &corners, &measured_corners, outline, i);
+        if settle_traced_corner(image, func, &mut corners, i, sign, threshold, &starts, fourth) {
             edged_corners.push(i);
         }
     }
@@ -7564,7 +8575,8 @@ fn align_assignment(
     for pass in 0..2 {
         for (n, &i) in loose.iter().enumerate() {
             let before = corners;
-            let mut edged = settle_corner(image, func, &mut corners, i, sign, threshold);
+            let starts = corner_starts(&placed, &map, &corners, &measured_corners, outline, i);
+            let mut edged = settle_corner(image, func, &mut corners, i, sign, threshold, &starts, fourth);
             if pass == 0 && !edged && lone_finder && n + 1 == loose.len() {
                 // The edges were not found from where the map put the
                 // corner: the corner opposite the one finder is tried
@@ -7573,7 +8585,7 @@ fn align_assignment(
                 // for the edges to be traced from.
                 let mut again = before;
                 again[i] = std::array::from_fn(|axis| before[(i + 1) % 4][axis] + before[(i + 3) % 4][axis] - before[(i + 2) % 4][axis]);
-                if settle_corner(image, func, &mut again, i, sign, threshold) {
+                if settle_corner(image, func, &mut again, i, sign, threshold, &[], false) {
                     corners = again;
                     edged = true;
                 }
@@ -7584,15 +8596,67 @@ fn align_assignment(
         }
     }
 
-    // Where an edge of the symbol bows, the paper curls, and between the
-    // anchors and that edge the map is the spline's guess: points along
-    // the bowed edge anchor it, so that the rows beside the edge follow
-    // the paper and not the plane. A version 1 symbol on a bottle has
-    // anchors on its timing patterns alone, and its far quadrant is
-    // placed by nothing else.
-    anchors.extend(edge_anchors(image, func, corners, &anchors, sign, threshold));
-    let controls: Vec<ControlPoint> = anchors.iter().map(Anchor::control_point).collect();
-    let projection = Projection::new(func.width, func.height, corners, &controls)?;
+    // An alignment pattern that does not yet stand firm is looked for
+    // again, now that the corners are placed and every pattern has had
+    // its turn.
+    if let Some(grid) = &grid {
+        let held: Vec<usize> = measured_corners.iter().chain(&edged_corners).copied().collect();
+        if look_again_for_alignment(image, func, grid, sites, &map, corners, &held, &mut placed, inverted, threshold) {
+            anchors = anchors_of(&placed);
+        }
+    }
+
+    // Between the anchors and an edge of the symbol the map is the
+    // spline's guess: points along each edge that traces anchor it there,
+    // so that the rows beside the edge follow the paper and not the
+    // plane. A version 1 symbol on a bottle has anchors on its timing
+    // patterns alone, and its far quadrant is placed by nothing else.
+    let (bowed, straight) = edge_anchors(image, func, corners, &anchors, sign, threshold);
+    anchors.extend(bowed);
+    let project = |anchors: &[Anchor]| {
+        let controls: Vec<ControlPoint> = anchors.iter().map(Anchor::control_point).collect();
+        Projection::new(func.width, func.height, corners, &controls)
+    };
+    // An alignment pattern standing firm with no other beside it to
+    // bear it out, as the one pattern of versions 2 to 6 stands, and
+    // lying where the map through everything else would not have it, is
+    // either the pattern on paper that curls or a patch of data that
+    // reads as one. The data modules about it say which: through the
+    // right map they read dark or light, and through a map a module out
+    // they read grey. It is kept where they read no less crisply with
+    // it than without.
+    if let Some(grid) = &grid {
+        for lone in placed.iter().filter(|p| p.firm && !has_pattern_beside(grid, &placed, p.anchor.at)) {
+            let at = lone.anchor.at;
+            let without: Vec<Anchor> = anchors.iter().filter(|a| !(a.kind == AnchorKind::Alignment && a.at == at)).copied().collect();
+            let (Some(with_it), Some(without_it)) = (project(&anchors), project(&without)) else { continue };
+            if distance(without_it.apply(at[0], at[1]), lone.anchor.center) < OUTLIER_MODULES * module_size_at(&without_it, at) {
+                continue;
+            }
+            let about = |x: usize, y: usize| (x as f64 + 0.5 - at[0]).abs() <= LONE_REACH && (y as f64 + 0.5 - at[1]).abs() <= LONE_REACH;
+            if let (Some(with_it), Some(without_it)) = (crispness(image, func, &with_it, about, threshold), crispness(image, func, &without_it, about, threshold))
+                && without_it > with_it
+            {
+                anchors = without;
+            }
+        }
+    }
+    // The points of a straight edge are kept where the modules beside
+    // the symbol's edges read no less crisply for them: they are there
+    // to hold a map the anchors have bent, and where the bend was an
+    // anchor read badly under a lamp's glare they would hold it wrong.
+    if !straight.is_empty() {
+        let mut held = anchors.clone();
+        held.extend(straight);
+        let beside = |x: usize, y: usize| x < EDGE_REACH || y < EDGE_REACH || x + EDGE_REACH >= func.width || y + EDGE_REACH >= func.height;
+        let crisp = |anchors: &[Anchor]| project(anchors).and_then(|map| crispness(image, func, &map, beside, threshold));
+        if let (Some(with_them), Some(without_them)) = (crisp(&held), crisp(&anchors))
+            && with_them >= without_them
+        {
+            anchors = held;
+        }
+    }
+    let projection = project(&anchors)?;
     let scorer = Scorer::new(image, &Template::whole(func), corners, threshold);
     let agreement = scorer.agreement_known(&projection, inverted)?.0;
     let around = [[-1.0, -1.0], [w + 1.0, -1.0], [w + 1.0, h + 1.0], [-1.0, h + 1.0]].map(|[x, y]| projection.apply(x, y));
@@ -7752,7 +8816,7 @@ pub(crate) fn settle_loose_corners_with(
     let mut corners = corners;
     for _ in 0..2 {
         for &i in &loose {
-            settle_corner(image, func, &mut corners, i, sign, threshold);
+            settle_corner(image, func, &mut corners, i, sign, threshold, &[], false);
         }
     }
     corners
@@ -7943,6 +9007,7 @@ mod tests {
     fn capstones_of_different_sizes_are_kept_apart() {
         let capstone = |unit: [f64; 2], module: f64| Capstone {
             measured: true,
+            regioned: false,
             corners: [[0.0; 2]; 4],
             center: [0.0; 2],
             unit,
@@ -8094,6 +9159,185 @@ mod tests {
         assert_eq!(v.inward, [-1.0, 0.0]);
         let [h, _] = edges_at(0, 21.0, 25.0);
         assert_eq!((h.along, h.inward), ([1.0, 0.0], [0.0, 1.0]));
+    }
+
+    #[test]
+    fn an_alignment_pattern_is_looked_for_where_its_neighbours_carry_it() {
+        // A version 7 symbol ten pixels a module, with its finders where
+        // the plane has them.
+        let func = FunctionMap::new(SymbolVersion::Qr(7));
+        let grid = AlignmentGrid::of(&func).unwrap();
+        let plane = Homography::rect_to_quad(45.0, 45.0, [[0.0, 0.0], [450.0, 0.0], [450.0, 450.0], [0.0, 450.0]]).unwrap();
+        let sites = sites(&func);
+        let site = |x: f64, y: f64| *sites.iter().find(|s| s.kind == AnchorKind::Alignment && s.at == [x, y]).unwrap();
+        // An anchor found `off` modules from where the plane puts it.
+        let stand = |kind: AnchorKind, at: [f64; 2], off: [f64; 2], firm: bool| {
+            let center = [10.0 * (at[0] + off[0]), 10.0 * (at[1] + off[1])];
+            Placed { anchor: Anchor { kind, at, center, partial: false, inferred: false }, pairs: vec![(at, center)], firm }
+        };
+        let mut placed: Vec<Placed> = [[3.5, 3.5], [41.5, 3.5], [3.5, 41.5]].map(|at| stand(AnchorKind::Finder, at, [0.0, 0.0], false)).into();
+        // With nothing but finders beside a pattern there is nothing to
+        // carry: they stand where the plane has them.
+        assert_eq!(carried_offset(&grid, &site(22.5, 6.5), &plane, &placed), None);
+        // The middle pattern is carried by the two beside it that stand.
+        placed.push(stand(AnchorKind::Alignment, [22.5, 6.5], [1.0, 0.2], true));
+        placed.push(stand(AnchorKind::Alignment, [6.5, 22.5], [0.0, 0.6], true));
+        let carried = carried_offset(&grid, &site(22.5, 22.5), &plane, &placed).unwrap();
+        assert!((carried[0] - 0.5).abs() < 1e-9 && (carried[1] - 0.4).abs() < 1e-9, "{carried:?}");
+        // A pattern placed by its rings alone carries nothing on.
+        placed.push(stand(AnchorKind::Alignment, [22.5, 22.5], [3.0, 3.0], false));
+        assert_eq!(carried_offset(&grid, &site(38.5, 22.5), &plane, &placed), None);
+        // Standing firm it does, with the finder in the corner above,
+        // which stands where the plane has it.
+        placed.last_mut().unwrap().firm = true;
+        let carried = carried_offset(&grid, &site(38.5, 22.5), &plane, &placed).unwrap();
+        assert!((carried[0] - 1.5).abs() < 1e-9 && (carried[1] - 1.5).abs() < 1e-9, "{carried:?}");
+        // The offsets are in the symbol's own modules whatever the plane.
+        let turned = Homography::rect_to_quad(45.0, 45.0, [[450.0, 0.0], [450.0, 900.0], [0.0, 900.0], [0.0, 0.0]]).unwrap();
+        let [x, y] = turned.apply(22.5 + 1.0, 6.5 - 2.0);
+        let offset = offset_in_modules(&turned, [22.5, 6.5], [x, y]).unwrap();
+        assert!((offset[0] - 1.0).abs() < 1e-9 && (offset[1] + 2.0).abs() < 1e-9, "{offset:?}");
+        // Versions with one alignment pattern have a grid of it and the
+        // finders; version 1 and the other families have none.
+        assert_eq!(AlignmentGrid::of(&FunctionMap::new(SymbolVersion::Qr(2))).map(|g| g.centers), Some(vec![6, 18]));
+        assert!(AlignmentGrid::of(&FunctionMap::new(SymbolVersion::Qr(1))).is_none());
+        assert!(AlignmentGrid::of(&FunctionMap::new(SymbolVersion::Rmqr(11))).is_none());
+    }
+
+    #[test]
+    fn an_alignment_pattern_that_stands_firm_is_not_dropped_for_lying_off_the_plane() {
+        // A version 7 symbol ten pixels a module, its three finders where
+        // the plane has them and its middle alignment pattern two modules
+        // along the row from there, as on a bottle.
+        let finder = |x0: f64, y0: f64| Placed {
+            anchor: Anchor { kind: AnchorKind::Finder, at: [x0 + 3.5, y0 + 3.5], center: [10.0 * (x0 + 3.5), 10.0 * (y0 + 3.5)], partial: false, inferred: false },
+            pairs: [[0.0, 0.0], [7.0, 0.0], [7.0, 7.0], [0.0, 7.0]].iter().map(|[dx, dy]| ([x0 + dx, y0 + dy], [10.0 * (x0 + dx), 10.0 * (y0 + dy)])).collect(),
+            firm: false,
+        };
+        let pattern = |firm: bool| Placed {
+            anchor: Anchor { kind: AnchorKind::Alignment, at: [22.5, 22.5], center: [245.0, 225.0], partial: false, inferred: false },
+            pairs: vec![([22.5, 22.5], [245.0, 225.0])],
+            firm,
+        };
+        // Placed by its rings alone, the plane through the finders
+        // condemns it.
+        let mut placed = vec![finder(0.0, 0.0), finder(38.0, 0.0), finder(0.0, 38.0), pattern(false)];
+        fit_anchors(&mut placed, None).unwrap();
+        assert_eq!(placed.iter().filter(|p| p.anchor.kind == AnchorKind::Alignment).count(), 0);
+        // Its template read whole, it stands, off the plane, and the
+        // pattern beside it is looked for as far off the plane as it was
+        // found.
+        let func = FunctionMap::new(SymbolVersion::Qr(7));
+        let grid = AlignmentGrid::of(&func).unwrap();
+        let mut placed = vec![finder(0.0, 0.0), finder(38.0, 0.0), finder(0.0, 38.0), pattern(true)];
+        let (plane, _) = fit_anchors(&mut placed, Some(&grid)).unwrap();
+        assert_eq!(placed.iter().filter(|p| p.anchor.kind == AnchorKind::Alignment).count(), 1);
+        let beside = *sites(&func).iter().find(|s| s.kind == AnchorKind::Alignment && s.at == [22.5, 38.5]).unwrap();
+        let carried = carried_offset(&grid, &beside, &plane, &placed).unwrap();
+        let found = offset_in_modules(&plane, [22.5, 22.5], [245.0, 225.0]).unwrap();
+        assert!((found[0] - 2.0).abs() < 1e-6 && placed.iter().any(|p| p.firm && p.pairs.is_empty()), "the pattern was left in the plane: {found:?}");
+        // The mean of what the pattern above was found off by and what
+        // the finder in the corner beside this one was, next to nothing.
+        let corner = offset_in_modules(&plane, [3.5, 41.5], [35.0, 415.0]).unwrap();
+        assert!(corner[0].abs() < 0.2 && corner[1].abs() < 0.2, "{corner:?}");
+        for axis in 0..2 {
+            assert!((carried[axis] - (found[axis] + corner[axis]) / 2.0).abs() < 1e-9, "{carried:?}");
+        }
+        // With the patterns beside it standing where the plane has them,
+        // as on flat paper, it is a patch of data two modules from where
+        // a pattern should be, and is dropped as any anchor would be;
+        // with them carried as far as it is, as round a bottle, it stays.
+        let beside = |off: f64| -> Vec<Placed> {
+            [[6.5, 22.5], [38.5, 22.5], [22.5, 6.5], [22.5, 38.5]]
+                .iter()
+                .map(|&at| {
+                    let center = [10.0 * (at[0] + off), 10.0 * at[1]];
+                    Placed { anchor: Anchor { kind: AnchorKind::Alignment, at, center, partial: false, inferred: false }, pairs: vec![(at, center)], firm: true }
+                })
+                .collect()
+        };
+        let stands = |placed: &[Placed]| placed.iter().any(|p| p.anchor.at == [22.5, 22.5]);
+        let mut flat = vec![finder(0.0, 0.0), finder(38.0, 0.0), finder(0.0, 38.0), pattern(true)];
+        flat.extend(beside(0.0));
+        fit_anchors(&mut flat, Some(&grid)).unwrap();
+        assert!(!stands(&flat) && flat.len() == 7, "the misleading pattern was kept");
+        let mut curled = vec![finder(0.0, 0.0), finder(38.0, 0.0), finder(0.0, 38.0), pattern(true)];
+        curled.extend(beside(1.6));
+        fit_anchors(&mut curled, Some(&grid)).unwrap();
+        assert!(stands(&curled) && curled.len() == 8, "a pattern carried as its neighbours are was dropped");
+    }
+
+    /// A version 1 symbol's fixed patterns with data made up for it: no
+    /// message, but dark and light modules along its edges as a symbol
+    /// has them.
+    fn made_up_symbol() -> ModuleGrid {
+        use crate::symbol::grid::Module;
+        let func = FunctionMap::new(SymbolVersion::Qr(1));
+        let mut grid = ModuleGrid::new(func.width, func.height);
+        let mut state = 0x2545_f491u32;
+        for y in 0..func.height {
+            for x in 0..func.width {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let dark = func.expected(x, y).unwrap_or(state >> 31 == 1);
+                grid.set(x, y, if dark { Module::Dark } else { Module::Light });
+            }
+        }
+        grid
+    }
+
+    #[test]
+    fn a_row_of_modules_inside_the_symbol_is_not_traced_as_its_edge() {
+        // A version 1 symbol eight pixels a module, upright, its corners
+        // known but the bottom-right, which is put a module up the right
+        // edge: the outline's bottom edge then runs from the symbol's own
+        // at the left to a row inside it at the right.
+        let grid = made_up_symbol();
+        let func = FunctionMap::new(SymbolVersion::Qr(1));
+        let image = draw_grid(&grid, [140.0, 130.0], 8.0, 0.0, (280, 260));
+        let truth = [[56.0, 46.0], [224.0, 46.0], [224.0, 214.0], [56.0, 214.0]];
+        let mut corners = truth;
+        corners[2] = [224.0, 206.0];
+        let map = Homography::rect_to_quad(21.0, 21.0, corners).unwrap();
+        let (level, contrast) = edge_levels(&image, &func, &map, None);
+        let [bottom, right] = edges_at(2, 21.0, 21.0);
+        // The profiles towards the corner find the boundary between the
+        // border row and the row within, and a line fits those with the
+        // true crossings near the finder; the dark modules of the border
+        // beyond that line give it away.
+        let slanted = trace_edge(&image, &map, &bottom, 1.0, level, contrast);
+        assert!(slanted.is_none_or(|traced| !traced.clear), "a line a row inside the symbol was taken to be clear of it");
+        // The right edge, which the outline has, traces clear, and so do
+        // both from the true corner, on their own lines.
+        let traced = trace_edge(&image, &map, &right, 1.0, level, contrast).expect("the right edge");
+        assert!(traced.clear && !traced.bent);
+        assert!(traced.line.distance([224.0, 100.0]) < 0.8 && traced.line.distance([224.0, 200.0]) < 0.8, "{:?}", traced.line);
+        let flat = Homography::rect_to_quad(21.0, 21.0, truth).unwrap();
+        let traced = trace_edge(&image, &flat, &bottom, 1.0, level, contrast).expect("the bottom edge");
+        assert!(traced.clear && !traced.bent);
+        assert!(traced.line.distance([100.0, 214.0]) < 0.8 && traced.line.distance([200.0, 214.0]) < 0.8, "{:?}", traced.line);
+        // The crossings kept lie on the fitted line, each filed under
+        // the point of the edge it was traced from.
+        assert!(traced.crossings.len() >= MIN_CROSSINGS);
+        for crossing in &traced.crossings {
+            assert!(crossing.at[1] == 21.0 && traced.line.distance(crossing.px) < 1e-9, "{crossing:?}");
+        }
+        // From the corner a module inside, the edges do not both trace
+        // clear; from a module further out they do, and place the corner.
+        let p = traced_corner(&image, &func, &corners, 2, 1.0, None, &[], true, f64::INFINITY).expect("the corner was not traced from a module out");
+        assert!(distance(p, truth[2]) < 0.2 * 8.0, "{p:?}");
+        // So they do from another start given, taken before those.
+        let p = traced_corner(&image, &func, &corners, 2, 1.0, None, &[[224.5, 213.0]], true, f64::INFINITY).expect("the corner was not traced from the start given");
+        assert!(distance(p, truth[2]) < 0.2 * 8.0, "{p:?}");
+        // A start that the corner does not come out beside is not
+        // believed: the edges were run on to it from their far ends.
+        let mut far = truth;
+        far[2] = [246.0, 236.0];
+        assert!(traced_corner(&image, &func, &far, 2, 1.0, None, &[], true, MAX_EDGE_SAGITTA).is_none_or(|p| distance(p, truth[2]) < 0.2 * 8.0));
+        // A corner that is not the fourth of a QR Code's stands where it
+        // traced from where it was put, clear or not.
+        if let Some(own) = traced_corner(&image, &func, &corners, 2, 1.0, None, &[], false, f64::INFINITY) {
+            assert!(distance(own, truth[2]) > 0.5 * 8.0, "{own:?}");
+        }
     }
 
     /// A symbol's fixed patterns drawn turned `degrees` clockwise about
@@ -8366,6 +9610,7 @@ mod tests {
             threshold: 0.5,
             line_only: false,
             measured: true,
+            regioned: false,
         }
     }
 
@@ -8502,6 +9747,7 @@ mod tests {
         let image = Luma::new(800, 800, vec![0.92; 800 * 800]);
         let capstone = |center: [f64; 2]| Capstone {
             measured: true,
+            regioned: false,
             corners: [[0.0; 2]; 4],
             center,
             unit: frame.unit(center),
@@ -9036,7 +10282,7 @@ mod tests {
         }
         let image = Luma::new(width, height, data);
         let view = ScannedView::of(&image, &SampleParams::default(), &[Family::Qr]).unwrap();
-        let capstones = view.capstones(Family::Qr);
+        let capstones = view.capstones(Family::Qr, &|_, _| false);
         let (s, c) = 37f64.to_radians().sin_cos();
         for i in (0..columns * rows).filter(|&i| is_turned(i)) {
             let centre = [((i % columns) * pitch + pitch / 2) as f64, ((i / columns) * pitch + pitch / 2) as f64];
@@ -9047,6 +10293,19 @@ mod tests {
                 assert!(seen, "no capstone at {finder:?}, of {} in all", capstones.len());
             }
         }
+        // With the first symbol of the sheet found already, what lies on
+        // it is not fitted again: the rest come back as they did, and
+        // no candidate there has been refined.
+        let half = 10.5 * module_px;
+        let centre = pitch as f64 / 2.0;
+        let first = placed(version, [[centre - half, centre - half], [centre + half, centre - half], [centre + half, centre + half], [centre - half, centre + half]]);
+        let again = ScannedView::of(&image, &SampleParams::default(), &[Family::Qr]).unwrap();
+        let rest = again.capstones(Family::Qr, &|_, at| holds(&first, at));
+        let elsewhere: Vec<[f64; 2]> = capstones.iter().filter(|c| !holds(&first, c.center)).map(|c| c.center).collect();
+        assert_eq!(rest.iter().map(|c| c.center).collect::<Vec<_>>(), elsewhere);
+        assert!(rest.len() + 3 <= capstones.len(), "{} of {}", rest.len(), capstones.len());
+        let on_first = |c: &Candidate| holds(&first, again.to_photo(again.rect.frame.to_image.apply(c.x, c.y)));
+        assert!(again.candidates.iter().zip(&again.refined[0]).filter(|(c, _)| on_first(c)).all(|(_, fit)| fit.get().is_none()));
     }
 
     /// Paper `width` by `height` with a Micro QR M2 symbol on it at each
@@ -9115,12 +10374,14 @@ mod tests {
         let there = found.iter().find(|d| distance(quad_centre(d.corners), small.map(|v| v as f64)) < 1.5).expect("the small symbol");
         let side = distance(there.corners[0], there.corners[1]);
         assert!((side - 39.0).abs() < 2.0, "thirteen modules of three pixels, not {side}");
-        // A region on a QR Code already found proposes nothing: it is
-        // left out before anything is fitted to it. One on a symbol
-        // with a single finder pattern is kept, for the QR Code that
-        // finder may be a third of. And a finder the copy will have
-        // shown, as the large symbol's at four pixels a module there,
-        // is the copy's to have made a symbol of.
+        // A region on a finder of a QR Code already found proposes
+        // nothing: it is left out before anything is fitted to it. One
+        // elsewhere on the QR Code is kept, for the symbol set within it
+        // whose finder it may be, and so is one on a symbol with a
+        // single finder pattern, for the QR Code that finder may be a
+        // third of. And a finder the copy will have shown, as the large
+        // symbol's at four pixels a module there, is the copy's to have
+        // made a symbol of.
         let over = |version: SymbolVersion, [x, y]: [usize; 2], half: f64| {
             let (x, y) = (x as f64, y as f64);
             placed(version, [[x - half, y - half], [x + half, y - half], [x + half, y + half], [x - half, y + half]])
@@ -9129,7 +10390,16 @@ mod tests {
         let all = regions(&[], f64::INFINITY);
         assert!(all >= 2, "a finder of each symbol, of {all} regions");
         assert_eq!(regions(&[over(SymbolVersion::Micro(2), small, 20.0)], f64::INFINITY), all);
-        assert!(regions(&[over(SymbolVersion::Qr(1), small, 40.0)], f64::INFINITY) < all);
+        // A version 1 QR Code of the small symbol's module, its top-left
+        // finder the small symbol's own: thirteen modules of three
+        // pixels put the finder nine pixels up and left of the centre,
+        // and twenty-one put the QR Code's centre twenty-one down and
+        // right of its finder's.
+        let on_finder = over(SymbolVersion::Qr(1), [small[0] + 12, small[1] + 12], 31.5);
+        assert!(regions(&[on_finder], f64::INFINITY) < all);
+        // A version 7 of the same module with the small symbol in the
+        // middle of its data.
+        assert_eq!(regions(&[over(SymbolVersion::Qr(7), small, 67.5)], f64::INFINITY), all);
         assert!((1..all).contains(&regions(&[], shown)), "the small symbol's finder and not the large one's");
     }
 

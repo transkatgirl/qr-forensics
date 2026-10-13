@@ -22,6 +22,19 @@
 //! where that saves bending, and a lone anchor off its pattern pulls the
 //! map less than its neighbours do together. The corners, which are
 //! measured or traced, are held exactly.
+//!
+//! An anchor on the outline itself, a point of the symbol's edge traced
+//! against the quiet zone or set by hand, holds the map across the edge
+//! only. The trace says where the edge runs; it cannot say which point
+//! of the edge it met, and the place along the edge it was filed under
+//! is only where the map of the moment had that point. Held there both
+//! ways, on a bottle, whose modules crowd together towards its sides,
+//! every such point pins the columns beside the edge to the spacing a
+//! plane gave them. So the part of its residual along the edge is left
+//! free, and takes the value that bends the surface least
+//! ([`Spline::relax`]): the map through it runs where the edge was
+//! traced, and along the edge goes where the anchors inside the symbol
+//! take it.
 
 use super::homography::Homography;
 
@@ -66,7 +79,7 @@ fn kernel(dx: f64, dy: f64) -> f64 {
 }
 
 /// How near a corner of the outline, in modules, an anchor yields to it.
-const CORNER_CLEARANCE: f64 = 1.5;
+pub const CORNER_CLEARANCE: f64 = 1.5;
 /// Smallest spread of control points, in modules, that lets a spline be
 /// solved: closer to a line than this and the affine part is not determined.
 const MIN_SPREAD: f64 = 1.0;
@@ -155,6 +168,46 @@ impl Spline {
         // The matrix is symmetric, so its inverse is too, and the weight on
         // site i is row i of the inverse times k.
         (0..n).map(|i| (0..m).map(|j| self.inverse[i * m + j] * k[j]).sum()).collect()
+    }
+
+    /// Let the values at some sites slide: each of `free` names a site
+    /// and a direction, a unit vector, along which that site's value is
+    /// not known, and the part of each such value along its direction is
+    /// set to what bends the surface least, the parts across them and
+    /// every other value staying as they are. The bending of the surface
+    /// through values `v` is `v`ᵀ·A·`v` in each coordinate, A the sites'
+    /// own block of the inverse; it is least over the free parts where,
+    /// at each freed site, the weight the solution gives that site has
+    /// nothing along its direction, which is a small linear system in
+    /// the free parts. Left as they were when that system cannot be
+    /// solved: no site but the freed ones held.
+    pub fn relax(&self, values: &mut [[f64; 2]], free: &[(usize, [f64; 2])]) {
+        let n = self.sites.len();
+        let m = n + 3;
+        let k = free.len();
+        if k == 0 {
+            return;
+        }
+        debug_assert_eq!(values.len(), n);
+        // Each value with its free part taken out.
+        let mut held = values.to_vec();
+        for &(i, t) in free {
+            let along = held[i][0] * t[0] + held[i][1] * t[1];
+            held[i] = [held[i][0] - along * t[0], held[i][1] - along * t[1]];
+        }
+        let mut a = vec![0.0f64; k * k];
+        let mut b = vec![0.0f64; k];
+        for (r, &(i, ti)) in free.iter().enumerate() {
+            for (c, &(j, tj)) in free.iter().enumerate() {
+                a[r * k + c] = self.inverse[i * m + j] * (ti[0] * tj[0] + ti[1] * tj[1]);
+            }
+            b[r] = -(0..n).map(|j| self.inverse[i * m + j] * (held[j][0] * ti[0] + held[j][1] * ti[1])).sum::<f64>();
+        }
+        let Some(inverse) = invert(&a, k) else { return };
+        for (r, &(i, t)) in free.iter().enumerate() {
+            let along: f64 = (0..k).map(|c| inverse[r * k + c] * b[c]).sum();
+            values[i] = [held[i][0] + along * t[0], held[i][1] + along * t[1]];
+        }
     }
 
     /// Interpolate two-dimensional `values`, one per site, at `p`.
@@ -290,7 +343,24 @@ impl Projection {
         all.extend(anchors.iter().filter(|c| !near_corner(c)).copied());
         // The corners are held exactly; the anchors may be missed a little.
         let smoothing: Vec<f64> = (0..all.len()).map(|i| if i < 4 { 0.0 } else { smoothing }).collect();
-        Some(Self::over_smoothed(base, &all, &smoothing))
+        // An anchor on the outline slides along the edge it lies on.
+        let on = |v: f64, edge: f64| (v - edge).abs() < 1e-9;
+        let slides: Vec<Option<[f64; 2]>> = all
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if i < 4 {
+                    None
+                } else if on(c.at[1], 0.0) || on(c.at[1], h) {
+                    Some([1.0, 0.0])
+                } else if on(c.at[0], 0.0) || on(c.at[0], w) {
+                    Some([0.0, 1.0])
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Some(Self::over_sliding(base, &all, &smoothing, &slides))
     }
 
     /// A base map corrected through `anchors`, exactly. Anchors too few or
@@ -301,13 +371,30 @@ impl Projection {
 
     /// [`Projection::over`] with a smoothing term for each anchor.
     pub fn over_smoothed(base: Homography, anchors: &[ControlPoint], smoothing: &[f64]) -> Self {
+        Self::over_sliding(base, anchors, smoothing, &vec![None; anchors.len()])
+    }
+
+    /// [`Projection::over_smoothed`] with some anchors free to slide: an
+    /// anchor with a direction in `slides`, in module coordinates, holds
+    /// the map across that direction only, as a point of the symbol's
+    /// edge does across the edge ([`Spline::relax`]).
+    pub fn over_sliding(base: Homography, anchors: &[ControlPoint], smoothing: &[f64], slides: &[Option<[f64; 2]>]) -> Self {
         let mut sites: Vec<[f64; 2]> = Vec::with_capacity(anchors.len());
         let mut kept: Vec<&ControlPoint> = Vec::with_capacity(anchors.len());
         let mut terms: Vec<f64> = Vec::with_capacity(anchors.len());
-        for (anchor, &term) in anchors.iter().zip(smoothing) {
+        let mut free: Vec<(usize, [f64; 2])> = Vec::new();
+        for ((anchor, &term), slide) in anchors.iter().zip(smoothing).zip(slides) {
             // A repeated site makes the system singular; the first wins.
             if sites.iter().any(|s| (s[0] - anchor.at[0]).abs() < 1e-9 && (s[1] - anchor.at[1]).abs() < 1e-9) {
                 continue;
+            }
+            // The direction in the photo, as the base has it there.
+            if let Some([dx, dy]) = slide {
+                let (here, there) = (base.apply(anchor.at[0], anchor.at[1]), base.apply(anchor.at[0] + dx, anchor.at[1] + dy));
+                let length = ((there[0] - here[0]).powi(2) + (there[1] - here[1]).powi(2)).sqrt();
+                if length > 0.0 && length.is_finite() {
+                    free.push((sites.len(), [(there[0] - here[0]) / length, (there[1] - here[1]) / length]));
+                }
             }
             sites.push(anchor.at);
             kept.push(anchor);
@@ -315,13 +402,17 @@ impl Projection {
         }
         let spline = Spline::smoothed(&sites, &terms);
         let residuals = match &spline {
-            Some(_) => kept
-                .iter()
-                .map(|a| {
-                    let [bx, by] = base.apply(a.at[0], a.at[1]);
-                    [a.px[0] - bx, a.px[1] - by]
-                })
-                .collect(),
+            Some(spline) => {
+                let mut residuals: Vec<[f64; 2]> = kept
+                    .iter()
+                    .map(|a| {
+                        let [bx, by] = base.apply(a.at[0], a.at[1]);
+                        [a.px[0] - bx, a.px[1] - by]
+                    })
+                    .collect();
+                spline.relax(&mut residuals, &free);
+                residuals
+            }
             None => Vec::new(),
         };
         Self { base, spline, residuals }
@@ -515,5 +606,78 @@ mod tests {
         let affine: Vec<[f64; 2]> = sites.iter().map(|s| [2.0 * s[0] - s[1] + 1.0, 0.5 * s[1] + 3.0]).collect();
         let p = [8.0, 9.0];
         assert!(close(spline.interpolate(&affine, p), [2.0 * p[0] - p[1] + 1.0, 0.5 * p[1] + 3.0], 1e-7));
+    }
+
+    #[test]
+    fn a_point_of_the_edge_holds_the_map_across_the_edge_only() {
+        // A symbol whose modules crowd together towards its right side,
+        // as on a bottle: the anchors inside it say so, and its top edge
+        // is straight, twelve pixels higher than the corners have it.
+        let quad = [[100.0, 100.0], [600.0, 100.0], [600.0, 600.0], [100.0, 600.0]];
+        let h = Homography::rect_to_quad(25.0, 25.0, quad).unwrap();
+        let crowded = |[x, y]: [f64; 2]| {
+            let [px, py] = h.apply(x, y);
+            [px + 40.0 * (std::f64::consts::PI * x / 25.0).sin(), py]
+        };
+        let inside: Vec<ControlPoint> =
+            [[6.5, 6.5], [12.5, 6.5], [18.5, 6.5], [6.5, 18.5], [12.5, 18.5], [18.5, 18.5]].iter().map(|&at| ControlPoint { at, px: crowded(at) }).collect();
+        // Points of the top edge as a trace through the plane files them:
+        // each under the place along the edge the plane has it at.
+        let edge = |x: f64, along: f64| ControlPoint { at: [x, 0.0], px: [h.apply(x, 0.0)[0] + along, 88.0] };
+        let with = |along: f64| {
+            let mut anchors = inside.clone();
+            anchors.extend([6.0, 12.0, 19.0].map(|x| edge(x, along)));
+            Projection::with_smoothing(25, 25, quad, &anchors, 0.0).unwrap()
+        };
+        let held = with(0.0);
+        // The map runs along the traced line at each of them.
+        for x in [6.0, 12.0, 19.0] {
+            assert!((held.apply(x, 0.0)[1] - 88.0).abs() < 1e-6, "{x}: {:?}", held.apply(x, 0.0));
+        }
+        // Where along the line a point was filed changes nothing.
+        let filed_elsewhere = with(25.0);
+        for at in [[6.0, 0.0], [12.0, 0.0], [12.5, 3.0], [20.0, 1.0], [12.5, 12.5]] {
+            assert!(close(held.apply(at[0], at[1]), filed_elsewhere.apply(at[0], at[1]), 1e-6), "{at:?}");
+        }
+        // Along the edge the map goes where the anchors inside take it:
+        // the column over the middle of the left three is carried right
+        // with them, further than the plane has it and further than the
+        // same points pinned both ways leave it.
+        let plane = h.apply(6.0, 0.0)[0];
+        let pinned = {
+            let mut anchors = inside.clone();
+            anchors.extend([6.0, 12.0, 19.0].map(|x| ControlPoint { at: [x, 0.5], px: [h.apply(x, 0.0)[0], 98.0] }));
+            Projection::with_smoothing(25, 25, quad, &anchors, 0.0).unwrap()
+        };
+        let slid = held.apply(6.0, 0.0)[0] - plane;
+        assert!(slid > 10.0, "the edge point slid {slid} px");
+        assert!(slid > pinned.apply(6.0, 0.5)[0] - plane + 5.0, "{slid} against {}", pinned.apply(6.0, 0.5)[0] - plane);
+        // The freed parts are those that bend the surface least: any
+        // other value along the edge at a freed site bends it more.
+        let spline = held.spline().unwrap();
+        let bending = |values: &[[f64; 2]]| -> f64 {
+            // The bending of the surface through `values`: the values
+            // times the sites' block of the inverse times the values.
+            let n = spline.sites.len();
+            let m = n + 3;
+            let mut sum = 0.0;
+            for i in 0..n {
+                for j in 0..n {
+                    sum += spline.inverse[i * m + j] * (values[i][0] * values[j][0] + values[i][1] * values[j][1]);
+                }
+            }
+            sum.abs()
+        };
+        let relaxed = held.residuals().to_vec();
+        let site = spline.sites().iter().position(|s| *s == [12.0, 0.0]).unwrap();
+        for nudge in [-6.0, 6.0] {
+            let mut other = relaxed.clone();
+            other[site][0] += nudge;
+            assert!(bending(&relaxed) < bending(&other), "{nudge}: {} against {}", bending(&relaxed), bending(&other));
+        }
+        // An anchor inside the symbol is held both ways as ever.
+        for anchor in &inside {
+            assert!(close(held.apply(anchor.at[0], anchor.at[1]), anchor.px, 1e-6));
+        }
     }
 }

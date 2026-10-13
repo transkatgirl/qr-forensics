@@ -52,7 +52,30 @@ impl Luma {
 
     /// Bilinear sample at pixel coordinates, where (0.5, 0.5) is the centre
     /// of the top-left pixel. `None` outside the image.
+    ///
+    /// Nearly every sample a search takes is one of a template's, well
+    /// inside the photo, and the fitting of templates is nearly all the
+    /// time a search takes: such a sample is read here, in line, with
+    /// the arithmetic of [`Self::sample_by_border`] and none of its
+    /// care for the border, where nothing needs clamping.
+    #[inline]
     pub fn sample(&self, x: f64, y: f64) -> Option<f32> {
+        let (fx, fy) = (x - 0.5, y - 0.5);
+        if fx >= 0.0 && fy >= 0.0 && fx < self.width as f64 - 1.0 && fy < self.height as f64 - 1.0 {
+            let (x0, y0) = (fx as usize, fy as usize);
+            let (tx, ty) = ((fx - x0 as f64) as f32, (fy - y0 as f64) as f32);
+            let first = y0 * self.width + x0;
+            let (above, below) = (&self.data[first..first + 2], &self.data[first + self.width..first + self.width + 2]);
+            let top = above[0] * (1.0 - tx) + above[1] * tx;
+            let bottom = below[0] * (1.0 - tx) + below[1] * tx;
+            return Some(top * (1.0 - ty) + bottom * ty);
+        }
+        self.sample_by_border(x, y)
+    }
+
+    /// [`Self::sample`] for a point within half a pixel of the image's
+    /// border, or off the image.
+    fn sample_by_border(&self, x: f64, y: f64) -> Option<f32> {
         let (fx, fy) = (x - 0.5, y - 0.5);
         if !(fx >= -0.5 && fy >= -0.5 && fx <= self.width as f64 - 0.5 && fy <= self.height as f64 - 0.5) {
             return None;

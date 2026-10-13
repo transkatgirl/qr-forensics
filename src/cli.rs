@@ -12,11 +12,13 @@
 //!                     [--outline x,y,x,y,x,y,x,y] [--hex | --escaped]
 //!                     [--charset name] [--corners] [--details] [--grid]
 //!                     [--partial] [--surface] [--enlarge n]
-//!                     [--sharpen light|strong] [--full-search] <image>...
+//!                     [--sharpen light|strong] [--full-search] [--] <image>...
 //! ```
 //!
 //! An option that takes a value takes the next argument, or what follows
-//! an equals sign, as `--outline=1,2,3,4,5,6,7,8`.
+//! an equals sign, as `--outline=1,2,3,4,5,6,7,8`. `--` ends the options,
+//! as it does for the shell's own tools: every argument after it names an
+//! image, whatever it begins with.
 //!
 //! `--corners` adds to each line where the symbol lies: its four corners
 //! in the pixels `--outline` takes, top-left first as the symbol has
@@ -92,10 +94,13 @@
 //! however large the photo.
 //!
 //! The outline is drawn top-left first and clockwise, in the photo's own
-//! pixels, upright as its EXIF orientation has it; only a photo under
-//! 256 pixels on its shorter side is worked on at another size, enlarged
-//! by a whole factor as the window's Enlarge starts for one, and its
-//! outline is in the enlarged pixels. What is inside it is read as
+//! pixels, upright as its EXIF orientation has it. A photo under 256
+//! pixels on its shorter side is worked on enlarged by a whole factor,
+//! as the window's Enlarge starts for one, and its outline is taken and
+//! its corners are printed in its own pixels all the same, as OpenCV and
+//! wechat_qrcode hand back a symbol's points in the pixels of the image
+//! they were given whatever they read it at: to as many more decimal
+//! places as keep the tenth of a pixel of the copy. What is inside it is read as
 //! the window's Find in outline reads it: as a QR Code first and, when that
 //! does not decode, as a Micro QR or rMQR symbol too, on the evidence
 //! Find in outline asks of another family, the best of the reads being
@@ -119,9 +124,11 @@
 //! `unconfirmed` when every block solved and the message parses but a
 //! block has too little to confirm it: one whose every error correction
 //! codeword went on filling in codewords that could not be read has
-//! nothing, where one that corrected as many wrong codewords as its
-//! error correction reaches is confirmed by having found them, and one
-//! of the smallest symbols that spent the codewords the standard
+//! nothing, and one that filled in any must have three codewords' worth
+//! to show for itself, a block of noise passing one spare codeword once
+//! in 256, where one read whole that corrected as many wrong codewords
+//! as its error correction reaches is confirmed by having found them,
+//! and one of the smallest symbols that spent the codewords the standard
 //! reserves for detecting a misdecode is not to be trusted whatever it
 //! found; `malformed` when every block is confirmed and the message does
 //! not parse to its end; and `partial` otherwise, with the blocks that
@@ -149,6 +156,7 @@ use qr_forensics::decode::pipeline::DecodeOptions;
 use qr_forensics::decode::sequence::{ParityCheck, Part, Sequence};
 use qr_forensics::decode::text::Charset;
 use qr_forensics::imaging::Luma;
+use qr_forensics::imaging::adjust::Enlarge;
 use qr_forensics::imaging::detect::{Lead, SearchParams, search_for_families};
 use qr_forensics::imaging::enhance::{Enhance, Sharpen};
 use qr_forensics::imaging::photo;
@@ -160,7 +168,7 @@ use qr_forensics::symbol::{Family, SymbolVersion};
 
 const USAGE: &str = "usage: qr-forensics decode [--family qr|micro|rmqr|model1] [--outline x,y,x,y,x,y,x,y] \
                      [--hex | --escaped] [--charset name] [--corners] [--details] [--grid] [--partial] \
-                     [--surface] [--enlarge n] [--sharpen light|strong] [--full-search] <image>...";
+                     [--surface] [--enlarge n] [--sharpen light|strong] [--full-search] [--] <image>...";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Show {
@@ -222,6 +230,11 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let text = arg.to_string_lossy();
+        // `--` ends the options: what follows names images.
+        if text == "--" {
+            options.images.extend(args.cloned());
+            break;
+        }
         // `--name=value` is `--name value`.
         let (name, inline) = match text.split_once('=') {
             Some((name, value)) if name.starts_with("--") => (name, Some(value)),
@@ -318,9 +331,24 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
 
 /// A photo as the app loads it: the file's pixels, enlarged when the
 /// photo is small and never shrunk, as luminance, with the default tone
-/// adjustments.
-fn load(path: &Path) -> Result<Luma, String> {
-    Ok(photo::luma_as_loaded(photo::open(path).map_err(|e| e.to_string())?))
+/// adjustments; and how many times its own size it was loaded at.
+fn load(path: &Path) -> Result<(Luma, f64), String> {
+    let image = photo::open(path).map_err(|e| e.to_string())?;
+    let times = Enlarge::for_photo(image.width(), image.height()).factor();
+    Ok((photo::luma_as_loaded(image), times))
+}
+
+/// Four points of a photo worked on at `times` its own size, as
+/// `--corners` prints them and `--outline` takes them back: in the
+/// photo's own pixels, to the tenth of a pixel of the copy worked on,
+/// which of a photo enlarged is a decimal place more for each ten times.
+/// A symbol in a photo of thirty pixels a side is placed to a fraction
+/// of a module there, and a tenth of the photo's own pixel is a tenth of
+/// a module of it.
+fn at(points: &[[f64; 2]; 4], times: f64) -> String {
+    let places = 1 + if times > 1.0 { (times.log10().ceil() as usize).max(1) } else { 0 };
+    let at: Vec<String> = points.iter().flat_map(|p| [p[0], p[1]]).map(|v| format!("{:.places$}", v / times)).collect();
+    at.join(",")
 }
 
 /// The version a search of `family` starts from, as the window starts.
@@ -344,7 +372,7 @@ pub(crate) fn standing(result: &ReadResult) -> String {
         "read".to_owned()
     } else if report.is_complete() && report.score.stream_valid {
         format!("unconfirmed, {} of {blocks} blocks confirmed", report.blocks_verified())
-    } else if report.score.all_verified {
+    } else if report.blocks_verified() == blocks {
         format!("malformed, {blocks} of {blocks} blocks solved")
     } else {
         format!("partial, {} of {blocks} blocks solved", report.blocks_solved())
@@ -389,8 +417,9 @@ fn details(result: &ReadResult) -> String {
 
 /// One symbol's line: the image, what was found, how the read stands,
 /// what it settled when `details` is asked, where it lies when `corners`
-/// is, and the message.
-fn describe(path: &Path, result: &ReadResult, options: &Options) -> String {
+/// is, in the pixels of a photo read at `times` its size, and the
+/// message.
+fn describe(path: &Path, result: &ReadResult, options: &Options, times: f64) -> String {
     let version = result.version();
     let mut what = format!("{} {}", version.family().label(), version);
     if result.detection.inverted {
@@ -409,8 +438,7 @@ fn describe(path: &Path, result: &ReadResult, options: &Options) -> String {
         line.push_str(&format!(": {}", details(result)));
     }
     if options.corners {
-        let at: Vec<String> = result.detection.corners.iter().flat_map(|c| [c[0], c[1]]).map(|v| format!("{v:.1}")).collect();
-        line.push_str(&format!(": at {}", at.join(",")));
+        line.push_str(&format!(": at {}", at(&result.detection.corners, times)));
     }
     format!("{line}: {message}")
 }
@@ -419,9 +447,8 @@ fn describe(path: &Path, result: &ReadResult, options: &Options) -> String {
 /// family they were taken for, how many there are, and the outline the
 /// search proposed about them, always, since where they lie is all there
 /// is to say of them, in the form `--outline` takes it back.
-fn describe_lead(path: &Path, lead: &Lead) -> String {
-    let at: Vec<String> = lead.outline.iter().flat_map(|c| [c[0], c[1]]).map(|v| format!("{v:.1}")).collect();
-    format!("{}: {}: {} finder patterns, no symbol fitted: at {}", path.display(), lead.family.label(), lead.finders.len(), at.join(","))
+fn describe_lead(path: &Path, lead: &Lead, times: f64) -> String {
+    format!("{}: {}: {} finder patterns, no symbol fitted: at {}", path.display(), lead.family.label(), lead.finders.len(), at(&lead.outline, times))
 }
 
 /// The messages the parts make up, one sequence for each count and
@@ -502,8 +529,8 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
     let mut status = 0;
     for image in &options.images {
         let path = Path::new(image);
-        let luma = match load(path) {
-            Ok(luma) => luma,
+        let (luma, times) = match load(path) {
+            Ok(loaded) => loaded,
             Err(message) => {
                 eprintln!("{}: {message}", path.display());
                 status = status.max(2);
@@ -513,7 +540,9 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
         // The finder patterns a search fitted no symbol to: an outline
         // given is read, and nothing is searched for.
         let mut leads: Vec<Lead> = Vec::new();
-        let results: Vec<ReadResult> = match options.outline {
+        // An outline is given in the photo's own pixels, and read in
+        // those the photo was loaded at.
+        let results: Vec<ReadResult> = match options.outline.map(|outline| outline.map(|[x, y]| [x * times, y * times])) {
             // A family named is the one family the outline is read as;
             // with none named it is read as Find in outline reads one, as a
             // QR Code and then as the other families.
@@ -546,7 +575,7 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
                 return status;
             }
             for lead in &leads {
-                if writeln!(out, "{}", describe_lead(path, lead)).is_err() {
+                if writeln!(out, "{}", describe_lead(path, lead, times)).is_err() {
                     return status;
                 }
             }
@@ -557,7 +586,7 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
             status = status.max(1);
         }
         for result in results.iter().filter(|r| r.is_trustworthy() || !any_read || options.partial) {
-            if writeln!(out, "{}", describe(path, result, &options)).is_err() {
+            if writeln!(out, "{}", describe(path, result, &options, times)).is_err() {
                 return status;
             }
             if options.grid {
@@ -571,7 +600,7 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
         // What the search found the finders of and fitted no symbol to
         // goes with the symbols that did not decode.
         for lead in leads.iter().filter(|_| !any_read || options.partial) {
-            if writeln!(out, "{}", describe_lead(path, lead)).is_err() {
+            if writeln!(out, "{}", describe_lead(path, lead, times)).is_err() {
                 return status;
             }
         }
@@ -621,6 +650,12 @@ mod tests {
         assert!(parse(&[OsString::from("--family")]).is_err());
         assert!(parse(&[OsString::from("--outline"), OsString::from("1,2,3"), OsString::from("a.png")]).is_err());
         assert!(parse(&[OsString::from("--what"), OsString::from("a.png")]).is_err());
+        // `--` ends the options: an image may be named as an option is.
+        let ended: Vec<OsString> = ["--corners", "a.png", "--", "--hex", "--", "-b.png"].iter().map(OsString::from).collect();
+        let options = parse(&ended).unwrap();
+        assert_eq!(options.images, ["a.png", "--hex", "--", "-b.png"].map(OsString::from));
+        assert!(options.corners && options.show == Show::Text);
+        assert!(parse(&[OsString::from("--")]).is_err());
         // The photo enlarged and sharpened, each on its own or both.
         assert_eq!(options.enhance, Enhance::NONE);
         let enhanced: Vec<OsString> = ["--enlarge", "3", "--sharpen=strong", "a.png"].iter().map(OsString::from).collect();
@@ -766,6 +801,12 @@ mod tests {
             assert_eq!(fields[4], "1234 ABCD");
             let at = fields[3].strip_prefix("at ").unwrap();
             assert_eq!(at.split(',').count(), 8, "{at}");
+            // The photo is thirty-four pixels a side and is read eight
+            // times that: the corners are in its own pixels, to the
+            // hundredth of one.
+            let numbers: Vec<f64> = at.split(',').map(|n| n.parse().unwrap()).collect();
+            assert!(numbers.iter().all(|n| (0.0..=34.0).contains(n)), "{at}");
+            assert!(at.split(',').all(|n| n.split_once('.').is_some_and(|(_, places)| places.len() == 2)), "{at}");
             // Fifteen rows of fifteen modules, every one read.
             assert_eq!(grid.len(), 15, "{text}");
             assert!(grid.iter().all(|row| row.len() == 15 && row.chars().all(|c| c == '#' || c == '.')), "{grid:?}");
@@ -856,6 +897,42 @@ mod tests {
             assert!(fields[3].ends_with(pinned), "{text}");
             assert_eq!(fields.last().map(String::as_str), Some(message), "{text}");
         }
+    }
+
+    #[test]
+    fn a_sound_symbol_whose_message_does_not_parse_is_malformed() {
+        use qr_forensics::decode::codewords::{Pin, PinSource, Pins};
+        use qr_forensics::decode::pipeline::decode;
+        use qr_forensics::decode::repair::{render_rgba, repaired_grid};
+        use qr_forensics::symbol::EcLevel;
+        // A version 1-L symbol sound in every codeword, whose data
+        // begins with an ECI header that names no assignment: its one
+        // block is confirmed, and its message does not parse so far as
+        // its first segment. It stood as `partial`, with one block of
+        // one solved, which a symbol with nothing left to solve is not.
+        let layout = SymbolLayout::new(Arc::new(FunctionMap::new(SymbolVersion::Qr(1))), EcLevel::L).unwrap();
+        let (opts, mask) = (DecodeOptions::default(), 0);
+        let pins: Pins = layout
+            .data_stream
+            .iter()
+            .enumerate()
+            .map(|(j, &cw)| (cw, Pin::full(if j == 0 { 0x7E } else { 0x00 }, PinSource::Manual)))
+            .collect();
+        let blank = layout.func.blank_grid();
+        let grid = repaired_grid(&blank, &layout, mask, &decode(&blank, &layout, mask, &pins, &opts));
+        let read = decode(&grid, &layout, mask, &Pins::new(), &opts);
+        assert!(read.blocks[0].is_verified() && read.parse.segments.is_empty() && !read.score.stream_valid);
+        let (width, height, pixels) = render_rgba(&grid, 8, 4);
+        let path = std::env::temp_dir().join(format!("qr-forensics-malformed-{}.png", std::process::id()));
+        image::save_buffer(&path, &pixels, width as u32, height as u32, image::ExtendedColorType::Rgba8).unwrap();
+        let mut out = Vec::new();
+        let status = run_to(&[path.clone().into_os_string()], &mut out);
+        let _ = std::fs::remove_file(&path);
+        let text = String::from_utf8(out).unwrap();
+        let (fields, _) = fields_and_grid(&text);
+        // No read, by the status, and the line says why not.
+        assert_eq!(status, 1, "{text}");
+        assert_eq!(&fields[1..3], ["QR Code 1", "malformed, 1 of 1 blocks solved"], "{text}");
     }
 
     #[test]

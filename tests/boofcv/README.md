@@ -40,8 +40,8 @@ QR_BOOFCV_DIR=path/to/qrcodes cargo test --release --test boofcv -- --nocapture
 ```
 
 It searches every photograph as `qr-forensics decode --partial --corners`
-does, a few at a time, which takes half an hour on a machine of fourteen
-cores, and prints a table of how the symbols of each set fared. `QR_BOOFCV_ONLY=perspective,close`
+does, a few at a time, which takes a quarter of an hour on a machine of
+fourteen cores, and prints a table of how the symbols of each set fared. `QR_BOOFCV_ONLY=perspective,close`
 searches those sets alone.
 
 ## The record
@@ -51,9 +51,9 @@ symbol's place among those its label file marks, counted from nothing,
 and how the search fared with it.
 
 ```text
-brightness/image017.jpg 0 not found
-brightness/image017.jpg 1 read
-brightness/image017.jpg 2 read
+bright_spots/image026.jpg 0 read
+bright_spots/image026.jpg 1 read
+bright_spots/image026.jpg 2 not found
 ```
 
 - `read`: a read that is to be trusted (`read`, or `read, padding
@@ -72,9 +72,11 @@ one; `tests/opencv` and `tests/blackbox` do that.
 
 The marks are in the pixels of each photograph as it is stored, as
 BoofCV loads one. Twenty-four of the photographs are stored on their
-sides with the turn noted in their EXIF data, and three are under 256
-pixels on their shorter side and are read enlarged; the test carries the
-marks into the pixels the reader prints before it compares them.
+sides with the turn noted in their EXIF data, and the test turns their
+marks with them before it compares them. Three are under 256 pixels on
+their shorter side and are read enlarged; the reader prints their
+corners in their own pixels all the same, and their marks stand as they
+are.
 
 The test fails where a symbol fares worse than recorded, and where one
 fares better without the record saying so, so that a change which finds
@@ -92,11 +94,17 @@ rewritten.
 ## What BoofCV makes of it
 
 BoofCV 1.5.0, as `FactoryFiducial.qrcode(null, GrayU8.class)` configures
-its detector, reads 923 of the 1232 symbols. The search here reads 1187
-as the record stands, every one of BoofCV's among them and each with
-the message BoofCV reads; 25 more it finds and cannot decode, and 20 it
-does not find. BoofCV takes a third of a second over a twelve-megapixel
-photograph where this search takes tens of seconds, and where it finds
-the position patterns of a symbol and cannot decode it, it says where:
-several of the choices in `src/imaging/detect.rs` are answers to one or
-the other.
+its detector, reads 923 of the 1232 symbols. The search here reads 1190
+as the record stands; 24 more it finds and cannot decode, and 18 it
+does not find. When it read 1187, every one of BoofCV's was among them,
+each with the message BoofCV reads. Three of those 1187 are found now
+and not read, `brightness/image012.jpg` 0, `curved/image017.jpg` 0 and
+`curved/image024.jpg` 0: each decodes only with its padding pinned and
+codewords doubted or filled in besides, on less than the three
+codewords' worth of confirmation such a decode has since been asked to
+show (`AIDED_VERIFIED_BITS` in `src/decode/rs.rs`), and whether BoofCV
+reads any of the three has not been looked at again. BoofCV takes a
+third of a second over a twelve-megapixel photograph where this search
+takes tens of seconds, and where it finds the position patterns of a
+symbol and cannot decode it, it says where: several of the choices in
+`src/imaging/detect.rs` are answers to one or the other.

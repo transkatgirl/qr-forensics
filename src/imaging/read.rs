@@ -41,6 +41,13 @@
 //!   and wechat_qrcode read a symbol mirrored whenever it has failed
 //!   plain, and a mirrored symbol's format word, a bit or two misread,
 //!   passes for a plain one's more often than not;
+//! - the format words next nearest the format bits, when the word they
+//!   settle verifies no block: a word misread in four bits or five lies
+//!   within the three the code corrects of another two times in five,
+//!   and then reads as that other with nothing to say it is not. ZXing's
+//!   decoder, and OpenCV's, take the word their format bits correct to
+//!   and fail with it; here the blocks are asked, and a level and mask
+//!   they bear out stand in its place;
 //! - the placement turned on its symbol, before any of the above, when
 //!   its fixed patterns fit that way and not as placed: a finder pattern
 //!   in the corner that should have none is as plain as anything a photo
@@ -122,9 +129,11 @@ use super::projection::{ControlPoint, Project, Projection};
 use super::refine::{MOVES, Scorer, Shifted, Template, Warp, descend_by, fixed_threshold, refine_corners_holding};
 use super::sample::{Kernel, Rule, SampleParams, classify, sample_modules_with};
 use super::{Luma, rotate_outline_cw, unrotate_point_cw};
+use crate::decode::bch::{FormatAnalysis, FormatCandidate};
 use crate::decode::codewords::Pins;
 use crate::decode::padding::recover_padding_after;
 use crate::decode::pipeline::{DecodeOptions, DecodeReport, GridAnalysis, analyze, brute_force, decode};
+use crate::decode::rs::AIDED_VERIFIED_BITS;
 use crate::decode::repair::known_modules;
 use crate::symbol::function_map::FunctionMap;
 use crate::symbol::{Family, SymbolVersion};
@@ -822,8 +831,9 @@ fn feedback_round(image: &Luma, current: &ReadResult, params: &SampleParams, opt
     for k in 0..anchors.len() {
         // An edge point was traced where the paper turns to ink, with
         // half its window off the symbol: the known modules do not
-        // place it better.
-        if anchors[k].kind == AnchorKind::Edge {
+        // place it better. An anchor set by hand where no pattern is stays
+        // where it was set.
+        if matches!(anchors[k].kind, AnchorKind::Edge | AnchorKind::Custom) {
             continue;
         }
         let Some((window, [x0, y0, x1, y1])) = window_of(&template, anchors[k].at) else { continue };
@@ -969,17 +979,85 @@ fn distance(a: [f64; 2], b: [f64; 2]) -> f64 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
 }
 
+/// Bits a format word may lie from the format bits as read and still be
+/// tried when the word they settle verifies no block: two past the three
+/// the code corrects.
+const RIVAL_REACH: u32 = 5;
+/// Format words so tried at the most, nearest first.
+const RIVALS: usize = 3;
+
 /// Decode `grid` as the symbol `func` maps: under the EC level and mask
 /// the format bits settle, or, when they settle nothing, the best attempt
 /// of a brute-force search. `None` when the version has no attempt at all.
+///
+/// A word the bits settle beyond doubt is still not always the symbol's.
+/// The words of the format code differ in seven bits or eight, so one
+/// misread in four lies as often as not three from another, which is
+/// within what the code corrects: of the patterns of four wrong bits, and
+/// of five, two in five read so, as that other word with nothing to say
+/// it is not. Every block is then unmasked with the wrong mask or cut to
+/// the wrong level's blocks, and none solves. So when the word settled
+/// verifies no block, the words next nearest the bits are tried
+/// ([`rival_decode`]), and one the blocks bear out is the format.
 fn decode_as(grid: &ModuleGrid, func: &Arc<FunctionMap>, analysis: &GridAnalysis, opts: &DecodeOptions) -> Option<DecodeReport> {
-    if analysis.format.is_reliable() {
-        let best = analysis.format.best().expect("a reliable format has a best candidate");
-        let layout = SymbolLayout::new(func.clone(), best.fields.ec)?;
-        Some(decode(grid, &layout, best.fields.mask, &Pins::new(), opts))
-    } else {
-        Some(brute_force(grid, func, None, opts).into_iter().next()?.report)
+    if !analysis.format.is_reliable() {
+        return Some(brute_force(grid, func, None, opts).into_iter().next()?.report);
     }
+    let best = analysis.format.best().expect("a reliable format has a best candidate");
+    let layout = SymbolLayout::new(func.clone(), best.fields.ec)?;
+    let report = decode(grid, &layout, best.fields.mask, &Pins::new(), opts);
+    if report.blocks_verified() > 0 {
+        return Some(report);
+    }
+    Some(rival_decode(grid, func, &analysis.format, opts).unwrap_or(report))
+}
+
+/// The best decode of `grid` under the format words nearest its format
+/// bits after the one they settle, when the blocks bear one out: the
+/// words of the grid's own size, painted as the settled one is, within
+/// [`RIVAL_REACH`] bits of the bits read, the [`RIVALS`] nearest of them.
+/// A word wrong in four bits or five that reads as another is always
+/// among the three nearest of the rest, and a word read clean, or with
+/// one bit wrong, has no other within reach, so a symbol whose format
+/// reads well and whose blocks are past correcting costs nothing here.
+///
+/// A rival stands on its blocks alone, the bits having spoken for
+/// another: on blocks verified with [`AIDED_VERIFIED_BITS`] between
+/// them, which leaves out the sixteen of an M1 symbol, whose every mask
+/// would otherwise be a fresh chance in 65536 for noise to pass. As
+/// [`brute_force`] does, each is decoded without doubting first, which
+/// tells the right mask from the rest when any block of it reads nearly
+/// clean, and only one borne out so is decoded again with it.
+fn rival_decode(grid: &ModuleGrid, func: &Arc<FunctionMap>, format: &FormatAnalysis, opts: &DecodeOptions) -> Option<DecodeReport> {
+    let best = format.best()?;
+    let mut rivals: Vec<&FormatCandidate> = format
+        .candidates
+        .iter()
+        .filter(|c| c.fits_grid && (c.unmasked, c.other_model) == (best.unmasked, best.other_model))
+        .filter(|c| c.fields != best.fields && c.best_mismatches <= RIVAL_REACH)
+        .collect();
+    rivals.sort_by_key(|c| (c.best_mismatches, c.best_weight));
+    rivals.truncate(RIVALS);
+    let borne_out = |report: &DecodeReport| {
+        report.blocks.iter().filter(|b| b.is_verified()).map(|b| b.outcome.confidence_bits()).sum::<u32>() >= AIDED_VERIFIED_BITS
+    };
+    let two_passes = opts.reliability && grid.has_reliability();
+    let first_pass = DecodeOptions { reliability: opts.reliability && !two_passes, ..*opts };
+    let mut found: Option<DecodeReport> = None;
+    for rival in rivals {
+        let Some(layout) = SymbolLayout::new(func.clone(), rival.fields.ec) else { continue };
+        let mut tried = decode(grid, &layout, rival.fields.mask, &Pins::new(), &first_pass);
+        if !borne_out(&tried) {
+            continue;
+        }
+        if two_passes && !tried.is_trustworthy() {
+            tried = decode(grid, &layout, rival.fields.mask, &Pins::new(), opts);
+        }
+        if found.as_ref().is_none_or(|held| tried.score > held.score) {
+            found = Some(tried);
+        }
+    }
+    found
 }
 
 /// Bring a detection made in the photo turned `quarters` quarter turns
@@ -1171,5 +1249,116 @@ mod tests {
         // lie on it and is read once.
         let offered = seated(&image, vec![upright.clone(), turned], &params);
         assert_eq!(offered, [upright]);
+    }
+
+    #[test]
+    fn a_format_word_read_as_its_neighbour_is_settled_by_the_blocks() {
+        use crate::decode::bch::{format_word_for, format_words};
+        use crate::symbol::EcLevel;
+        use qrcode_generator::{Segment, qr};
+        // The words of the format code lie seven bits apart, or eight.
+        // With all but three of the bits between the symbol's word and
+        // another misread, the same in both copies, what is read lies
+        // three from the other word, which the code corrects, and four
+        // or five from the symbol's own: the bits settle the other
+        // beyond doubt, and under its level and mask no block solves.
+        // The symbol's own word is among the nearest of the rest, and
+        // its blocks bear it out.
+        let (version, ec, mask) = (SymbolVersion::Qr(2), EcLevel::L, 3);
+        let text = "format words lie seven bits off";
+        let symbol = qr::Encoder::new(qr::ErrorCorrection::Low)
+            .version(qr::Version::new(2).unwrap())
+            .mask(qr::Mask::new(mask).unwrap())
+            .boost_error_correction(false)
+            .encode_segments(&[Segment::bytes(text)])
+            .unwrap();
+        let clean = ModuleGrid::from_bools(symbol.width(), symbol.height(), symbol.modules());
+        let func = Arc::new(FunctionMap::new(version));
+        let opts = DecodeOptions::default();
+        let misread = |flips: &[usize]| {
+            let mut grid = clean.clone();
+            for copy in &func.format {
+                for &b in flips {
+                    let (x, y) = (copy.bits[b].x as usize, copy.bits[b].y as usize);
+                    grid.set(x, y, grid.get(x, y).inverted());
+                }
+            }
+            grid
+        };
+        let own = format_word_for(version, ec, mask).unwrap();
+        let mut neighbours = 0;
+        for (fields, word) in format_words(version) {
+            let differing: Vec<usize> = (0..15).filter(|b| (own ^ word) >> b & 1 != 0).collect();
+            if !matches!(differing.len(), 7 | 8) {
+                continue;
+            }
+            neighbours += 1;
+            // Each run of three of the differing bits left as they
+            // were, and the rest misread.
+            for kept in 0..differing.len() - 2 {
+                let flips: Vec<usize> = (0..differing.len()).filter(|i| !(kept..kept + 3).contains(i)).map(|i| differing[i]).collect();
+                let grid = misread(&flips);
+                let analysis = analyze(&grid, &func);
+                assert!(analysis.format.is_reliable(), "{fields:?} {flips:?}");
+                assert_eq!(analysis.format.best().map(|best| best.fields), Some(fields), "{flips:?}");
+                let settled = decode(&grid, &SymbolLayout::new(func.clone(), fields.ec).unwrap(), fields.mask, &Pins::new(), &opts);
+                assert_eq!(settled.blocks_verified(), 0, "{fields:?} {flips:?}");
+                let report = decode_as(&grid, &func, &analysis, &opts).unwrap();
+                assert!(report.is_trustworthy(), "{fields:?} {flips:?}");
+                assert_eq!((report.ec, report.mask, report.text.plain().as_str()), (ec, mask, text), "{fields:?} {flips:?}");
+            }
+        }
+        assert_eq!(neighbours, 30);
+
+        // A word read clean has no other within reach, and a symbol whose
+        // blocks are past correcting is decoded under it once and left.
+        let mut torn = clean.clone();
+        for y in 9..func.height {
+            for x in 9..func.width {
+                if func.expected(x, y).is_none() && (x + y) % 2 == 0 {
+                    torn.set(x, y, torn.get(x, y).inverted());
+                }
+            }
+        }
+        let analysis = analyze(&torn, &func);
+        assert!(analysis.format.is_reliable());
+        assert!(rival_decode(&torn, &func, &analysis.format, &opts).is_none());
+        let report = decode_as(&torn, &func, &analysis, &opts).unwrap();
+        assert_eq!((report.ec, report.mask, report.blocks_verified()), (ec, mask, 0));
+
+        // An M1 symbol's two check codewords are sixteen bits whatever
+        // the mask, and no mask but the one its bits settle is taken on
+        // them: with the bits misread toward another mask's word it is
+        // left unread, as it was.
+        use qrcode_generator::micro;
+        let m1 = micro::Encoder::new(micro::ErrorCorrection::DetectionOnly)
+            .version(micro::Version::M1)
+            .mask(micro::Mask::new(1).unwrap())
+            .boost_error_correction(false)
+            .encode_segments(&[Segment::numeric("12345").unwrap()])
+            .unwrap();
+        let clean = ModuleGrid::from_bools(m1.width(), m1.height(), m1.modules());
+        let version = SymbolVersion::Micro(1);
+        let func = Arc::new(FunctionMap::new(version));
+        let analysis = analyze(&clean, &func);
+        let read = decode_as(&clean, &func, &analysis, &opts).unwrap();
+        assert!(read.is_trustworthy() && read.text.plain() == "12345" && (read.ec, read.mask) == (EcLevel::L, 1));
+        let own = format_word_for(version, EcLevel::L, 1).unwrap();
+        let mut others = 0;
+        for (fields, word) in format_words(version).into_iter().filter(|(fields, _)| fields.version == version && fields.mask != 1) {
+            let differing: Vec<usize> = (0..15).filter(|b| (own ^ word) >> b & 1 != 0).collect();
+            let mut grid = clean.clone();
+            for &b in &differing[3..] {
+                let (x, y) = (func.format[0].bits[b].x as usize, func.format[0].bits[b].y as usize);
+                grid.set(x, y, grid.get(x, y).inverted());
+            }
+            let analysis = analyze(&grid, &func);
+            assert!(analysis.format.is_reliable(), "{fields:?}");
+            assert_eq!(analysis.format.best().map(|best| best.fields.mask), Some(fields.mask));
+            assert!(rival_decode(&grid, &func, &analysis.format, &opts).is_none(), "{fields:?}");
+            assert!(!decode_as(&grid, &func, &analysis, &opts).unwrap().is_trustworthy(), "{fields:?}");
+            others += 1;
+        }
+        assert_eq!(others, 3);
     }
 }

@@ -10,7 +10,7 @@ use qr_forensics::decode::sequence::Sequence;
 use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::adjust::{Adjust, Enlarge};
 use qr_forensics::imaging::binarize::BinarizeParams;
-use qr_forensics::imaging::detect::{Anchor, Detection};
+use qr_forensics::imaging::detect::{Anchor, AnchorKind, Detection};
 use qr_forensics::imaging::projection::{ControlPoint, Projection};
 use qr_forensics::imaging::detect::SearchParams;
 use qr_forensics::imaging::read::ReadResult;
@@ -42,6 +42,21 @@ impl DocAnchor {
     pub fn control_point(&self) -> ControlPoint {
         self.anchor.control_point()
     }
+}
+
+/// A hold taken of the grid itself in the Align stage, on a module of it
+/// and not on a handle: the anchor that module's middle is, or is to be,
+/// and how far it lies from the pointer in the photo, which it keeps
+/// while the pointer moves.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Grasp {
+    pub kind: AnchorKind,
+    /// The middle of the module, in module coordinates.
+    pub at: [f64; 2],
+    /// The anchor was set already, and partly damaged.
+    pub partial: bool,
+    /// The anchor's place in the photo less the pointer's.
+    pub lead: [f64; 2],
 }
 
 /// Symbols a search of the whole photo found, on offer until the list is
@@ -213,6 +228,40 @@ impl Model {
     /// Photo position of module corner (`x`, `y`), 0..=width, 0..=height.
     pub fn corner(&self, x: usize, y: usize) -> [f64; 2] {
         self.lattice[y * (self.width + 1) + x]
+    }
+
+    /// The point of the grid, in modules, drawn at `px` in the photo:
+    /// the module whose four corners the point lies among, and how far
+    /// across and down it. The grid is drawn straight from one module
+    /// corner to the next, and this is the grid as drawn, so that what is
+    /// grasped is what was under the pointer. `None` off the grid.
+    pub fn module_at(&self, px: [f64; 2]) -> Option<[f64; 2]> {
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let (c00, c10, c11, c01) = (self.corner(x, y), self.corner(x + 1, y), self.corner(x + 1, y + 1), self.corner(x, y + 1));
+                if !super::quad_contains(&[c00, c10, c11, c01], px) {
+                    continue;
+                }
+                // Across and down the module by Newton's method on the
+                // blend of its corners, which a module near enough a
+                // parallelogram settles in a step or two.
+                let (mut u, mut v) = (0.5, 0.5);
+                for _ in 0..8 {
+                    let at = |i: usize| (1.0 - u) * (1.0 - v) * c00[i] + u * (1.0 - v) * c10[i] + u * v * c11[i] + (1.0 - u) * v * c01[i];
+                    let du = |i: usize| (1.0 - v) * (c10[i] - c00[i]) + v * (c11[i] - c01[i]);
+                    let dv = |i: usize| (1.0 - u) * (c01[i] - c00[i]) + u * (c11[i] - c10[i]);
+                    let (ex, ey) = (px[0] - at(0), px[1] - at(1));
+                    let det = du(0) * dv(1) - du(1) * dv(0);
+                    if det.abs() < 1e-12 {
+                        break;
+                    }
+                    u += (ex * dv(1) - ey * dv(0)) / det;
+                    v += (du(0) * ey - du(1) * ex) / det;
+                }
+                return Some([x as f64 + u.clamp(0.0, 1.0), y as f64 + v.clamp(0.0, 1.0)]);
+            }
+        }
+        None
     }
 }
 
@@ -720,6 +769,9 @@ pub struct ViewState {
     pub auto_invert: bool,
     /// Draw anchor handles in the Align stage.
     pub show_anchors: bool,
+    /// The anchor a drag begun on the grid itself is pulling about,
+    /// while the drag lasts.
+    pub grasped: Option<Grasp>,
     pub result_mode: ResultMode,
     /// Parts of a structured append message collected so far.
     pub sequence: Sequence,
@@ -786,6 +838,7 @@ impl Default for ViewState {
             use_anchors: true,
             auto_invert: true,
             show_anchors: true,
+            grasped: None,
             result_mode: ResultMode::Text,
             sequence: Sequence::default(),
             binarize: BinarizeParams::default(),

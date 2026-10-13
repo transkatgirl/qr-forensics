@@ -279,15 +279,16 @@ fn utf16_keeps_its_alignment_past_an_unreadable_byte() {
 
 #[test]
 fn a_kanji_segment_tips_doubtful_bytes_to_shift_jis() {
-    // One double-byte character is too little to believe Shift-JIS on its
-    // own: 8E 9A reads as a GBK character by validity. Beside a kanji
-    // segment, Shift-JIS is the natural reading, as ZBar takes it.
-    let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode("字");
-    assert!((0x81..=0x9F).contains(&bytes[0]), "{bytes:?}");
+    // One double-byte character whose bytes ISO-8859-1 has text for is
+    // too little to believe Shift-JIS on its own: E0 40 reads as `à@`.
+    // Beside a kanji segment, Shift-JIS is the natural reading, as ZBar
+    // takes it.
+    let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode("漾");
+    assert_eq!(bytes[..], [0xE0, 0x40]);
     let layout = layout(SymbolVersion::Qr(2), EcLevel::L);
     let alone = encode(SymbolVersion::Qr(2), EcLevel::L, Some(0), &[Segment::bytes(&bytes)]).unwrap();
     let report = decode_plain(&alone, &layout, 0);
-    assert_ne!(report.text.plain(), "字");
+    assert_eq!(report.text.plain(), "à@");
     let beside = encode(
         SymbolVersion::Qr(2),
         EcLevel::L,
@@ -296,8 +297,16 @@ fn a_kanji_segment_tips_doubtful_bytes_to_shift_jis() {
     )
     .unwrap();
     let report = decode_plain(&beside, &layout, 0);
-    assert_eq!(report.text.plain(), "日本字");
+    assert_eq!(report.text.plain(), "日本漾");
     assert_eq!(report.text.encoding.as_deref(), Some("Shift_JIS (guessed)"));
+    // A lead byte ISO-8859-1 has only a control code for needs no kanji
+    // beside it: 8E 9A is a character of GBK as well, and Shift-JIS is
+    // asked first.
+    let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode("字");
+    assert!((0x81..=0x9F).contains(&bytes[0]), "{bytes:?}");
+    let alone = encode(SymbolVersion::Qr(2), EcLevel::L, Some(0), &[Segment::bytes(&bytes)]).unwrap();
+    let report = decode_plain(&alone, &layout, 0);
+    assert_eq!((report.text.plain().as_str(), report.text.encoding.as_deref()), ("字", Some("Shift_JIS (guessed)")));
 }
 
 #[test]

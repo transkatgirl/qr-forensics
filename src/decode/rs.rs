@@ -15,15 +15,47 @@
 use super::gf256::{self, div, exp, mul, poly_degree, poly_eval, poly_mul};
 use crate::symbol::grid::CERTAIN;
 
-/// Confirming bits a solution needs before it counts as verified: one
-/// codeword of slack, or as many known bits reproduced, or errors located
-/// that as few blocks of noise would show ([`located_error_bits`]).
+/// Confirming bits a solution needs before it counts as verified, when
+/// it is the decode the standard describes of a block read whole: every
+/// codeword known, the wrong ones located by the code, and nothing else
+/// tried. One codeword of slack, or errors located that as few blocks of
+/// noise would show ([`located_error_bits`]). Such a decode never shows
+/// less within the standard's limit: the reserve speaks where there is
+/// one, and the errors located at the limit where there is none.
 pub const VERIFIED_BITS: u32 = 8;
+
+/// Confirming bits any other solution needs: one that filled in codewords
+/// that could not be read, or was reached by doubting codewords or bits
+/// that could, by flipping them, bit by bit, or from pins alone. Three
+/// codewords of slack, or as much between the slack, the known bits of
+/// erased codewords reproduced and the errors located.
+///
+/// An erased codeword is given whatever value fits, so a block with all
+/// but one of its error correction codewords spent on erasures is
+/// confirmed by the one syndrome left, and the rest of the block may hold
+/// anything: a block of noise passes once in 256, and as often with all
+/// but four so spent and two wrong codewords "located" by the four. That
+/// is no rare block in a damaged symbol. A tear takes most of one block
+/// of four and leaves the others clean, the read is made again under
+/// other kernels and thresholds, and the garbage that passes sits inside
+/// a byte segment whose stream parses as well as ever: a version 5-Q
+/// symbol with seventeen of a block's eighteen error correction
+/// codewords' worth unknown and the rest of the block misread was read,
+/// one try in four hundred, as its message with a block's worth of bytes
+/// it never held. ZXing, BoofCV and OpenCV decode errors alone, within
+/// half the code's distance, where the same block of noise passes once
+/// in 10^14; three codewords make it once in sixteen million here, and a
+/// solution with less is kept, and shown, as one that solved without
+/// confirmation.
+pub const AIDED_VERIFIED_BITS: u32 = 3 * VERIFIED_BITS;
 
 /// Spare equations a solution found by doubting bits must keep. Doubting
 /// tries many counts of doubted bits, and a wrong solution passes `s`
 /// spare equations by chance once in `2^s` tries, so one codeword's worth
-/// is not enough when a score of counts are tried.
+/// is not enough when a score of counts are tried. Two are enough for
+/// the solution to be offered, and no more: it is verified with three
+/// ([`AIDED_VERIFIED_BITS`]), between the spare equations and the
+/// agreement of the bits doubted.
 pub const DOUBT_SPARE_EQUATIONS: usize = 2 * VERIFIED_BITS as usize;
 
 /// Confirming bits a solution found by doubting codewords must show.
@@ -36,6 +68,9 @@ pub const DOUBT_SPARE_EQUATIONS: usize = 2 * VERIFIED_BITS as usize;
 /// bit or two give and codewords of noise do not, or as much from the
 /// errors it located among the codewords it did not doubt, once those
 /// have paid for the counts tried: a bit for each doubling of them.
+/// That much has it offered; it is verified with a codeword's worth
+/// more ([`AIDED_VERIFIED_BITS`]), since with this much one block of
+/// noise in thirty thousand still passed.
 pub const DOUBT_CONFIRMING_BITS: u32 = 2 * VERIFIED_BITS;
 
 /// What a known bit of an erased codeword costs a solution that overturns
@@ -459,7 +494,14 @@ pub const CHASE_BITS: usize = 6;
 /// Fewest EC codewords a chased solution must leave unused: the patterns
 /// tried are a power of two, and each is a fresh chance of a misdecode,
 /// which a second spare codeword makes two hundred and fifty-six times
-/// rarer.
+/// rarer. With that the solution is offered. It is verified with
+/// [`AIDED_VERIFIED_BITS`] behind it, which two spare codewords make
+/// when the flipped block's decode located errors to the worth of a
+/// third, as it does where flipping reaches a block a little past the
+/// code's correction, and do not make when the rest of the redundancy
+/// went on codewords that could not be read: with sixteen of a block's
+/// eighteen so spent, one block of noise in a thousand was chased to a
+/// codeword that stood as verified.
 pub const CHASE_MIN_SLACK: usize = 2;
 
 /// Decode by flipping: take the least reliable bits of the fully read
@@ -1566,6 +1608,52 @@ mod tests {
         let sol = rs_decode_reserving(&read, 10, 2).unwrap();
         assert_eq!((sol.errors, sol.slack, sol.corrected == block), (5, 0, true));
         assert!(sol.confidence_bits() >= VERIFIED_BITS && !sol.within_standard());
+    }
+
+    #[test]
+    fn one_spare_codeword_confirms_little_of_a_block_mostly_unread() {
+        // A 5-Q block with seventeen of its codewords unknown has one
+        // syndrome left of its eighteen to check the sixteen that were
+        // read, and two of those are wrong. Whatever the first is off
+        // by, one value in 255 of the second leaves that syndrome zero,
+        // and the block "solves", to codewords it never held.
+        let data: Vec<u8> = (0..15u8).map(|i| 0x40 + i).collect();
+        let block: Vec<u8> = data.iter().copied().chain(rs_encode(&data, 18)).collect();
+        let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+        for cw in read.iter_mut().skip(16) {
+            *cw = CwRead::unknown();
+        }
+        read[0].value ^= 0x01;
+        let mut passed = Vec::new();
+        for magnitude in 1..=255u8 {
+            let mut trial = read.clone();
+            trial[1].value ^= magnitude;
+            if let Ok(sol) = rs_decode(&trial, 18) {
+                passed.push((magnitude, sol));
+            }
+        }
+        assert_eq!(passed.len(), 1);
+        let (magnitude, sol) = &passed[0];
+        assert_eq!((*magnitude, sol.errors, sol.erasures, sol.slack), (0x04, 0, 17, 1));
+        assert!(sol.corrected != block);
+        // A byte of confirmation: what the plain decode of a block read
+        // whole stands on, and a third of what this must show.
+        assert_eq!(sol.confidence_bits(), VERIFIED_BITS);
+        assert!(sol.confidence_bits() < AIDED_VERIFIED_BITS);
+
+        // With fifteen unknown there are three syndromes left, and no
+        // value of the second wrong codeword passes them: one block in
+        // sixteen million would, or one in two thousand as a single
+        // wrong codeword the code located with a codeword to spare,
+        // which is short of three as well.
+        read[16] = CwRead::known(block[16]);
+        read[17] = CwRead::known(block[17]);
+        for magnitude in 1..=255u8 {
+            let mut trial = read.clone();
+            trial[1].value ^= magnitude;
+            assert!(rs_decode(&trial, 18).is_err(), "{magnitude:#x}");
+        }
+        assert_eq!(8 + located_error_bits(18, 1), 11);
     }
 
     #[test]

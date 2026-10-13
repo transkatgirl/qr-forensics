@@ -18,7 +18,7 @@ blurred/image012.jpg 0 read
 blurred/image013.jpg 0 read
 blurred/image014.jpg 0 read
 blurred/image015.jpg 0 read
-blurred/image015.jpg 1 not found
+blurred/image015.jpg 1 read
 blurred/image016.jpg 0 read
 blurred/image016.jpg 1 read
 blurred/image016.jpg 2 read
@@ -197,7 +197,7 @@ brightness/image010.jpg 2 read
 brightness/image011.jpg 0 read
 brightness/image011.jpg 1 read
 brightness/image011.jpg 2 read
-brightness/image012.jpg 0 read
+brightness/image012.jpg 0 found
 brightness/image012.jpg 1 found
 brightness/image012.jpg 2 not found
 brightness/image013.jpg 0 read
@@ -212,7 +212,7 @@ brightness/image015.jpg 2 read
 brightness/image016.jpg 0 read
 brightness/image016.jpg 1 read
 brightness/image016.jpg 2 read
-brightness/image017.jpg 0 not found
+brightness/image017.jpg 0 read
 brightness/image017.jpg 1 read
 brightness/image017.jpg 2 read
 brightness/image018.jpg 0 read
@@ -288,7 +288,7 @@ close/image037.jpg 0 read
 close/image038.jpg 0 read
 close/image039.jpg 0 read
 close/image040.jpg 0 read
-curved/image001.png 0 found
+curved/image001.png 0 read
 curved/image002.png 0 read
 curved/image003.png 0 read
 curved/image004.png 0 read
@@ -306,7 +306,7 @@ curved/image015.jpg 0 read
 curved/image015.jpg 1 read
 curved/image016.jpg 0 read
 curved/image016.jpg 1 read
-curved/image017.jpg 0 read
+curved/image017.jpg 0 found
 curved/image017.jpg 1 read
 curved/image018.jpg 0 read
 curved/image018.jpg 1 read
@@ -320,10 +320,10 @@ curved/image022.jpg 0 read
 curved/image022.jpg 1 read
 curved/image023.jpg 0 found
 curved/image023.jpg 1 read
-curved/image024.jpg 0 read
+curved/image024.jpg 0 found
 curved/image024.jpg 1 read
 curved/image025.jpg 0 read
-curved/image026.jpg 0 found
+curved/image026.jpg 0 read
 curved/image027.jpg 0 read
 curved/image028.jpg 0 read
 curved/image029.jpg 0 read
@@ -333,7 +333,7 @@ curved/image032.jpg 0 read
 curved/image033.jpg 0 read
 curved/image034.jpg 0 read
 curved/image035.jpg 0 read
-curved/image036.jpg 0 found
+curved/image036.jpg 0 read
 curved/image037.jpg 0 read
 curved/image038.jpg 0 read
 curved/image039.jpg 0 read
@@ -374,7 +374,7 @@ damaged/image017.jpg 0 found
 damaged/image018.jpg 0 read
 damaged/image019.jpg 0 read
 damaged/image020.jpg 0 read
-damaged/image021.jpg 0 found
+damaged/image021.jpg 0 read
 damaged/image022.jpg 0 found
 damaged/image023.jpg 0 found
 damaged/image024.jpg 0 found

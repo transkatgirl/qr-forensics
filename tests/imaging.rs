@@ -4,6 +4,7 @@
 mod common;
 
 use common::*;
+use qr_forensics::decode::bch::{format_word_for, format_words};
 use qr_forensics::decode::codewords::Pins;
 use qr_forensics::decode::pipeline::{BlockOutcome, DecodeOptions, SolveMethod, analyze, decode};
 use qr_forensics::imaging::Luma;
@@ -1034,6 +1035,194 @@ fn a_finder_with_a_torn_corner_still_anchors() {
     }
 }
 
+/// Photograph `grid` through `to_grid`, which says for a pixel of the
+/// photo where on the symbol it looks, in modules, or nowhere at all.
+fn render_through(grid: &ModuleGrid, size: (usize, usize), to_grid: impl Fn(f64, f64) -> Option<[f64; 2]>) -> Luma {
+    let (gw, gh) = (grid.width() as f64, grid.height() as f64);
+    let mut data = Vec::with_capacity(size.0 * size.1);
+    for py in 0..size.1 {
+        for px in 0..size.0 {
+            let mut sum = 0.0;
+            for sy in 0..3 {
+                for sx in 0..3 {
+                    let at = to_grid(px as f64 + (sx as f64 + 0.5) / 3.0, py as f64 + (sy as f64 + 0.5) / 3.0);
+                    let inside = at.filter(|[mx, my]| *mx >= 0.0 && *my >= 0.0 && *mx < gw && *my < gh);
+                    sum += match inside.map(|[mx, my]| grid.get(mx as usize, my as usize)) {
+                        Some(Module::Dark) => 0.08f32,
+                        Some(Module::Unknown) => 0.5,
+                        _ => 0.92,
+                    };
+                }
+            }
+            data.push(sum / 9.0);
+        }
+    }
+    Luma::new(size.0, size.1, data)
+}
+
+/// A symbol `modules` across on a bottle standing upright, seen square on
+/// from far off: its middle column faces the camera at `centre`, a module
+/// there is `module_px` wide and tall, and the bottle's radius is `radius`
+/// times the symbol's width. The columns crowd together towards the
+/// symbol's sides, and the rows stay as they were.
+#[derive(Clone, Copy)]
+struct Bottle {
+    centre: [f64; 2],
+    module_px: f64,
+    modules: f64,
+    radius: f64,
+}
+
+impl Bottle {
+    fn radius_px(&self) -> f64 {
+        self.radius * self.modules * self.module_px
+    }
+
+    /// Where the point `at` of the symbol, in modules, shows in the photo.
+    fn position(&self, at: [f64; 2]) -> [f64; 2] {
+        let r = self.radius_px();
+        let arc = (at[0] - self.modules / 2.0) * self.module_px;
+        [self.centre[0] + r * (arc / r).sin(), self.centre[1] + (at[1] - self.modules / 2.0) * self.module_px]
+    }
+
+    fn render(&self, grid: &ModuleGrid, size: (usize, usize)) -> Luma {
+        let r = self.radius_px();
+        render_through(grid, size, |x, y| {
+            let across = (x - self.centre[0]) / r;
+            (across.abs() < 1.0).then(|| [self.modules / 2.0 + r * across.asin() / self.module_px, self.modules / 2.0 + (y - self.centre[1]) / self.module_px])
+        })
+    }
+
+    fn corners(&self) -> [[f64; 2]; 4] {
+        let n = self.modules;
+        [[0.0, 0.0], [n, 0.0], [n, n], [0.0, n]].map(|at| self.position(at))
+    }
+}
+
+#[test]
+fn alignment_patterns_are_followed_round_a_bottle() {
+    // On a bottle no plane lies within a module of the alignment
+    // patterns away from the finders, and a pattern was doubted for
+    // lying off the plane through the others: of a version 10 symbol's
+    // six, those furthest round the bottle were found and dropped, or
+    // never looked for where they lay. Each is looked for now where its
+    // neighbours in the grid carry it to, as BoofCV carries each
+    // pattern's offset on to the next, and stands when its template
+    // reads whole and its neighbours bear it out.
+    let params = SampleParams::default();
+    for (version, ec, alignments) in [(SymbolVersion::Qr(10), EcLevel::M, 6)] {
+        let grid = symbol(version, ec);
+        let bottle = Bottle { centre: [330.3, 300.2], module_px: 8.0, modules: grid.width() as f64, radius: 0.6 };
+        let image = bottle.render(&grid, (660, 600));
+        let region = loosen(bottle.corners(), 1.1, [5.0, -4.0]);
+        let read = read_outline(&image, version, region, &params, &DecodeOptions::default()).unwrap_or_else(|| panic!("{version}: not read"));
+        assert!(read.report.is_trustworthy(), "{version}: {} of {} blocks", read.report.blocks_verified(), read.report.blocks.len());
+        let found = &read.detection;
+        assert_eq!(found.version, version);
+        let patterns: Vec<_> = found.anchors.iter().filter(|a| a.kind == AnchorKind::Alignment).collect();
+        assert_eq!(patterns.len(), alignments, "{version}: {patterns:?}");
+        for pattern in patterns {
+            let truth = bottle.position(pattern.at);
+            assert!(!pattern.inferred, "{version}: the pattern at {:?} was not found", pattern.at);
+            assert!(distance(pattern.center, truth) < 0.3 * bottle.module_px, "{version}: the pattern at {:?} stands {:.2} px off", pattern.at, distance(pattern.center, truth));
+        }
+    }
+}
+
+#[test]
+fn the_straight_side_of_a_symbol_on_a_bottle_is_held_by_its_edge() {
+    // The sides of a symbol on an upright bottle are straight, and a
+    // straight edge gave the map no points: between the alignment
+    // patterns nearest a side and the two corners at its ends the map
+    // was the spline's guess, and the columns beside the side came out
+    // most of a module wide of it. Points along every traced edge hold
+    // the map now, across the edge and not along it.
+    let params = SampleParams::default();
+    let (version, ec) = (SymbolVersion::Qr(7), EcLevel::M);
+    let grid = symbol(version, ec);
+    let n = grid.width();
+    let bottle = Bottle { centre: [300.3, 280.2], module_px: 8.0, modules: n as f64, radius: 0.7 };
+    let image = bottle.render(&grid, (600, 560));
+    let region = loosen(bottle.corners(), 1.1, [5.0, -4.0]);
+    let read = read_outline(&image, version, region, &params, &DecodeOptions::default()).expect("not read");
+    assert!(read.report.is_trustworthy());
+    let found = &read.detection;
+    // The straight sides have points along them, as a bowed edge has.
+    let on_side = |a: &&qr_forensics::imaging::detect::Anchor| a.kind == AnchorKind::Edge && (a.at[0] == 0.0 || a.at[0] == n as f64);
+    assert!(found.anchors.iter().filter(on_side).count() >= 2, "{:?}", found.anchors.iter().filter(on_side).collect::<Vec<_>>());
+    // With them the map lies nearer the bottle at its worst than
+    // without them.
+    let worst = |map: &Projection| {
+        use qr_forensics::imaging::projection::Project;
+        let mut worst: f64 = 0.0;
+        for y in 0..n {
+            for x in 0..n {
+                let at = [x as f64 + 0.5, y as f64 + 0.5];
+                // In the modules of the place itself, which towards the
+                // sides are narrower than they are tall.
+                let (truth, right) = (bottle.position(at), bottle.position([at[0] + 1.0, at[1]]));
+                let put = map.apply(at[0], at[1]);
+                worst = worst.max(((put[0] - truth[0]) / (right[0] - truth[0])).abs().max((put[1] - truth[1]).abs() / bottle.module_px));
+            }
+        }
+        worst
+    };
+    let without: Vec<ControlPoint> = found.anchors.iter().filter(|a| !on_side(a)).map(|a| a.control_point()).collect();
+    let (held, loose) = (worst(&found.projection().unwrap()), worst(&Projection::new(n, n, found.corners, &without).unwrap()));
+    assert!(held < loose, "{held:.2} modules off the bottle at worst with the points, {loose:.2} without");
+}
+
+#[test]
+fn a_flat_symbol_is_given_no_points_along_its_edges() {
+    // On flat paper the corners already say where the edges run, and
+    // points traced along them would add only what each is out by: a
+    // straight edge gives points where the anchors inside the symbol
+    // bend the map at it, and here they bend it nowhere.
+    let params = SampleParams::default();
+    for (version, ec) in [(SymbolVersion::Qr(2), EcLevel::M), (SymbolVersion::Qr(7), EcLevel::M)] {
+        let grid = symbol(version, ec);
+        let image = render(&grid, QUAD, (760, 640), |_, _, v| v);
+        let found = detect_outline(&image, version, loosen(QUAD, 1.1, [5.0, -4.0]), &params).unwrap();
+        assert_eq!(found.count(AnchorKind::Edge), 0, "{version}: {:?}", found.anchors.iter().filter(|a| a.kind == AnchorKind::Edge).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn a_corner_past_a_crease_is_not_traced_a_row_inside_the_symbol() {
+    // Paper folded down a column and turned away beyond it: the modules
+    // past the fold are four fifths as wide. The plane through the
+    // finders runs the bottom edge to a far corner more than a module
+    // inside the symbol, and the profiles traced from there found the
+    // edge near the finder and, towards the corner, the boundary between
+    // the border row and the row within; a line fitted the lot, the
+    // corner came out a module short, and stood as measured. A line is
+    // taken for the edge now only with paper beyond it, and the edges
+    // are traced from more places than where the plane puts the corner.
+    let params = SampleParams::default();
+    let (version, ec) = (SymbolVersion::Qr(1), EcLevel::M);
+    let grid = symbol(version, ec);
+    let (n, module_px, origin, fold, squeeze) = (grid.width() as f64, 8.0, [56.3, 56.2], 10.5, 0.8);
+    let position = |at: [f64; 2]| {
+        let across = if at[0] > fold { fold + (at[0] - fold) * squeeze } else { at[0] };
+        [origin[0] + across * module_px, origin[1] + at[1] * module_px]
+    };
+    let image = render_through(&grid, (290, 290), |x, y| {
+        let across = (x - origin[0]) / module_px;
+        Some([if across > fold { fold + (across - fold) / squeeze } else { across }, (y - origin[1]) / module_px])
+    });
+    let corners = [[0.0, 0.0], [n, 0.0], [n, n], [0.0, n]].map(position);
+    let region = loosen(corners, 1.15, [3.0, -2.0]);
+    let found = detect_outline(&image, version, region, &params).expect("nothing found");
+    assert_eq!(found.version, version);
+    for (i, corner) in corners.iter().enumerate() {
+        let off = distance(found.corners[i], *corner) / module_px;
+        assert!(off < 0.35, "corner {i} is {off:.2} modules off: {:?} for {corner:?}", found.corners[i]);
+    }
+    assert!(found.edged_corners.contains(&2), "the far corner was not traced along the edges: {:?}", found.edged_corners);
+    let read = read_outline(&image, version, region, &params, &DecodeOptions::default()).expect("not read");
+    assert!(read.report.is_trustworthy());
+}
+
 #[test]
 fn loose_corners_are_traced_along_the_edge_or_settled_without_a_quiet_zone() {
     let params = SampleParams::default();
@@ -1247,6 +1436,101 @@ fn defocus(image: &Luma, sigma: f64) -> Luma {
             .collect()
     };
     Luma::new(image.width, image.height, pass(&pass(&image.data, true), false))
+}
+
+#[test]
+fn a_symbol_set_within_another_is_found_with_it() {
+    // A version 1 symbol on a patch of white ten modules square in the
+    // data of a version 7, where a logo might be printed: a third the
+    // outer symbol's module, clear of its alignment patterns. Everything
+    // on a symbol found was once the symbol's own, and the inner one,
+    // which read through an outline, was never offered. Rendered pixel
+    // for pixel, where the outer symbol is read off the pixels, and
+    // turned a little, where it is searched for like any photo.
+    let (outer, inner) = (symbol(SymbolVersion::Qr(7), EcLevel::H), symbol(SymbolVersion::Qr(1), EcLevel::M));
+    let params = SampleParams::default();
+    for degrees in [0.0, 7.0] {
+        let outer_quad = turned_quad([350.0, 350.0], 45.0 * 12.0, degrees);
+        let place = Homography::rect_to_quad(45.0, 45.0, outer_quad).unwrap();
+        let inner_quad = [[26.5, 26.5], [33.5, 26.5], [33.5, 33.5], [26.5, 33.5]].map(|[x, y]| place.apply(x, y));
+        let (to_outer, to_inner) = (place.inverse().unwrap(), Homography::rect_to_quad(21.0, 21.0, inner_quad).unwrap().inverse().unwrap());
+        let image = render(&outer, outer_quad, (700, 700), |x, y, value| {
+            let [ox, oy] = to_outer.apply(x, y);
+            if !(25.0..35.0).contains(&ox) || !(25.0..35.0).contains(&oy) {
+                return value;
+            }
+            let [ix, iy] = to_inner.apply(x, y);
+            let dark = ix >= 0.0 && iy >= 0.0 && ix < 21.0 && iy < 21.0 && inner.get(ix as usize, iy as usize) == Module::Dark;
+            if dark { 0.08 } else { 0.92 }
+        });
+        let found = find_symbols(&image, Family::Qr, &params);
+        let mut versions: Vec<SymbolVersion> = found.iter().map(|d| d.version).collect();
+        versions.sort_by_key(|v| v.width());
+        assert_eq!(versions, [SymbolVersion::Qr(1), SymbolVersion::Qr(7)], "{degrees}°: {found:?}");
+        for (version, quad, module_px) in [(SymbolVersion::Qr(7), outer_quad, 12.0), (SymbolVersion::Qr(1), inner_quad, 4.0)] {
+            let of = found.iter().find(|d| d.version == version).unwrap();
+            let error = corner_error(of.corners, quad) / module_px;
+            assert!(error < 0.75, "{degrees}°: {version} corners {error:.2} modules off");
+        }
+        let within = found.iter().find(|d| d.version == SymbolVersion::Qr(1)).unwrap();
+        assert_eq!(read_through(&image, within, &inner, &params), inner, "{degrees}°");
+    }
+}
+
+#[test]
+fn a_symbol_seen_from_over_one_finder_is_found() {
+    // A symbol seen from over its top-left finder, the corner opposite
+    // drawn in towards the middle: the near finder is more than twice
+    // the size of the other two in the photo's pixels, and three so
+    // unlike once proposed nothing between them.
+    let params = SampleParams::default();
+    for version in [SymbolVersion::Qr(1), SymbolVersion::Qr(5)] {
+        let grid = symbol(version, EcLevel::M);
+        let side = version.width() as f64 * 8.0;
+        let (near, far) = (48.0, 48.0 + side);
+        let quad = [[near, near], [far, near + 0.07 * side], [near + 0.685 * side, near + 0.685 * side], [near + 0.07 * side, far]];
+        let size = (side + 96.0) as usize;
+        let image = defocus(&render(&grid, quad, (size, size), |_, _, v| v), 0.8);
+        let found = find_symbols(&image, Family::Qr, &params);
+        assert_eq!(found.iter().map(|d| d.version).collect::<Vec<_>>(), [version], "{found:?}");
+        let error = corner_error(found[0].corners, quad);
+        assert!(error < 4.0, "{version}: corners {error:.1} px off");
+        assert_eq!(read_through(&image, &found[0], &grid, &params), grid, "{version}");
+    }
+}
+
+#[test]
+fn two_finders_that_face_each_other_propose_with_no_timing_pattern_between_them() {
+    // A version 2 symbol with its bottom-left finder torn off and the
+    // timing pattern between the two that are left rubbed out. Two
+    // finders along a side proposed an outline only where a timing
+    // pattern read between them, so these proposed nothing in the photo
+    // as it is, and the symbol was found some rungs up the ladder or
+    // not at all; they face each other as the finders along a side do,
+    // and the fit of the outline between them, by the alignment pattern
+    // and the format word, finds the symbol.
+    let (version, ec) = (SymbolVersion::Qr(2), EcLevel::M);
+    let mut grid = symbol(version, ec);
+    for y in 17..25 {
+        for x in 0..8 {
+            grid.set(x, y, Module::Light);
+        }
+    }
+    for x in 8..17 {
+        grid.set(x, 6, Module::Light);
+    }
+    let params = SampleParams::default();
+    for degrees in [5.0, 40.0] {
+        let quad = turned_quad([300.0, 260.0], 25.0 * 10.0, degrees);
+        let image = render(&grid, quad, (600, 520), |_, _, v| v);
+        let found = find_symbols(&image, Family::Qr, &params);
+        assert_eq!(found.iter().map(|d| d.version).collect::<Vec<_>>(), [version], "{degrees}°: {found:?}");
+        assert_eq!(found[0].count(AnchorKind::Finder), 2, "{degrees}°: {:?}", found[0].anchors);
+        // In the photo as it is, with no rung of the ladder climbed.
+        assert_eq!(found[0].retry, None, "{degrees}°");
+        let error = corner_error(found[0].corners, quad) / 10.0;
+        assert!(error < 1.0, "{degrees}°: corners {error:.2} modules off");
+    }
 }
 
 /// How many modules of `read` differ from `truth`'s, unknown ones
@@ -1740,6 +2024,40 @@ fn a_mirrored_symbol_reads_with_its_format_word_damaged() {
 /// the mirrored symbol unread while the format bits alone were asked
 /// which way round it lay.
 const MIRROR_FLIPS: &[&[usize]] = &[&[0, 10], &[2, 9], &[3, 4], &[12, 14], &[0, 2, 3], &[1, 6, 10]];
+
+#[test]
+fn a_format_word_misread_as_another_reads_by_its_blocks() {
+    // Four bits of the format word misread, the same in both copies,
+    // and all four among the seven in which it differs from one other
+    // word: what the photo shows lies three bits from that word, which
+    // the code corrects, and the bits settle its level and mask beyond
+    // doubt. Under them no block solves. The symbol's own word is the
+    // nearest of the rest, and the blocks bear it out.
+    let (version, ec) = (SymbolVersion::Qr(3), EcLevel::M);
+    let layout = layout(version, ec);
+    let clean = symbol(version, ec);
+    let text = decode_plain(&clean, &layout, 0).text.plain();
+    let own = format_word_for(version, ec, 0).unwrap();
+    let (other, word) = format_words(version).into_iter().find(|&(_, word)| (own ^ word).count_ones() == 7).unwrap();
+    let mut grid = clean.clone();
+    for copy in &layout.func.format {
+        for b in (0..15).filter(|b| (own ^ word) >> b & 1 != 0).take(4) {
+            let (x, y) = (copy.bits[b].x as usize, copy.bits[b].y as usize);
+            grid.set(x, y, grid.get(x, y).inverted());
+        }
+    }
+    let format = analyze(&grid, &layout.func).format;
+    assert!(format.is_reliable());
+    assert_eq!(format.best().map(|best| best.fields), Some(other));
+    assert_ne!((other.ec, other.mask), (ec, 0));
+
+    let quad = detection_quad(version);
+    let photo = render(&grid, quad, (760, 640), |_, _, v| v);
+    let read = decode_photo(&photo, Family::Qr, loosen(quad, 1.1, [-5.0, 4.0]), &SampleParams::default()).expect("found");
+    assert!(read.report.is_trustworthy(), "{:?}", read.report.score);
+    assert_eq!((read.report.ec, read.report.mask), (ec, 0));
+    assert_eq!(read.text(), text);
+}
 
 #[test]
 fn the_finder_of_a_symbol_already_found_proposes_nothing() {

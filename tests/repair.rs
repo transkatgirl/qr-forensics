@@ -10,12 +10,14 @@ use qr_forensics::symbol::grid::{Module, ModuleGrid};
 use qr_forensics::symbol::{EcLevel, SymbolVersion};
 use qrcode_generator::Segment;
 
-/// Erase and corrupt within capacity in every block, wipe one copy of the
-/// format information (or, where there is only one, flip three of its
-/// bits), and scribble on the fixed patterns.
+/// Erase and corrupt within capacity in every block, with the three
+/// codewords to spare that verify a block some of whose codewords were
+/// filled in, wipe one copy of the format information (or, where there
+/// is only one, flip three of its bits), and scribble on the fixed
+/// patterns.
 fn damage(grid: &mut ModuleGrid, layout: &qr_forensics::symbol::layout::SymbolLayout, rng: &mut Rng) {
     for block in &layout.blocks {
-        let budget = block.ec_len - 1;
+        let budget = block.ec_len - 3;
         let erasures = rng.below(budget / 2 + 1);
         let errors = (budget - erasures) / 2;
         for (n, &i) in rng.distinct(erasures + errors, block.codewords.len()).iter().enumerate() {

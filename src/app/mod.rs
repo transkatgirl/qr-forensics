@@ -1581,7 +1581,21 @@ impl App {
             found.anchors.retain(|a| a.kind != AnchorKind::Alignment);
         }
         let pins_ec = (!read.pins.is_empty()).then_some(read.report.ec);
-        self.doc = Document { grid: read.grid, pins: read.pins, pins_ec, ..self.doc.blank_like(version) };
+        // A read made under another level and mask than the format bits
+        // settle, the blocks having borne out a word next nearest them,
+        // keeps that level and mask: left to its bits, the grid would be
+        // decoded here under the word they spell, and not read.
+        let format = match read.analysis.format.best() {
+            Some(best)
+                if read.reinterpreted.is_none()
+                    && read.analysis.format.is_reliable()
+                    && (best.fields.ec, best.fields.mask) != (read.report.ec, read.report.mask) =>
+            {
+                FormatSel::Manual { ec: read.report.ec, mask: read.report.mask }
+            }
+            _ => FormatSel::Auto,
+        };
+        self.doc = Document { grid: read.grid, pins: read.pins, pins_ec, format, ..self.doc.blank_like(version) };
         self.view.selected = None;
         self.view.highlight_block = None;
         self.view.table_block = None;
@@ -1693,7 +1707,7 @@ impl App {
         }
         let edges = found.count(AnchorKind::Edge);
         if edges > 0 {
-            parts.push(plural(edges, "point along a bowed edge"));
+            parts.push(plural(edges, "edge point"));
         }
         let what = list_phrase(&parts);
         let polarity = if found.inverted { " with dark and light swapped" } else { "" };
@@ -1907,8 +1921,9 @@ impl App {
                             let at = symmetry.map_point(width, height, anchor.anchor.at);
                             anchor.anchor.at = at;
                             // A point traced along the edge is on the
-                            // edge wherever the turn takes it.
-                            let sited = anchor.anchor.kind == AnchorKind::Edge
+                            // edge wherever the turn takes it, and a
+                            // custom anchor on its module.
+                            let sited = matches!(anchor.anchor.kind, AnchorKind::Edge | AnchorKind::Custom)
                                 || sites.iter().any(|site| {
                                     site.kind == anchor.anchor.kind
                                         && (site.at[0] - at[0]).abs() < 1e-6
@@ -2916,7 +2931,8 @@ const CREDIBLE_SCORE: f64 = 0.75;
 /// or rMQR symbol of its own, so QR Code is searched first, and the
 /// finders of each credible QR Code found are withheld from the searches
 /// after it. For what gets by all the same, a detection whose centre lies
-/// inside a larger, credible one is dropped as a part of it; and two
+/// inside a larger, credible one is dropped as a part of it, unless it
+/// decodes as found, as a symbol set within another does; and two
 /// detections of about the same size and place are the same symbol,
 /// listed once under the better claim.
 ///
@@ -3043,9 +3059,13 @@ fn merge_detections(mut all: Vec<Detection>) -> Vec<Detection> {
 }
 
 /// Whether `small` is a part of `big`: its centre lies inside `big`'s
-/// outline, which is larger and credible.
+/// outline, which is larger and credible, and it does not decode as
+/// found. One that does is a symbol set within another, where a logo
+/// might be, and no part of it: a finder pattern and the data beside it
+/// fit as a symbol often enough, and do not decode as one.
 fn part_of(small: &Detection, big: &Detection) -> bool {
     credible(big)
+        && small.decodes != Some(true)
         && quad_area(&big.corners) > quad_area(&small.corners)
         && quad_contains(&big.corners, quad_centre(&small.corners))
 }
@@ -3219,7 +3239,14 @@ mod tests {
         let poor = claim(SymbolVersion::Qr(2), square(0.0, 0.0, 250.0), (70, 100), true);
         let part = claim(SymbolVersion::Micro(3), square(0.0, 0.0, 110.0), (94, 100), false);
         assert!(!part_of(&part, &Detection { decodes: Some(false), ..poor.clone() }));
-        assert_eq!(merge_detections(vec![part, poor]).len(), 1);
+        assert_eq!(merge_detections(vec![part, poor.clone()]).len(), 1);
+        // A symbol set within another decodes, which no part of one
+        // does, and is listed with it whichever comes first.
+        let within = claim(SymbolVersion::Qr(1), square(100.0, 100.0, 40.0), (99, 100), true);
+        assert!(!part_of(&within, &poor));
+        for found in [vec![within.clone(), poor.clone()], vec![poor, within]] {
+            assert_eq!(merge_detections(found).len(), 2);
+        }
     }
 
     #[test]
@@ -4087,6 +4114,146 @@ mod tests {
     }
 
     #[test]
+    fn a_point_of_the_photo_is_found_on_the_grid_drawn_there() {
+        let mut bench = Bench::new();
+        // An outline out of square, and an anchor that bends the grid in
+        // it: the grid is asked where it was drawn.
+        bench.app.doc.corners = [[40.0, 40.0], [290.0, 50.0], [280.0, 290.0], [45.0, 285.0]];
+        bench.app.doc.set_anchor(anchor(AnchorKind::Custom, [12.5, 12.5], [175.0, 163.0]), AnchorSource::Manual);
+        bench.step();
+        let model = bench.app.model.as_ref().expect("the outline is usable");
+        let apart = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]);
+        assert!(apart(model.projection.apply(12.5, 12.5), [175.0, 163.0]) < 2.0, "the grid is not bent through the anchor");
+        for at in [[0.5, 0.5], [12.25, 3.75], [12.5, 12.5], [7.0, 19.0], [24.9, 24.9]] {
+            let px = model.projection.apply(at[0], at[1]);
+            let found = model.module_at(px).expect("the point is on the grid");
+            assert!(apart(found, at) < 0.02, "{at:?} was found at {found:?}");
+        }
+        // Off the grid there is nothing to find.
+        assert_eq!(model.module_at([10.0, 10.0]), None);
+        assert_eq!(model.module_at([300.0, 160.0]), None);
+    }
+
+    #[test]
+    fn the_grid_is_taken_hold_of_where_it_has_no_pattern() {
+        let mut bench = Bench::new();
+        bench.app.doc.corners = STRAIGHT;
+        bench.step();
+        // The view a little closer than it fits the photo at, so that a
+        // module is wider than the handle on it.
+        bench.app.view.align_view.auto_fit = false;
+        bench.app.view.align_view.scale = 2.5;
+        bench.step();
+        let locate = bench.locate();
+        let scale = f64::from(bench.app.view.align_view.scale);
+        let apart = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]);
+        // A drag of thirty points across and eighteen up from a place of
+        // the photo: how far that is in the photo.
+        let dragged = [30.0 / scale, -18.0 / scale];
+        let drag = |bench: &mut Bench, from: [f64; 2]| {
+            let mut pointer = locate(from);
+            bench.frame(vec![egui::Event::PointerMoved(pointer)]);
+            bench.step();
+            bench.button(pointer, egui::PointerButton::Primary, true);
+            for _ in 0..6 {
+                pointer += egui::vec2(5.0, -3.0);
+                bench.frame(vec![egui::Event::PointerMoved(pointer)]);
+            }
+            bench.button(pointer, egui::PointerButton::Primary, false);
+            bench.step();
+        };
+        // The pointer taken off the grid, since a handle under it is
+        // drawn larger.
+        let aside = |bench: &mut Bench| {
+            bench.frame(vec![egui::Event::PointerMoved(locate([140.0, 34.0]))]);
+            bench.step();
+        };
+        // In the symbol's data, clear of every handle: the grid lies ten
+        // pixels a module from (40, 40), so this is a point of the
+        // module twelve across and fourteen down, towards its corner.
+        // The anchor is set on the middle of that module, and goes as
+        // far from where the grid had the middle as the pointer went.
+        let (middle, start) = ([165.0, 185.0], [163.0, 187.0]);
+        drag(&mut bench, start);
+        let anchors = bench.app.doc.anchors.clone();
+        assert_eq!(anchors.len(), 1, "{anchors:?}");
+        let custom = anchors[0];
+        assert_eq!((custom.anchor.kind, custom.anchor.at, custom.source), (AnchorKind::Custom, [12.5, 14.5], AnchorSource::Manual));
+        let end = [middle[0] + dragged[0], middle[1] + dragged[1]];
+        assert!(apart(custom.anchor.center, end) < 1e-3, "it went to {:?}, not {end:?}", custom.anchor.center);
+        assert_eq!(bench.app.view.grasped, None, "the drag is over");
+        // The grid goes with it there, most of the way: the map may
+        // miss an anchor a little to save bending.
+        let model = bench.app.model.as_ref().expect("the outline is usable");
+        let bent = model.projection.apply(12.5, 14.5);
+        assert!(apart(bent, end) < 0.3 * apart(middle, end), "the grid went from {middle:?} to {bent:?}, the anchor to {end:?}");
+        // It has a handle of its own, drawn where it is, by which it is
+        // moved again: the same anchor, and no second one beside it.
+        aside(&mut bench);
+        let handles = bench.handles(4.0);
+        assert_eq!(handles.len(), 1, "{handles:?}");
+        assert!((handles[0] - locate(custom.anchor.center)).length() < 1.0);
+        drag(&mut bench, custom.anchor.center);
+        let anchors = bench.app.doc.anchors.clone();
+        assert_eq!(anchors.len(), 1, "{anchors:?}");
+        assert_eq!((anchors[0].anchor.kind, anchors[0].anchor.at), (AnchorKind::Custom, [12.5, 14.5]));
+        let moved = [anchors[0].anchor.center[0] - custom.anchor.center[0], anchors[0].anchor.center[1] - custom.anchor.center[1]];
+        assert!(moved[0] > dragged[0] / 2.0 && moved[1] < dragged[1] / 2.0, "the handle took it {moved:?}");
+        // So it is by another drag begun on its module, clear of its
+        // handle: the anchor the module has is the one moved, from
+        // where it stands.
+        let stood = anchors[0].anchor.center;
+        bench.app.doc.set_anchor(Anchor { center: [165.0, 185.0], ..anchors[0].anchor }, AnchorSource::Manual);
+        bench.step();
+        assert!(4.8 * scale > 9.5, "a module is no wider than the handle on it");
+        drag(&mut bench, [169.8, 189.8]);
+        let anchors = bench.app.doc.anchors.clone();
+        assert_eq!(anchors.len(), 1, "{anchors:?}");
+        assert!(apart(anchors[0].anchor.center, end) < 1e-3, "{:?} for {end:?}", anchors[0].anchor.center);
+        // Each drag is a step to be undone.
+        bench.act(Action::Undo);
+        assert_eq!(bench.app.doc.anchors[0].anchor.center, [165.0, 185.0]);
+        bench.app.doc.set_anchor(Anchor { center: stood, ..anchors[0].anchor }, AnchorSource::Manual);
+        bench.act(Action::Undo);
+        assert_eq!(bench.app.doc.anchors, [custom]);
+        bench.act(Action::Undo);
+        assert!(bench.app.doc.anchors.is_empty());
+        // A right-click on its handle drops it.
+        drag(&mut bench, start);
+        aside(&mut bench);
+        let handles = bench.handles(4.0);
+        assert_eq!(handles.len(), 1, "{handles:?}");
+        bench.click(handles[0], egui::PointerButton::Secondary);
+        assert!(bench.app.doc.anchors.is_empty());
+        // A module a pattern is centred on is that pattern's site: taken
+        // hold of clear of its handle, it is the pattern's anchor that
+        // is set.
+        let timing = anchor_sites(&bench.app.derived.func).into_iter().find(|site| site.kind == AnchorKind::Timing).expect("a timing site").at;
+        drag(&mut bench, [40.0 + 10.0 * timing[0] + 4.8, 40.0 + 10.0 * timing[1] + 4.8]);
+        let anchors = bench.app.doc.anchors.clone();
+        assert_eq!(anchors.len(), 1, "{anchors:?}");
+        assert_eq!((anchors[0].anchor.kind, anchors[0].anchor.at, anchors[0].source), (AnchorKind::Timing, timing, AnchorSource::Manual));
+        bench.act(Action::ClearAnchors);
+        // In the module at a corner the map yields to the corner, and no
+        // anchor is set; nor off the grid, nor with the grid held flat.
+        drag(&mut bench, [48.0, 48.0]);
+        assert_eq!(bench.app.doc.corners, STRAIGHT, "the press was on the corner's handle");
+        drag(&mut bench, [140.0, 34.0]);
+        bench.app.view.use_anchors = false;
+        drag(&mut bench, start);
+        assert!(bench.app.doc.anchors.is_empty(), "{:?}", bench.app.doc.anchors);
+        // With Space held the drag moves the view.
+        bench.app.view.use_anchors = true;
+        let before = bench.app.view.align_view.center;
+        let space = |pressed| egui::Event::Key { key: egui::Key::Space, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE };
+        bench.frame(vec![space(true)]);
+        drag(&mut bench, start);
+        bench.frame(vec![space(false)]);
+        assert!(bench.app.doc.anchors.is_empty(), "{:?}", bench.app.doc.anchors);
+        assert_ne!(bench.app.view.align_view.center, before);
+    }
+
+    #[test]
     fn a_handle_inside_a_symbol_found_takes_its_own_clicks() {
         let mut bench = Bench::new();
         bench.app.doc.corners = STRAIGHT;
@@ -4385,6 +4552,10 @@ mod tests {
         let timing_px = projection.apply(timing[0], timing[1]);
         bench.app.doc.set_anchor(finder_anchor(finder_px), AnchorSource::Detected);
         bench.app.doc.set_anchor(anchor(AnchorKind::Timing, timing, timing_px), AnchorSource::Detected);
+        // And one set by hand on a module of the data, where no pattern
+        // is.
+        let custom = anchor(AnchorKind::Custom, [12.5, 14.5], projection.apply(12.5, 14.5));
+        bench.app.doc.set_anchor(custom, AnchorSource::Manual);
         // The transform the Paint section offers turns the grid, and the
         // outline and the anchors with it.
         bench.act(Action::Transform(Transform::Symmetry(turned.symmetry)));
@@ -4394,9 +4565,16 @@ mod tests {
         assert_eq!(bench.app.doc.corners, STRAIGHT);
         // The finder pattern's anchor went with its pattern to the corner
         // the turn took it to, where the version has a finder pattern;
-        // the timing module landed on no timing pattern, and went.
+        // the timing module landed on no timing pattern, and went; the
+        // custom anchor stands for the module it went to with the rest.
         let anchors: Vec<Anchor> = bench.app.doc.anchors.iter().map(|a| a.anchor).collect();
-        assert_eq!(anchors, [Anchor { at: turned.symmetry.map_point(25, 25, [3.5, 3.5]), ..finder_anchor(finder_px) }]);
+        assert_eq!(
+            anchors,
+            [
+                Anchor { at: turned.symmetry.map_point(25, 25, [3.5, 3.5]), ..finder_anchor(finder_px) },
+                Anchor { at: turned.symmetry.map_point(25, 25, [12.5, 14.5]), ..custom },
+            ]
+        );
         assert!(bench.notice().text.contains("1 anchor was removed"), "{}", bench.notice().text);
         // What is sampled next is the photo of these modules.
         for y in 9..15 {

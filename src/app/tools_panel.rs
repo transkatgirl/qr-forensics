@@ -3,7 +3,7 @@
 use eframe::egui;
 use qr_forensics::imaging::adjust::{Adjust, Channel, Enlarge, Filter, LENS_MIN_PAIRS, MAX_ENLARGED_SIDE};
 use qr_forensics::imaging::binarize::BinarizeParams;
-use qr_forensics::imaging::detect::anchor_sites;
+use qr_forensics::imaging::detect::{AnchorKind, anchor_sites};
 use qr_forensics::imaging::sample::Kernel;
 use qr_forensics::symbol::function_map::looks_inverted;
 use qr_forensics::symbol::grid::Module;
@@ -363,7 +363,8 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
     );
     ui.weak(
         "Anchors pin the fixed patterns to the photo, and the grid bends through them. Drag a hollow handle onto \
-         its pattern to set one; right-click a handle to remove it.",
+         its pattern to set one, or drag any other module of the grid to set a custom anchor on its middle; \
+         right-click a handle to remove it.",
     );
     if let Some(preview) = &app.preview {
         let (matching, known) = preview.fixed;
@@ -390,15 +391,22 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
     }
     {
         let sites = anchor_sites(&app.derived.func).len();
+        // Custom anchors stand on no site, and are counted apart.
+        let custom = app.doc.anchors.iter().filter(|a| a.anchor.kind == AnchorKind::Custom).count();
+        let sited = app.doc.anchors.len() - custom;
         let detected = app.doc.anchors.iter().filter(|a| a.source == AnchorSource::Detected).count();
-        let manual = app.doc.anchors.len() - detected;
+        let manual = sited - detected;
         let partial = app.doc.anchors.iter().filter(|a| a.anchor.partial).count();
-        let mut text = format!("Anchors: {} of {sites} sites set ({detected} found, {manual} by hand)", app.doc.anchors.len());
+        let mut text = format!("Anchors: {sited} of {sites} sites set ({detected} found, {manual} by hand)");
         if partial > 0 {
             text.push_str(&format!(", {partial} partly damaged"));
         }
+        if custom > 0 {
+            text.push_str(&format!(", and {custom} custom"));
+        }
         ui.label(text).on_hover_text(
-            "A site is a finder pattern, an alignment pattern, the rMQR sub-pattern or a module of a timing pattern",
+            "A site is a finder pattern, an alignment pattern, the rMQR sub-pattern or a module of a timing pattern; a \
+             custom anchor is one set by hand on any other module",
         );
         ui.horizontal(|ui| {
             ui.checkbox(&mut app.view.use_anchors, "Bend the grid through the anchors")
@@ -408,7 +416,8 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
             ui.checkbox(&mut app.view.show_anchors, "Show anchor handles").on_hover_text(
                 "A handle on every fixed pattern and three along each edge. Drag one to where its pattern or edge \
                  really lies and the grid bends through it. Edge handles suit a symbol on a bottle or curled paper, \
-                 whose sides bow.",
+                 whose sides bow. Drag any other module of the grid to set a custom anchor on its middle and bend \
+                 the grid by it where it has no pattern.",
             );
             if ui.add_enabled(!app.doc.anchors.is_empty(), egui::Button::new("Clear anchors")).clicked() {
                 actions.push(Action::ClearAnchors);

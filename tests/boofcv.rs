@@ -40,7 +40,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use image::metadata::Orientation;
 use image::{ImageDecoder, ImageReader};
-use qr_forensics::imaging::adjust::Enlarge;
 
 type Quad = [[f64; 2]; 4];
 
@@ -103,23 +102,22 @@ fn marked(labels: &Path) -> Vec<Quad> {
 }
 
 /// A point marked in a photo as it is stored, `width` by `height`, in the
-/// pixels the reader prints: the photo turned upright as its EXIF
-/// orientation asks, and a small one enlarged as it is when loaded. The
-/// benchmark's marks are in the stored pixels, as BoofCV loads them.
+/// pixels the reader prints: the photo's own, turned upright as its EXIF
+/// orientation asks. A small photo is read enlarged, and its corners are
+/// printed in its own pixels all the same. The benchmark's marks are in
+/// the stored pixels, as BoofCV loads them.
 fn as_read(point: [f64; 2], orientation: Orientation, width: f64, height: f64) -> [f64; 2] {
     let [x, y] = point;
-    let (upright, across, down) = match orientation {
-        Orientation::NoTransforms => ([x, y], width, height),
-        Orientation::Rotate90 => ([height - y, x], height, width),
-        Orientation::Rotate180 => ([width - x, height - y], width, height),
-        Orientation::Rotate270 => ([y, width - x], height, width),
-        Orientation::FlipHorizontal => ([width - x, y], width, height),
-        Orientation::FlipVertical => ([x, height - y], width, height),
-        Orientation::Rotate90FlipH => ([y, x], height, width),
-        Orientation::Rotate270FlipH => ([height - y, width - x], height, width),
-    };
-    let enlarged = Enlarge::for_photo(across as u32, down as u32).factor();
-    [upright[0] * enlarged, upright[1] * enlarged]
+    match orientation {
+        Orientation::NoTransforms => [x, y],
+        Orientation::Rotate90 => [height - y, x],
+        Orientation::Rotate180 => [width - x, height - y],
+        Orientation::Rotate270 => [y, width - x],
+        Orientation::FlipHorizontal => [width - x, y],
+        Orientation::FlipVertical => [x, height - y],
+        Orientation::Rotate90FlipH => [y, x],
+        Orientation::Rotate270FlipH => [height - y, width - x],
+    }
 }
 
 /// The photographs of the sets asked for, in name order.
@@ -341,8 +339,9 @@ fn marks_are_carried_into_the_pixels_the_reader_prints() {
     assert_eq!(as_read([4032.0, 3024.0], Orientation::Rotate90, 4032.0, 3024.0), [0.0, 4032.0]);
     assert_eq!(as_read([10.0, 20.0], Orientation::NoTransforms, 4032.0, 3024.0), [10.0, 20.0]);
     assert_eq!(as_read([10.0, 20.0], Orientation::Rotate180, 400.0, 300.0), [390.0, 280.0]);
-    // A photo under 256 pixels on its shorter side is read enlarged.
-    assert_eq!(as_read([10.0, 20.0], Orientation::NoTransforms, 95.0, 126.0), [30.0, 60.0]);
+    // A photo under 256 pixels on its shorter side is read enlarged, and
+    // its corners are printed in its own pixels.
+    assert_eq!(as_read([10.0, 20.0], Orientation::NoTransforms, 95.0, 126.0), [10.0, 20.0]);
     // An outline lies on a mark it is drawn a little loose about, and
     // not on its neighbour on a sheet.
     let square = |x: f64, y: f64, side: f64| [[x, y], [x + side, y], [x + side, y + side], [x, y + side]];

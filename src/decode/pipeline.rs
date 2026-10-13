@@ -8,7 +8,7 @@ use super::bitstream::{self, Certainty, EndOfData, ParseReport, StreamBits};
 use super::codewords::{Pin, Pins, apply_pins, codeword_bit_mask, read_codewords};
 use super::padding::{self, TailCheck};
 use super::rs::{
-    CwRead, RsFailure, VERIFIED_BITS, rs_decode_chasing, rs_decode_doubting, rs_decode_reserving,
+    AIDED_VERIFIED_BITS, CwRead, RsFailure, VERIFIED_BITS, rs_decode_chasing, rs_decode_doubting, rs_decode_reserving,
     solve_bit_erasures, solve_bit_erasures_doubting,
 };
 use super::text::{self, Charset, TextReport};
@@ -89,6 +89,32 @@ impl BlockOutcome {
             BlockOutcome::Failed(_) => 0,
         }
     }
+
+    /// Confirming bits the solution must show to count as verified: a
+    /// byte's worth for the plain decode of a block read whole, which is
+    /// the decode every reader makes and never shows so little within
+    /// the standard's limit, and three codewords' worth
+    /// ([`AIDED_VERIFIED_BITS`]) for one that filled in codewords that
+    /// could not be read or was reached by any of the fallbacks. `None`
+    /// for a failure.
+    pub fn bits_to_verify(&self) -> Option<u32> {
+        match *self {
+            BlockOutcome::Solved { method: SolveMethod::ReedSolomon, erasures: 0, .. } => Some(VERIFIED_BITS),
+            BlockOutcome::Solved { .. } => Some(AIDED_VERIFIED_BITS),
+            BlockOutcome::Failed(_) => None,
+        }
+    }
+
+    /// Solved with the confirmation its kind of solution needs
+    /// ([`Self::bits_to_verify`]), within the standard's limit.
+    pub fn is_verified(&self) -> bool {
+        match *self {
+            BlockOutcome::Solved { confidence_bits, beyond_standard: false, .. } => {
+                self.bits_to_verify().is_some_and(|needed| confidence_bits >= needed)
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,13 +142,10 @@ impl BlockReport {
         matches!(self.outcome, BlockOutcome::Solved { .. })
     }
 
-    /// Solved with at least a byte's worth of confirmation, within the
-    /// standard's limit.
+    /// Solved with the confirmation its solution needs, within the
+    /// standard's limit ([`BlockOutcome::is_verified`]).
     pub fn is_verified(&self) -> bool {
-        matches!(
-            self.outcome,
-            BlockOutcome::Solved { confidence_bits, beyond_standard: false, .. } if confidence_bits >= VERIFIED_BITS
-        )
+        self.outcome.is_verified()
     }
 
     /// Solved only by spending reserved codewords.
@@ -198,9 +221,11 @@ impl CodewordReport {
 /// outranks all else. Below that the stream comes before the blocks: a
 /// placement whose stream parses, through bits no block confirmed, is
 /// nearer the symbol than one whose every block "verified" while its
-/// stream reads as noise. A wrong placement manages the latter, with the
-/// fallbacks that erase all but one codeword of a block's redundancy and
-/// are confirmed by the eight bits left; BoofCV takes a symbol as read
+/// stream reads as noise. A wrong placement manages the latter now and
+/// then, where a block spends most of its redundancy on what it erased
+/// and is confirmed by the little left, which noise passes once in so
+/// many blocks however much of it is asked
+/// ([`super::rs::AIDED_VERIFIED_BITS`]); BoofCV takes a symbol as read
 /// only when its error correction succeeds and its message parses, and
 /// the order here does the same.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -277,11 +302,7 @@ impl BlockSolve {
 /// How block solutions rank: verified solutions within the standard first,
 /// then by confirmation. A failure ranks below every solution.
 fn solve_rank(outcome: &BlockOutcome) -> (bool, u32) {
-    let verified = matches!(
-        *outcome,
-        BlockOutcome::Solved { confidence_bits, beyond_standard: false, .. } if confidence_bits >= VERIFIED_BITS
-    );
-    (verified, outcome.confidence_bits())
+    (outcome.is_verified(), outcome.confidence_bits())
 }
 
 /// Solve one block, trying the cheap exact decoder first and then every
@@ -294,11 +315,12 @@ fn solve_rank(outcome: &BlockOutcome) -> (bool, u32) {
 /// standard, as one that corrected to the limit of the block's error
 /// correction is by the errors it located. One with too little to confirm
 /// it, which is nothing where it only filled unknown codewords and had
-/// none to spare, or one that spent the reserved codewords, is kept as a
-/// last resort while the fallbacks look for better: doubting the one
-/// wrong codeword that read faintly turns a solution that fills sixteen
-/// unknown codewords and locates that one with nothing to spare into a
-/// confirmed one.
+/// none to spare, and less than three codewords' worth wherever it
+/// filled any ([`BlockOutcome::bits_to_verify`]), or one that spent the
+/// reserved codewords, is kept as a last resort while the fallbacks look
+/// for better: flipping the faint bit of the one wrong codeword turns a
+/// solution that fills fifteen unknown codewords and locates that one
+/// with a codeword to spare into a confirmed one, with three.
 fn solve_block(
     block: &[CwRead],
     reliability: &[u8],

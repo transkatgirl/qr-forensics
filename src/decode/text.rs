@@ -967,10 +967,20 @@ struct Run {
 }
 
 /// Pick a character set for byte data that carries no ECI: ASCII and UTF-8
-/// when the bytes allow it, then Shift-JIS, then the standard's default.
-/// A kanji segment elsewhere in the symbol tips doubtful byte data towards
-/// Shift-JIS, as it does for ZBar, which tries Shift-JIS before Latin-1 in
-/// a symbol that has one.
+/// when the bytes allow it, then Shift-JIS, then the Chinese double-byte
+/// sets, then the standard's default. A kanji segment elsewhere in the
+/// symbol tips doubtful byte data towards Shift-JIS, as it does for ZBar,
+/// which tries Shift-JIS before Latin-1 in a symbol that has one.
+///
+/// Shift-JIS is asked before GBK, as ZXing asks it and the copy of ZXing
+/// in OpenCV's wechat_qrcode after it. Nearly every pair of bytes is a
+/// character of GBK, so bytes that are Shift-JIS are GBK as well, and a
+/// lead byte from 0x81 to 0x9F is where Shift-JIS keeps its kana and
+/// common kanji and where GBK keeps characters seldom written: when GBK
+/// was asked first of a message too short for three characters in a row,
+/// `日本` read as `擔杮` and `東京` as `搶嫗`. What is given up is the short
+/// message of GBK's rarer characters that is Shift-JIS too, which reads
+/// as what it is when the set is chosen.
 fn guess_codec(segments: &[Segment]) -> Codec {
     let has_kanji = segments.iter().any(|s| matches!(s.content, SegmentContent::Kanji(_)));
     let mut runs: Vec<Run> = Vec::new();
@@ -1011,18 +1021,16 @@ fn guess_codec(segments: &[Segment]) -> Codec {
     match shift_jis_evidence(&runs) {
         Evidence::Strong => return Codec::Rs(encoding_rs::SHIFT_JIS),
         Evidence::Weak if has_kanji => return Codec::Rs(encoding_rs::SHIFT_JIS),
-        Evidence::Weak => {
-            if let Some(codec) = double_byte_evidence(&runs) {
-                return codec;
-            }
-            return Codec::Rs(encoding_rs::SHIFT_JIS);
-        }
+        Evidence::Weak if windows_1252_shaped(&runs) => return Codec::Rs(encoding_rs::WINDOWS_1252),
+        Evidence::Weak => return Codec::Rs(encoding_rs::SHIFT_JIS),
         Evidence::None => {}
     }
     if has_kanji && decodes_as_shift_jis(&runs) {
         return Codec::Rs(encoding_rs::SHIFT_JIS);
     }
-    if let Some(codec) = double_byte_evidence(&runs) {
+    if !windows_1252_shaped(&runs)
+        && let Some(codec) = double_byte_evidence(&runs)
+    {
         return codec;
     }
     // The standard's default, ISO-8859-1, has only control codes from 0x80
@@ -1119,12 +1127,80 @@ fn shift_jis_evidence(runs: &[Run]) -> Evidence {
     }
 }
 
+/// The bytes from 0x80 to 0x9F are all typography of windows-1252 set
+/// among ASCII letters as Western text sets it, and there is one at
+/// least: the apostrophe of `It’s`, the dash of `word—word`, the
+/// ellipsis of `…and`, the letters of `cœur` and `Škoda`. Each is the
+/// lead byte of a double-byte character in Shift-JIS and in GBK, and the
+/// letter after it a trail byte, so `It’s ok` is `It痴 ok` to the one and
+/// `It抯 ok` to the other, and valid in both; ZXing, which knows no
+/// windows-1252, reads it as Shift-JIS.
+///
+/// Only what is followed by a letter is asked about, since a lead byte
+/// before a space, a digit or the end of the data is no character of
+/// either set and the bytes fall to windows-1252 without this: a closing
+/// quote, a dash between spaces or figures, a trade mark sign. And it is
+/// asked narrowly, since a kanji after an ASCII letter looks the same:
+/// an apostrophe between two letters, a dash after a letter or a figure,
+/// an ellipsis before a word, and `œ`, `š`, `ž` and their capitals in a
+/// word of three letters or more, so that `市`, which is `Žs`, is still
+/// a kanji. An opening quote is not asked about at all: one that is
+/// closed is closed before a space, and `田` is `“c`.
+fn windows_1252_shaped(runs: &[Run]) -> bool {
+    // A letter of windows-1252: those of ASCII and of ISO-8859-1, and the
+    // six it adds from 0x80 to 0x9F with the Y of 0x9F.
+    let letter = |byte: u8| byte.is_ascii_alphabetic() || matches!(byte, 0x8A | 0x8C | 0x8E | 0x9A | 0x9C | 0x9E | 0x9F | 0xC0..=0xD6 | 0xD8..=0xF6 | 0xF8..=0xFF);
+    let mut seen = false;
+    for Run { bytes, after_gap, .. } in runs {
+        for (i, &byte) in bytes.iter().enumerate() {
+            if !(0x80..=0x9F).contains(&byte) {
+                continue;
+            }
+            let Some(&after) = bytes.get(i + 1) else { return false };
+            // What stands before the first byte of a run that follows a
+            // gap is not known, and is taken for nothing that helps.
+            let before = match i.checked_sub(1) {
+                Some(j) => Some(bytes[j]),
+                None if *after_gap => return false,
+                None => None,
+            };
+            let begins_word = before.is_none_or(|b| b.is_ascii() && !b.is_ascii_alphabetic());
+            let in_word = || {
+                let from = bytes[..i].iter().rev().take_while(|&&b| letter(b)).count();
+                let to = bytes[i..].iter().take_while(|&&b| letter(b)).count();
+                from + to >= 3
+            };
+            let fits = match byte {
+                // The apostrophe.
+                0x92 => before.is_some_and(|b| b.is_ascii_alphabetic()) && after.is_ascii_alphabetic(),
+                // The en dash and the em dash.
+                0x96 | 0x97 => before.is_some_and(|b| b.is_ascii_alphanumeric()) && after.is_ascii_alphabetic(),
+                // The ellipsis.
+                0x85 => before.is_none_or(|b| b.is_ascii()) && after.is_ascii_alphabetic(),
+                // š, œ and ž, within a word or at the head of one.
+                0x9A | 0x9C | 0x9E => (begins_word || before.is_some_and(|b| b.is_ascii_alphabetic())) && after.is_ascii_lowercase() && in_word(),
+                // Š, Œ and Ž, at the head of a word or within one in capitals.
+                0x8A | 0x8C | 0x8E => (begins_word || before.is_some_and(|b| b.is_ascii_uppercase())) && after.is_ascii_alphabetic() && in_word(),
+                _ => false,
+            };
+            if !fits {
+                return false;
+            }
+            seen = true;
+        }
+    }
+    seen
+}
+
 /// The Chinese double-byte sets, by the validity of the bytes as ZBar
 /// checks them, and only on three characters in a row so that accented
 /// Latin text is not taken for them. GB 2312 takes both bytes from 0xA1
 /// to 0xFE; Big5 takes a lead from 0xA1 to 0xF9 and a trail from 0x40 to
 /// 0x7E or 0xA1 to 0xFE; GBK extends GB 2312 with leads down to 0x81,
-/// which Latin-1 text never contains, so for those validity is enough.
+/// which ISO-8859-1 text never contains, so for those validity is enough
+/// once the bytes are known not to be Shift-JIS, which has its commonest
+/// characters there, nor windows-1252 text with its typography there
+/// ([`windows_1252_shaped`]): the caller asks both first.
 fn double_byte_evidence(runs: &[Run]) -> Option<Codec> {
     let longest_run = |lead: &dyn Fn(u8) -> bool, trail: &dyn Fn(u8) -> bool| -> Option<usize> {
         let mut longest = 0;
@@ -1353,6 +1429,46 @@ mod tests {
     }
 
     #[test]
+    fn short_shift_jis_is_not_taken_for_gbk() {
+        // A character or two with a lead byte from 0x81 to 0x9F: each is
+        // a character of GBK too, and read as one when GBK was asked
+        // first, `日本` as `擔杮`.
+        for text in ["日本", "東京", "東京 2020", "大阪", "5円", "駅", "あ", "愛", "〒100-0001", "http://example.jp/東京", "080-1234-5678 田中"] {
+            let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode(text);
+            let report = decode_text(&[byte_segment(&known(&bytes), Certainty::Verified)], Charset::Auto);
+            assert_eq!((report.plain().as_str(), report.encoding.as_deref()), (text, Some("Shift_JIS (guessed)")));
+        }
+    }
+
+    #[test]
+    fn typography_among_ascii_letters_is_windows_1252() {
+        // Each of these is Shift-JIS and GBK from end to end, the mark
+        // from 0x80 to 0x9F a lead byte and the letter after it a trail.
+        for text in ["It’s ok", "don’t", "WE’RE OPEN", "L’Oréal", "rock’n’roll", "word—word", "A–Z", "…and more", "cœur", "œuvre", "Škoda Octavia", "ŠKODA", "Žižek"] {
+            let (bytes, _, lossy) = encoding_rs::WINDOWS_1252.encode(text);
+            assert!(!lossy, "{text}");
+            let report = decode_text(&[byte_segment(&known(&bytes), Certainty::Verified)], Charset::Auto);
+            assert_eq!((report.plain().as_str(), report.encoding.as_deref()), (text, Some("windows-1252 (guessed)")));
+        }
+        // A kanji whose bytes are such a mark and a letter is a kanji
+        // still where Western text would not set the mark so: `谷` is an
+        // apostrophe with no letter before it, `市` is `Žs`, a word of
+        // two letters, `田` an opening quote, and the second character
+        // of `地図` no character of windows-1252.
+        for text in ["谷", "市", "田", "都", "地図", "QR地図", "知る", "3個"] {
+            let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode(text);
+            let report = decode_text(&[byte_segment(&known(&bytes), Certainty::Verified)], Charset::Auto);
+            assert_eq!((report.plain().as_str(), report.encoding.as_deref()), (text, Some("Shift_JIS (guessed)")));
+        }
+        // What is not known is not taken to help: after a byte that
+        // could not be read, the Š need not begin a word.
+        let mut bytes = vec![None];
+        bytes.extend(known(b"\x8Akoda x\x96y"));
+        let report = decode_text(&[byte_segment(&bytes, Certainty::Verified)], Charset::Auto);
+        assert_eq!(report.encoding.as_deref(), Some("Shift_JIS (guessed)"));
+    }
+
+    #[test]
     fn chinese_double_byte_sets_are_detected_by_validity() {
         let (bytes, _, _) = encoding_rs::GB18030.encode("中文二维码");
         let report = decode_text(&[byte_segment(&known(&bytes), Certainty::Verified)], Charset::Auto);
@@ -1362,11 +1478,19 @@ mod tests {
         let report = decode_text(&[byte_segment(&known(&bytes), Certainty::Verified)], Charset::Auto);
         assert_eq!(report.plain(), "繁體中文");
         assert_eq!(report.encoding.as_deref(), Some("Big5 (guessed)"));
-        // A GBK-only lead byte settles it with fewer characters.
-        let (bytes, _, _) = encoding_rs::GB18030.encode("丂");
+        // A GBK-only lead byte settles it with fewer characters, where
+        // the bytes are not Shift-JIS as well: 0x86 leads nothing there.
+        let (bytes, _, _) = encoding_rs::GB18030.encode("喆");
         assert!(bytes[0] < 0xA1, "{bytes:?}");
         let report = decode_text(&[byte_segment(&known(&bytes), Certainty::Verified)], Charset::Auto);
-        assert_eq!(report.plain(), "丂");
+        assert_eq!((report.plain().as_str(), report.encoding.as_deref()), ("喆", Some("gb18030 (guessed)")));
+        // Where they are, Shift-JIS has them: GBK's 丂 is 0x81 0x40, the
+        // ideographic space, and reads as itself when the set is chosen.
+        let (bytes, _, _) = encoding_rs::GB18030.encode("丂");
+        let seg = byte_segment(&known(&bytes), Certainty::Verified);
+        let report = decode_text(std::slice::from_ref(&seg), Charset::Auto);
+        assert_eq!((report.plain().as_str(), report.encoding.as_deref()), ("\u{3000}", Some("Shift_JIS (guessed)")));
+        assert_eq!(decode_text(&[seg], Charset::Gb18030).plain(), "丂");
         // Two accented letters are still Latin-1.
         let seg = byte_segment(&known(b"caf\xE9 \xE9lan \xC4\xE4"), Certainty::Verified);
         assert_eq!(decode_text(&[seg], Charset::Auto).encoding.as_deref(), Some("ISO-8859-1 (guessed)"));
