@@ -1852,7 +1852,8 @@ impl App {
             self.view.sample = SampleParams { kernel: read.kernel, sharpen_modules, ..self.view.sample.under(read.rule) };
             through = self.adjust_as_read(read.enhance, read_enlarge);
         }
-        self.view.stage = Stage::Edit;
+        // The stage is left as it is: a read loaded from the Align stage
+        // is looked over there, on the photo, and the grid is a click away.
         let how = match (decoded, padding_pinned) {
             (true, true) => "it decodes with its padding pinned, and the pins are in place".to_owned(),
             (true, false) => "it decodes".to_owned(),
@@ -5221,7 +5222,8 @@ mod tests {
         bench.act(Action::FindSymbols);
         bench.settle();
         assert!(bench.notice().text.starts_with("Loaded symbol 1 as it was read"), "{}", bench.notice().text);
-        assert_eq!(bench.app.view.stage, Stage::Edit);
+        // Loading a read leaves the stage as it is.
+        assert_eq!(bench.app.view.stage, Stage::Align);
         assert!(bench.app.derived.report.is_trustworthy());
         assert_eq!(bench.app.derived.report.text.plain(), message);
         let in_use = bench.app.proposals.as_ref().and_then(|proposals| proposal_in_use(proposals, &bench.app.doc.corners));
@@ -5293,7 +5295,7 @@ mod tests {
         bench.act(Action::UseProposal(0));
         assert_eq!(bench.app.running(), None);
         bench.step();
-        assert_eq!(bench.app.view.stage, Stage::Edit);
+        assert_eq!(bench.app.view.stage, Stage::Align);
         bench.assert_all_of(version);
         assert!(bench.app.derived.report.is_trustworthy());
         assert_eq!(bench.app.derived.report.text.plain(), message);
@@ -5819,7 +5821,7 @@ mod tests {
         bench.act(Action::FindCorners);
         bench.settle();
         bench.step();
-        assert_eq!(bench.app.view.stage, Stage::Edit);
+        assert_eq!(bench.app.view.stage, Stage::Align);
         bench.assert_all_of(version);
         assert!(bench.app.derived.report.is_trustworthy());
         assert_eq!(bench.app.derived.report.text.plain(), message);
