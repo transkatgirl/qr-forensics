@@ -825,11 +825,6 @@ pub enum Retry {
     /// Enlarged by a whole factor, which gives a symbol of a pixel a
     /// module runs the scan can see.
     Upscaled { factor: u8 },
-    /// Turned clockwise by so many quarter turns, as zxing-cpp retries a
-    /// failed read with `tryRotate`: the fits that place the corners and
-    /// anchors walk the photo's axes, and a symbol that reads at one turn
-    /// of the photo can sit a fraction of a module off at another.
-    Turned { quarters: u8 },
     /// The scan's local threshold narrowed to the blocks within `radius`
     /// pixels of each pixel, where the outline sets a neighbourhood a
     /// sixth of its size: a finder pattern in a shadow or a glare
@@ -883,7 +878,6 @@ impl fmt::Display for Retry {
             Retry::Closed { radius } => write!(f, "the dark closed over gaps of {radius} px"),
             Retry::Downscaled { factor } => write!(f, "the photo shrunk {factor} times"),
             Retry::Upscaled { factor } => write!(f, "the photo enlarged {factor} times"),
-            Retry::Turned { quarters } => write!(f, "the photo turned {}°", 90 * u16::from(quarters % 4)),
             Retry::Thresholded { radius } => write!(f, "the threshold narrowed to {radius} px about each pixel"),
             Retry::Enhanced(enhance) => write!(f, "the photo {enhance}"),
         }
@@ -1016,6 +1010,14 @@ pub struct Detection {
     /// pattern, or the enlargement a small outline is given from the
     /// start. `None` when the photo was searched as it is.
     pub retry: Option<Retry>,
+    /// Quarter turns clockwise of the photo, or of the copy `retry`
+    /// names, the symbol was found in, as zxing-cpp retries a failed read
+    /// with `tryRotate`: the fits that place the corners and anchors walk
+    /// the photo's axes, and a symbol that reads at one turn of the photo
+    /// can sit a fraction of a module off at another. Zero when it was
+    /// found with the photo as it lies. Kept apart from `retry`, since a
+    /// symbol found turned inside a copy was found both ways.
+    pub turned: u8,
     /// Whether the symbol decodes as found (see [`decodes_as_found`]).
     /// Asked by whoever lists detections for choosing among, which lists
     /// what decodes first; `None` when it was not asked.
@@ -1025,6 +1027,19 @@ pub struct Detection {
 impl Detection {
     pub fn count(&self, kind: AnchorKind) -> usize {
         self.anchors.iter().filter(|a| a.kind == kind).count()
+    }
+
+    /// What the photo had to be made into for the symbol to be found,
+    /// in words: the step of the ladder or the copy, the turn, or both;
+    /// `None` when it was found in the photo as it lies.
+    pub fn found_with(&self) -> Option<String> {
+        let turned = (!self.turned.is_multiple_of(4)).then(|| format!("the photo turned {}°", 90 * u16::from(self.turned % 4)));
+        match (&self.retry, turned) {
+            (None, None) => None,
+            (Some(retry), None) => Some(retry.to_string()),
+            (None, Some(turned)) => Some(turned),
+            (Some(retry), Some(turned)) => Some(format!("{retry}, and {turned}")),
+        }
     }
 
     /// Anchors with a damaged quarter.
@@ -1111,9 +1126,16 @@ impl Detection {
             .iter()
             .filter_map(|anchor| {
                 let at = symmetry.map_point(func.width, func.height, anchor.at);
-                let sited = matches!(anchor.kind, AnchorKind::Edge | AnchorKind::Custom)
-                    || sites.iter().any(|site| site.kind == anchor.kind && (site.at[0] - at[0]).abs() < 1e-6 && (site.at[1] - at[1]).abs() < 1e-6);
-                sited.then_some(Anchor { at, ..*anchor })
+                let same_place = |site: &&Site| (site.at[0] - at[0]).abs() < 1e-6 && (site.at[1] - at[1]).abs() < 1e-6;
+                // A custom anchor the turn sets on a module with a
+                // pattern of its own becomes that pattern's anchor, so
+                // that no module carries two.
+                let (sited, kind) = match anchor.kind {
+                    AnchorKind::Edge => (true, anchor.kind),
+                    AnchorKind::Custom => (true, sites.iter().find(same_place).map_or(anchor.kind, |site| site.kind)),
+                    kind => (sites.iter().filter(same_place).any(|site| site.kind == kind), kind),
+                };
+                sited.then_some(Anchor { at, kind, ..*anchor })
             })
             .collect();
         turned.mirrored = self.mirrored != symmetry.is_reflection();
@@ -1589,6 +1611,7 @@ fn pure_detection(
         edged_corners: Vec::new(),
         measured_corners: vec![0, 1, 2, 3],
         retry: None,
+        turned: 0,
         decodes: None,
     };
     // A square symbol seen from the back reads as its transpose; the
@@ -2074,11 +2097,13 @@ impl Rectified {
     }
 
     /// The same, with the scan's local threshold reaching `radius`
-    /// pixels about each pixel when one is given, instead of what the
-    /// outline's size sets.
+    /// pixels of the image about each pixel when one is given, instead of
+    /// what the outline's size sets: brought to rectified pixels, as
+    /// [`Self::ruled`] brings a reading's reach, so that a region scanned
+    /// reduced is narrowed to the same stretch of the photo.
     fn narrowed(mut self, radius: Option<f64>) -> Self {
         if let Some(radius) = radius {
-            self.local_radius = radius;
+            self.local_radius = radius * self.frame.scale;
         }
         self
     }
@@ -2196,9 +2221,6 @@ impl View {
                 let view = Enhanced::window(image, [x0, y0, x1, y1], enhance)?;
                 return Some(Self { luma: view.luma, origin: view.origin, scale: 1.0 / view.factor, local_radius: None });
             }
-            // A turn is not a view of a window: the whole photo is turned
-            // and read in full by `read`, which brings the result back.
-            Retry::Turned { .. } => return None,
         };
         Some(Self { luma, origin: [x0 as f64, y0 as f64], scale, local_radius })
     }
@@ -8794,6 +8816,7 @@ fn align_assignment(
         edged_corners,
         measured_corners,
         retry: None,
+        turned: 0,
         decodes: None,
     };
     // A square symbol seen from the back reads as its transpose, which
@@ -9897,6 +9920,39 @@ mod tests {
     }
 
     #[test]
+    fn what_the_symbol_was_found_with_is_said_in_full() {
+        let mut found = Detection {
+            corners: [[0.0; 2]; 4],
+            version: SymbolVersion::Qr(1),
+            inverted: false,
+            mirrored: false,
+            mirrored_by_decode: false,
+            turns: 0,
+            anchors: Vec::new(),
+            agreement: (0, 0),
+            info: InfoEvidence::default(),
+            edged_corners: Vec::new(),
+            measured_corners: Vec::new(),
+            retry: None,
+            turned: 0,
+            decodes: None,
+        };
+        assert_eq!(found.found_with(), None);
+        // The turn alone, the copy alone, and a symbol found turned
+        // inside a copy, which was found both ways.
+        found.turned = 1;
+        assert_eq!(found.found_with().as_deref(), Some("the photo turned 90°"));
+        let enhanced = Retry::Enhanced(Enhance { enlarge: 2, sharpen: Sharpen::Light });
+        found.retry = Some(enhanced);
+        assert_eq!(found.found_with(), Some(format!("{enhanced}, and the photo turned 90°")));
+        found.turned = 0;
+        assert_eq!(found.found_with(), Some(enhanced.to_string()));
+        found.retry = Some(Retry::Downscaled { factor: 2 });
+        found.turned = 3;
+        assert_eq!(found.found_with().as_deref(), Some("the photo shrunk 2 times, and the photo turned 270°"));
+    }
+
+    #[test]
     fn a_turned_placement_over_the_same_square_is_offered_too() {
         // Two finders on a diagonal stand a version 1 symbol either way
         // up over the same square. The decode must be offered both: the
@@ -9916,6 +9972,7 @@ mod tests {
             edged_corners: Vec::new(),
             measured_corners: Vec::new(),
             retry: None,
+            turned: 0,
             decodes: None,
         };
         let upright = placement(square, 0);
@@ -9942,6 +9999,7 @@ mod tests {
             edged_corners: Vec::new(),
             measured_corners: Vec::new(),
             retry: None,
+            turned: 0,
             decodes: None,
         };
         assert!(named(SymbolVersion::Micro(4), Some(0)).version_confirmed());
@@ -10060,6 +10118,12 @@ mod tests {
         let reduced = reduced.ruled(Binarizer::Local { radius: 48.0 });
         assert_eq!(reduced.binarizer, Binarizer::Local { radius: 16.0 });
         assert!((reduced.local_radius - 16.0).abs() < 1e-9, "{}", reduced.local_radius);
+        // The rung that narrows the scan's threshold reaches as far
+        // across the reduced region as across the photo.
+        let narrowed = Rectified::with_longest(&image, region, 130.0).unwrap().narrowed(Some(48.0));
+        assert!((narrowed.local_radius - 16.0).abs() < 1e-9, "{}", narrowed.local_radius);
+        let unreduced = Rectified::new(&image, region).unwrap().narrowed(Some(48.0));
+        assert!((unreduced.local_radius - 48.0).abs() < 1e-9, "{}", unreduced.local_radius);
         let windowed = Rectified::with_longest(&image, region, 130.0).unwrap().ruled(Binarizer::Window { radius: 12.0 });
         assert_eq!(windowed.binarizer, Binarizer::Window { radius: 4.0 });
         assert!((windowed.local_radius - BlockMean::radius_for(100.0)).abs() < 1e-9, "a window leaves the local reach alone");
@@ -10278,6 +10342,7 @@ mod tests {
             edged_corners: Vec::new(),
             measured_corners: Vec::new(),
             retry: None,
+            turned: 0,
             decodes: None,
         }
     }

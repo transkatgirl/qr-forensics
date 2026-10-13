@@ -1080,9 +1080,10 @@ fn unturn(found: &mut Detection, quarters: u8, width: usize, height: usize, regi
         anchor.center = unrotate_point_cw(anchor.center, quarters, width, height);
     }
     found.turns = turns_between(region, found.corners);
-    if found.retry.is_none() {
-        found.retry = Some(Retry::Turned { quarters });
-    }
+    // The turn is noted beside whatever else the photo was made into:
+    // the step of the ladder the detector climbed to, or the copy a
+    // read in one brings the detection back from, stays as it is.
+    found.turned = quarters % 4;
 }
 
 #[cfg(test)]
@@ -1119,6 +1120,7 @@ mod tests {
             edged_corners: Vec::new(),
             measured_corners: vec![0, 1, 3],
             retry: None,
+            turned: 0,
             decodes: None,
         }
     }

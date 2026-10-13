@@ -381,6 +381,11 @@ fn picked_line(app: &App, at: usize) -> String {
     )
 }
 
+/// The known-text field's own id, so that a test can give it the keyboard.
+pub(super) fn known_text_id() -> egui::Id {
+    egui::Id::new("known_text")
+}
+
 /// Text the user knows the message to hold, and where: pinned, it costs
 /// no error correction.
 fn known_text_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
@@ -391,6 +396,7 @@ fn known_text_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action
     );
     ui.add(
         egui::TextEdit::multiline(&mut app.view.known_text)
+            .id(known_text_id())
             .desired_rows(1)
             .desired_width(f32::INFINITY)
             .font(egui::TextStyle::Monospace)

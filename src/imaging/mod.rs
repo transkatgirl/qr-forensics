@@ -76,6 +76,11 @@ impl Luma {
     /// [`Self::sample`] for a point within half a pixel of the image's
     /// border, or off the image.
     fn sample_by_border(&self, x: f64, y: f64) -> Option<f32> {
+        // An image with no pixels has no border to be within: the clamps
+        // below would be asked for a range that ends before it begins.
+        if self.width == 0 || self.height == 0 {
+            return None;
+        }
         let (fx, fy) = (x - 0.5, y - 0.5);
         if !(fx >= -0.5 && fy >= -0.5 && fx <= self.width as f64 - 0.5 && fy <= self.height as f64 - 0.5) {
             return None;
@@ -190,6 +195,27 @@ mod tests {
         let frame = [[0.0, 0.0], [2.0, 0.0], [2.0, 3.0], [0.0, 3.0]];
         assert_eq!(rotate_outline_cw(frame, 1, 2, 3), [[0.0, 0.0], [3.0, 0.0], [3.0, 2.0], [0.0, 2.0]]);
         assert_eq!(rotate_outline_cw(frame, 2, 2, 3), frame);
+    }
+
+    #[test]
+    fn sampling_stays_inside_the_image() {
+        let image = Luma::new(2, 3, vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+        // Pixel centres read the pixel; the border reads the edge pixel.
+        assert_eq!(image.sample(0.5, 0.5), Some(0.0));
+        assert_eq!(image.sample(1.5, 0.5), Some(1.0));
+        assert_eq!(image.sample(0.0, 0.0), Some(0.0));
+        assert_eq!(image.sample(2.0, 3.0), Some(1.0));
+        assert_eq!(image.sample(-0.1, 1.0), None);
+        assert_eq!(image.sample(2.1, 1.0), None);
+        assert_eq!(image.sample(f64::NAN, 1.0), None);
+        // An image with no pixels has nothing to read anywhere, its own
+        // corner included.
+        for (width, height) in [(0, 0), (0, 3), (3, 0)] {
+            let empty = Luma::new(width, height, Vec::new());
+            for point in [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.5, 0.5]] {
+                assert_eq!(empty.sample(point[0], point[1]), None, "{width}x{height} at {point:?}");
+            }
+        }
     }
 
     #[test]

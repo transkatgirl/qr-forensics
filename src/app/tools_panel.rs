@@ -754,7 +754,7 @@ fn detection_row(
     let confirmed = if found.version_confirmed() { ", version confirmed" } else { "" };
     let polarity = if found.inverted { ", light on dark" } else { "" };
     let mirrored = if found.mirrored { ", mirrored" } else { "" };
-    let retry = found.retry.map_or(String::new(), |r| format!(", with {r}"));
+    let retry = found.found_with().map_or(String::new(), |with| format!(", with {with}"));
     let standing = standing.map_or(String::new(), |standing| format!("  ·  {standing}"));
     let text = format!(
         "{}. {} {}  —  {:.0}% fixed{decodes}{confirmed}{polarity}{mirrored}{retry}{standing}",

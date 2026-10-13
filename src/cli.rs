@@ -142,9 +142,9 @@
 //!
 //! The exit status is 0 when every image gave a trustworthy read, 1 when
 //! one did not, and 2 for a bad command line or an image that would not
-//! load. When standard output is closed, as `| head` closes it, the run
-//! stops there without complaint, with the status of the images read so
-//! far.
+//! load. `--help` prints the usage and exits with 0. When standard output
+//! is closed, as `| head` closes it, the run stops there without
+//! complaint, with the status of the images read so far.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -212,7 +212,25 @@ fn charset_named(name: &str) -> Option<Charset> {
         .or_else(|| name.parse().ok().map(Charset::Eci).filter(|c| c.label() != "unsupported"))
 }
 
-fn parse(args: &[OsString]) -> Result<Options, String> {
+/// Why a command line is not run: it asked for the usage, or it is wrong,
+/// and how.
+#[derive(Debug, PartialEq, Eq)]
+enum Unparsed {
+    Help,
+    Bad(String),
+}
+
+fn parse(args: &[OsString]) -> Result<Options, Unparsed> {
+    match parse_options(args) {
+        Ok(Some(options)) => Ok(options),
+        Ok(None) => Err(Unparsed::Help),
+        Err(message) => Err(Unparsed::Bad(message)),
+    }
+}
+
+/// The options the command line gives, or `None` when it asks for the
+/// usage instead.
+fn parse_options(args: &[OsString]) -> Result<Option<Options>, String> {
     let mut options = Options {
         family: None,
         outline: None,
@@ -264,14 +282,23 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
                 let [x0, y0, x1, y1, x2, y2, x3, y3] = numbers[..] else {
                     return Err(format!("an outline is eight numbers, not {}", numbers.len()));
                 };
+                if let Some(bad) = numbers.iter().find(|n| !n.is_finite()) {
+                    return Err(format!("outline {value:?}: {bad} is no pixel position"));
+                }
                 options.outline = Some([[x0, y0], [x1, y1], [x2, y2], [x3, y3]]);
             }
             "--hex" => {
                 flag()?;
+                if options.show == Show::Escaped {
+                    return Err("--hex and --escaped each print the message one way; give one of them".to_owned());
+                }
                 options.show = Show::Hex;
             }
             "--escaped" => {
                 flag()?;
+                if options.show == Show::Hex {
+                    return Err("--hex and --escaped each print the message one way; give one of them".to_owned());
+                }
                 options.show = Show::Escaped;
             }
             "--charset" => {
@@ -318,7 +345,7 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
                 flag()?;
                 options.search.coarse_to_fine = false;
             }
-            "--help" | "-h" => return Err(String::new()),
+            "--help" | "-h" => return Ok(None),
             other if other.starts_with("--") => return Err(format!("unknown option {other}")),
             _ => options.images.push(arg.clone()),
         }
@@ -326,7 +353,7 @@ fn parse(args: &[OsString]) -> Result<Options, String> {
     if options.images.is_empty() {
         return Err("no image given".to_owned());
     }
-    Ok(options)
+    Ok(Some(options))
 }
 
 /// A photo as the app loads it: the file's pixels, enlarged when the
@@ -515,10 +542,13 @@ pub fn run(args: &[OsString]) -> i32 {
 fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
     let options = match parse(args) {
         Ok(options) => options,
-        Err(message) => {
-            if !message.is_empty() {
-                eprintln!("{message}");
-            }
+        Err(Unparsed::Help) => {
+            // Asked for, the usage is the output, and the run went well.
+            let _ = writeln!(out, "{USAGE}");
+            return 0;
+        }
+        Err(Unparsed::Bad(message)) => {
+            eprintln!("{message}");
             eprintln!("{USAGE}");
             return 2;
         }
@@ -667,8 +697,33 @@ mod tests {
         }
         assert!(parse(&[OsString::from("--sharpen")]).is_err());
         assert!(parse(&[]).is_err());
-        assert_eq!(run(&[OsString::from("--help")]), 2);
+        // The usage asked for is printed as output, and is no error; a
+        // bad command line is one, and says what is bad.
+        assert!(matches!(parse(&[OsString::from("--help")]), Err(Unparsed::Help)));
+        assert!(matches!(parse(&[OsString::from("-h"), OsString::from("a.png")]), Err(Unparsed::Help)));
+        let mut out = Vec::new();
+        assert_eq!(run_to(&[OsString::from("--help")], &mut out), 0);
+        assert_eq!(String::from_utf8(out).unwrap(), format!("{USAGE}\n"));
         assert_eq!(run(&[OsString::from("/nowhere/at/all.png")]), 2);
+        assert!(matches!(parse(&[OsString::from("--what"), OsString::from("a.png")]), Err(Unparsed::Bad(message)) if message.contains("--what")));
+        // One way of printing the message at a time.
+        for both in [["--hex", "--escaped"], ["--escaped", "--hex"]] {
+            let args: Vec<OsString> = both.iter().chain(&["a.png"]).map(OsString::from).collect();
+            assert!(matches!(parse(&args), Err(Unparsed::Bad(message)) if message.contains("one of them")), "{both:?}");
+        }
+        let twice: Vec<OsString> = ["--hex", "--hex", "a.png"].iter().map(OsString::from).collect();
+        assert_eq!(parse(&twice).unwrap().show, Show::Hex);
+        // An outline is made of pixel positions, which are finite.
+        for bad in ["nan,2,3,4,5,6,7,8", "1,2,3,4,inf,6,7,8", "1,2,3,4,5,6,7,-inf"] {
+            let args = [OsString::from(format!("--outline={bad}")), OsString::from("a.png")];
+            assert!(matches!(parse(&args), Err(Unparsed::Bad(message)) if message.contains("no pixel position")), "{bad}");
+        }
+        // Model 1 is searched for by name as any family is: a search of
+        // the whole photo for it alone finds a Model 1 symbol by its
+        // finders, which are those of a QR Code, and fits it as Model 1.
+        let model1: Vec<OsString> = ["--family", "model1", "a.png"].iter().map(OsString::from).collect();
+        let options = parse(&model1).unwrap();
+        assert_eq!((options.family, options.outline), (Some(Family::Model1), None));
     }
 
     #[test]

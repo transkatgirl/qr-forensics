@@ -176,6 +176,8 @@ impl App {
         let rest: Vec<&str> = words.collect();
         let word = |i: usize| rest.get(i).copied().unwrap_or_else(|| panic!("selftest: `{step}` needs more arguments"));
         let number = |i: usize| word(i).parse::<f64>().unwrap_or_else(|_| panic!("selftest: bad number in `{step}`"));
+        // A place in a list, counted from one as the lists show them.
+        let ordinal = |i: usize| (number(i) as usize).checked_sub(1).unwrap_or_else(|| panic!("selftest: `{step}` counts from 1"));
         match command {
             "shot" => {
                 test.pending = Some(test.dir.join(format!("{}.png", word(0))));
@@ -200,16 +202,16 @@ impl App {
             }
             "find" => actions.push(Action::FindCorners),
             "symbols" => actions.push(Action::FindSymbols),
-            "use" => actions.push(Action::UseProposal(number(0) as usize - 1)),
+            "use" => actions.push(Action::UseProposal(ordinal(0))),
             "placements" => actions.push(Action::ListPlacements),
-            "place" => actions.push(Action::UsePlacement(number(0) as usize - 1)),
+            "place" => actions.push(Action::UsePlacement(ordinal(0))),
             "autoload" => self.view.load_reads = word(0) == "on",
             "only" => self.view.own_family_only = word(0) == "on",
             "readall" => actions.push(Action::ReadFound),
             "crop" => actions.push(Action::CropToOutline),
             "whole" => actions.push(Action::ShowWholePhoto),
             "known" => self.view.known_text = step.strip_prefix("known").unwrap_or_default().trim().to_owned(),
-            "at" => (self.view.known_at, self.view.known_from_start) = (number(0) as usize - 1, false),
+            "at" => (self.view.known_at, self.view.known_from_start) = (ordinal(0), false),
             "start" => {
                 self.view.known_from_start = true;
                 self.view.known_mode = match word(0) {
@@ -221,7 +223,8 @@ impl App {
             }
             "pintext" => actions.push(Action::PinText),
             "beginnings" => actions.push(Action::TryBeginnings),
-            "pick" => self.view.picked_char = word(0).parse::<usize>().ok().map(|n| n - 1),
+            // Counted from one; `pick 0` picks nothing.
+            "pick" => self.view.picked_char = word(0).parse::<usize>().ok().filter(|&n| n > 0).map(|n| n - 1),
             "export" => {
                 let format = if word(0) == "svg" { ExportFormat::Svg } else { ExportFormat::Png };
                 self.export_image(&test.dir.join(word(1)), format);

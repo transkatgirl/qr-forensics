@@ -24,8 +24,8 @@ use qr_forensics::imaging::adjust::{Adjust, Enlarge, LENS_MIN_PAIRS, estimate_k1
 use qr_forensics::imaging::photo::{crop_box, flatten_alpha};
 use qr_forensics::imaging::resize::resize;
 use qr_forensics::imaging::detect::{
-    Anchor, AnchorKind, Detection, Lead, SEARCH_SIDE, SearchParams, anchor_sites, decodes_as_found, detect_candidates,
-    refine_anchors, search_for_families, settle_loose_corners,
+    Anchor, AnchorKind, AnchorSite, Detection, Lead, SEARCH_SIDE, SearchParams, anchor_sites, decodes_as_found,
+    detect_candidates, refine_anchors, search_for_families, settle_loose_corners,
 };
 use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline};
 use qr_forensics::imaging::refine::{Refinement, refine_corners, refine_corners_holding};
@@ -289,8 +289,11 @@ enum JobResult {
     /// A symbol the search found, or a placement the detector ranked,
     /// made ready to adopt, and what to call it in a notice.
     Adopt(Prepared, String),
-    /// Refine: `None` when the corners form no usable outline.
-    Refine(Option<Refined>),
+    /// Refine: the corners and anchors it set out from, and what it made
+    /// of them, `None` when the corners form no usable outline. A result
+    /// is for the outline it set out from: one the user has moved on
+    /// meanwhile is not overwritten with it.
+    Refine { corners: [[f64; 2]; 4], anchors: Vec<Anchor>, refined: Option<Refined> },
     Suggest(Vec<VersionGuess>),
     /// Read all: what each symbol found reads as, in the order of the
     /// outlines the symbols had when the job began, and the photo's
@@ -625,6 +628,12 @@ impl App {
             return;
         }
         self.begin_edit();
+        // The versions suggested were ranked for the family in use: under
+        // another family the list would offer them still, and a click on
+        // one would switch the family back.
+        if version.family() != self.doc.version.family() {
+            self.guesses = None;
+        }
         self.doc = self.doc.blank_like(version);
         self.view.selected = None;
         self.view.highlight_block = None;
@@ -1315,7 +1324,8 @@ impl App {
         let (corners, params) = (self.doc.corners, self.view.sample);
         let anchors: Vec<Anchor> = self.doc.anchors.iter().map(|a| a.anchor).collect();
         self.start_job(ctx, JobKind::Refine, move || {
-            JobResult::Refine(refine_outline(&luma, &func, corners, anchors, &params))
+            let refined = refine_outline(&luma, &func, corners, anchors.clone(), &params);
+            JobResult::Refine { corners, anchors, refined }
         });
     }
 
@@ -1507,11 +1517,22 @@ impl App {
                 let text = self.take_in(prepared, &what);
                 self.notify(text);
             }
-            JobResult::Refine(_) if version_changed => self.notify(
+            JobResult::Refine { .. } if version_changed => self.notify(
                 "The version changed while the corners were being refined, so the result was dropped; press \
                  Refine again.",
             ),
-            JobResult::Refine(refined) => self.finish_refine(refined),
+            // A corner dragged or an anchor moved or dropped while the
+            // step ran: the result is of the outline before that, and
+            // taking it in would undo the hand's work.
+            JobResult::Refine { corners, anchors, .. }
+                if corners != self.doc.corners || self.doc.anchors.iter().map(|a| a.anchor).ne(anchors.iter().copied()) =>
+            {
+                self.notify(
+                    "The outline or the anchors changed while they were being refined, so the result was dropped; \
+                     press Refine again.",
+                );
+            }
+            JobResult::Refine { refined, .. } => self.finish_refine(refined),
             JobResult::Suggest(_) if version_changed => self.notify(
                 "The version changed while the versions were being ranked, so the ranking was dropped; press \
                  Suggest version again.",
@@ -1959,8 +1980,8 @@ impl App {
         let what = list_phrase(&parts);
         let polarity = if found.inverted { " with dark and light swapped" } else { "" };
         let mut text = format!("Found {what}; fixed patterns match {matching} of {fixed}{polarity}.");
-        if let Some(retry) = found.retry {
-            text.push_str(&format!(" Found only with {retry}."));
+        if let Some(with) = found.found_with() {
+            text.push_str(&format!(" Found only with {with}."));
         }
         if found.partial() > 0 {
             text.push_str(&format!(" {} partly damaged, placed from the undamaged part.", plural(found.partial(), "pattern")));
@@ -2184,15 +2205,24 @@ impl App {
                         .filter_map(|mut anchor| {
                             let at = symmetry.map_point(width, height, anchor.anchor.at);
                             anchor.anchor.at = at;
+                            let same_place = |site: &&AnchorSite| (site.at[0] - at[0]).abs() < 1e-6 && (site.at[1] - at[1]).abs() < 1e-6;
                             // A point traced along the edge is on the
                             // edge wherever the turn takes it, and a
-                            // custom anchor on its module.
-                            let sited = matches!(anchor.anchor.kind, AnchorKind::Edge | AnchorKind::Custom)
-                                || sites.iter().any(|site| {
-                                    site.kind == anchor.anchor.kind
-                                        && (site.at[0] - at[0]).abs() < 1e-6
-                                        && (site.at[1] - at[1]).abs() < 1e-6
-                                });
+                            // custom anchor on its module. One the turn
+                            // sets on a module that has a pattern of its
+                            // own becomes that pattern's anchor, as a
+                            // grasp on the pattern makes one, so that the
+                            // module has one handle and not two.
+                            let sited = match anchor.anchor.kind {
+                                AnchorKind::Edge => true,
+                                AnchorKind::Custom => {
+                                    if let Some(site) = sites.iter().find(same_place) {
+                                        anchor.anchor.kind = site.kind;
+                                    }
+                                    true
+                                }
+                                kind => sites.iter().filter(same_place).any(|site| site.kind == kind),
+                            };
                             sited.then_some(anchor)
                         })
                         .collect();
@@ -2746,10 +2776,17 @@ impl App {
     }
 
     fn shortcuts(&mut self, ui: &egui::Ui, actions: &mut Vec<Action>) {
+        // A text field that has the keyboard keeps every shortcut: its
+        // own editing undoes a typo with the undo keys, which it would
+        // never see once they were consumed here, and would have the
+        // document's last edit undone under it instead.
+        let typing = ui.ctx().egui_wants_keyboard_input();
         // Redo first: the undo shortcut also matches with Shift held.
-        let (redo, undo, open) = ui.input_mut(|i| {
-            (i.consume_shortcut(&REDO), i.consume_shortcut(&UNDO), i.consume_shortcut(&OPEN))
-        });
+        let (redo, undo, open) = if typing {
+            (false, false, false)
+        } else {
+            ui.input_mut(|i| (i.consume_shortcut(&REDO), i.consume_shortcut(&UNDO), i.consume_shortcut(&OPEN)))
+        };
         if redo {
             actions.push(Action::Redo);
         } else if undo {
@@ -2758,7 +2795,6 @@ impl App {
         if open {
             actions.push(Action::OpenImage);
         }
-        let typing = ui.ctx().egui_wants_keyboard_input();
         let (pasted, released) = ui.input(|i| {
             let released = |event: &egui::Event| {
                 matches!(event, egui::Event::Key { key: egui::Key::V, pressed: false, modifiers, .. } if modifiers.command)
@@ -3908,6 +3944,7 @@ mod tests {
             edged_corners: Vec::new(),
             measured_corners: Vec::new(),
             retry: None,
+            turned: 0,
             decodes: None,
         }
     }
@@ -5102,6 +5139,111 @@ mod tests {
     }
 
     #[test]
+    fn a_text_field_that_has_the_keyboard_keeps_the_undo_keys() {
+        let mut bench = Bench::new();
+        let key = |modifiers| egui::Event::Key { key: egui::Key::Z, physical_key: None, pressed: true, repeat: false, modifiers };
+        let (undo, redo) = (key(egui::Modifiers::COMMAND), key(egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT)));
+        // The document's grid starts blank: an edit paints a module.
+        assert_eq!(bench.app.doc.grid.get(10, 10), Module::Unknown);
+        // An edit to the grid, undone and redone by the keys while
+        // nothing has the keyboard.
+        bench.app.checkpoint();
+        bench.app.doc.grid.set(10, 10, Module::Dark);
+        bench.frame(vec![undo.clone()]);
+        bench.step();
+        assert_eq!(bench.app.doc.grid.get(10, 10), Module::Unknown);
+        bench.frame(vec![redo]);
+        bench.step();
+        assert_eq!(bench.app.doc.grid.get(10, 10), Module::Dark);
+        // With the known-text field holding the keyboard the keys are
+        // the field's, which undoes a typo with them: the grid's edit
+        // stands, where it was undone under the typist before.
+        bench.ctx.memory_mut(|memory| memory.request_focus(inspector::known_text_id()));
+        bench.step();
+        assert!(bench.ctx.egui_wants_keyboard_input(), "the field has the keyboard");
+        bench.frame(vec![undo.clone()]);
+        bench.step();
+        assert!(bench.ctx.egui_wants_keyboard_input(), "and keeps it");
+        assert_eq!(bench.app.doc.grid.get(10, 10), Module::Dark, "the edit stands");
+        // The field given up, the keys are the document's again.
+        bench.ctx.memory_mut(|memory| memory.surrender_focus(inspector::known_text_id()));
+        bench.step();
+        assert!(!bench.ctx.egui_wants_keyboard_input());
+        bench.frame(vec![undo]);
+        bench.step();
+        assert_eq!(bench.app.doc.grid.get(10, 10), Module::Unknown);
+    }
+
+    #[test]
+    fn a_refine_result_is_dropped_when_the_outline_moved_meanwhile() {
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        bench.app.doc.corners = STRAIGHT;
+        bench.app.doc.set_anchor(finder_anchor([75.0, 75.0]), AnchorSource::Manual);
+        let anchors: Vec<Anchor> = bench.app.doc.anchors.iter().map(|a| a.anchor).collect();
+        let job = |corners: [[f64; 2]; 4], anchors: Vec<Anchor>| move || JobResult::Refine { corners, anchors, refined: None };
+        // Of the outline as it stands, the result is taken in: here,
+        // that the corners are unusable.
+        bench.app.start_job(&ctx, JobKind::Refine, job(STRAIGHT, anchors.clone()));
+        bench.settle();
+        let notice = bench.notice();
+        assert!(notice.is_error && notice.text.starts_with("The corners do not form"), "{}", notice.text);
+        // A corner dragged while the step ran: the result is of the
+        // outline before the drag, and is dropped, with the drag kept.
+        bench.app.start_job(&ctx, JobKind::Refine, job(STRAIGHT, anchors.clone()));
+        bench.app.doc.corners[2][0] += 3.0;
+        bench.settle();
+        let notice = bench.notice();
+        assert!(!notice.is_error && notice.text.contains("changed while they were being refined"), "{}", notice.text);
+        assert_eq!(bench.app.doc.corners[2][0], STRAIGHT[2][0] + 3.0);
+        // So is the result of a step whose anchors were dropped meanwhile.
+        let corners = bench.app.doc.corners;
+        bench.app.start_job(&ctx, JobKind::Refine, job(corners, anchors));
+        bench.app.doc.anchors.clear();
+        bench.settle();
+        assert!(bench.notice().text.contains("changed while they were being refined"), "{}", bench.notice().text);
+        assert!(bench.app.doc.anchors.is_empty(), "the anchor dropped stays dropped");
+    }
+
+    #[test]
+    fn the_versions_suggested_go_with_their_family() {
+        let mut bench = Bench::new();
+        let guess = |version| VersionGuess { version, matching: 90, fixed: 100, inverted: false };
+        bench.app.guesses = Some(vec![guess(SymbolVersion::Qr(3)), guess(SymbolVersion::Qr(2))]);
+        // Another version of the family keeps the list; another family
+        // drops it, since a click on one of its versions would switch
+        // the family back.
+        bench.act(Action::SetVersion(SymbolVersion::Qr(3)));
+        assert!(bench.app.guesses.is_some());
+        bench.act(Action::SetVersion(SymbolVersion::Micro(2)));
+        assert!(bench.app.guesses.is_none());
+    }
+
+    #[test]
+    fn a_custom_anchor_turned_onto_a_pattern_becomes_that_patterns_anchor() {
+        let mut bench = Bench::new();
+        bench.app.doc.corners = STRAIGHT;
+        // An anchor set by hand on the corner module of the top-left
+        // finder pattern, which is no site: a half turn takes it onto the
+        // alignment pattern, which is one, and would otherwise leave the
+        // module with two handles, the pattern's and the anchor's own.
+        let custom = anchor(AnchorKind::Custom, [6.5, 6.5], [105.0, 105.0]);
+        bench.app.doc.set_anchor(custom, AnchorSource::Manual);
+        bench.act(Action::Transform(Transform::Symmetry(Symmetry::Rotate180)));
+        bench.step();
+        let anchors: Vec<Anchor> = bench.app.doc.anchors.iter().map(|a| a.anchor).collect();
+        assert_eq!(anchors, [Anchor { kind: AnchorKind::Alignment, at: [18.5, 18.5], ..custom }]);
+        assert_eq!(bench.app.doc.anchors[0].source, AnchorSource::Manual);
+        assert!(bench.app.message.as_ref().is_none_or(|notice| !notice.text.contains("removed")), "{:?}", bench.app.message.as_ref().map(|n| &n.text));
+        // The pattern's anchor now, it goes as any pattern's anchor goes
+        // when a turn leaves no pattern of its kind under it.
+        bench.act(Action::Transform(Transform::Symmetry(Symmetry::Rotate180)));
+        bench.step();
+        assert!(bench.app.doc.anchors.is_empty());
+        assert!(bench.notice().text.contains("1 anchor was removed"), "{}", bench.notice().text);
+    }
+
+    #[test]
     fn a_photo_is_searched_for_symbols_only_when_asked() {
         let mut bench = Bench::new();
         // Loading the photo searched nothing: the notice says it is
@@ -5203,7 +5345,7 @@ mod tests {
         });
         bench.app.start_job(&ctx, JobKind::Refine, move || {
             stepping();
-            JobResult::Refine(None)
+            JobResult::Refine { corners: [[0.0; 2]; 4], anchors: Vec::new(), refined: None }
         });
         bench.act(Action::ClosePhoto);
         wait_for(4);
