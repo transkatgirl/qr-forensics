@@ -602,7 +602,9 @@ impl App {
     /// a guess holds, and a module of that colour already is painted all
     /// the same: how sure it is goes with the paint, so that a guess is
     /// made certain, or a module sampled or certain made a guess, by
-    /// painting over it.
+    /// painting over it. Unknown is neither, and on a module unknown
+    /// already it paints nothing: there is no colour there to be sure of,
+    /// and the press is no edit.
     fn paint(&mut self, x: i32, y: i32, ink: Ink) {
         let func = &self.derived.func;
         if x < 0 || y < 0 || x as usize >= func.width || y as usize >= func.height {
@@ -615,6 +617,7 @@ impl App {
         let grid = &mut self.doc.grid;
         let before = (grid.get(x, y), grid.reliability(x, y));
         match ink {
+            Ink::Module(Module::Unknown) if before.0 == Module::Unknown => {}
             Ink::Module(module) if self.view.paint_as_guess && module != Module::Unknown => grid.set_guessed(x, y, module),
             Ink::Module(module) => grid.set(x, y, module),
             Ink::Photo => {
@@ -6523,5 +6526,48 @@ mod tests {
         repaint(&mut bench);
         assert!(wrong.iter().all(|&(x, y)| bench.app.doc.grid.reliability(x, y) == CERTAIN));
         assert_eq!(bench.app.derived.report.blocks_solved(), 0);
+    }
+
+    #[test]
+    fn unknown_painted_on_a_module_unknown_already_is_no_edit() {
+        let mut bench = Bench::new();
+        bench.size = egui::vec2(1440.0, 3000.0);
+        bench.act(Action::ClosePhoto);
+        let clean = symbol_of("https://example.com/q?id=7Q2M-XK4P-99AD");
+        bench.hold(clean.clone());
+        let layout = bench.app.derived.layout.clone();
+        let at = |i: usize| {
+            let module = layout.codeword_modules(layout.data_stream[i])[3];
+            (module.x as usize, module.y as usize)
+        };
+        // A module sampling left unknown, inside its unsure band: it has
+        // the reliability it was read at all the same.
+        let (x, y) = at(2);
+        let mut grid = clean;
+        grid.set_sampled(x, y, Module::Unknown, 40);
+        bench.hold(grid);
+        bench.app.view.stage = Stage::Edit;
+        bench.step();
+        // Another module painted and the stroke undone, so that there is
+        // a state to redo and none to undo.
+        let cell = bench.cells();
+        let (ox, oy) = at(5);
+        bench.app.view.ink = Ink::Module(bench.app.doc.grid.get(ox, oy).inverted());
+        bench.click(cell(ox, oy), egui::PointerButton::Primary);
+        bench.act(Action::Undo);
+        bench.step();
+        let before = bench.app.doc.clone();
+        assert!(bench.app.history.can_redo(&before) && !bench.app.history.can_undo(&before));
+        // Unknown on the unknown module, certain and as a guess: nothing
+        // of it is changed, and the press costs neither.
+        for guess in [false, true] {
+            bench.app.view.paint_as_guess = guess;
+            bench.app.view.ink = Ink::Module(Module::Unknown);
+            bench.click(cell(x, y), egui::PointerButton::Primary);
+            assert!(bench.app.doc == before, "guess {guess}");
+            assert_eq!(bench.app.doc.grid.reliability(x, y), 40, "guess {guess}");
+            assert!(bench.app.history.can_redo(&bench.app.doc), "guess {guess}: the state undone is still there to redo");
+            assert!(!bench.app.history.can_undo(&bench.app.doc), "guess {guess}: the press left no step to undo");
+        }
     }
 }
