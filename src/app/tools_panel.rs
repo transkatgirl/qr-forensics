@@ -311,8 +311,10 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
 
     // The binarised view is a way of looking, not a reading: its settings
     // are not undoable, and are shown only while the view is, which is
-    // the only time they do anything.
-    if !(app.view.stage == Stage::Align && app.view.align_overlay == AlignOverlay::Binarised) {
+    // the only time they do anything, unless they are set for the scan,
+    // when they are what the scan reads by and stay on show.
+    let shown = app.view.stage == Stage::Align && app.view.align_overlay == AlignOverlay::Binarised;
+    if !(shown || app.view.binarize_for_scan) {
         return;
     }
     ui.add_space(4.0);
@@ -409,6 +411,14 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         app.view.binarize = defaults;
         app.view.binarize_auto = true;
     }
+    ui.checkbox(&mut app.view.binarize_for_scan, "Read the photo as the binarised view shows it").on_hover_text(
+        "Find in outline, Other placements, Search whole photo and the reads of what they find look for finder patterns \
+         against this threshold, and nothing else, in place of the three readings they pool: the local threshold, one \
+         threshold for the outline and the windows. These settings stay on show while this is ticked. What is scanned \
+         sets a reading's level and floor: for an outline, the outline and its margin, as the view has it, and for the \
+         whole photo, the whole of it. A copy of the photo made for a look, shrunk or enlarged, has the reach scaled \
+         with it.",
+    );
 }
 
 fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
@@ -579,6 +589,16 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
          patterns its regions show beside the symbols found. Much faster on a large photo. Turn off for a symbol \
          only a few pixels a module, which the copy may lose.",
     );
+    if app.view.binarize_for_scan {
+        let (width, height) = app.photo.as_ref().map_or((0, 0), |photo| (photo.width, photo.height));
+        let binarizer = app.view.binarize_for(app.doc.corners, width, height).binarizer();
+        ui.weak(format!("The photo is read against {binarizer}, as the binarised view shows it.")).on_hover_text(
+            "Find in outline, Other placements, Search whole photo and the reads of what they find look for finder \
+             patterns against that threshold and nothing else. It is set under Photo, with the binarised view's \
+             settings: untick Read the photo as the binarised view shows it there to pool the search's three readings \
+             again.",
+        );
+    }
     app.view.hover_placement = None;
     if let Some(placements) = &app.placements {
         let in_use = super::placement_in_use(placements, &app.doc.corners);

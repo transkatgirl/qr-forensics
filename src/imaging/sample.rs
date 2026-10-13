@@ -1,6 +1,7 @@
 //! Reading module colours off a photo through a projection.
 
 use super::Luma;
+use super::binarize::Binarizer;
 use super::enhance::{Enhance, Enhanced};
 use super::homography::Homography;
 use super::projection::Project;
@@ -434,6 +435,12 @@ pub struct SampleParams {
     /// where they are small or their luminances separate poorly
     /// ([`sample_modules_noting`]). On, unless it is turned off by hand.
     pub sharpen_modules: bool,
+    /// How the photo is thresholded when the symbol is looked for in it
+    /// ([`super::detect`]): the finder scan's three readings pooled, or
+    /// one of them alone, as the binarised view shows one, set for the
+    /// scan in its place. The reaches are in the photo's pixels, and a
+    /// copy made for a look takes them scaled with it.
+    pub binarizer: Binarizer,
 }
 
 impl Default for SampleParams {
@@ -447,6 +454,7 @@ impl Default for SampleParams {
             kernel: Kernel::Vote,
             enhance: Enhance::NONE,
             sharpen_modules: true,
+            binarizer: Binarizer::Pooled,
         }
     }
 }

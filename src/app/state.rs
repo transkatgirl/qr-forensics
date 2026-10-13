@@ -863,10 +863,18 @@ pub struct ViewState {
     /// Parts of a structured append message collected so far.
     pub sequence: Sequence,
     /// Settings of the binarised view: the scan's own rule for the
-    /// outline while `binarize_auto` holds, and whatever was set since.
+    /// outline while `binarize_auto` holds, and whatever was set since,
+    /// over the outline's region either way ([`ViewState::binarize_for`]).
     pub binarize: BinarizeParams,
     /// The binarised view follows the outline, as the scan does.
     pub binarize_auto: bool,
+    /// The scan reads the photo against the binarised view's threshold
+    /// and nothing else, in place of the three readings it pools: Find
+    /// in outline, Other placements, Search whole photo and the reads of
+    /// what they find take it from the view's settings as they stand
+    /// ([`ViewState::binarize_for`]) when they start. Set with those
+    /// settings, which stay on show while it holds.
+    pub binarize_for_scan: bool,
     /// The pointer press on a photo adjustment control under way has
     /// taken its undo point: a slider drag changes the value every frame
     /// and must make one step of undo, not one a frame.
@@ -920,6 +928,21 @@ pub struct ViewState {
     pub pasted_on_press: bool,
 }
 
+impl ViewState {
+    /// The binarised view's settings as they stand for an outline
+    /// `corners` in a photo `width` by `height`: the scan's own for that
+    /// outline while they are automatic, and whatever was set otherwise,
+    /// over that outline's region all the same: the scan takes the level
+    /// and the floor of a reading from the outline it is given, and
+    /// settings made by hand once kept the region of the outline they
+    /// were made on, so that the view showed a level the scan did not
+    /// read by once the outline had moved.
+    pub fn binarize_for(&self, corners: [[f64; 2]; 4], width: usize, height: usize) -> BinarizeParams {
+        let auto = BinarizeParams::for_outline(corners, width, height);
+        if self.binarize_auto { auto } else { BinarizeParams { region: auto.region, ..self.binarize } }
+    }
+}
+
 impl Default for ViewState {
     fn default() -> Self {
         Self {
@@ -953,6 +976,7 @@ impl Default for ViewState {
             sequence: Sequence::default(),
             binarize: BinarizeParams::default(),
             binarize_auto: true,
+            binarize_for_scan: false,
             adjust_gesture: false,
             greyscale: false,
             wheel: WheelLatch::default(),

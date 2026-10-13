@@ -20,6 +20,8 @@
 //! binarise local|global|window <px>
 //!                             the binarised view's rule, a window of so
 //!                             many pixels either side
+//! binarise-scan on|off        read the photo against the binarised
+//!                             view's threshold alone
 //! window <w> <h>              resize the window, in points
 //! wait <frames>               let the window settle for so many frames
 //! layers both|photo|grid
@@ -247,6 +249,7 @@ impl App {
                     _ => AlignOverlay::FixedPatterns,
                 }
             }
+            "binarise-scan" => self.view.binarize_for_scan = word(0) == "on",
             "binarise" => {
                 self.view.binarize_auto = false;
                 (self.view.binarize.global, self.view.binarize.window) = match word(0) {

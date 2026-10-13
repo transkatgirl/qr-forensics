@@ -942,7 +942,7 @@ impl App {
         let view = &mut self.view.align_view;
         view.center = egui::vec2(view.center.x * scale[0] as f32, view.center.y * scale[1] as f32);
         view.scale /= ((scale[0] + scale[1]) / 2.0) as f32;
-        // The binarised view's region and radius were in the old pixels.
+        // The binarised view's radius and window were in the old pixels.
         self.view.binarize_auto = true;
         self.photo_generation += 1;
         let dropped = self.abandon_work();
@@ -1153,7 +1153,7 @@ impl App {
         };
         let luma = photo.luma.clone();
         let searched_inverted = photo.adjust.invert;
-        let (version, corners, params, opts) = (self.doc.version, self.doc.corners, self.view.sample, self.opts);
+        let (version, corners, params, opts) = (self.doc.version, self.doc.corners, self.scan_params(), self.opts);
         let own_family_only = self.view.own_family_only;
         self.start_job(ctx, JobKind::FindCorners, move || {
             JobResult::Corners(read_inside(&luma, version, corners, &params, &opts, searched_inverted, own_family_only))
@@ -1280,7 +1280,7 @@ impl App {
         };
         let luma = photo.luma.clone();
         let photo_inverted = photo.adjust.invert;
-        let (version, params, opts, func) = (self.doc.version, self.view.sample, self.opts, self.derived.func.clone());
+        let (version, params, opts, func) = (self.doc.version, self.scan_params(), self.opts, self.derived.func.clone());
         self.start_job(ctx, JobKind::Adopt, move || {
             // A detection says how its symbol read against the photo as
             // it was searched: with Invert photo changed since, the
@@ -1388,7 +1388,7 @@ impl App {
         };
         let luma = photo.luma.clone();
         let photo_inverted = photo.adjust.invert;
-        let (version, corners, params) = (self.doc.version, self.doc.corners, self.view.sample);
+        let (version, corners, params) = (self.doc.version, self.doc.corners, self.scan_params());
         self.start_job(ctx, JobKind::Placements, move || {
             JobResult::Placements { found: detect_candidates(&luma, version, corners, &params), photo_inverted }
         });
@@ -1430,6 +1430,23 @@ impl App {
     /// The step a job is running, if one is.
     fn running(&self) -> Option<JobKind> {
         self.job.as_ref().map(|job| job.kind)
+    }
+
+    /// The sampling settings a step that looks for the symbol in the
+    /// photo works with: the view's, and, where the binarised view's
+    /// threshold is set for the scan, that threshold in place of the
+    /// scan's three readings, as the view would show it now, following
+    /// the outline while it is automatic. The settings the sample
+    /// preview is keyed by are left as they are: the preview reads no
+    /// finder patterns.
+    fn scan_params(&self) -> SampleParams {
+        let mut params = self.view.sample;
+        if self.view.binarize_for_scan
+            && let Some(photo) = &self.photo
+        {
+            params.binarizer = self.view.binarize_for(self.doc.corners, photo.width, photo.height).binarizer();
+        }
+        params
     }
 
     /// Run `work` on a thread of its own; [`Self::poll_job`] takes its
@@ -1520,7 +1537,7 @@ impl App {
         }
         let photo_inverted = photo.adjust.invert;
         let luma = photo.luma.clone();
-        let params = self.view.sample;
+        let params = self.scan_params();
         let search = self.view.search;
         let family = self.view.own_family_only.then(|| self.doc.version.family());
         self.start_search(ctx, photo_inverted, family, move || match family {
@@ -1674,7 +1691,7 @@ impl App {
         // the other way against the photo as it is.
         let flipped = proposals.photo_inverted != photo_inverted;
         let found: Vec<Detection> = proposals.found.iter().map(|found| Detection { inverted: found.inverted ^ flipped, ..found.clone() }).collect();
-        let (params, opts) = (self.view.sample, self.opts);
+        let (params, opts) = (self.scan_params(), self.opts);
         self.start_job(ctx, JobKind::ReadFound, move || {
             let outlines = found.iter().map(|found| found.corners).collect();
             let reads = work::map(&found, |found| read_detection(&luma, found.clone(), &params, &opts));
@@ -3710,6 +3727,48 @@ mod tests {
         let (read, other) = read_outline_of_any_family(&luma, SymbolVersion::Micro(2), outline, &params, &opts).expect("a symbol");
         assert_eq!(other, None);
         assert_eq!(read.text(), "Wikipedia");
+    }
+
+    #[test]
+    fn the_binarised_views_threshold_can_be_set_for_the_scan() {
+        use qr_forensics::imaging::binarize::{BinarizeParams, Binarizer};
+        let mut bench = Bench::new();
+        // The scan pools its three readings until the view's is set for it.
+        assert_eq!(bench.app.scan_params(), bench.app.view.sample);
+        assert_eq!(bench.app.scan_params().binarizer, Binarizer::Pooled);
+        bench.app.view.binarize_for_scan = true;
+        // Automatic, the view shows the scan's own local reading at the
+        // reach the outline sets, and the scan reads by that alone.
+        let photo = bench.app.photo.as_ref().expect("a photo is loaded");
+        let (width, height) = (photo.width, photo.height);
+        let expected = BinarizeParams::for_outline(bench.app.doc.corners, width, height);
+        assert_eq!(bench.app.scan_params().binarizer, Binarizer::Local { radius: expected.radius as f64 });
+        // It follows the outline as it stands when the step starts.
+        bench.app.doc.corners = square(10.0, 10.0, 30.0);
+        assert_eq!(bench.app.scan_params().binarizer, Binarizer::Local { radius: BinarizeParams::MIN_RADIUS as f64 });
+        // Set by hand, it is what was set.
+        bench.app.view.binarize_auto = false;
+        bench.app.view.binarize = BinarizeParams { window: Some(8), ..expected };
+        assert_eq!(bench.app.scan_params().binarizer, Binarizer::Window { radius: 8.0 });
+        bench.app.view.binarize = BinarizeParams { global: true, ..expected };
+        assert_eq!(bench.app.scan_params().binarizer, Binarizer::Global);
+        // The settings the sample preview is keyed by are untouched.
+        assert_eq!(bench.app.view.sample.binarizer, Binarizer::Pooled);
+        // The panels show the setting with the view off and on, and the
+        // view, once shown, is of the threshold set.
+        bench.app.view.align_overlay = AlignOverlay::FixedPatterns;
+        bench.step();
+        bench.app.view.align_overlay = AlignOverlay::Binarised;
+        bench.step();
+        let binarised = bench.app.photo.as_ref().and_then(|photo| photo.binarised.as_ref()).expect("the view was made");
+        assert_eq!(binarised.params.binarizer(), Binarizer::Global);
+        // And over the outline as it stands, not as it stood when the
+        // threshold was set by hand: the scan takes its level from there.
+        assert_ne!(binarised.params.region, expected.region);
+        assert_eq!(binarised.params.region, BinarizeParams::for_outline(bench.app.doc.corners, width, height).region);
+        // Unticked, the scan pools again.
+        bench.app.view.binarize_for_scan = false;
+        assert_eq!(bench.app.scan_params().binarizer, Binarizer::Pooled);
     }
 
     #[test]

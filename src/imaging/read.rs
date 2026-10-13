@@ -298,6 +298,9 @@ fn read_outline_through(
         return read_outline_plain(image, version, region, &plain, opts, false);
     }
     let view = Enhanced::around(image, region, enhance)?;
+    // A reading set for the scan reaches as far across the copy as it
+    // was set to reach across the photo.
+    let plain = SampleParams { binarizer: plain.binarizer.scaled(view.factor), ..plain };
     let mut result = read_outline_plain(&view.luma, version, region.map(|p| view.to_view(p)), &plain, opts, true)?;
     bring_back(&mut result, &view, enhance);
     Some(result)
@@ -465,6 +468,7 @@ fn read_found_through(
     for anchor in &mut found.anchors {
         anchor.center = view.to_view(anchor.center);
     }
+    let plain = SampleParams { binarizer: plain.binarizer.scaled(view.factor), ..plain };
     prepare(&view.luma, seat(&view.luma, found, &plain), &plain).is_some_and(|prepared| {
         read_placement(&view.luma, &prepared, &variants, &plain, opts, &mut |mut result| {
             bring_back(&mut result, &view, enhance);

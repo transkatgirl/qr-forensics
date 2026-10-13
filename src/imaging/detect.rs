@@ -127,6 +127,12 @@
 //! window a few pixels about each pixel as well, from the start
 //! ([`super::binarize::window_dark`]): a finder pattern blurred by half
 //! a module keeps its rings only against what lies right beside them.
+//! One of the three readings may be set for the scan in place of the
+//! three ([`SampleParams::binarizer`]), reaching as far as it is set
+//! to, as the app's binarised view shows one: the scan then reads the
+//! outline against that and nothing else, so that what the view shows
+//! is what the scan sees, and the rung that narrows the scan's own
+//! threshold is not climbed.
 //! And three rungs sharpen the photo, at its size and enlarged
 //! ([`super::enhance`]), for a symbol so far out of focus that no
 //! threshold tells its finders' rings from their stones.
@@ -211,7 +217,7 @@ use std::sync::{Arc, OnceLock};
 
 use super::Luma;
 use super::adjust::Filter;
-use super::binarize::{BlockMean, WINDOW_BIAS, WINDOW_RADII, window_dark};
+use super::binarize::{Binarizer, BlockMean, WINDOW_BIAS, WINDOW_RADII, window_dark};
 use super::enhance::{Enhance, Enhanced, MAX_VIEW_SIDE, Sharpen};
 use super::homography::{Homography, Model};
 use super::projection::{ControlPoint, Project, Projection};
@@ -844,6 +850,15 @@ pub enum Retry {
 }
 
 impl Retry {
+    /// Whether this rung is climbed with the scan reading the photo as
+    /// `binarizer` has it: every rung is, but the one that narrows the
+    /// scan's own local threshold where one reading is set in place of
+    /// the scan's three, which is then the reading, at the reach it was
+    /// set to.
+    fn climbed_under(self, binarizer: Binarizer) -> bool {
+        !(binarizer.is_set() && matches!(self, Retry::Thresholded { .. }))
+    }
+
     /// The ladder, cheapest step first: a smaller copy costs less than a
     /// filtered one, and that less than a larger one. The narrowed
     /// threshold costs a pass over the photo as it is, between the two,
@@ -1207,6 +1222,7 @@ pub(crate) fn detect_candidates_by(
         let found = Retry::LADDER
             .into_iter()
             .filter(|step| !matches!(step, Retry::Upscaled { factor } if *factor <= enlarge))
+            .filter(|step| step.climbed_under(params.binarizer))
             .filter(|step| match climb {
                 Climb::All => true,
                 Climb::Unsharpened => !matches!(step, Retry::Enhanced(_)),
@@ -1269,6 +1285,9 @@ fn detect_candidates_through(
     step: Retry,
 ) -> Vec<Detection> {
     let Some(view) = View::around(image, region, step) else { return Vec::new() };
+    // A reading set for the scan reaches as far across the copy as it
+    // was set to reach across the photo.
+    let params = &SampleParams { binarizer: params.binarizer.scaled(1.0 / view.scale), ..*params };
     let mut found = detect_candidates_in(&view.luma, version, region.map(|p| view.to_view(p)), params, true, view.local_radius, MAX_RECTIFIED);
     for detection in &mut found {
         view.unscale(detection);
@@ -1321,7 +1340,9 @@ fn detect_candidates_in(
     local_radius: Option<f64>,
     longest: f64,
 ) -> Vec<Detection> {
-    let Some(rect) = Rectified::with_longest(image, region, longest).map(|rect| rect.narrowed(local_radius)) else { return Vec::new() };
+    let Some(rect) = Rectified::with_longest(image, region, longest).map(|rect| rect.narrowed(local_radius).ruled(params.binarizer)) else {
+        return Vec::new();
+    };
     let threshold = fixed_threshold(params);
     let family = version.family();
     let all = collect_capstones(image, &rect, threshold, family);
@@ -1873,19 +1894,23 @@ fn drop_faint_partials(all: &mut Vec<Capstone>) {
 ///
 /// Both readings of the image are labelled, the one against one threshold
 /// before the one that follows the lighting, and a region either shows is
-/// kept once, as the first shows it. None is turned away for there being
+/// kept once, as the first shows it; with one reading set for the scan,
+/// that reading alone is, one threshold at Otsu's split whatever the
+/// sampling's is fixed at. None is turned away for there being
 /// too many: a region has already read as a finder along two lines of
 /// its own, which is BoofCV's whole test of a position pattern, and a
 /// sheet of sixty symbols has a hundred and eighty of them.
 fn region_candidates(rect: &Rectified, threshold: Option<f32>, max_module: f64, scanned: &mut [Candidate]) -> Vec<Candidate> {
-    let global = threshold.unwrap_or_else(|| otsu(rect.data.iter().copied().filter(|v| v.is_finite())));
-    let global_dark = |x: i64, y: i64| rect.at(x, y).map(|v| v < global);
-    let local = LocalMean::new(rect);
-    let local_dark = |x: i64, y: i64| local.dark(rect, x, y);
-    let binarisers: [&dyn Fn(i64, i64) -> Option<bool>; 2] = [&global_dark, &local_dark];
+    let readings: Vec<Reading> = if rect.binarizer.is_set() {
+        vec![Reading::of(rect, None, rect.binarizer)]
+    } else {
+        let local = Binarizer::Local { radius: rect.local_radius };
+        vec![Reading::of(rect, threshold, Binarizer::Global), Reading::of(rect, threshold, local)]
+    };
     let mut out: Vec<Candidate> = Vec::new();
-    for dark in binarisers {
-        for region in regions::finder_regions(rect.frame.width, rect.frame.height, dark, MIN_MODULE, max_module) {
+    for reading in &readings {
+        let dark = |x: i64, y: i64| reading.dark(rect, x, y);
+        for region in regions::finder_regions(rect.frame.width, rect.frame.height, &dark, MIN_MODULE, max_module) {
             let module = (region.module[0] + region.module[1]) / 2.0;
             let near = |c: &Candidate| c.inverted == region.inverted && distance([c.x, c.y], [region.x, region.y]) < module.max(c.module_mean());
             let quad = region.corners.map(|[x, y]| rect.frame.to_image.apply(x, y));
@@ -1958,6 +1983,9 @@ struct Frame {
     origin: [f64; 2],
     /// The outline's size in rectified pixels.
     size: [f64; 2],
+    /// Rectified pixels to a pixel of the image: one, or less for a
+    /// region that comes out reduced.
+    scale: f64,
 }
 
 impl Frame {
@@ -1988,7 +2016,7 @@ impl Frame {
         ])?;
         let to_image = unit_to_image.compose(&pixel_to_unit);
         let from_image = to_image.inverse()?;
-        Some(Self { width, height, to_image, from_image, origin, size })
+        Some(Self { width, height, to_image, from_image, origin, size, scale })
     }
 
     fn to_rectified(self, point: [f64; 2]) -> [f64; 2] {
@@ -2012,8 +2040,12 @@ struct Rectified {
     spread: f32,
     /// How far around each pixel the scan's local threshold reaches, in
     /// rectified pixels: what the outline's size sets, unless a rung of
-    /// the ladder narrowed it.
+    /// the ladder narrowed it, or one reading set for the scan has its
+    /// own reach.
     local_radius: f64,
+    /// How the scan reads it: its three readings pooled, or the one set
+    /// for it, reaching as far as that is set to in rectified pixels.
+    binarizer: Binarizer,
 }
 
 impl Rectified {
@@ -2038,7 +2070,7 @@ impl Rectified {
         }
         let spread = robust_spread(data.iter().copied().filter(|v| v.is_finite()));
         let local_radius = BlockMean::radius_for(frame.size[0].min(frame.size[1]));
-        Some(Self { frame, data, spread, local_radius })
+        Some(Self { frame, data, spread, local_radius, binarizer: Binarizer::Pooled })
     }
 
     /// The same, with the scan's local threshold reaching `radius`
@@ -2048,6 +2080,19 @@ impl Rectified {
         if let Some(radius) = radius {
             self.local_radius = radius;
         }
+        self
+    }
+
+    /// The same, read as `binarizer` has it: against the one reading
+    /// set for the scan alone, when one is, its reach brought from the
+    /// image's pixels to rectified ones, which for the local reading is
+    /// then the reach of the scan's local threshold.
+    fn ruled(mut self, binarizer: Binarizer) -> Self {
+        let binarizer = binarizer.scaled(self.frame.scale);
+        if let Binarizer::Local { radius } = binarizer {
+            self.local_radius = radius;
+        }
+        self.binarizer = binarizer;
         self
     }
 
@@ -2192,6 +2237,50 @@ impl LocalMean {
     fn dark(&self, rect: &Rectified, x: i64, y: i64) -> Option<bool> {
         let value = rect.at(x, y)?;
         Some(self.blocks.is_dark(value, x as usize, y as usize))
+    }
+}
+
+/// One way the scan reads the rectified image as dark and light, made
+/// ready to read: against one threshold, against the lighting around
+/// each pixel, or against the mean of a window about it.
+enum Reading {
+    Global(f32),
+    Local(LocalMean),
+    /// The mask [`window_dark`] makes.
+    Window(Vec<u8>),
+}
+
+impl Reading {
+    /// The reading `binarizer` sets: the global one at `threshold` when
+    /// a threshold is given and at Otsu's split otherwise, a window at
+    /// its reach, or the local one at the reach the scan's local
+    /// threshold has, which is the reach set where the local reading
+    /// was ([`Rectified::ruled`]); the scan's own local reading where
+    /// none is set.
+    fn of(rect: &Rectified, threshold: Option<f32>, binarizer: Binarizer) -> Self {
+        let (w, h) = (rect.frame.width, rect.frame.height);
+        match binarizer {
+            Binarizer::Global => Self::Global(threshold.unwrap_or_else(|| otsu(rect.data.iter().copied().filter(|v| v.is_finite())))),
+            Binarizer::Window { radius } => Self::Window(window_dark(&rect.data, w, h, radius.round().max(1.0) as usize, WINDOW_BIAS * rect.spread)),
+            Binarizer::Local { .. } | Binarizer::Pooled => Self::Local(LocalMean::new(rect)),
+        }
+    }
+
+    /// Whether the pixel reads dark; `None` where there is no pixel.
+    fn dark(&self, rect: &Rectified, x: i64, y: i64) -> Option<bool> {
+        match self {
+            Self::Global(threshold) => rect.at(x, y).map(|v| v < *threshold),
+            Self::Local(local) => local.dark(rect, x, y),
+            Self::Window(mask) => {
+                if x < 0 || y < 0 || x as usize >= rect.frame.width || y as usize >= rect.frame.height {
+                    return None;
+                }
+                match mask[y as usize * rect.frame.width + x as usize] {
+                    2 => None,
+                    kind => Some(kind == 1),
+                }
+            }
+        }
     }
 }
 
@@ -2625,6 +2714,19 @@ fn scan(
 /// ZXing likewise asks only for a quorum of two rows and then judges the
 /// candidates by their geometry.
 fn scan_for_finders(rect: &Rectified, threshold: Option<f32>, max_module: f64) -> Vec<Candidate> {
+    // The centre run is three modules across, so that many lines could
+    // vote, along each axis.
+    let rate = |c: &Candidate| c.votes as f64 / (3.0 * (c.module[0] + c.module[1])).max(1.0);
+    let strongest_first = |a: &Candidate, b: &Candidate| {
+        a.half.cmp(&b.half).then(rate(b).total_cmp(&rate(a))).then((b.module[0] + b.module[1]).total_cmp(&(a.module[0] + a.module[1])))
+    };
+    // One reading set for the scan is the scan: its candidates alone,
+    // whole ones first and each strongest first.
+    if rect.binarizer.is_set() {
+        let mut alone = scan_alone(rect, max_module);
+        alone.sort_by(strongest_first);
+        return alone;
+    }
     let mut clusters = scan_thresholds(rect, threshold, max_module);
     // The windows' hits are gathered apart, and stand only where the
     // two thresholds made no whole candidate: pooled into one gathering
@@ -2638,12 +2740,6 @@ fn scan_for_finders(rect: &Rectified, threshold: Option<f32>, max_module: f64) -
         let near = |o: &Candidate| o.inverted == c.inverted && distance([o.x, o.y], [c.x, c.y]) < c.module_mean().max(o.module_mean());
         !clusters.iter().any(|o| !o.half && near(o))
     });
-    // The centre run is three modules across, so that many lines could
-    // vote, along each axis.
-    let rate = |c: &Candidate| c.votes as f64 / (3.0 * (c.module[0] + c.module[1])).max(1.0);
-    let strongest_first = |a: &Candidate, b: &Candidate| {
-        a.half.cmp(&b.half).then(rate(b).total_cmp(&rate(a))).then((b.module[0] + b.module[1]).total_cmp(&(a.module[0] + a.module[1])))
-    };
     clusters.sort_by(strongest_first);
     windowed.sort_by(strongest_first);
     // Whole candidates before half ones, and among each the two
@@ -2665,17 +2761,31 @@ fn quorate(c: &Candidate) -> bool {
 /// outline and against the threshold that follows the local lighting,
 /// rows and columns each, pooled, in no order.
 fn scan_thresholds(rect: &Rectified, threshold: Option<f32>, max_module: f64) -> Vec<Candidate> {
-    let global = threshold.unwrap_or_else(|| otsu(rect.data.iter().copied().filter(|v| v.is_finite())));
-    let (w, h) = (rect.frame.width, rect.frame.height);
-    let mut clusters = Clusters::new(w, h);
-    let global_dark = |x: i64, y: i64| rect.at(x, y).map(|v| v < global);
-    scan(w, h, &global_dark, MIN_MODULE, max_module, &mut clusters, false);
-    scan(h, w, &|x, y| global_dark(y, x), MIN_MODULE, max_module, &mut clusters, true);
-    let local = LocalMean::new(rect);
-    let local_dark = |x: i64, y: i64| local.dark(rect, x, y);
-    scan(w, h, &local_dark, MIN_MODULE, max_module, &mut clusters, false);
-    scan(h, w, &|x, y| local_dark(y, x), MIN_MODULE, max_module, &mut clusters, true);
+    let mut clusters = Clusters::new(rect.frame.width, rect.frame.height);
+    let local = Binarizer::Local { radius: rect.local_radius };
+    for reading in [Reading::of(rect, threshold, Binarizer::Global), Reading::of(rect, threshold, local)] {
+        scan_both_ways(rect, &|x, y| reading.dark(rect, x, y), max_module, &mut clusters);
+    }
     clusters.quorate()
+}
+
+/// The candidates of the one reading set for the scan, rows and
+/// columns, pooled, in no order. One threshold set for the scan is
+/// Otsu's split, as the view shows it, whatever the sampling's
+/// threshold is fixed at.
+fn scan_alone(rect: &Rectified, max_module: f64) -> Vec<Candidate> {
+    let mut clusters = Clusters::new(rect.frame.width, rect.frame.height);
+    let reading = Reading::of(rect, None, rect.binarizer);
+    scan_both_ways(rect, &|x, y| reading.dark(rect, x, y), max_module, &mut clusters);
+    clusters.quorate()
+}
+
+/// [`scan`] of the rows of the rectified image, binarised by `dark`,
+/// and then of its columns, into `clusters`.
+fn scan_both_ways(rect: &Rectified, dark: &dyn Fn(i64, i64) -> Option<bool>, max_module: f64, clusters: &mut Clusters) {
+    let (w, h) = (rect.frame.width, rect.frame.height);
+    scan(w, h, dark, MIN_MODULE, max_module, clusters, false);
+    scan(h, w, &|x, y| dark(y, x), MIN_MODULE, max_module, clusters, true);
 }
 
 /// The candidates of the scans against the mean of a window a few
@@ -2684,22 +2794,10 @@ fn scan_thresholds(rect: &Rectified, threshold: Option<f32>, max_module: f64) ->
 /// blurred until its rings are ripples reads as rings only against what
 /// lies right beside them. See [`super::binarize`].
 fn scan_windows(rect: &Rectified, max_module: f64) -> Vec<Candidate> {
-    let (w, h) = (rect.frame.width, rect.frame.height);
-    let mut clusters = Clusters::new(w, h);
-    let bias = WINDOW_BIAS * rect.spread;
+    let mut clusters = Clusters::new(rect.frame.width, rect.frame.height);
     for radius in WINDOW_RADII.into_iter().filter(|&radius| radius as f64 <= rect.local_radius) {
-        let mask = window_dark(&rect.data, w, h, radius, bias);
-        let window = |x: i64, y: i64| {
-            if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
-                return None;
-            }
-            match mask[y as usize * w + x as usize] {
-                2 => None,
-                kind => Some(kind == 1),
-            }
-        };
-        scan(w, h, &window, MIN_MODULE, max_module, &mut clusters, false);
-        scan(h, w, &|x, y| window(y, x), MIN_MODULE, max_module, &mut clusters, true);
+        let reading = Reading::of(rect, None, Binarizer::Window { radius: radius as f64 });
+        scan_both_ways(rect, &|x, y| reading.dark(rect, x, y), max_module, &mut clusters);
     }
     clusters.quorate()
 }
@@ -4866,7 +4964,10 @@ pub fn search_for_families(
         return Search { leads: leads_left(leads, &detections), detections };
     };
     let (across, down) = (image.width as f64 / copy.width as f64, image.height as f64 / copy.height as f64);
-    let found = search_whole(&copy, families, params, search, credible, &mut leads);
+    // A reading set for the scan reaches as far across the copy as it
+    // was set to reach across the photo.
+    let in_copy = SampleParams { binarizer: params.binarizer.scaled(2.0 / (across + down)), ..*params };
+    let found = search_whole(&copy, families, &in_copy, search, credible, &mut leads);
     let detections = work::map(&found, |found| {
         let mut found = found.clone();
         found.corners = found.corners.map(|[x, y]| [x * across, y * down]);
@@ -5272,7 +5373,8 @@ fn search_fine(
 ) -> Vec<Detection> {
     let mut all: Vec<Detection> = known.to_vec();
     let mut wanted: Vec<Family> = families.to_vec();
-    let steps: Vec<Option<Retry>> = std::iter::once(None).chain(Retry::LADDER.iter().copied().map(Some)).collect();
+    let steps: Vec<Option<Retry>> =
+        std::iter::once(None).chain(Retry::LADDER.iter().copied().filter(|step| step.climbed_under(params.binarizer)).map(Some)).collect();
     let view_of = |step: Option<Retry>, wanted: &[Family]| match step {
         None => ScannedView::of(image, params, wanted),
         Some(step) => ScannedView::through(image, step, params, wanted),
@@ -5519,6 +5621,8 @@ struct ScannedView<'a> {
     step: Option<Retry>,
     /// The reach of the scan's local threshold, where the rung narrows it.
     local_radius: Option<f64>,
+    /// How the scan reads the copy, its reach in the copy's pixels.
+    binarizer: Binarizer,
     rect: Rectified,
     threshold: Option<f32>,
     /// The scan's candidates, strongest first, and the regions', best first.
@@ -5540,7 +5644,8 @@ impl<'a> ScannedView<'a> {
     /// when the copy cannot be made.
     fn through(image: &'a Luma, step: Retry, params: &SampleParams, families: &[Family]) -> Option<Self> {
         let view = View::whole(image, step)?;
-        Self::new(Cow::Owned(view.luma), view.origin, view.scale, Some(step), view.local_radius, params, families, true)
+        let params = SampleParams { binarizer: params.binarizer.scaled(1.0 / view.scale), ..*params };
+        Self::new(Cow::Owned(view.luma), view.origin, view.scale, Some(step), view.local_radius, &params, families, true)
     }
 
     /// The photo as it is, with the finder patterns its regions show
@@ -5582,14 +5687,14 @@ impl<'a> ScannedView<'a> {
     ) -> Option<Self> {
         let (w, h) = (luma.width as f64, luma.height as f64);
         let region = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]];
-        let rect = Rectified::with_longest(&luma, region, MAX_RECTIFIED_WHOLE)?.narrowed(local_radius);
+        let rect = Rectified::with_longest(&luma, region, MAX_RECTIFIED_WHOLE)?.narrowed(local_radius).ruled(params.binarizer);
         let threshold = fixed_threshold(params);
         let widest = families.iter().map(|&f| max_module_fraction(f)).fold(0.0, f64::max);
         let max_module = rect.frame.size[0].min(rect.frame.size[1]) * widest;
         let mut candidates = if scanned { scan_for_finders(&rect, threshold, max_module) } else { Vec::new() };
         let regions = region_candidates(&rect, threshold, max_module, &mut candidates);
         let refined = [vec![OnceLock::new(); candidates.len()], vec![OnceLock::new(); regions.len()]];
-        Some(Self { luma, origin, scale, step, local_radius, rect, threshold, candidates, regions, refined })
+        Some(Self { luma, origin, scale, step, local_radius, binarizer: params.binarizer, rect, threshold, candidates, regions, refined })
     }
 
     fn to_photo(&self, p: [f64; 2]) -> [f64; 2] {
@@ -5696,6 +5801,9 @@ impl<'a> ScannedView<'a> {
     fn find(&self, family: Family, params: &SampleParams, taken: &[Detection], known: &[Detection]) -> Found {
         let image: &Luma = &self.luma;
         let threshold = self.threshold;
+        // The proposals are fitted in the copy's own pixels, where a
+        // reading set for the scan reaches as the copy was scanned.
+        let params = &SampleParams { binarizer: self.binarizer, ..*params };
         // The finders of a symbol already found are not offered again, as
         // those of a symbol found here are not below. A symbol with one
         // finder may have been claimed off a finder of a QR Code no copy
@@ -9905,6 +10013,72 @@ mod tests {
         let narrowed = rect.narrowed(Some(f64::from(NARROW_RADIUS)));
         let found = scan_thresholds(&narrowed, None, max_module);
         assert!(found.iter().any(|c| near(c) && !c.half), "{found:?}");
+    }
+
+    #[test]
+    fn one_reading_set_for_the_scan_is_the_scan() {
+        // The finder in a shadow of the test above: the two thresholds
+        // the scan pools make nothing of it, and the windows do.
+        let finder = draw_turned(SymbolVersion::Micro(1), [128.0, 128.0], 8.0, 0.0, (300, 300));
+        let image = lit(&finder, |x, y| if x >= 64 && y >= 64 { 0.4 } else { 1.0 });
+        let region = [[0.0, 0.0], [300.0, 0.0], [300.0, 300.0], [0.0, 300.0]];
+        let max_module = 300.0 * max_module_fraction(Family::Qr);
+        let rect = |binarizer: Binarizer| Rectified::new(&image, region).unwrap().ruled(binarizer);
+        let own = rect(Binarizer::Pooled).local_radius;
+        let centre = rect(Binarizer::Pooled).to_rectified([128.0 - 16.0, 128.0 - 16.0]);
+        let near = |c: &Candidate| distance([c.x, c.y], centre) < 8.0 && !c.inverted;
+        let finds = |binarizer: Binarizer| scan_for_finders(&rect(binarizer), None, max_module).iter().any(|c| near(c) && !c.half);
+        // One threshold alone reads the shadowed paper as ink, and the
+        // local threshold at the reach the outline sets alone pulls the
+        // finder's light runs dark: neither finds it, and neither has
+        // the windows to find it with.
+        assert!(!finds(Binarizer::Global));
+        assert!(!finds(Binarizer::Local { radius: own }));
+        // Narrowed into the shadow, the local threshold alone does, and
+        // so does a window alone, as the view shows each.
+        assert!(finds(Binarizer::Local { radius: f64::from(NARROW_RADIUS) }));
+        assert!(finds(Binarizer::Window { radius: 16.0 }));
+        // The regions are labelled under the one reading set, and none
+        // other: one threshold alone shows no finder there either way.
+        let regions = region_candidates(&rect(Binarizer::Global), None, max_module, &mut Vec::new());
+        assert!(!regions.iter().any(near), "{regions:?}");
+        let regions = region_candidates(&rect(Binarizer::Local { radius: f64::from(NARROW_RADIUS) }), None, max_module, &mut Vec::new());
+        assert!(regions.iter().any(near), "{regions:?}");
+        // One threshold set for the scan is Otsu's split, as the view
+        // shows it, whatever the sampling's threshold is fixed at: in
+        // even light it reads the finder with that one fixed where
+        // nothing reads dark.
+        let even = Rectified::new(&finder, region).unwrap().ruled(Binarizer::Global);
+        assert!(scan_for_finders(&even, Some(0.0), max_module).iter().any(|c| near(c) && !c.half));
+        let regions = region_candidates(&even, Some(0.0), max_module, &mut Vec::new());
+        assert!(regions.iter().any(near), "{regions:?}");
+        // The reach set is in the image's pixels, and is brought to the
+        // rectified image's: a region scanned reduced to a third has it
+        // a third as long, and the local reading's reach is the scan's.
+        let reduced = Rectified::with_longest(&image, region, 130.0).unwrap();
+        assert!((reduced.frame.scale - 1.0 / 3.0).abs() < 1e-9, "{}", reduced.frame.scale);
+        let reduced = reduced.ruled(Binarizer::Local { radius: 48.0 });
+        assert_eq!(reduced.binarizer, Binarizer::Local { radius: 16.0 });
+        assert!((reduced.local_radius - 16.0).abs() < 1e-9, "{}", reduced.local_radius);
+        let windowed = Rectified::with_longest(&image, region, 130.0).unwrap().ruled(Binarizer::Window { radius: 12.0 });
+        assert_eq!(windowed.binarizer, Binarizer::Window { radius: 4.0 });
+        assert!((windowed.local_radius - BlockMean::radius_for(100.0)).abs() < 1e-9, "a window leaves the local reach alone");
+        // A copy of the photo made for a look takes the reach scaled
+        // with it, and the proposals it fits are fitted with the same.
+        let params = SampleParams { binarizer: Binarizer::Local { radius: 40.0 }, ..SampleParams::default() };
+        let view = ScannedView::through(&image, Retry::Downscaled { factor: 2 }, &params, &[Family::Qr]).unwrap();
+        assert_eq!(view.binarizer, Binarizer::Local { radius: 20.0 });
+        assert_eq!(view.rect.binarizer, Binarizer::Local { radius: 20.0 });
+        assert!((view.rect.local_radius - 20.0).abs() < 1e-9);
+        let whole = ScannedView::of(&image, &params, &[Family::Qr]).unwrap();
+        assert_eq!(whole.rect.binarizer, Binarizer::Local { radius: 40.0 });
+        // The rung that narrows the scan's own threshold is not climbed
+        // where a reading is set in its place: that reading is the
+        // scan, at the reach it was set to.
+        assert!(Retry::Thresholded { radius: NARROW_RADIUS }.climbed_under(Binarizer::Pooled));
+        assert!(!Retry::Thresholded { radius: NARROW_RADIUS }.climbed_under(Binarizer::Global));
+        assert!(!Retry::Thresholded { radius: NARROW_RADIUS }.climbed_under(Binarizer::Local { radius: 40.0 }));
+        assert!(Retry::Downscaled { factor: 2 }.climbed_under(Binarizer::Global));
     }
 
     /// A grid drawn `module_px` pixels a module about `centre`, turned

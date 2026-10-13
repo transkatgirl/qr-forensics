@@ -7,7 +7,7 @@ use qr_forensics::decode::bitstream::EndOfData;
 use qr_forensics::decode::codewords::PinSource;
 use qr_forensics::decode::pipeline::CwStatus;
 use qr_forensics::imaging::Luma;
-use qr_forensics::imaging::binarize::{BinarizeParams, binarize};
+use qr_forensics::imaging::binarize::binarize;
 use qr_forensics::imaging::detect::{Anchor, AnchorKind, anchor_sites, edge_sites};
 use qr_forensics::imaging::projection::{CORNER_CLEARANCE, Project, Projection};
 use qr_forensics::symbol::function_map::Role;
@@ -230,9 +230,7 @@ fn align_stage(
     // while the luminance and the settings stay the same.
     let texture = match view.align_overlay {
         AlignOverlay::Binarised if !peek => {
-            if view.binarize_auto {
-                view.binarize = BinarizeParams::for_outline(doc.corners, photo.width, photo.height);
-            }
+            view.binarize = view.binarize_for(doc.corners, photo.width, photo.height);
             if !photo.binarised.as_ref().is_some_and(|b| b.is_for(&photo.luma, &view.binarize)) {
                 let bw = binarize(&photo.luma, &view.binarize);
                 let gray: Vec<u8> = bw.data.iter().map(|&v| if v < 0.5 { 0 } else { 255 }).collect();

@@ -38,6 +38,8 @@
 //! crop through four binarizers whose windows run from a tenth to a
 //! quarter of it.
 
+use std::fmt;
+
 use super::Luma;
 use super::sample::{NOISE_RANGE, otsu, robust_spread};
 
@@ -182,6 +184,61 @@ pub const WINDOW_RADII: [usize; 4] = [4, 8, 16, 32];
 /// for the same reason.
 pub const WINDOW_BIAS: f32 = 0.03;
 
+/// How the finder scan thresholds the photo: the three readings it pools,
+/// or one of them alone, reaching as far as it is set to, as the
+/// binarised view shows one ([`BinarizeParams::binarizer`]). The scan
+/// reads the outline, or the whole photo, against one reading set for
+/// it and nothing else, so that what the view shows is what the scan
+/// sees. The reaches are in the pixels of the image set for, and a copy
+/// of it made larger or smaller for a look takes them scaled with it
+/// ([`Binarizer::scaled`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Binarizer {
+    /// The three readings pooled: the scan as it is, against the
+    /// lighting around each pixel within a sixth of the outline, against
+    /// one threshold for the outline, and against the windows at each of
+    /// [`WINDOW_RADII`].
+    Pooled,
+    /// Each pixel against the lighting around it alone: the mean of the
+    /// blocks within `radius` pixels ([`BlockMean`]).
+    Local { radius: f64 },
+    /// One threshold alone, Otsu's split of the luminance of what is
+    /// scanned.
+    Global,
+    /// Each pixel against the mean of the window `radius` pixels either
+    /// side of it alone ([`window_dark`]).
+    Window { radius: f64 },
+}
+
+impl Binarizer {
+    /// Whether one reading is set in place of the scan's three.
+    pub fn is_set(self) -> bool {
+        self != Self::Pooled
+    }
+
+    /// The same reading for a copy of the image `factor` times as large:
+    /// each reach `factor` times as long, so that it reaches as far
+    /// across the copy as it was set to reach across the image.
+    pub fn scaled(self, factor: f64) -> Self {
+        match self {
+            Self::Local { radius } => Self::Local { radius: radius * factor },
+            Self::Window { radius } => Self::Window { radius: radius * factor },
+            other => other,
+        }
+    }
+}
+
+impl fmt::Display for Binarizer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pooled => write!(f, "its three readings pooled"),
+            Self::Local { radius } => write!(f, "the local threshold, reaching {radius:.0} px about each pixel"),
+            Self::Global => write!(f, "one threshold for the whole of what it scans"),
+            Self::Window { radius } => write!(f, "a window reaching {radius:.0} px either side of each pixel"),
+        }
+    }
+}
+
 /// Each pixel of a `width` × `height` image against the mean of the
 /// window `radius` pixels either side of it, clipped to the image: 1
 /// where it lies more than `bias` below that mean and reads dark, 0
@@ -294,6 +351,20 @@ impl BinarizeParams {
         };
         Self { radius: radius.clamp(Self::MIN_RADIUS, Self::MAX_RADIUS), global: false, window: None, region }
     }
+
+    /// The one reading these settings show, as the scan takes it in
+    /// place of its three when it is set for the scan: the window when
+    /// one is given, else the one threshold when that is asked for, else
+    /// the local threshold at this radius. The region is the view's own:
+    /// the scan takes the level and the floor of a reading from what it
+    /// scans, which for an outline is what the view's region is.
+    pub fn binarizer(&self) -> Binarizer {
+        match self.window {
+            Some(radius) => Binarizer::Window { radius: radius as f64 },
+            None if self.global => Binarizer::Global,
+            None => Binarizer::Local { radius: self.radius as f64 },
+        }
+    }
 }
 
 impl Default for BinarizeParams {
@@ -350,6 +421,26 @@ mod tests {
         assert_eq!(BinarizeParams::for_outline(square(10.0, 10.0, 20.0), 1000, 800).radius, BinarizeParams::MIN_RADIUS);
         assert_eq!(BinarizeParams::for_outline([[0.0; 2]; 4], 1000, 800).region, None);
         assert_eq!(BinarizeParams::default().region, None);
+    }
+
+    #[test]
+    fn the_view_names_the_one_reading_it_shows() {
+        let local = BinarizeParams { radius: 40, global: false, window: None, region: None };
+        assert_eq!(local.binarizer(), Binarizer::Local { radius: 40.0 });
+        assert_eq!(BinarizeParams { global: true, ..local }.binarizer(), Binarizer::Global);
+        // A window given is the reading, whatever else is set beside it.
+        assert_eq!(BinarizeParams { global: true, window: Some(8), ..local }.binarizer(), Binarizer::Window { radius: 8.0 });
+        assert!(local.binarizer().is_set() && !Binarizer::Pooled.is_set());
+        // A copy twice as large has each reach twice as long, and one
+        // threshold reaches as far as ever.
+        assert_eq!(Binarizer::Local { radius: 40.0 }.scaled(2.0), Binarizer::Local { radius: 80.0 });
+        assert_eq!(Binarizer::Window { radius: 8.0 }.scaled(0.25), Binarizer::Window { radius: 2.0 });
+        assert_eq!(Binarizer::Global.scaled(3.0), Binarizer::Global);
+        assert_eq!(Binarizer::Pooled.scaled(3.0), Binarizer::Pooled);
+        assert_eq!(Binarizer::Local { radius: 33.3 }.to_string(), "the local threshold, reaching 33 px about each pixel");
+        assert_eq!(Binarizer::Window { radius: 8.0 }.to_string(), "a window reaching 8 px either side of each pixel");
+        assert_eq!(Binarizer::Global.to_string(), "one threshold for the whole of what it scans");
+        assert_eq!(Binarizer::Pooled.to_string(), "its three readings pooled");
     }
 
     #[test]
