@@ -881,7 +881,7 @@ fn format_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
 
 fn outcome_text(block: &BlockReport) -> (String, bool) {
     match block.outcome {
-        BlockOutcome::Solved { method, errors, erasures, slack, confidence_bits, beyond_standard } => {
+        BlockOutcome::Solved { method, errors, erasures, slack, confidence_bits, risk_bits, beyond_standard } => {
             let mut text = match method {
                 SolveMethod::ReedSolomon if errors + erasures == 0 => "clean".to_owned(),
                 SolveMethod::ReedSolomon => format!("solved: {errors} wrong, {erasures} unknown, {slack} to spare"),
@@ -918,15 +918,24 @@ fn outcome_text(block: &BlockReport) -> (String, bool) {
                 SolveMethod::List { multiplicity } => format!(
                     "solved by list decoding (multiplicity {multiplicity}): {errors} wrong, {erasures} unknown, {confidence_bits} checks"
                 ),
+                SolveMethod::BeliefPropagation { rounds, flipped_bits } => format!(
+                    "solved by belief propagation ({rounds} rounds, {flipped_bits} bits flipped): {errors} wrong, \
+                     {erasures} unknown, {confidence_bits} checks"
+                ),
                 SolveMethod::PinnedOnly => "solved from pins alone".to_owned(),
             };
+            if risk_bits > 0 {
+                text.push_str(&format!(" — at most a 1 in 2^{risk_bits} chance it's wrong"));
+            } else {
+                text.push_str(" — nothing confirms it");
+            }
             if beyond_standard {
                 text.push_str(&format!(
                     " — beyond the standard's limit: {} of the EC codewords are reserved for detection, not correction, \
                      and this solution spent them",
                     block.reserved
                 ));
-            } else if !block.is_verified() {
+            } else if !block.is_verified() && risk_bits > 0 {
                 text.push_str(" — unconfirmed");
             }
             if block.half_padded_with_ones {

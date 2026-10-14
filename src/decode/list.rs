@@ -48,7 +48,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use super::gf256::{self, div, exp, mul, poly_eval};
-use super::rs::{CwRead, DOUBT_CONFIRMING_BITS, RsSolution, doubted_agreement, list_solution_bits, nearest, settle, soft_distance};
+use super::rs::{CwRead, DOUBT_CONFIRMING_BITS, RsSolution, doubted_agreement, list_solution_bits, nearest, preferring_the_standard, settle, soft_distance};
 use crate::symbol::grid::CERTAIN;
 use crate::work;
 
@@ -322,19 +322,20 @@ impl Curve {
         }
     }
 
-    /// `self *= (X - x)`.
+    /// `self *= (X - x)`, in place: from the top, each coefficient
+    /// moves up a degree and leaves `x` times itself behind.
     fn times_x_minus(&mut self, x: u8) {
         for poly in &mut self.coef {
             if poly.is_empty() {
                 continue;
             }
-            let mut out = vec![0u8; poly.len() + 1];
-            for (d, &c) in poly.iter().enumerate() {
-                out[d + 1] ^= c;
-                out[d] ^= mul(c, x);
+            poly.push(0);
+            for d in (0..poly.len() - 1).rev() {
+                let c = poly[d];
+                poly[d + 1] ^= c;
+                poly[d] = mul(c, x);
             }
-            trim(&mut out);
-            *poly = out;
+            trim(poly);
         }
     }
 
@@ -435,13 +436,14 @@ fn interpolate(constraints: &[(u8, u8, usize)], w: usize, list_size: usize) -> O
                 }
                 let d: Vec<u8> = curves.iter().map(|c| c.hasse(a, b, &xpow, &ypow)).collect();
                 let Some(pivot) = (0..=list_size).filter(|&j| d[j] != 0).min_by_key(|&j| curves[j].leading(w)) else { continue };
-                let pivot_curve = curves[pivot].clone();
+                let pivot_curve = std::mem::take(&mut curves[pivot]);
                 for j in 0..=list_size {
                     if j != pivot && d[j] != 0 {
                         let c = div(d[j], d[pivot]);
                         curves[j].add_scaled(&pivot_curve, c);
                     }
                 }
+                curves[pivot] = pivot_curve;
                 curves[pivot].times_x_minus(x);
                 met += 1;
                 if met.is_multiple_of(64) && work::cancelled() {
@@ -498,8 +500,9 @@ fn y_roots(curve: &Curve, k: usize) -> Vec<Vec<u8>> {
 /// constraints to spend on the curve ([`LIST_COST`]): every codeword of
 /// the code the curve through the block's points, weighed by their
 /// reliability, passes through, each restated against the block as read
-/// as any solution is, kept when it lies within the standard and
-/// [`DOUBT_CONFIRMING_BITS`] confirm it, and of those the nearest the
+/// as any solution is, kept when [`DOUBT_CONFIRMING_BITS`] confirm it,
+/// those within the standard over any that spend its reserve
+/// ([`preferring_the_standard`]), and of those the nearest the
 /// block as read by a clear margin, or every one within the margin,
 /// nearest first ([`nearest`]). Each comes with the greatest
 /// multiplicity any point was given. A pinned bit is never overturned.
@@ -586,11 +589,12 @@ pub fn rs_decode_listing(block: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: 
         let slack = redundancy.saturating_sub(2 * hard).min(bits as usize / 8);
         let located = bits - 8 * slack as u32;
         let Ok(solution) = settle(block, &doubted_erased, &erased, corrected, errors, slack, located, reserved) else { continue };
-        if !solution.within_standard() || solution.confidence_bits() < DOUBT_CONFIRMING_BITS {
+        if solution.confidence_bits() < DOUBT_CONFIRMING_BITS {
             continue;
         }
         found.push((soft_distance(block, bit_reliability, &solution.corrected), (multiplicity, solution)));
     }
+    let found = preferring_the_standard(found, |(_, solution)| solution);
     nearest(found, |a, b| a.1.corrected == b.1.corrected, |a, b| a.1.confidence_bits() > b.1.confidence_bits())
 }
 

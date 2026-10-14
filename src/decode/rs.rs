@@ -36,7 +36,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::gf256::{self, div, exp, mul, poly_degree, poly_eval, poly_mul};
+use super::gf256::{self, div, exp, exp_of_sum, log, mul, poly_degree, poly_eval, poly_mul};
 use crate::symbol::grid::CERTAIN;
 use crate::work;
 
@@ -346,6 +346,70 @@ pub fn list_solution_bits(read: usize, redundancy: usize, errors: usize) -> u32 
     bits.max(0.0).floor() as u32
 }
 
+/// Furthest the soft count ([`soft_count_bits`]) looks, in
+/// reliability-weighted bits: a solution lying further from the block
+/// as read than this is confirmed by the hard count alone. Sixteen
+/// certain bits, or four hundred faint ones, which is more than any
+/// block has.
+pub const SOFT_COUNT_REACH: u32 = 4096;
+
+/// What confirms a codeword found within `distance` of the block as
+/// read, in bits weighed by their reliability ([`soft_distance`]), in
+/// bits: how rarely a block of noise has any codeword so near. The
+/// code is linear over GF(2) with `redundancy_bits` equations once the
+/// unknown bits are spent, so one binary word in `2^redundancy_bits` is
+/// a codeword, and about each word there are as many words within
+/// `distance` as there are sets of its known bits whose reliabilities
+/// and one sum to `distance` or less: counted by dynamic programming
+/// over the reliabilities, which are small integers. So noise shows a
+/// codeword within `distance` once in the quotient, and a solution
+/// that overturns only faint bits is rare in noise however many
+/// codewords it changes, where the hard count ([`list_solution_bits`])
+/// charges it a byte's worth for each. Pinned bits are never
+/// overturned and are not counted. Nought beyond
+/// [`SOFT_COUNT_REACH`], where the hard count serves.
+///
+/// The count asks nothing of the reliabilities but that noise be noise:
+/// the sets are what they are whatever the reliabilities mean, and a
+/// block of noise lies within `distance` of some codeword as often as
+/// the count says. Reliabilities that overstate how well the modules
+/// were read make the right codeword lie far off, and go unconfirmed;
+/// they never make a wrong one lie near.
+pub fn soft_count_bits(block: &[CwRead], bit_reliability: &[[u8; 8]], redundancy_bits: usize, distance: u32) -> u32 {
+    if distance > SOFT_COUNT_REACH {
+        return 0;
+    }
+    let reach = distance as usize;
+    // ways[d]: how many sets of the bits seen so far cost exactly d,
+    // scaled down by 2^scaled whenever they grow large.
+    let mut ways = vec![0f64; reach + 1];
+    ways[0] = 1.0;
+    let mut scaled = 0i64;
+    for (cw, reliability) in block.iter().zip(bit_reliability) {
+        for b in 0..8 {
+            if cw.known >> b & 1 == 0 || cw.pinned >> b & 1 != 0 {
+                continue;
+            }
+            let cost = usize::from(reliability[b]) + 1;
+            if cost > reach {
+                continue;
+            }
+            for d in (cost..=reach).rev() {
+                ways[d] += ways[d - cost];
+            }
+            if ways.iter().any(|&w| w > 2f64.powi(500)) {
+                for w in &mut ways {
+                    *w *= 2f64.powi(-500);
+                }
+                scaled += 500;
+            }
+        }
+    }
+    let total: f64 = ways.iter().sum();
+    let volume = total.log2() + scaled as f64;
+    (redundancy_bits as f64 - volume - (255f64 / 254.0).log2()).max(0.0).floor() as u32
+}
+
 /// One codeword as read from the symbol.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CwRead {
@@ -551,7 +615,7 @@ fn syndrome_of_bit(n: usize, i: usize, bit: u8, ec_len: usize) -> Vec<u8> {
 /// erased or a bit flipped each time, has them once for all its tries:
 /// the erasures by trial change nothing of them, and a flipped bit adds
 /// [`syndrome_of_bit`].
-fn rs_decode_core(block: &[CwRead], doubted: &[usize], ec_len: usize, reserved: usize, syndromes: &[u8]) -> Result<RsSolution, RsFailure> {
+pub(super) fn rs_decode_core(block: &[CwRead], doubted: &[usize], ec_len: usize, reserved: usize, syndromes: &[u8]) -> Result<RsSolution, RsFailure> {
     let n = block.len();
     assert!(n <= 255 && ec_len <= n, "block of {n} with {ec_len} EC codewords");
     debug_assert_eq!(syndromes.len(), ec_len);
@@ -716,10 +780,12 @@ pub(super) fn settle(
 
 /// Decode by doubting: erase the least reliable fully read codewords, one
 /// more at a time, and keep the solution with the most confirmation,
-/// among those that show [`DOUBT_CONFIRMING_BITS`] of it and stay within
-/// the standard's limit when `reserved` codewords are kept for detection.
-/// Returns how many codewords were doubted. Codewords at [`CERTAIN`]
-/// reliability and pinned codewords are never doubted.
+/// among those that show [`DOUBT_CONFIRMING_BITS`] of it: one within the
+/// standard's limit when `reserved` codewords are kept for detection, or,
+/// when none is, one that spends them, which the caller marks as beyond
+/// the standard ([`RsSolution::within_standard`]). Returns how many
+/// codewords were doubted. Codewords at [`CERTAIN`] reliability and
+/// pinned codewords are never doubted.
 pub fn rs_decode_doubting(
     block: &[CwRead],
     reliability: &[u8],
@@ -735,16 +801,30 @@ pub fn rs_decode_doubting(
     doubtful.truncate(ec_len.saturating_sub(erasures));
 
     let mut best: Option<(usize, RsSolution)> = None;
+    let mut beyond: Option<(usize, RsSolution)> = None;
     for k in 1..=doubtful.len() {
         if let Ok(solution) = rs_decode_doubted(block, &doubtful[..k], ec_len, reserved).map(|s| s.among(doubtful.len()))
             && solution.confidence_bits() >= DOUBT_CONFIRMING_BITS
-            && solution.within_standard()
-            && best.as_ref().is_none_or(|(_, b)| solution.confidence_bits() > b.confidence_bits())
         {
-            best = Some((k, solution));
+            let held = if solution.within_standard() { &mut best } else { &mut beyond };
+            if held.as_ref().is_none_or(|(_, b)| solution.confidence_bits() > b.confidence_bits()) {
+                *held = Some((k, solution));
+            }
         }
     }
-    best
+    best.or(beyond)
+}
+
+/// Of solutions found many ways, those within the standard's limit
+/// when any is ([`RsSolution::within_standard`]), and all of them
+/// otherwise: a solution that spends the codewords the standard reserves
+/// for detection is offered only where none that keeps them was found.
+pub(super) fn preferring_the_standard<T>(found: Vec<(u32, T)>, solution: impl Fn(&T) -> &RsSolution) -> Vec<(u32, T)> {
+    if found.iter().any(|(_, t)| solution(t).within_standard()) {
+        found.into_iter().filter(|(_, t)| solution(t).within_standard()).collect()
+    } else {
+        found
+    }
 }
 
 /// Bits [`rs_decode_chasing`] flips at the most: every pattern of the
@@ -803,7 +883,8 @@ pub const CHASE_MIN_SLACK: usize = 2;
 ///
 /// Trying many patterns is list decoding, and a wrong pattern can land
 /// on a wrong codeword that verifies, so every pattern's verified
-/// solution within the standard is kept, and where they name different
+/// solution is kept, those within the standard over any that spend its
+/// reserve ([`preferring_the_standard`]), and where they name different
 /// codewords the one nearest the block as read, in bits weighed by
 /// their reliability, is kept over the rest only when it is nearer by a
 /// clear margin ([`nearest`]): the patterns flip the faintest bits, and
@@ -871,22 +952,44 @@ pub fn rs_decode_chasing_bits(
     let base = rs_syndromes(&received, ec_len);
     let deltas: Vec<Vec<u8>> = doubtful.iter().map(|&(_, i, b)| syndrome_of_bit(n, i, b, ec_len)).collect();
     let patterns = (1usize << doubtful.len()) - 1;
+    // The erasures are the same under every pattern, so their locator,
+    // and what it makes of the syndromes and of each flip's addition to
+    // them, is computed once; each pattern then has its Forney
+    // syndromes by a few additions, and most patterns are refused on
+    // those alone ([`Locator::locates`]), without the decode.
+    let erased: Vec<usize> = (0..n).filter(|&i| block[i].is_erasure()).collect();
+    let f = erased.len();
+    if f > ec_len {
+        return Vec::new();
+    }
+    let gamma = erased.iter().fold(vec![1u8], |gamma, &i| poly_mul(&gamma, &[1, exp(n - 1 - i)]));
+    let forney_of = |syndromes: &[u8]| -> Vec<u8> { (f..ec_len).map(|k| (0..=f).fold(0, |acc, m| acc ^ mul(gamma[m], syndromes[k - m]))).collect() };
+    let delta_forney: Vec<Vec<u8>> = deltas.iter().map(|d| forney_of(d)).collect();
+    let budget = (ec_len - f) / 2;
     let mut found: Vec<(u32, (u32, RsSolution))> = Vec::new();
     let mut trial = block.to_vec();
     let mut syndromes = base.clone();
-    for pattern in 1u32..1 << doubtful.len() {
-        if pattern % 256 == 0 && work::cancelled() {
+    let mut forney = forney_of(&base);
+    let mut locator = Locator::new(ec_len, n);
+    // The patterns in Gray code order: each differs from the last in
+    // one bit, flipped in the trial and added to the syndromes.
+    let mut pattern = 0u32;
+    for step in 1..=patterns as u32 {
+        if step % 256 == 0 && work::cancelled() {
             break;
         }
-        trial.copy_from_slice(block);
-        syndromes.copy_from_slice(&base);
-        for (k, &(_, i, b)) in doubtful.iter().enumerate() {
-            if pattern >> k & 1 != 0 {
-                trial[i].value ^= 1 << b;
-                for (s, d) in syndromes.iter_mut().zip(&deltas[k]) {
-                    *s ^= d;
-                }
-            }
+        let k = step.trailing_zeros() as usize;
+        pattern ^= 1 << k;
+        let (_, i, b) = doubtful[k];
+        trial[i].value ^= 1 << b;
+        for (s, d) in syndromes.iter_mut().zip(&deltas[k]) {
+            *s ^= d;
+        }
+        for (s, d) in forney.iter_mut().zip(&delta_forney[k]) {
+            *s ^= d;
+        }
+        if !locator.locates(&forney, budget, &erased) {
+            continue;
         }
         let Ok(solution) = rs_decode_core(&trial, &[], ec_len, reserved, &syndromes).map(|s| s.among(patterns)) else { continue };
         // A thousand trials are a thousand chances for a wrong codeword
@@ -894,12 +997,13 @@ pub fn rs_decode_chasing_bits(
         // must show more redundancy than one found at the first try, and
         // must reproduce every known bit of the erased codewords: one
         // that overturns them has been read into the noise.
-        if !solution.within_standard() || solution.slack < CHASE_MIN_SLACK || solution.flipped_known_bits > 0 {
+        if solution.slack < CHASE_MIN_SLACK || solution.flipped_known_bits > 0 {
             continue;
         }
         let solution = restated(block, solution);
         found.push((soft_distance(block, bit_reliability, &solution.corrected), (pattern, solution)));
     }
+    let found = preferring_the_standard(found, |(_, solution)| solution);
     nearest(found, |a, b| a.1.corrected == b.1.corrected, |a, b| a.1.confidence_bits() > b.1.confidence_bits())
         .into_iter()
         .map(|(pattern, solution)| {
@@ -912,6 +1016,105 @@ pub fn rs_decode_chasing_bits(
             (flipped, solution)
         })
         .collect()
+}
+
+/// Berlekamp-Massey with its buffers kept between calls, for the solvers
+/// that decode a block many ways over: the locator of a try is found
+/// without an allocation, and the try given up as soon as the locator
+/// would be longer than the code allows.
+struct Locator {
+    c: Vec<u8>,
+    b: Vec<u8>,
+    previous: Vec<u8>,
+    /// Positions of the block the locator is searched for roots over.
+    n: usize,
+    /// `powers[j * n + i]` is `j · (n - 1 - i) mod 255`: the logarithm
+    /// of the `j`th power of position `i`'s locator, so that the locator
+    /// is evaluated at a position by a lookup a coefficient.
+    powers: Vec<u16>,
+}
+
+impl Locator {
+    fn new(ec_len: usize, n: usize) -> Self {
+        let powers = (0..=ec_len).flat_map(|j| (0..n).map(move |i| ((j * (n - 1 - i)) % 255) as u16)).collect();
+        Self { c: Vec::with_capacity(ec_len + 2), b: Vec::with_capacity(ec_len + 2), previous: Vec::with_capacity(ec_len + 2), n, powers }
+    }
+
+    /// Whether the Forney syndromes `s` of a try have an error locator
+    /// [`rs_decode_core`] would accept: of length at most `max_len`,
+    /// of that degree, with as many roots among the `n` positions of
+    /// the block and none at an `erased` position. The same test the
+    /// decode makes, made cheaply: the shortest LFSR is grown as
+    /// [`berlekamp_massey`] grows it, and the try given up the moment
+    /// it grows past `max_len`, since it never shrinks.
+    fn locates(&mut self, s: &[u8], max_len: usize, erased: &[usize]) -> bool {
+        let Self { c, b, previous, n, powers } = self;
+        let n = *n;
+        c.clear();
+        c.push(1);
+        b.clear();
+        b.push(1);
+        let (mut l, mut m, mut last) = (0usize, 1usize, 1u8);
+        for i in 0..s.len() {
+            let mut d = s[i];
+            for j in 1..=l.min(c.len() - 1) {
+                d ^= mul(c[j], s[i - j]);
+            }
+            if d == 0 {
+                m += 1;
+                continue;
+            }
+            let scale = div(d, last);
+            let grows = 2 * l <= i;
+            if grows {
+                if i + 1 - l > max_len {
+                    return false;
+                }
+                previous.clear();
+                previous.extend_from_slice(c);
+            }
+            if c.len() < b.len() + m {
+                c.resize(b.len() + m, 0);
+            }
+            for (k, &coef) in b.iter().enumerate() {
+                c[k + m] ^= mul(scale, coef);
+            }
+            if grows {
+                l = i + 1 - l;
+                std::mem::swap(b, previous);
+                last = d;
+                m = 1;
+            } else {
+                m += 1;
+            }
+        }
+        if poly_degree(c) != l {
+            return false;
+        }
+        if l == 0 {
+            return true;
+        }
+        // The locator at the inverse of each position's locator, which
+        // is where a root lies for an error there: `c[0]`, which is one,
+        // plus each coefficient times the position's locator to the
+        // minus `j`, by the logarithms.
+        let logs: Vec<(usize, usize)> = (1..=l).filter(|&j| c[j] != 0).map(|j| (j, log(c[j]))).collect();
+        let mut roots = 0;
+        for i in 0..n {
+            let mut value = c[0];
+            for &(j, lg) in &logs {
+                // α^(-j·p) is α^(255 - j·p mod 255).
+                value ^= exp_of_sum(lg + 255 - usize::from(powers[j * n + i]));
+            }
+            if value == 0 {
+                if erased.binary_search(&i).is_ok() {
+                    return false;
+                }
+                roots += 1;
+            }
+        }
+        roots == l
+    }
 }
 
 /// A solution of a block some of whose codewords were flipped or erased
@@ -954,10 +1157,14 @@ fn restated(block: &[CwRead], mut solution: RsSolution) -> RsSolution {
 /// Many tries are many chances for a wrong codeword to lie within reach,
 /// so what a solution's located errors confirm is charged for every set
 /// tried, of every size so far ([`RsSolution::among`]), a solution is
-/// kept only within the standard and with [`DOUBT_CONFIRMING_BITS`]
-/// behind it, and where the sets reach different codewords the one
-/// nearest the block as read is kept by a clear margin, or every one
-/// within the margin is returned, nearest first ([`nearest`]). Each
+/// kept only with [`DOUBT_CONFIRMING_BITS`] behind it, and where the
+/// sets reach different codewords the one nearest the block as read is
+/// kept by a clear margin, or every one within the margin is returned,
+/// nearest first ([`nearest`]). A size whose every solution spends the
+/// codewords the standard reserves for detection does not end the
+/// search: the sizes after it may reach the block within the standard,
+/// and its solutions are returned only when none of them does
+/// ([`preferring_the_standard`]). Each
 /// comes with the codewords erased, restated against the block as read
 /// as a chased one is. A codeword pinned whole is never erased. `sets`
 /// is how many sets may be tried in all, [`TRIAL_SETS`] at the most: a
@@ -976,29 +1183,66 @@ pub fn rs_decode_trying(
     let candidates: Vec<usize> = (0..block.len()).filter(|&i| !block[i].is_erasure() && block[i].pinned != 0xFF).collect();
     let received: Vec<u8> = block.iter().map(|c| c.value & c.known).collect();
     let syndromes = rs_syndromes(&received, ec_len);
+    let n = block.len();
+    let read_erased: Vec<usize> = (0..n).filter(|&i| block[i].is_erasure()).collect();
+    let read_gamma = read_erased.iter().fold(vec![1u8], |gamma, &i| poly_mul(&gamma, &[1, exp(n - 1 - i)]));
+    let mut locator = Locator::new(ec_len, n);
     let mut tried = 0;
+    let mut beyond: Vec<(Vec<usize>, RsSolution)> = Vec::new();
     let mut size = if left % 2 == 1 { 1 } else { 2 };
     while size < left {
         let budget = sets.min(TRIAL_SETS_MAX);
         let Some(count) = sets_of(candidates.len(), size, budget).filter(|&count| count > 0 && tried + count <= budget) else { break };
         tried += count;
         let mut found: Vec<(u32, (Vec<usize>, RsSolution))> = Vec::new();
+        let (mut gamma, mut forney, mut all_erased) = (Vec::with_capacity(ec_len + 1), Vec::with_capacity(ec_len), Vec::with_capacity(ec_len));
         each_set(candidates.len(), size, |set| {
+            // The set's Forney syndromes, and the cheap test of them
+            // ([`Locator::locates`]) before the decode, which most sets
+            // fail: the erasure locator of the block as read, times
+            // `(1 + X x)` for each codeword of the set, in place.
+            gamma.clear();
+            gamma.extend_from_slice(&read_gamma);
+            for &k in set {
+                let x = exp(n - 1 - candidates[k]);
+                gamma.push(0);
+                for m in (1..gamma.len()).rev() {
+                    gamma[m] ^= mul(x, gamma[m - 1]);
+                }
+            }
+            let f = gamma.len() - 1;
+            forney.clear();
+            forney.extend((f..ec_len).map(|k| (0..=f).fold(0, |acc, m| acc ^ mul(gamma[m], syndromes[k - m]))));
+            all_erased.clear();
+            all_erased.extend(read_erased.iter().copied());
+            all_erased.extend(set.iter().map(|&k| candidates[k]));
+            all_erased.sort_unstable();
+            if !locator.locates(&forney, (ec_len - f) / 2, &all_erased) {
+                return;
+            }
             let erased: Vec<usize> = set.iter().map(|&k| candidates[k]).collect();
             let Ok(solution) = rs_decode_core(block, &erased, ec_len, reserved, &syndromes).map(|s| s.among(tried)) else { return };
-            if !solution.within_standard() || solution.confidence_bits() < DOUBT_CONFIRMING_BITS {
+            if solution.confidence_bits() < DOUBT_CONFIRMING_BITS {
                 return;
             }
             let solution = restated(block, solution);
             found.push((soft_distance(block, bit_reliability, &solution.corrected), (erased, solution)));
         });
+        let within = found.iter().any(|(_, (_, solution))| solution.within_standard());
+        let found = preferring_the_standard(found, |(_, solution)| solution);
         let kept = nearest(found, |a, b| a.1.corrected == b.1.corrected, |a, b| a.1.confidence_bits() > b.1.confidence_bits());
-        if !kept.is_empty() || work::cancelled() {
+        if within && !kept.is_empty() {
             return kept;
+        }
+        if beyond.is_empty() {
+            beyond = kept;
+        }
+        if work::cancelled() {
+            break;
         }
         size += 2;
     }
-    Vec::new()
+    beyond
 }
 
 /// A block solved by doubting single bits, or by flipping a few bits
@@ -2222,8 +2466,10 @@ mod tests {
         assert_eq!(sol.confidence_bits(), 8 + doubted_agreement(49, 7));
         assert_eq!(sol.corrected, block);
         // With two codewords reserved for detection that solution is
-        // beyond the standard's limit, and doubting will not offer it.
-        assert_eq!(rs_decode_doubting(&read, &reliability, ec_len, 2), None);
+        // beyond the standard's limit, and doubting offers it so marked,
+        // having none within it.
+        let (_, beyond) = rs_decode_doubting(&read, &reliability, ec_len, 2).unwrap();
+        assert!(!beyond.within_standard() && beyond.corrected == block);
     }
 
     #[test]
@@ -2404,9 +2650,10 @@ mod tests {
             assert!(!e.was_erasure && e.magnitude == read[e.index].value ^ block[e.index]);
         }
         // Certain bits are never flipped; with three codewords reserved
-        // the solution is beyond the standard and not offered.
+        // the solution is beyond the standard, and offered so marked.
         assert!(rs_decode_chasing(&read, &vec![[CERTAIN; 8]; block.len()], ec_len, 0, CHASE_BITS).is_empty());
-        assert!(rs_decode_chasing(&read, &reliability, ec_len, 3, CHASE_BITS).is_empty());
+        let (_, beyond) = only(rs_decode_chasing(&read, &reliability, ec_len, 3, CHASE_BITS)).unwrap();
+        assert!(!beyond.within_standard() && beyond.corrected == block);
         // One of many decodes flips fewer bits, and never fewer than six.
         assert_eq!((chase_bits(1), chase_bits(2), chase_bits(32), chase_bits(1 << 20)), (10, 9, 6, 6));
         // A pinned bit is never flipped either, however faint.
@@ -2848,6 +3095,133 @@ mod tests {
             assert!(rs_decode(&trial, 18).is_err(), "{magnitude:#x}");
         }
         assert_eq!(8 + located_error_bits(18, 1), 11);
+    }
+
+    #[test]
+    fn the_locator_test_agrees_with_the_decode() {
+        // Over blocks with every kind of damage, erasures among them,
+        // the cheap test of a try is right exactly when the decode
+        // gets past its locator: the budget, the degree and the roots.
+        let mut rng = Rng(0x10CA);
+        let (mut passed, mut refused) = (0, 0);
+        for round in 0..3000 {
+            let ec_len = 2 + rng.below(29);
+            let data_len = 1 + rng.below(60);
+            let block = codeword(&mut rng, data_len, ec_len);
+            let n = block.len();
+            let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+            let erasures = rng.below(ec_len.min(n) / 2 + 1);
+            let wrong = rng.below(ec_len / 2 + 2);
+            for &i in &rng.distinct((erasures + wrong).min(n), n) {
+                if erasures > 0 && read[i].known == 0xFF && rng.below(2) == 0 {
+                    read[i] = CwRead::unknown();
+                } else {
+                    read[i].value ^= rng.nonzero();
+                }
+            }
+            let erased: Vec<usize> = (0..n).filter(|&i| read[i].is_erasure()).collect();
+            let f = erased.len();
+            let received: Vec<u8> = read.iter().map(|c| c.value & c.known).collect();
+            let syndromes = rs_syndromes(&received, ec_len);
+            let gamma = erased.iter().fold(vec![1u8], |gamma, &i| poly_mul(&gamma, &[1, exp(n - 1 - i)]));
+            let forney: Vec<u8> = (f..ec_len).map(|k| (0..=f).fold(0, |acc, m| acc ^ mul(gamma[m], syndromes[k - m]))).collect();
+            let mut locator = Locator::new(ec_len, n);
+            let cheap = locator.locates(&forney, (ec_len - f) / 2, &erased);
+            let full = rs_decode_core(&read, &[], ec_len, 0, &syndromes);
+            let past_locator = !matches!(full, Err(RsFailure::BudgetExceeded | RsFailure::LocatorDegree | RsFailure::RootCount { .. }));
+            assert_eq!(cheap, past_locator, "round {round}: {full:?}");
+            if cheap { passed += 1 } else { refused += 1 }
+        }
+        assert!(passed > 500 && refused > 500, "{passed} passed, {refused} refused");
+    }
+
+    /// How long the chase takes at its most, for seeing what a change
+    /// to it buys: run by hand, with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn chase_timing() {
+        let mut rng = Rng(0x7E);
+        for &(data_len, ec_len, wrong) in &[(118usize, 30usize, 10usize), (9, 17, 5), (15, 18, 6)] {
+            let block = codeword(&mut rng, data_len, ec_len);
+            let n = block.len();
+            let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+            let mut reliability = vec![[200u8; 8]; n];
+            // Solid errors to the limit of the code, and faint bits that
+            // are right beyond them, so that no pattern solves and every
+            // one is decoded.
+            for &i in &rng.distinct(wrong + 16, n) {
+                let b = rng.below(8);
+                if wrong > 0 && read[i].value == block[i] && rng.below(2) == 0 {
+                    read[i].value ^= rng.nonzero();
+                } else {
+                    reliability[i][b] = 5 + rng.below(20) as u8;
+                }
+            }
+            for bits in [10usize, 13, 16] {
+                let started = std::time::Instant::now();
+                let found = rs_decode_chasing(&read, &reliability, ec_len, 0, bits);
+                let took = started.elapsed();
+                println!("({data_len}, {ec_len}) chase of {bits} bits: {took:?}, {} found", found.len());
+            }
+            // And the trials of erasures, on the block wrong one past
+            // the code: every single and then every pair.
+            let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+            for &i in &rng.distinct(ec_len / 2 + 1, n) {
+                read[i].value ^= rng.nonzero();
+            }
+            let started = std::time::Instant::now();
+            let found = rs_decode_trying(&read, &vec![[CERTAIN; 8]; n], ec_len, 0, TRIAL_SETS);
+            let took = started.elapsed();
+            // Against every set decoded in full, as the trials once did.
+            let received: Vec<u8> = read.iter().map(|c| c.value & c.known).collect();
+            let syndromes = rs_syndromes(&received, ec_len);
+            let (mut sets, mut solved) = (0, 0);
+            let started_slow = std::time::Instant::now();
+            for size in [1, 2] {
+                each_set(n, size, |set| {
+                    sets += 1;
+                    solved += usize::from(rs_decode_core(&read, set, ec_len, 0, &syndromes).is_ok());
+                });
+            }
+            let slow = started_slow.elapsed();
+            println!("({data_len}, {ec_len}) trials of erasures: {took:?}, {} found; every set decoded in full: {slow:?} over {sets} sets, {solved} solved", found.len());
+        }
+    }
+
+    #[test]
+    fn the_soft_count_is_the_hard_count_on_a_block_painted_by_hand_and_more_on_faint_bits() {
+        // Painted by hand every bit costs 256, and the sets within the
+        // reach are the sets of so many bits: within one codeword's
+        // worth of distance, the sets of up to eight bits of the block,
+        // which are more than the one byte the hard count allows, so
+        // the soft count is the lower of the two.
+        let block: Vec<CwRead> = (0..33).map(|_| CwRead::known(0)).collect();
+        let certain = vec![[CERTAIN; 8]; 33];
+        // Nothing overturned: every equation, less the hard count's
+        // allowance for the codewords nearer than the one found.
+        assert_eq!(soft_count_bits(&block, &certain, 8 * 18, 0), 8 * 18 - 1);
+        assert_eq!(soft_count_bits(&block, &certain, 8 * 18, 0), list_solution_bits(33, 18, 0));
+        let sets_of_eight: f64 = (0..=8).map(|j| (0..j).map(|i| (264 - i) as f64 / (i + 1) as f64).product::<f64>()).sum();
+        assert_eq!(soft_count_bits(&block, &certain, 8 * 18, 8 * 256), (144.0 - sets_of_eight.log2() - (255f64 / 254.0).log2()).floor() as u32);
+        assert!(soft_count_bits(&block, &certain, 8 * 18, 8 * 256) < list_solution_bits(33, 18, 1));
+        assert_eq!(soft_count_bits(&block, &certain, 8 * 18, SOFT_COUNT_REACH + 1), 0);
+        // Twenty faint bits among solid ones: the sets within the cost
+        // of overturning ten of them are sets of the faint bits mostly,
+        // and the count is far more than the hard count's for the ten
+        // codewords those bits lie in.
+        let mut faint = vec![[200u8; 8]; 33];
+        for i in 0..20 {
+            faint[i][i % 8] = 4;
+        }
+        let soft = soft_count_bits(&block, &faint, 8 * 18, 10 * 5);
+        assert!(soft > 100 && soft > list_solution_bits(33, 18, 10), "{soft}");
+        // Pinned bits are not counted; unknown bits spend equations.
+        let mut pinned = block.clone();
+        for cw in &mut pinned[..20] {
+            cw.pinned = 0xFF;
+        }
+        assert!(soft_count_bits(&pinned, &faint, 8 * 18, 10 * 5) > soft);
+        assert_eq!(soft_count_bits(&block, &faint, 8 * 18 - 40, 10 * 5), soft - 40);
     }
 
     #[test]

@@ -3,15 +3,16 @@
 
 use std::sync::Arc;
 
+use super::abp::{ABP_ROUNDS, ABP_ROUNDS_MIN, rs_decode_propagating};
 use super::bch::{self, FormatAnalysis, VersionAnalysis};
 use super::bitstream::{self, Certainty, EndOfData, ParseReport, StreamBits};
 use super::codewords::{Pin, Pins, apply_pins, codeword_bit_mask, read_codewords};
 use super::list::{LIST_COST, LIST_COST_MIN, rs_decode_listing};
 use super::padding::{self, TailCheck};
 use super::rs::{
-    AIDED_VERIFIED_BITS, BitDoubt, BitSolveFailure, CHASE_BITS, CwRead, RsFailure, RsSolution, TRIAL_SETS, TRIAL_SETS_MIN, Trials,
-    VERIFIED_BITS, chase_bits_among, rs_decode_chasing_bits, rs_decode_doubting, rs_decode_reserving, rs_decode_trying,
-    solve_bit_erasures, solve_bit_erasures_doubting, solve_bit_erasures_trying,
+    AIDED_VERIFIED_BITS, BitDoubt, BitSolveFailure, CHASE_BITS, CwRead, DISTANCE_MARGIN, RsFailure, RsSolution, TRIAL_SETS, TRIAL_SETS_MIN,
+    Trials, VERIFIED_BITS, chase_bits_among, rs_decode_chasing_bits, rs_decode_doubting, rs_decode_reserving, rs_decode_trying,
+    soft_count_bits, soft_distance, solve_bit_erasures, solve_bit_erasures_doubting, solve_bit_erasures_trying, tries_charge,
 };
 use super::text::{self, Charset, TextReport};
 use crate::symbol::EcLevel;
@@ -88,6 +89,15 @@ pub struct DecodeOptions {
     /// costs. A decode that is one of many has less, and never less than
     /// [`super::list::LIST_COST_MIN`].
     pub list_cost: usize,
+    /// While `reliability` holds, pass beliefs between the bits of a
+    /// block that fails ([`super::abp`], [`SolveMethod::BeliefPropagation`]):
+    /// the parity checks the bits share, adapted each round so that the
+    /// least reliable bits each sit in a check of their own, say of each
+    /// bit what the others make likely, and the block is decoded from
+    /// the beliefs that settle. Reaches damage the doubting and the
+    /// chase cannot: faint misreads among more faint bits read right
+    /// than the doubting can take as unknown.
+    pub belief_propagation: bool,
     /// When the decode is no read, find the padding, terminator and
     /// headers the stream shows, pin them, and solve again the blocks
     /// the pins touch, to a fixed point, as padding recovery does by
@@ -114,6 +124,7 @@ impl Default for DecodeOptions {
             chase_bits: CHASE_BITS,
             list_decode: true,
             list_cost: LIST_COST,
+            belief_propagation: true,
             derive_pins: false,
         }
     }
@@ -166,9 +177,33 @@ pub enum SolveMethod {
     /// weighed by their reliability, with a point of this multiplicity
     /// at the most ([`super::list`]).
     List { multiplicity: usize },
+    /// Decoded from the beliefs that settled after this many rounds of
+    /// passing them between the bits along their parity checks
+    /// ([`super::abp`]), which overturned `flipped_bits` of the bits as
+    /// read.
+    BeliefPropagation { rounds: usize, flipped_bits: usize },
     /// Everything except pinned codewords treated as erased.
     PinnedOnly,
 }
+
+/// The risk a solution must keep below for its block to count as
+/// verified ([`BlockOutcome::risk_bits`]): wrong no oftener than once in
+/// two to this many. A byte's worth, which is the least the plain decode
+/// of a block read whole shows within the standard's limit, and what
+/// every reader takes.
+pub const VERIFIED_RISK_BITS: u32 = VERIFIED_BITS;
+
+/// What a solution is charged, in bits of risk, that filled in codewords
+/// that could not be read or was reached by any of the fallbacks: each
+/// is one of many decodes of the grid, under other kernels, thresholds
+/// and placements, that the solver cannot count, and each of those is a
+/// fresh chance for a block of noise to pass. Two codewords' worth,
+/// which with the byte the verification asks is the three such a
+/// solution had to show before ([`AIDED_VERIFIED_BITS`]): with less,
+/// one try in four hundred read a version 5-Q symbol as its message
+/// with a block's worth of bytes it never held. The one constant of the
+/// risk that is set by trial; the rest is counted.
+pub const SELECTION_CHARGE_BITS: u32 = AIDED_VERIFIED_BITS - VERIFIED_BITS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockOutcome {
@@ -180,13 +215,26 @@ pub enum BlockOutcome {
         erasures: usize,
         /// Redundancy left over, in codewords.
         slack: usize,
-        /// Independent bits confirming the solution: the redundancy left
-        /// over, the known bits of erased codewords it reproduced, and
-        /// what the errors it located confirm
-        /// ([`super::rs::located_error_bits`]). Zero means any input would
-        /// have produced a "solution", as one does that only fills
-        /// unknown codewords and has nothing left over.
+        /// Independent bits confirming the solution as its solver counts
+        /// them: the redundancy left over, the known bits of erased
+        /// codewords it reproduced, and what the errors it located
+        /// confirm ([`super::rs::located_error_bits`]). Zero means any
+        /// input would have produced a "solution", as one does that only
+        /// fills unknown codewords and has nothing left over.
         confidence_bits: u32,
+        /// How rarely the solution is wrong, as bits: no oftener than
+        /// once in two to this many, by everything that speaks for it
+        /// weighed on one footing ([`solve_block`]). What
+        /// `confidence_bits` counts, or the soft count of
+        /// [`super::rs::soft_count_bits`] where that counts more, less
+        /// [`SELECTION_CHARGE_BITS`] for a solution that filled in
+        /// codewords or was reached by a fallback; and no more than the
+        /// margin, in bits of likelihood, by which the solution lies
+        /// nearer the block as read than any other codeword a solver
+        /// found, since of two codewords within reach the nearer is the
+        /// likelier by just that much, and both may be wrong. The one
+        /// number verification goes by ([`VERIFIED_RISK_BITS`]).
+        risk_bits: u32,
         /// The solution spent error correction codewords the standard
         /// reserves for detection in the smallest symbols (ISO/IEC 18004
         /// Table 9), so it is one the standard says not to trust.
@@ -204,30 +252,18 @@ impl BlockOutcome {
         }
     }
 
-    /// Confirming bits the solution must show to count as verified: a
-    /// byte's worth for the plain decode of a block read whole, which is
-    /// the decode every reader makes and never shows so little within
-    /// the standard's limit, and three codewords' worth
-    /// ([`AIDED_VERIFIED_BITS`]) for one that filled in codewords that
-    /// could not be read or was reached by any of the fallbacks, the
-    /// trials of erasures among them. `None` for a failure.
-    pub fn bits_to_verify(&self) -> Option<u32> {
+    /// Bits of risk, zero for a failure.
+    pub fn risk_bits(&self) -> u32 {
         match *self {
-            BlockOutcome::Solved { method: SolveMethod::ReedSolomon, erasures: 0, .. } => Some(VERIFIED_BITS),
-            BlockOutcome::Solved { .. } => Some(AIDED_VERIFIED_BITS),
-            BlockOutcome::Failed(_) => None,
+            BlockOutcome::Solved { risk_bits, .. } => risk_bits,
+            BlockOutcome::Failed(_) => 0,
         }
     }
 
-    /// Solved with the confirmation its kind of solution needs
-    /// ([`Self::bits_to_verify`]), within the standard's limit.
+    /// Solved with its risk below [`VERIFIED_RISK_BITS`], within the
+    /// standard's limit.
     pub fn is_verified(&self) -> bool {
-        match *self {
-            BlockOutcome::Solved { confidence_bits, beyond_standard: false, .. } => {
-                self.bits_to_verify().is_some_and(|needed| confidence_bits >= needed)
-            }
-            _ => false,
-        }
+        matches!(*self, BlockOutcome::Solved { risk_bits, beyond_standard: false, .. } if risk_bits >= VERIFIED_RISK_BITS)
     }
 }
 
@@ -428,10 +464,56 @@ struct Candidate {
     outcome: BlockOutcome,
     corrected: Vec<u8>,
     doubted: Vec<u8>,
+    /// Decodes the solver made to reach it, at the most: what the soft
+    /// count is charged for.
+    tries: usize,
+    /// Bits of risk on its own ([`Candidate::weigh`]), before any other
+    /// codeword found is held against it.
+    alone: u32,
 }
 
 impl Candidate {
-    fn rank(&self) -> (bool, u32) {
+    fn new(outcome: BlockOutcome, corrected: Vec<u8>, doubted: Vec<u8>, tries: usize) -> Self {
+        Self { outcome, corrected, doubted, tries, alone: 0 }
+    }
+
+    /// The candidate weighed on its own: its risk is what its solver
+    /// counted for it ([`BlockOutcome::confidence_bits`]), or the soft
+    /// count ([`soft_count_bits`]) for the bits it overturns weighed by
+    /// their reliability, charged for the tries and one for the choice
+    /// between the two counts, whichever is the more; less
+    /// [`SELECTION_CHARGE_BITS`] for anything but the plain decode of a
+    /// block read whole.
+    fn weigh(mut self, block: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: usize) -> Self {
+        let BlockOutcome::Solved { method, erasures, confidence_bits, .. } = self.outcome else { return self };
+        let unknown: usize = block.iter().map(|c| c.known.count_zeros() as usize).sum();
+        let distance = soft_distance(block, bit_reliability, &self.corrected);
+        let soft = soft_count_bits(block, bit_reliability, (8 * ec_len).saturating_sub(unknown), distance).saturating_sub(tries_charge(self.tries) + 1);
+        let charge = if matches!(method, SolveMethod::ReedSolomon) && erasures == 0 { 0 } else { SELECTION_CHARGE_BITS };
+        self.alone = confidence_bits.max(soft).saturating_sub(charge);
+        self.set_risk(self.alone);
+        self
+    }
+
+    fn set_risk(&mut self, risk_bits: u32) {
+        if let BlockOutcome::Solved { risk_bits: risk, .. } = &mut self.outcome {
+            *risk = risk_bits;
+        }
+    }
+
+    /// The candidate with its risk set.
+    fn at_risk(mut self, risk_bits: u32) -> Self {
+        self.set_risk(risk_bits);
+        self
+    }
+
+    /// Verified on its own: within the standard, with its risk alone
+    /// below the threshold.
+    fn verified_alone(&self) -> bool {
+        matches!(self.outcome, BlockOutcome::Solved { beyond_standard: false, .. }) && self.alone >= VERIFIED_RISK_BITS
+    }
+
+    fn rank(&self) -> (bool, u32, u32) {
         solve_rank(&self.outcome)
     }
 }
@@ -446,9 +528,9 @@ struct BlockSolve {
     /// The bits of each codeword the solution was reached by doubting
     /// ([`CodewordReport::doubted`]); empty when it doubted none.
     doubted: Vec<u8>,
-    /// Solutions a solver that tries many ways found and could not tell
-    /// apart by the block as read, when nothing verified the block: for
-    /// the message to tell apart ([`arbitrate`]), best ranked first.
+    /// Codewords the solvers found that the block as read lies as near
+    /// to as each other, when nothing verified the block: for the
+    /// message to tell apart ([`arbitrate`]), best ranked first.
     rivals: Vec<Candidate>,
     /// The solution was told from this many rivals by the message.
     arbitrated_among: usize,
@@ -474,15 +556,16 @@ impl BlockSolve {
         }
     }
 
-    fn rank(&self) -> (bool, u32) {
+    fn rank(&self) -> (bool, u32, u32) {
         solve_rank(&self.outcome)
     }
 }
 
-/// How block solutions rank: verified solutions within the standard first,
-/// then by confirmation. A failure ranks below every solution.
-fn solve_rank(outcome: &BlockOutcome) -> (bool, u32) {
-    (outcome.is_verified(), outcome.confidence_bits())
+/// How block solutions rank: verified solutions within the standard
+/// first, then by risk, then by what their solver counted. A failure
+/// ranks below every solution.
+fn solve_rank(outcome: &BlockOutcome) -> (bool, u32, u32) {
+    (outcome.is_verified(), outcome.risk_bits(), outcome.confidence_bits())
 }
 
 /// Rivals a block keeps for the message to tell apart, at the most: the
@@ -490,27 +573,34 @@ fn solve_rank(outcome: &BlockOutcome) -> (bool, u32) {
 const MAX_RIVALS: usize = 8;
 
 /// Solve one block, trying the cheap exact decoder first and then every
-/// fallback, keeping the solution with the most confirmation. `reserved`
-/// EC codewords are the standard's misdecode protection: a solution that
+/// fallback, and keeping the solution of least risk. `reserved` EC
+/// codewords are the standard's misdecode protection: a solution that
 /// spends them is reported, but marked as beyond the standard, and ranks
 /// below any verified solution within it.
 ///
-/// An exact solution ends the search only when it is verified within the
-/// standard, as one that corrected to the limit of the block's error
-/// correction is by the errors it located. One with too little to confirm
-/// it, which is nothing where it only filled unknown codewords and had
-/// none to spare, and less than three codewords' worth wherever it
-/// filled any ([`BlockOutcome::bits_to_verify`]), or one that spent the
-/// reserved codewords, is kept as a last resort while the fallbacks look
-/// for better: flipping the faint bit of the one wrong codeword turns a
-/// solution that fills fifteen unknown codewords and locates that one
-/// with a codeword to spare into a confirmed one, with three.
+/// Every solution found is weighed on one footing
+/// ([`BlockOutcome::risk_bits`]): what its solver counted for it, or
+/// the soft count for the bits it overturns, charged for the tries, and
+/// less the selection charge for anything but the plain decode of a
+/// block read whole. An exact solution ends the search only when it is
+/// verified so, within the standard, as one that corrected to the limit
+/// of the block's error correction is by the errors it located. One
+/// with too little to confirm it, which is nothing where it only filled
+/// unknown codewords and had none to spare, or one that spent the
+/// reserved codewords, is kept while the fallbacks look for better:
+/// flipping the faint bit of the one wrong codeword turns a solution
+/// that fills fifteen unknown codewords and locates that one with a
+/// codeword to spare into a confirmed one, with three.
 ///
-/// A fallback that tries many ways may reach two codewords it cannot
-/// tell apart by the block as read ([`super::rs::DISTANCE_MARGIN`]).
-/// Those are kept beside the solution as rivals, when nothing verified
-/// the block, for the message to tell apart ([`arbitrate`]): a block
-/// that would otherwise have been given up over a tie.
+/// The solutions found are then held against each other by the block
+/// as read: of two codewords the solvers reach, the nearer in bits
+/// weighed by their reliability is the likelier by just the margin
+/// between them, and no solution's risk is less than its margin over the
+/// nearest other. Two within [`DISTANCE_MARGIN`] of each other the block
+/// as read cannot tell apart; when nothing verifies the block they are
+/// kept beside the solution as rivals, for the message to tell apart
+/// ([`arbitrate`]): a block that would otherwise have been given up
+/// over a tie.
 fn solve_block(
     block: &[CwRead],
     reliability: &[u8],
@@ -519,32 +609,29 @@ fn solve_block(
     reserved: usize,
     opts: &DecodeOptions,
 ) -> BlockSolve {
-    let mut best: Option<Candidate> = None;
-    let mut rivals: Vec<Candidate> = Vec::new();
-    fn consider(best: &mut Option<Candidate>, candidate: Candidate) {
-        if best.as_ref().is_none_or(|b| candidate.rank() > b.rank()) {
-            *best = Some(candidate);
-        }
-    }
-    /// What a solver that tries many ways found: one solution is
-    /// considered as any other's; several it could not tell apart are
-    /// kept as rivals.
-    fn offer(best: &mut Option<Candidate>, rivals: &mut Vec<Candidate>, mut found: Vec<Candidate>) {
-        if found.len() == 1 {
-            consider(best, found.pop().expect("one"));
-        } else {
-            rivals.extend(found);
-        }
-    }
-
-    let verified_so_far = |best: &Option<Candidate>| best.as_ref().is_some_and(|b| b.rank().0);
+    let mut pool: Vec<Candidate> = Vec::new();
+    let weigh = |candidate: Candidate| candidate.weigh(block, bit_reliability, ec_len);
+    let verified_so_far = |pool: &[Candidate]| pool.iter().any(Candidate::verified_alone);
     let erased = block.iter().filter(|c| c.is_erasure()).count();
+    // The standard reserves error correction codewords for detection in
+    // the smallest symbols (ISO/IEC 18004 Table 9), and a solution that
+    // spends them is one it says not to trust. The plain decoder keeps
+    // such a solution all the same, as a last resort, marked as beyond
+    // the standard and never verified, and the fallbacks offer theirs
+    // the same way, each preferring a solution within the standard where
+    // it finds one ([`super::rs::preferring_the_standard`]): on a
+    // version 1 or 2 symbol, or a Micro QR, that is the only way past
+    // what the plain decoder reaches. A block whose every EC codeword is
+    // reserved, as M1's, the chase, the curve and the propagation leave
+    // alone: there the reserve is all there is, and flipping bits until
+    // the check passes is correction by another name.
     let rs_outcome = |method: SolveMethod, solution: &RsSolution| BlockOutcome::Solved {
         method,
         errors: solution.errors,
         erasures: solution.erasures,
         slack: solution.slack,
         confidence_bits: solution.confidence_bits(),
+        risk_bits: 0,
         beyond_standard: !solution.within_standard(),
     };
     let bit_outcome = |doubt: &BitDoubt| {
@@ -559,23 +646,26 @@ fn solve_block(
             erasures: erased,
             slack: 0,
             confidence_bits: doubt.confidence_bits(),
+            risk_bits: 0,
             beyond_standard: doubt.solution.spare_equations < 8 * reserved,
         }
     };
     let bit_candidate = |doubt: BitDoubt| {
         let outcome = bit_outcome(&doubt);
-        Candidate { outcome, corrected: doubt.solution.corrected, doubted: doubt.doubted }
+        weigh(Candidate::new(outcome, doubt.solution.corrected, doubt.doubted, doubt.tries))
     };
     let flips = opts.reliability && opts.flip_bits;
+    let chase_bits = chase_bits_among(opts.chase_bits, opts.tries);
+    let patterns = (1usize << chase_bits) - 1;
 
     let failure = match rs_decode_reserving(block, ec_len, reserved).map(|s| s.among(opts.tries)) {
         Ok(solution) => {
             let outcome = rs_outcome(SolveMethod::ReedSolomon, &solution);
-            let candidate = Candidate { outcome, corrected: solution.corrected, doubted: Vec::new() };
-            if candidate.rank().0 {
+            let candidate = weigh(Candidate::new(outcome, solution.corrected, Vec::new(), opts.tries));
+            if candidate.verified_alone() {
                 return BlockSolve::solved(candidate);
             }
-            consider(&mut best, candidate);
+            pool.push(candidate);
             RsFailure::BudgetExceeded
         }
         Err(failure) => failure,
@@ -585,7 +675,7 @@ fn solve_block(
     // located as wrong names the same codeword with a unit of redundancy
     // more to spare, for nothing: a wrong codeword costs two and an
     // erasure one.
-    let exact_failed = best.is_none();
+    let exact_failed = pool.is_empty();
 
     let mut partial = None;
     if opts.bit_level {
@@ -599,10 +689,11 @@ fn solve_block(
                     erasures: erased,
                     slack: 0,
                     confidence_bits: solution.spare_equations as u32,
+                    risk_bits: 0,
                     // Spare equations stand in for unused codewords.
                     beyond_standard: solution.spare_equations < 8 * reserved,
                 };
-                consider(&mut best, Candidate { outcome, corrected: solution.corrected, doubted: Vec::new() });
+                pool.push(weigh(Candidate::new(outcome, solution.corrected, Vec::new(), 1)));
             }
             Ok(solution) => partial = Some(solution),
             Err(_) => {}
@@ -613,7 +704,7 @@ fn solve_block(
         let trials = Trials { flips, free: opts.erase_by_trial && exact_failed, sets: opts.trial_sets };
         if (trials.flips || trials.free) && inconsistent {
             let found = solve_bit_erasures_trying(block, bit_reliability, ec_len, trials);
-            offer(&mut best, &mut rivals, found.into_iter().map(bit_candidate).collect());
+            pool.extend(found.into_iter().map(bit_candidate));
         }
     }
 
@@ -629,7 +720,7 @@ fn solve_block(
         for erratum in solution.errata.iter().filter(|e| e.was_erasure && !block[e.index].is_erasure()) {
             which[erratum.index] = 0xFF;
         }
-        consider(&mut best, Candidate { outcome, corrected: solution.corrected, doubted: which });
+        pool.push(weigh(Candidate::new(outcome, solution.corrected, which, ec_len)));
     }
 
     // Doubting bits rather than codewords reaches damage spread over more
@@ -641,28 +732,49 @@ fn solve_block(
     if opts.reliability && opts.doubt_bits && opts.bit_level {
         let trials = Trials { flips, free: opts.erase_by_trial && exact_failed, sets: opts.trial_sets };
         let found = solve_bit_erasures_doubting(block, bit_reliability, ec_len, trials);
-        offer(&mut best, &mut rivals, found.into_iter().map(bit_candidate).collect());
+        pool.extend(found.into_iter().map(bit_candidate));
     }
 
     // Flipping the faintest bits outright costs no redundancy where
     // doubting a codeword costs a unit and doubting a bit an equation: a
     // block wrong in a few more codewords than the code corrects is
     // reached when the extra ones read faintly, after doubting has run
-    // out of erasures. Many tries are many chances of a misdecode, so of
-    // the patterns that solve to different codewords the nearest the
-    // block as read is kept only by a clear margin, and the rest kept as
-    // rivals.
-    if flips {
-        let found = rs_decode_chasing_bits(block, bit_reliability, ec_len, reserved, chase_bits_among(opts.chase_bits, opts.tries))
-            .into_iter()
-            .map(|(flipped, solution)| {
+    // out of erasures. Only while nothing has verified the block, as the
+    // solvers below: a thousand decodes buy nothing a verified solution
+    // has not.
+    if flips && !verified_so_far(&pool) {
+        let found = rs_decode_chasing_bits(block, bit_reliability, ec_len, reserved, chase_bits).into_iter().map(|(flipped, solution)| {
+            let solution = solution.among(opts.tries);
+            let flipped_bits = flipped.iter().map(|bits| bits.count_ones() as usize).sum();
+            let outcome = rs_outcome(SolveMethod::Chase { flipped_bits }, &solution);
+            weigh(Candidate::new(outcome, solution.corrected, flipped, patterns))
+        });
+        pool.extend(found);
+    }
+
+    // Beliefs passed between the bits along the checks they share, the
+    // checks adapted each round to the bits' reliability: what every
+    // other solver takes as fixed, the reliability of each bit, is what
+    // this moves, by what the rest of the block makes likely. Only
+    // while nothing has verified the block, and only where a bit was
+    // sampled: a bit painted by hand is never moved.
+    if opts.reliability
+        && opts.belief_propagation
+        && !verified_so_far(&pool)
+        && bit_reliability.iter().flatten().any(|&r| r < CERTAIN)
+    {
+        let rounds = (ABP_ROUNDS / opts.tries.max(1)).max(ABP_ROUNDS_MIN);
+        let trials = Trials { flips, free: opts.erase_by_trial && exact_failed, sets: opts.trial_sets };
+        let chase = if flips { chase_bits } else { 0 };
+        let found = rs_decode_propagating(block, bit_reliability, ec_len, reserved, rounds, trials, chase).into_iter().map(
+            |(rounds, flipped, solution)| {
                 let solution = solution.among(opts.tries);
                 let flipped_bits = flipped.iter().map(|bits| bits.count_ones() as usize).sum();
-                let outcome = rs_outcome(SolveMethod::Chase { flipped_bits }, &solution);
-                Candidate { outcome, corrected: solution.corrected, doubted: flipped }
-            })
-            .collect();
-        offer(&mut best, &mut rivals, found);
+                let outcome = rs_outcome(SolveMethod::BeliefPropagation { rounds, flipped_bits }, &solution);
+                weigh(Candidate::new(outcome, solution.corrected, flipped, rounds + patterns))
+            },
+        );
+        pool.extend(found);
     }
 
     // A curve through the block's codewords, weighed by their
@@ -676,22 +788,19 @@ fn solve_block(
     // exact decoder found and no other. With doubting by reliability
     // turned off every bit is as certain as painted, and the curve is
     // the hard decision one.
-    if opts.list_decode && opts.list_cost > 0 && exact_failed && !verified_so_far(&best) {
+    if opts.list_decode && opts.list_cost > 0 && exact_failed && !verified_so_far(&pool) {
         let certain = vec![[CERTAIN; 8]; block.len()];
         let weighed = if opts.reliability { bit_reliability } else { &certain[..] };
-        let found = rs_decode_listing(block, weighed, ec_len, reserved, opts.list_cost)
-            .into_iter()
-            .map(|(multiplicity, solution)| {
-                let solution = solution.among(opts.tries);
-                let outcome = rs_outcome(SolveMethod::List { multiplicity }, &solution);
-                let mut which = vec![0u8; block.len()];
-                for erratum in solution.errata.iter().filter(|e| !e.was_erasure) {
-                    which[erratum.index] = erratum.magnitude & block[erratum.index].known;
-                }
-                Candidate { outcome, corrected: solution.corrected, doubted: which }
-            })
-            .collect();
-        offer(&mut best, &mut rivals, found);
+        let found = rs_decode_listing(block, weighed, ec_len, reserved, opts.list_cost).into_iter().map(|(multiplicity, solution)| {
+            let solution = solution.among(opts.tries);
+            let outcome = rs_outcome(SolveMethod::List { multiplicity }, &solution);
+            let mut which = vec![0u8; block.len()];
+            for erratum in solution.errata.iter().filter(|e| !e.was_erasure) {
+                which[erratum.index] = erratum.magnitude & block[erratum.index].known;
+            }
+            weigh(Candidate::new(outcome, solution.corrected, which, 1))
+        });
+        pool.extend(found);
     }
 
     // Erasing codewords by trial reaches a wrong codeword or two more
@@ -699,20 +808,17 @@ fn solve_block(
     // last resort of a grid painted by hand, which nothing above can
     // doubt, and the dearest, every set of the block's codewords being
     // a decode. Only when nothing above has verified the block.
-    if opts.erase_by_trial && exact_failed && !verified_so_far(&best) {
-        let found = rs_decode_trying(block, bit_reliability, ec_len, reserved, opts.trial_sets)
-            .into_iter()
-            .map(|(erased, solution)| {
-                let solution = solution.among(opts.tries);
-                let outcome = rs_outcome(SolveMethod::Trial { erased: erased.len() }, &solution);
-                let mut which = vec![0u8; block.len()];
-                for &i in &erased {
-                    which[i] = block[i].known & !block[i].pinned;
-                }
-                Candidate { outcome, corrected: solution.corrected, doubted: which }
-            })
-            .collect();
-        offer(&mut best, &mut rivals, found);
+    if opts.erase_by_trial && exact_failed && !verified_so_far(&pool) {
+        let found = rs_decode_trying(block, bit_reliability, ec_len, reserved, opts.trial_sets).into_iter().map(|(erased, solution)| {
+            let solution = solution.among(opts.tries);
+            let outcome = rs_outcome(SolveMethod::Trial { erased: erased.len() }, &solution);
+            let mut which = vec![0u8; block.len()];
+            for &i in &erased {
+                which[i] = block[i].known & !block[i].pinned;
+            }
+            weigh(Candidate::new(outcome, solution.corrected, which, opts.trial_sets))
+        });
+        pool.extend(found);
     }
 
     // With enough pinned codewords the block is determined by pins alone,
@@ -729,46 +835,67 @@ fn solve_block(
                 erasures: solution.erasures,
                 slack: solution.slack,
                 confidence_bits: solution.confidence_bits(),
+                risk_bits: 0,
                 beyond_standard: !solution.within_standard(),
             };
-            consider(&mut best, Candidate { outcome, corrected: solution.corrected, doubted: Vec::new() });
+            pool.push(weigh(Candidate::new(outcome, solution.corrected, Vec::new(), 1)));
         }
     }
 
-    // Rivals are for a block nothing verified. Each codeword once, the
-    // best ranked solution of it standing for the rest, and the best
-    // ranked few of those.
-    let rivals = if verified_so_far(&best) {
+    // Every codeword found once, the best ranked solution of it standing
+    // for the rest; then each held against the nearest other by the
+    // block as read: its risk is no more than its margin over that one.
+    let mut distinct: Vec<Candidate> = Vec::new();
+    for candidate in pool {
+        match distinct.iter_mut().find(|d| d.corrected == candidate.corrected) {
+            Some(held) => {
+                if candidate.rank() > held.rank() {
+                    *held = candidate;
+                }
+            }
+            None => distinct.push(candidate),
+        }
+    }
+    let distances: Vec<u32> = distinct.iter().map(|c| soft_distance(block, bit_reliability, &c.corrected)).collect();
+    let nearest = distances.iter().copied().min().unwrap_or(0);
+    for (i, candidate) in distinct.iter_mut().enumerate() {
+        let margin = (0..distances.len()).filter(|&j| j != i).map(|j| distances[j].saturating_sub(distances[i]) / 8).min();
+        candidate.set_risk(margin.map_or(candidate.alone, |margin| candidate.alone.min(margin)));
+    }
+    distinct.sort_by(|a, b| b.rank().cmp(&a.rank()));
+    let Some(best) = distinct.first() else {
+        let inferred = match partial {
+            Some(solution) => solution.corrected.iter().zip(&solution.solved).map(|(&v, &m)| (v & m, m)).collect(),
+            None => vec![(0, 0); block.len()],
+        };
+        return BlockSolve {
+            outcome: BlockOutcome::Failed(failure),
+            corrected: None,
+            inferred,
+            doubted: Vec::new(),
+            rivals: Vec::new(),
+            arbitrated_among: 0,
+            near_errors: 0,
+            half_padded_with_ones: false,
+        };
+    };
+    // Rivals are for a block nothing verified: the codewords the block
+    // as read lies as near to as the nearest, which it cannot tell
+    // apart, the best ranked few of them.
+    let rivals = if best.outcome.is_verified() {
         Vec::new()
     } else {
-        rivals.sort_by(|a, b| b.rank().cmp(&a.rank()));
-        let mut distinct: Vec<Candidate> = Vec::new();
-        for candidate in rivals {
-            if !distinct.iter().any(|d| d.corrected == candidate.corrected) {
-                distinct.push(candidate);
-            }
-        }
-        distinct.truncate(MAX_RIVALS);
-        distinct
+        let tied: Vec<Candidate> = distinct
+            .iter()
+            .zip(&distances)
+            .filter(|(_, d)| **d < nearest + DISTANCE_MARGIN)
+            .map(|(c, _)| c.clone())
+            .take(MAX_RIVALS)
+            .collect();
+        if tied.len() >= 2 { tied } else { Vec::new() }
     };
-
-    if let Some(candidate) = best {
-        return BlockSolve { rivals, ..BlockSolve::solved(candidate) };
-    }
-    let inferred = match partial {
-        Some(solution) => solution.corrected.iter().zip(&solution.solved).map(|(&v, &m)| (v & m, m)).collect(),
-        None => vec![(0, 0); block.len()],
-    };
-    BlockSolve {
-        outcome: BlockOutcome::Failed(failure),
-        corrected: None,
-        inferred,
-        doubted: Vec::new(),
-        rivals,
-        arbitrated_among: 0,
-        near_errors: 0,
-        half_padded_with_ones: false,
-    }
+    let best = distinct.swap_remove(0);
+    BlockSolve { rivals, ..BlockSolve::solved(best) }
 }
 
 /// The reliability of each bit of each codeword, `bits[cw][b]` for bit
@@ -970,7 +1097,10 @@ impl StreamScore {
 /// every other. A tie between rivals that agree on every data codeword
 /// is no tie for the message, and the nearest the block as read is
 /// taken; between rivals that disagree, the block stays as it was. The
-/// blocks are taken in order, each with those before it as settled.
+/// blocks are taken in order, each with those before it as settled. A
+/// rival taken stands on its own risk ([`Candidate::alone`]): the
+/// margin that held it down was over the rivals the message has now
+/// told it from.
 ///
 /// The solvers that try many ways are list decoders, and a list of two
 /// is what they return where the block as read lies as near to two
@@ -1012,7 +1142,7 @@ fn arbitrate(
             _ if agree_on_data => Some(0),
             _ => None,
         };
-        let taken = winner.map(|r| rivals[r].clone()).filter(|candidate| candidate.rank() > solves[b].rank());
+        let taken = winner.map(|r| rivals[r].clone().at_risk(rivals[r].alone)).filter(|candidate| candidate.rank() > solves[b].rank());
         if let Some(candidate) = taken {
             let (near_errors, half) = (solves[b].near_errors, solves[b].half_padded_with_ones);
             solves[b] = BlockSolve { arbitrated_among: rivals.len(), near_errors, half_padded_with_ones: half, ..BlockSolve::solved(candidate) };
@@ -1080,7 +1210,7 @@ fn lowered_beside(module_reliability: &[u8], lying: &[(usize, usize)], width: us
 /// the first thing [`solve_block`] tries, and all a sound block needs,
 /// made alone before the hard blocks are shared over the cores, since
 /// it is microseconds and a thread is more.
-fn exact_solve(block: &[CwRead], ec_len: usize, reserved: usize, opts: &DecodeOptions) -> Option<BlockSolve> {
+fn exact_solve(block: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: usize, reserved: usize, opts: &DecodeOptions) -> Option<BlockSolve> {
     let solution = rs_decode_reserving(block, ec_len, reserved).ok()?.among(opts.tries);
     let outcome = BlockOutcome::Solved {
         method: SolveMethod::ReedSolomon,
@@ -1088,10 +1218,11 @@ fn exact_solve(block: &[CwRead], ec_len: usize, reserved: usize, opts: &DecodeOp
         erasures: solution.erasures,
         slack: solution.slack,
         confidence_bits: solution.confidence_bits(),
+        risk_bits: 0,
         beyond_standard: !solution.within_standard(),
     };
-    let candidate = Candidate { outcome, corrected: solution.corrected, doubted: Vec::new() };
-    candidate.rank().0.then(|| BlockSolve::solved(candidate))
+    let candidate = Candidate::new(outcome, solution.corrected, Vec::new(), opts.tries).weigh(block, bit_reliability, ec_len);
+    candidate.verified_alone().then(|| BlockSolve::solved(candidate))
 }
 
 /// What one block was last solved from, and what came of it.
@@ -1132,7 +1263,7 @@ fn solve_blocks(
             out.push(Some(before.solve.clone()));
             continue;
         }
-        match exact_solve(&reads, spec.ec_len, spec.reserved, opts) {
+        match exact_solve(&reads, &bits, spec.ec_len, spec.reserved, opts) {
             Some(solve) => {
                 solved[b] = Some(Solved { reads, bits, solve: solve.clone() });
                 out.push(Some(solve));

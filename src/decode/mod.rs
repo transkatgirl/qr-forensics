@@ -1,6 +1,7 @@
 //! The decode pipeline, from module grid to text, with every intermediate
 //! stage kept for inspection.
 
+pub mod abp;
 pub mod bch;
 pub mod bitstream;
 pub mod codewords;

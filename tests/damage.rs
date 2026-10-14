@@ -69,7 +69,7 @@ fn recovers_exactly_within_capacity() {
                 let block = &layout.blocks[b];
                 let slack = block.ec_len - erasures - 2 * errors;
                 match report.blocks[b].outcome {
-                    BlockOutcome::Solved { method, errors: e, erasures: f, slack: s, confidence_bits, beyond_standard } => {
+                    BlockOutcome::Solved { method, errors: e, erasures: f, slack: s, confidence_bits, beyond_standard, .. } => {
                         assert_eq!((method, e, f, s), (SolveMethod::ReedSolomon, *errors, *erasures, slack), "{what} block {b}");
                         assert_eq!(beyond_standard, slack < block.reserved, "{what} block {b}");
                         // The slack, and what the errors located among
@@ -82,8 +82,10 @@ fn recovers_exactly_within_capacity() {
                         // and one with codewords filled in by three
                         // codewords' worth.
                         let needed = if *erasures == 0 { VERIFIED_BITS } else { AIDED_VERIFIED_BITS };
-                        assert_eq!(report.blocks[b].is_verified(), confidence_bits >= needed, "{what} block {b}: {confidence_bits}");
-                        confirmed &= confidence_bits >= needed;
+                        // Verified by that, or by the soft count of the
+                        // bits it overturned, which may be the more.
+                        assert!(report.blocks[b].is_verified() >= (confidence_bits >= needed), "{what} block {b}: {confidence_bits}");
+                        confirmed &= report.blocks[b].is_verified();
                     }
                     other => panic!("{what} block {b}: {other:?}"),
                 }
@@ -138,7 +140,7 @@ fn a_block_corrected_to_the_limit_of_its_error_correction_is_confirmed() {
         for (b, block) in layout.blocks.iter().enumerate() {
             let limit = (block.ec_len - block.reserved) / 2;
             match report.blocks[b].outcome {
-                BlockOutcome::Solved { method: SolveMethod::ReedSolomon, errors, erasures: 0, slack, confidence_bits, beyond_standard: false } => {
+                BlockOutcome::Solved { method: SolveMethod::ReedSolomon, errors, erasures: 0, slack, confidence_bits, beyond_standard: false, .. } => {
                     assert_eq!((errors, slack), (limit, block.ec_len - 2 * limit), "{what} block {b}");
                     assert_eq!(confidence_bits, 8 * slack as u32 + located_error_bits(block.codewords.len(), limit), "{what} block {b}");
                 }
@@ -221,7 +223,7 @@ fn every_block_but_m1s_can_be_verified_with_codewords_filled_in() {
     let mut grid = encode(SymbolVersion::Micro(1), EcLevel::L, Some(1), &[Segment::numeric(text).unwrap()]).unwrap();
     let report = decode_plain(&grid, &layout, 1);
     match report.blocks[0].outcome {
-        BlockOutcome::Solved { method: SolveMethod::ReedSolomon, errors: 0, erasures: 0, slack: 2, confidence_bits: 16, beyond_standard: false } => {}
+        BlockOutcome::Solved { method: SolveMethod::ReedSolomon, errors: 0, erasures: 0, slack: 2, confidence_bits: 16, beyond_standard: false, .. } => {}
         other => panic!("{other:?}"),
     }
     assert!(report.is_trustworthy());
@@ -349,7 +351,7 @@ fn a_block_filled_with_one_codeword_to_spare_is_no_read() {
         if report.blocks[0].is_solved() {
             solved += 1;
             match report.blocks[0].outcome {
-                BlockOutcome::Solved { method: SolveMethod::ReedSolomon, errors: 0, erasures: 17, slack: 1, confidence_bits: 8, beyond_standard: false } => {}
+                BlockOutcome::Solved { method: SolveMethod::ReedSolomon, errors: 0, erasures: 17, slack: 1, confidence_bits: 8, beyond_standard: false, .. } => {}
                 other => panic!("{magnitude:#x}: {other:?}"),
             }
             // Every block solved and the stream parsing: `unconfirmed`,
@@ -369,7 +371,7 @@ fn a_block_filled_with_one_codeword_to_spare_is_no_read() {
     }
     let report = decode_plain(&grid, &layout, 2);
     match report.blocks[0].outcome {
-        BlockOutcome::Solved { method: SolveMethod::ReedSolomon, errors: 0, erasures: 15, slack: 3, confidence_bits: 24, beyond_standard: false } => {}
+        BlockOutcome::Solved { method: SolveMethod::ReedSolomon, errors: 0, erasures: 15, slack: 3, confidence_bits: 24, beyond_standard: false, .. } => {}
         other => panic!("{other:?}"),
     }
     assert!(report.is_trustworthy());
@@ -595,7 +597,14 @@ fn doubting_recovers_from_misread_sampled_modules() {
         // Each of the three ways is left out by itself: with none of
         // them the block fails as it does with doubting off, and with
         // one alone it solves that way or not at all.
-        let none = DecodeOptions { doubt_codewords: false, doubt_bits: false, flip_bits: false, list_decode: false, ..Default::default() };
+        let none = DecodeOptions {
+            doubt_codewords: false,
+            doubt_bits: false,
+            flip_bits: false,
+            list_decode: false,
+            belief_propagation: false,
+            ..Default::default()
+        };
         let unaided = decode(&grid, &layout, mask, &Pins::new(), &none).blocks[0].outcome;
         assert!(
             matches!(unaided, BlockOutcome::Failed(_) | BlockOutcome::Solved { method: SolveMethod::Trial { .. }, .. }),
@@ -832,7 +841,7 @@ fn doubting_bits_recovers_faint_modules_in_more_codewords_than_erasures_allow() 
         // With the bit-level solver off there is nothing to doubt bits
         // with, and only chasing, which flips ten at the most, can reach
         // the block.
-        let no_bits = DecodeOptions { bit_level: false, ..Default::default() };
+        let no_bits = DecodeOptions { bit_level: false, belief_propagation: false, ..Default::default() };
         let chased = decode(&grid, &layout, mask, &Pins::new(), &no_bits).blocks[0].outcome;
         assert!(
             matches!(chased, BlockOutcome::Failed(_) | BlockOutcome::Solved { method: SolveMethod::Chase { .. }, .. }),
@@ -1173,8 +1182,11 @@ fn errors_located_in_one_block_make_the_modules_beside_them_doubtful_in_another(
         other => panic!("A: {other:?}"),
     }
     match report.blocks[1].outcome {
-        BlockOutcome::Solved { method: SolveMethod::Chase { flipped_bits: 2 }, errors, slack: 2, .. } => {
-            assert_eq!(errors, limit + 1, "B");
+        // Chasing flips the two and locates the rest; doubting the two
+        // codewords whole reaches the same codeword, and whichever is
+        // the less risky stands for it.
+        BlockOutcome::Solved { method: SolveMethod::Chase { flipped_bits: 2 } | SolveMethod::Reliability { doubted: 2 }, errors, erasures, .. } => {
+            assert_eq!(errors + erasures, limit + 1, "B");
         }
         other => panic!("B beside A's errors: {other:?}"),
     }
@@ -1336,7 +1348,14 @@ fn list_decoding_reaches_a_block_wrong_in_more_codewords_than_the_trials_reach()
         let (x, y) = (pos.x as usize, pos.y as usize);
         grid.set_sampled(x, y, grid.get(x, y).inverted(), rng.below(10) as u8);
     }
-    let alone = DecodeOptions { doubt_codewords: false, doubt_bits: false, flip_bits: false, erase_by_trial: false, ..DecodeOptions::default() };
+    let alone = DecodeOptions {
+        doubt_codewords: false,
+        doubt_bits: false,
+        flip_bits: false,
+        erase_by_trial: false,
+        belief_propagation: false,
+        ..DecodeOptions::default()
+    };
     let report = decode(&grid, &layout, mask, &Pins::new(), &alone);
     assert!(matches!(report.blocks[0].outcome, BlockOutcome::Solved { method: SolveMethod::List { .. }, errors: 16, .. }), "{:?}", report.blocks[0].outcome);
     assert!(report.blocks[0].is_verified() && report.text.plain() == text);
@@ -1344,4 +1363,64 @@ fn list_decoding_reaches_a_block_wrong_in_more_codewords_than_the_trials_reach()
     // one, and sixteen is past it.
     let hard = DecodeOptions { reliability: false, erase_by_trial: false, ..DecodeOptions::default() };
     assert!(!decode(&grid, &layout, mask, &Pins::new(), &hard).blocks[0].is_verified());
+}
+
+#[test]
+fn a_fallback_spends_the_reserve_as_the_plain_decoder_does() {
+    // A version 1-H symbol painted by hand: seventeen EC codewords, one
+    // reserved for detection, so the standard corrects eight. Eleven
+    // wrong codewords are past the plain decoder, past the trials of
+    // erasures within their budget, and within the curve of list
+    // decoding, whose solution is held to spend every codeword of the
+    // redundancy, the reserve among them. The curve offers it as the
+    // plain decoder offers a solution that spends the reserve: marked
+    // beyond the standard, never confirmed, and the message read off it
+    // all the same.
+    let mut rng = Rng(0x5E5E);
+    let (version, ec) = (SymbolVersion::Qr(1), EcLevel::H);
+    let mask = rng.below(version.mask_count() as usize) as u8;
+    let (layout, clean, text) = sample(version, ec, mask, &mut rng);
+    let block = &layout.blocks[0];
+    assert_eq!((block.ec_len, block.reserved), (17, 1));
+    let mut grid = clean.clone();
+    for i in rng.distinct(11, block.codewords.len()) {
+        corrupt_codeword(&mut grid, &layout, block.codewords[i], rng.below(8));
+    }
+    let report = decode_plain(&grid, &layout, mask);
+    match report.blocks[0].outcome {
+        BlockOutcome::Solved { method: SolveMethod::List { .. }, errors: 11, erasures: 0, slack: 0, beyond_standard: true, .. } => {}
+        other => panic!("{other:?}"),
+    }
+    assert!(report.blocks[0].is_beyond_standard() && !report.blocks[0].is_verified());
+    assert_eq!(report.text.plain(), text);
+    assert!(!report.is_trustworthy());
+    // Eight wrong are within the plain decoder, which spends the
+    // reserve itself: the same marking, from it.
+    let mut grid = clean.clone();
+    for i in rng.distinct(8, block.codewords.len()) {
+        corrupt_codeword(&mut grid, &layout, block.codewords[i], rng.below(8));
+    }
+    let report = decode_plain(&grid, &layout, mask);
+    assert!(matches!(report.blocks[0].outcome, BlockOutcome::Solved { method: SolveMethod::ReedSolomon, errors: 8, slack: 1, beyond_standard: false, .. }), "{:?}", report.blocks[0].outcome);
+    assert!(report.blocks[0].is_verified());
+    // A fallback prefers a solution within the standard: nine wrong are
+    // reached by the trials erasing three, which leaves two to spare,
+    // over the curve's and the trials' own that leave nothing.
+    let mut grid = clean.clone();
+    for i in rng.distinct(9, block.codewords.len()) {
+        corrupt_codeword(&mut grid, &layout, block.codewords[i], rng.below(8));
+    }
+    let report = decode_plain(&grid, &layout, mask);
+    assert!(matches!(report.blocks[0].outcome, BlockOutcome::Solved { method: SolveMethod::Trial { erased: 3 }, errors: 9, slack: 2, beyond_standard: false, .. }), "{:?}", report.blocks[0].outcome);
+    assert!(report.blocks[0].is_verified());
+    // A block whose every EC codeword is reserved is held to the
+    // reserve still: an M1 symbol wrong in two codewords, past the one
+    // its two EC codewords detect, has no solution from anyone.
+    let (layout, text) = (common::layout(SymbolVersion::Micro(1), EcLevel::L), "12345");
+    let mut grid = encode(SymbolVersion::Micro(1), EcLevel::L, Some(1), &[Segment::numeric(text).unwrap()]).unwrap();
+    for cw in [0, 1] {
+        corrupt_codeword(&mut grid, &layout, layout.blocks[0].codewords[cw], 2);
+    }
+    let report = decode_plain(&grid, &layout, 1);
+    assert!(matches!(report.blocks[0].outcome, BlockOutcome::Failed(_)), "{:?}", report.blocks[0].outcome);
 }

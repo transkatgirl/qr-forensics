@@ -1633,26 +1633,26 @@ fn a_blurred_symbol_in_failing_light_reads_once_a_stained_codeword_a_block_is_fr
         read.report.blocks.iter().map(|b| b.outcome).collect::<Vec<_>>()
     );
     // Through the very placement that read, sampled as the guess at the
-    // blur sharpens it, with nothing freed by trial and no solid bit
-    // flipped, no kernel reads under either of the rules that split the
-    // symbol, through the band or with the unsure modules kept at their
-    // colour: the codewords the blur carried over are wrong either way.
-    // Freed whole, or, where the blur carried only a bit or two or three
-    // of it over, those bits flipped by what the equations were left
-    // wanting, the neighbourhood reads it. The surface reads it with
-    // nothing freed or flipped.
+    // blur sharpens it, with nothing freed by trial, no solid bit
+    // flipped and no belief passed between the bits, no kernel reads
+    // under either of the rules that split the symbol, through the band
+    // or with the unsure modules kept at their colour: the codewords the
+    // blur carried over are wrong either way. Freed whole, or, where the
+    // blur carried only a bit or two or three of it over, those bits
+    // flipped by what the equations were left wanting, the neighbourhood
+    // reads it. The surface reads it with nothing freed or flipped.
     let map = read.detection.projection().expect("the placement maps");
     let reads = |rule: Rule, kernel: Kernel, band: f32, aided: bool| {
         let how = SampleParams { kernel, band, ..params.under(rule) };
         let sampled = sample_modules_with(&image, &map, grid.width(), grid.height(), kernel);
         let other = classify(&sampled, &how).to_grid(grid.width(), grid.height());
-        let opts = DecodeOptions { erase_by_trial: aided, flip_bits: aided, ..opts };
+        let opts = DecodeOptions { erase_by_trial: aided, flip_bits: aided, belief_propagation: aided, ..opts };
         decode(&other, &layout, 0, &Pins::new(), &opts).is_trustworthy()
     };
     for rule in [Rule::Neighbourhood, Rule::Level] {
         for kernel in Kernel::ALL {
             for band in [params.band, 0.0] {
-                assert!(!reads(rule, kernel, band, false), "{rule:?} with {kernel:?} at a band of {band} reads it with nothing freed or flipped");
+                assert!(!reads(rule, kernel, band, false), "{rule:?} with {kernel:?} at a band of {band} reads it with nothing freed, flipped or passed");
             }
         }
     }

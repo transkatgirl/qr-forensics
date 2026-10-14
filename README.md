@@ -232,9 +232,13 @@ Overlays colour the grid by what the decoder knows:
   **Brute force** decodes under every EC level and mask and ranks the
   results.
 - **Blocks.** Each Reed-Solomon block: how it was solved, or what it still
-  needs. **Show** outlines its unknown codewords on the grid, or the modules
-  that were doubted to solve it, and **Sample** re-reads that block alone
-  from the photo.
+  needs, and the chance the solution is wrong, given as at most 1 in 2^n.
+  That figure combines all the evidence for the solution, and is capped
+  by how much closer the solution is to the block as read than any other
+  codeword the solvers found. A block counts as confirmed at 1 in 256 or
+  better (n ≥ 8). **Show** outlines its unknown codewords on the grid,
+  or the modules that were doubted to solve it, and **Sample** re-reads
+  that block alone from the photo.
 - **Codewords.** Every codeword with its bits as read, final value and
   status. Click a row, or a module with the **Inspect** tool, to see where a
   codeword lives.
@@ -275,6 +279,11 @@ fails:
 - erasing codewords by trial: every set of the smallest size that goes
   past what the code corrects, then the next size, whatever their
   reliability;
+- adaptive belief propagation: over several rounds, the block's parity
+  checks update each bit's reliability from the other bits in the same
+  checks, and the block is decoded from the updated reliabilities. Each
+  round the checks are rearranged so the least reliable bits each sit in
+  a check of their own;
 - soft-decision list decoding, which weights each codeword by its
   reliability and finds every valid codeword close enough to the block as
   read.
@@ -286,10 +295,22 @@ block), or a block whose unknown bits solve bit by bit except for a stain
 over a few codewords. List decoding goes further the lower the block's
 rate: up to 11 wrong codewords in a version 1-H block, where the usual
 limit is 8, and 19 in a 40-H block, where it is 15; at level L it gains
-nothing. Sliders set how much the expensive solvers try: sets erased,
-bits flipped, and the list decoder's constraint budget. Every extra try
-is another chance of a wrong answer, so solutions found with a bigger
-budget need more to confirm them.
+nothing. Belief propagation finds faint misreads among more faint but
+correct modules than doubting can treat as unknown, which is typical of
+a noisy photo of a small symbol. Sliders set how much the expensive solvers try:
+sets erased, bits flipped, and the list decoder's constraint budget.
+Every extra try is another chance of a wrong answer, so solutions found
+with a bigger budget need more to confirm them.
+
+A solution is confirmed by how rarely random data would pass the same
+tests: the redundancy it left unused, the errors it located, and, for a
+solution that only flipped faint modules, how few other sets of modules
+would be as cheap to flip, however many modules that is. In the
+smallest symbols the standard reserves some error correction codewords
+for detecting misreads rather than correcting them. A solution that
+uses them is marked as beyond the standard and is never confirmed,
+whichever solver found it, and each fallback prefers a solution that
+leaves them unused if it finds one.
 
 **Pin the padding and headers found**, also under Decoding, does what
 Padding recovery does by hand, on every decode: it finds where the

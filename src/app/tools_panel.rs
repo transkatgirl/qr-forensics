@@ -1154,8 +1154,8 @@ fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     ui.checkbox(&mut opts.reliability, "Doubt the least reliable modules").on_hover_text(
         "When a block fails, treat its codewords with the faintest sampled modules as unknown, a few at a \
          time, until it solves with something to spare. Modules painted by hand are never doubted unless they \
-         were painted below certain. The three ways of doubting below are \
-         each tried, and the solution with the most to confirm it kept; Blocks says which solved a block, and \
+         were painted below certain. Each method below is tried, and the \
+         solution with the most to confirm it kept; Blocks says which solved a block, and \
          its Show outlines the modules that were doubted.",
     );
     ui.indent("doubting", |ui| {
@@ -1176,6 +1176,14 @@ fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                  by bit but for a module or two or three read solidly wrong, flip the ones the equations name. Many tries are \
                  many chances of a wrong answer, so every pattern that solves must agree, or the message is asked which \
                  it is; turn this off where a solution it reached looks wrong.",
+            );
+            ui.checkbox(&mut opts.belief_propagation, "Belief propagation").on_hover_text(
+                "Run adaptive belief propagation (Jiang and Narayanan): over several rounds, the block's parity checks \
+                 update each bit's reliability from the other bits in the same checks, and the block is decoded from \
+                 the updated reliabilities. Each round the checks are rearranged so the least reliable bits each sit \
+                 in a check of their own. Finds faint misreads among more faint but correct modules than doubting can \
+                 treat as unknown, and more misreads than Flip the faintest bits tries. A solution is confirmed by how \
+                 rarely random data lands that close to a codeword; the bits it flipped add nothing to that.",
             );
             if opts.flip_bits {
                 ui.add(egui::Slider::new(&mut opts.chase_bits, 1..=CHASE_MAX_BITS).text("bits flipped")).on_hover_text(

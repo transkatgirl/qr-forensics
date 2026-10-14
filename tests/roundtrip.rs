@@ -38,6 +38,7 @@ fn assert_clean(grid: &ModuleGrid, layout: &SymbolLayout, ec: EcLevel, mask: u8,
                 erasures: 0,
                 slack: block.ec_len,
                 confidence_bits: 8 * block.ec_len as u32,
+                risk_bits: 8 * block.ec_len as u32,
                 beyond_standard: false,
             },
             "{what}: block {b}"

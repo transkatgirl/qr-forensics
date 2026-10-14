@@ -30,6 +30,14 @@ pub fn exp(i: usize) -> u8 {
     TABLES.0[i % 255]
 }
 
+/// α^i for an exponent below 510: the sum of two logarithms, with no
+/// reduction.
+#[inline]
+pub fn exp_of_sum(i: usize) -> u8 {
+    debug_assert!(i < 510);
+    TABLES.0[i]
+}
+
 /// Discrete logarithm base α. `x` must be non-zero.
 #[inline]
 pub fn log(x: u8) -> usize {
