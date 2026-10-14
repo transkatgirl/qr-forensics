@@ -409,10 +409,13 @@ pub(crate) fn standing(result: &ReadResult) -> String {
 /// What a decode settled on the way to the message, as `--details`
 /// prints it: the level and mask, the character set byte data was read
 /// in, the symbology identifier, the place in a structured append
-/// sequence, the padding that was pinned, and what `--enlarge`,
-/// `--sharpen` and `--surface` would have to ask for to read the symbol
-/// the same again at the first try. The standard's filler goes without
-/// saying, and another is named.
+/// sequence, the padding that was pinned, what `--enlarge`, `--sharpen`
+/// and `--surface` would have to ask for to read the symbol the same
+/// again at the first try, and `unsure modules kept` when the read
+/// stands only with the modules its unsure band would leave unknown
+/// kept at the colour they fell on, which the window reads again with
+/// the band at nought. The standard's filler goes without saying, and
+/// another is named.
 fn details(result: &ReadResult) -> String {
     let (version, report) = (result.version(), &result.report);
     let mut parts = vec![format!("EC {}", version.ec_label(report.ec))];
@@ -438,6 +441,9 @@ fn details(result: &ReadResult) -> String {
     }
     if result.rule == Rule::Surface {
         parts.push("threshold surface".to_owned());
+    }
+    if result.unsure_kept {
+        parts.push("unsure modules kept".to_owned());
     }
     parts.join(", ")
 }

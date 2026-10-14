@@ -7,7 +7,7 @@ use common::*;
 use qr_forensics::decode::bitstream::Certainty;
 use qr_forensics::decode::codewords::Pins;
 use qr_forensics::decode::pipeline::{BlockOutcome, CwStatus, DecodeOptions, SolveMethod, decode};
-use qr_forensics::decode::rs::{AIDED_VERIFIED_BITS, CHASE_BITS, RsFailure, VERIFIED_BITS, located_error_bits};
+use qr_forensics::decode::rs::{AIDED_VERIFIED_BITS, CHASE_BITS, RsFailure, TRIAL_SETS, VERIFIED_BITS, located_error_bits, sets_of};
 use qr_forensics::decode::text::UNKNOWN_CHAR;
 use qr_forensics::symbol::grid::{CERTAIN, Module, ModuleGrid};
 use qr_forensics::symbol::layout::SymbolLayout;
@@ -114,7 +114,11 @@ fn a_block_corrected_to_the_limit_of_its_error_correction_is_confirmed() {
     // count is even, is every one of them spent: the blocks solve with
     // nothing to spare, and are confirmed by the errors they located, as
     // every reader that follows the standard takes them. One wrong
-    // codeword more in a block is past the code, and no read.
+    // codeword more in a block is past the code, and no read, but for
+    // the trials of erasures, which reach one more in any block, by
+    // the smallest set of erasures that goes past the code or the next
+    // where the standard's reserve refuses that one, when enough is
+    // located to confirm it.
     let mut rng = Rng(0x11A17);
     for (version, ec) in SAMPLES {
         let mask = rng.below(version.mask_count() as usize) as u8;
@@ -146,9 +150,23 @@ fn a_block_corrected_to_the_limit_of_its_error_correction_is_confirmed() {
         assert_eq!(report.text.plain(), text, "{what}");
 
         corrupt_codeword(&mut grid, &layout, spare[0], rng.below(8));
-        let report = decode_plain(&grid, &layout, mask);
+        let no_trial = DecodeOptions { erase_by_trial: false, ..Default::default() };
+        let report = decode(&grid, &layout, mask, &Pins::new(), &no_trial);
         assert!(!report.blocks[0].is_verified(), "{what}: {:?}", report.blocks[0].outcome);
         assert!(!report.is_trustworthy(), "{what}");
+        let report = decode_plain(&grid, &layout, mask);
+        let limit = (layout.blocks[0].ec_len - layout.blocks[0].reserved) / 2;
+        match report.blocks[0].outcome {
+            BlockOutcome::Solved { method: SolveMethod::Trial { erased }, errors, erasures: 0, .. } => {
+                let smallest = 2 - layout.blocks[0].ec_len % 2;
+                assert!(erased == smallest || erased == smallest + 2, "{what}: {:?}", report.blocks[0].outcome);
+                assert_eq!(errors, limit + 1, "{what}: {:?}", report.blocks[0].outcome);
+                assert_eq!(report.text.plain(), text, "{what}");
+                assert_eq!(report.blocks[0].is_verified(), report.is_trustworthy(), "{what}");
+            }
+            BlockOutcome::Failed(_) => {}
+            other => panic!("{what}: {other:?}"),
+        }
     }
 }
 
@@ -516,11 +534,15 @@ fn doubting_recovers_from_misread_sampled_modules() {
         }
         let what = format!("{version}-{ec:?} with {wrong} misread");
         let strict = DecodeOptions { reliability: false, ..Default::default() };
-        assert!(!decode(&grid, &layout, mask, &Pins::new(), &strict).blocks[0].is_solved(), "{what}");
+        let unaided = decode(&grid, &layout, mask, &Pins::new(), &strict).blocks[0].outcome;
+        assert!(
+            matches!(unaided, BlockOutcome::Failed(_) | BlockOutcome::Solved { method: SolveMethod::Trial { .. }, .. }),
+            "{what}: {unaided:?}"
+        );
         let report = decode_plain(&grid, &layout, mask);
-        // Doubting the faint codewords, doubting the faint bits and
-        // flipping them all reach the answer; whichever is confirmed by
-        // more bits is kept.
+        // Doubting the faint codewords, doubting the faint bits, flipping
+        // them and doubting some while flipping the rest all reach the
+        // answer; whichever is confirmed by more bits is kept.
         match report.blocks[0].outcome {
             BlockOutcome::Solved { method: SolveMethod::Reliability { doubted }, .. } => {
                 assert!(doubted >= wrong && doubted <= block.ec_len, "{what}: doubted {doubted}");
@@ -530,6 +552,10 @@ fn doubting_recovers_from_misread_sampled_modules() {
             }
             BlockOutcome::Solved { method: SolveMethod::Chase { flipped_bits }, errors, .. } => {
                 assert!(flipped_bits >= 1 && flipped_bits <= wrong.min(CHASE_BITS), "{what}: flipped {flipped_bits} bits");
+                assert_eq!(errors, wrong, "{what}");
+            }
+            BlockOutcome::Solved { method: SolveMethod::BitFlip { doubted_bits, flipped_bits }, errors, .. } => {
+                assert!(flipped_bits >= 1 && flipped_bits <= 3 && doubted_bits + flipped_bits >= wrong, "{what}: {doubted_bits} doubted, {flipped_bits} flipped");
                 assert_eq!(errors, wrong, "{what}");
             }
             other => panic!("{what}: {other:?}"),
@@ -551,6 +577,9 @@ fn doubting_recovers_from_misread_sampled_modules() {
             BlockOutcome::Solved { method: SolveMethod::Reliability { doubted }, .. } => assert_eq!(doubted_codewords, doubted, "{what}"),
             BlockOutcome::Solved { method: SolveMethod::BitReliability { doubted_bits: bits }, .. } => assert_eq!(doubted_bits, bits, "{what}"),
             BlockOutcome::Solved { method: SolveMethod::Chase { flipped_bits }, .. } => assert_eq!(doubted_bits, flipped_bits, "{what}"),
+            BlockOutcome::Solved { method: SolveMethod::BitFlip { doubted_bits: bits, flipped_bits }, .. } => {
+                assert_eq!(doubted_bits, bits + flipped_bits, "{what}")
+            }
             other => panic!("{what}: {other:?}"),
         }
         assert!(truth.codewords.iter().all(|c| c.doubted == 0), "{what}");
@@ -558,7 +587,11 @@ fn doubting_recovers_from_misread_sampled_modules() {
         // them the block fails as it does with doubting off, and with
         // one alone it solves that way or not at all.
         let none = DecodeOptions { doubt_codewords: false, doubt_bits: false, flip_bits: false, ..Default::default() };
-        assert!(!decode(&grid, &layout, mask, &Pins::new(), &none).blocks[0].is_solved(), "{what}");
+        let unaided = decode(&grid, &layout, mask, &Pins::new(), &none).blocks[0].outcome;
+        assert!(
+            matches!(unaided, BlockOutcome::Failed(_) | BlockOutcome::Solved { method: SolveMethod::Trial { .. }, .. }),
+            "{what}: {unaided:?}"
+        );
         let alone = [
             DecodeOptions { doubt_codewords: true, ..none },
             DecodeOptions { doubt_bits: true, ..none },
@@ -567,24 +600,165 @@ fn doubting_recovers_from_misread_sampled_modules() {
         for (way, only) in alone.iter().enumerate() {
             let own = match decode(&grid, &layout, mask, &Pins::new(), only).blocks[0].outcome {
                 BlockOutcome::Solved { method: SolveMethod::Reliability { .. }, .. } => 0,
-                BlockOutcome::Solved { method: SolveMethod::BitReliability { .. }, .. } => 1,
-                BlockOutcome::Solved { method: SolveMethod::Chase { .. }, .. } => 2,
+                BlockOutcome::Solved { method: SolveMethod::BitReliability { .. } | SolveMethod::BitTrial { .. }, .. } => 1,
+                BlockOutcome::Solved { method: SolveMethod::Chase { .. } | SolveMethod::BitFlip { .. }, .. } => 2,
+                BlockOutcome::Solved { method: SolveMethod::Trial { .. }, .. } | BlockOutcome::Failed(_) => continue,
                 BlockOutcome::Solved { method, .. } => panic!("{what}: {method:?}"),
-                BlockOutcome::Failed(_) => continue,
             };
             assert_eq!(own, way, "{what}");
         }
     }
     // A certain module is never doubted, so painting a wrong module by hand
-    // keeps the failure.
+    // keeps the failure: two past the code, which is one past what the
+    // trials of erasures reach.
     let (version, ec, mask) = (SymbolVersion::Qr(4), EcLevel::M, 1);
     let (layout, mut grid, _) = sample(version, ec, mask, &mut rng);
     let block = &layout.blocks[0];
-    for i in 0..block.ec_len / 2 + 1 {
+    for i in 0..block.ec_len / 2 + 2 {
         corrupt_codeword(&mut grid, &layout, block.codewords[i], i);
     }
     assert!(grid.cells().iter().all(|_| true) && grid.reliability(0, 0) == CERTAIN);
     assert!(!decode_plain(&grid, &layout, mask).blocks[0].is_solved());
+}
+
+#[test]
+fn erasing_by_trial_reaches_one_wrong_codeword_past_the_code() {
+    // Painted by hand, every module is certain, and nothing that doubts
+    // or flips by reliability has anything to go on; erasing codewords
+    // by trial, every pair of the block's, reaches one wrong codeword
+    // more than the code corrects, and the errors the code then locates
+    // among the rest confirm it. One more again is reached by the sets
+    // two larger, where the block is small enough for those to fit the
+    // budget with the smaller ones, and is past the trials where it is
+    // not.
+    let mut rng = Rng(0x7A1A1);
+    let mut reached = 0;
+    for (version, ec) in SAMPLES {
+        let mask = rng.below(version.mask_count() as usize) as u8;
+        let (layout, clean, text) = sample(version, ec, mask, &mut rng);
+        let block = &layout.blocks[0];
+        let n = block.codewords.len();
+        if block.reserved > 0 {
+            continue;
+        }
+        let limit = block.ec_len / 2;
+        let mut grid = clean.clone();
+        let picked = rng.distinct(limit + 2, n);
+        for &i in &picked[..limit + 1] {
+            corrupt_codeword(&mut grid, &layout, block.codewords[i], rng.below(8));
+        }
+        let what = format!("{version}-{ec:?} with {} wrong", limit + 1);
+        assert!(!grid.has_reliability());
+        let no_trial = DecodeOptions { erase_by_trial: false, ..Default::default() };
+        assert!(matches!(decode(&grid, &layout, mask, &Pins::new(), &no_trial).blocks[0].outcome, BlockOutcome::Failed(_)), "{what}");
+        let report = decode_plain(&grid, &layout, mask);
+        let smallest = 2 - block.ec_len % 2;
+        let erased = match report.blocks[0].outcome {
+            BlockOutcome::Solved { method: SolveMethod::Trial { erased }, errors, erasures: 0, beyond_standard: false, .. } => {
+                // The smallest set that goes past the code, or the next,
+                // where the smallest locates too little to be offered.
+                assert!(erased == smallest || erased == smallest + 2, "{what}: {:?}", report.blocks[0].outcome);
+                assert_eq!(errors, limit + 1, "{what}");
+                erased
+            }
+            // Too little located to confirm a solution found among so
+            // many tries: the smallest blocks.
+            BlockOutcome::Failed(_) if block.ec_len < 16 => continue,
+            other => panic!("{what}: {other:?}"),
+        };
+        assert_eq!(report.text.plain(), text, "{what}");
+        // The smallest blocks locate too little to confirm a solution
+        // found among hundreds of tries, and the largest too little for
+        // one found among thousands of pairs: it stands unconfirmed.
+        if !report.blocks[0].is_verified() {
+            assert!(!report.is_trustworthy(), "{what}: {:?}", report.blocks[0].outcome);
+            continue;
+        }
+        assert!(report.is_trustworthy(), "{what}");
+        let truth = decode_plain(&clean, &layout, mask);
+        for (got, want) in report.codewords.iter().zip(&truth.codewords) {
+            assert_eq!(got.final_value, want.final_value, "{what}");
+        }
+        assert_eq!(report.codewords.iter().filter(|c| c.status == CwStatus::Corrected).count(), limit + 1, "{what}");
+        // The codewords erased by trial are shown as doubted, as the
+        // codewords doubted for their reliability are.
+        let doubted = report.codewords.iter().filter(|c| c.doubted != 0).count();
+        assert_eq!(doubted, erased, "{what}");
+        reached += 1;
+
+        corrupt_codeword(&mut grid, &layout, block.codewords[picked[limit + 1]], rng.below(8));
+        let past = decode_plain(&grid, &layout, mask);
+        let smallest = 2 - block.ec_len % 2;
+        let fits = sets_of(n, smallest).zip(sets_of(n, smallest + 2)).is_some_and(|(small, large)| small + large <= TRIAL_SETS);
+        match past.blocks[0].outcome {
+            BlockOutcome::Solved { method: SolveMethod::Trial { erased: again }, errors, .. } if fits => {
+                assert_eq!((again, errors), (erased + 2, limit + 2), "{what} and one more");
+                assert_eq!(past.text.plain(), text, "{what} and one more");
+            }
+            BlockOutcome::Failed(_) => {}
+            other => panic!("{what} and one more: {other:?}"),
+        }
+    }
+    assert!(reached >= 4, "{reached} blocks reached by trial");
+}
+
+#[test]
+fn erasing_by_trial_frees_a_wrong_codeword_among_scattered_unknown_bits() {
+    // A codeword to a module unknown over more codewords than there is
+    // redundancy to erase, which solves bit by bit as long as every bit
+    // read is right, and a stain over one codeword, or two, read wrong
+    // in every module: the bit-level solver finds its equations
+    // inconsistent, and erasing by trial finds the codewords that make
+    // them agree, with no reliability to go on.
+    let mut rng = Rng(0x57A1);
+    let mut freed = 0;
+    for (version, ec) in SAMPLES {
+        let mask = rng.below(version.mask_count() as usize) as u8;
+        let (layout, clean, text) = sample(version, ec, mask, &mut rng);
+        let block = &layout.blocks[0];
+        let n = block.codewords.len();
+        if block.ec_len < 10 {
+            continue;
+        }
+        for stains in [1usize, 2] {
+            let mut grid = clean.clone();
+            let unknown = (block.ec_len + 2).min(n - stains - 1);
+            let picked = rng.distinct(unknown + stains, n);
+            for &i in &picked[..unknown] {
+                let modules = layout.codeword_modules(block.codewords[i]);
+                let pos = modules[rng.below(modules.len())];
+                grid.set(pos.x as usize, pos.y as usize, Module::Unknown);
+            }
+            for &i in &picked[unknown..] {
+                for pos in layout.codeword_modules(block.codewords[i]) {
+                    let (x, y) = (pos.x as usize, pos.y as usize);
+                    grid.set(x, y, grid.get(x, y).inverted());
+                }
+            }
+            let what = format!("{version}-{ec:?} with {unknown} unknown bits and {stains} stained codewords");
+            let no_trial = DecodeOptions { erase_by_trial: false, ..Default::default() };
+            assert!(!decode(&grid, &layout, mask, &Pins::new(), &no_trial).blocks[0].is_solved(), "{what}");
+            let report = decode_plain(&grid, &layout, mask);
+            match report.blocks[0].outcome {
+                BlockOutcome::Solved { method: SolveMethod::BitTrial { doubted_bits: 0, erased }, errors, .. } => {
+                    assert_eq!((erased, errors), (stains, stains), "{what}");
+                }
+                // Pairs of a block too large to try them all, or too
+                // few equations left to confirm one found among them.
+                BlockOutcome::Failed(_) if stains == 2 && (n * (n - 1) / 2 > TRIAL_SETS || block.ec_len < 16) => continue,
+                other => panic!("{what}: {other:?}"),
+            }
+            assert!(report.blocks[0].is_verified(), "{what}: {:?}", report.blocks[0].outcome);
+            assert_eq!(report.text.plain(), text, "{what}");
+            let truth = decode_plain(&clean, &layout, mask);
+            for (got, want) in report.codewords.iter().zip(&truth.codewords) {
+                assert_eq!(got.final_value, want.final_value, "{what}");
+            }
+            assert_eq!(report.codewords.iter().filter(|c| c.doubted != 0).count(), stains, "{what}");
+            freed += 1;
+        }
+    }
+    assert!(freed >= 8, "{freed} blocks freed by trial");
 }
 
 #[test]
@@ -616,7 +790,11 @@ fn doubting_bits_recovers_faint_modules_in_more_codewords_than_erasures_allow() 
         }
         let what = format!("{version}-{ec:?} with {wrong} misread");
         let strict = DecodeOptions { reliability: false, ..Default::default() };
-        assert!(!decode(&grid, &layout, mask, &Pins::new(), &strict).blocks[0].is_solved(), "{what}");
+        let unaided = decode(&grid, &layout, mask, &Pins::new(), &strict).blocks[0].outcome;
+        assert!(
+            matches!(unaided, BlockOutcome::Failed(_) | BlockOutcome::Solved { method: SolveMethod::Trial { .. }, .. }),
+            "{what}: {unaided:?}"
+        );
         let report = decode_plain(&grid, &layout, mask);
         match report.blocks[0].outcome {
             BlockOutcome::Solved { method: SolveMethod::BitReliability { doubted_bits }, errors, confidence_bits, .. } => {
@@ -633,9 +811,15 @@ fn doubting_bits_recovers_faint_modules_in_more_codewords_than_erasures_allow() 
             assert_eq!(got.final_value, want.final_value, "{what}");
         }
         assert_eq!(report.codewords.iter().filter(|c| c.status == CwStatus::Corrected).count(), wrong, "{what}");
-        // With the bit-level solver off there is nothing to doubt bits with.
+        // With the bit-level solver off there is nothing to doubt bits
+        // with, and only chasing, which flips ten at the most, can reach
+        // the block.
         let no_bits = DecodeOptions { bit_level: false, ..Default::default() };
-        assert!(!decode(&grid, &layout, mask, &Pins::new(), &no_bits).blocks[0].is_solved(), "{what}");
+        let chased = decode(&grid, &layout, mask, &Pins::new(), &no_bits).blocks[0].outcome;
+        assert!(
+            matches!(chased, BlockOutcome::Failed(_) | BlockOutcome::Solved { method: SolveMethod::Chase { .. }, .. }),
+            "{what}: {chased:?}"
+        );
     }
     // A hand-painted grid has nothing faint in it: the same damage painted
     // by hand is certain, and stays a failure.
@@ -688,7 +872,11 @@ fn chasing_flips_faint_bits_where_erasing_them_costs_too_much() {
         }
         let what = format!("{version}-{ec:?} with {solid} solid and {faint} faint misreads");
         let strict = DecodeOptions { reliability: false, ..Default::default() };
-        assert!(!decode(&grid, &layout, mask, &Pins::new(), &strict).blocks[0].is_solved(), "{what}");
+        let unaided = decode(&grid, &layout, mask, &Pins::new(), &strict).blocks[0].outcome;
+        assert!(
+            matches!(unaided, BlockOutcome::Failed(_) | BlockOutcome::Solved { method: SolveMethod::Trial { .. }, .. }),
+            "{what}: {unaided:?}"
+        );
         let report = decode_plain(&grid, &layout, mask);
         match report.blocks[0].outcome {
             BlockOutcome::Solved { method: SolveMethod::Chase { flipped_bits }, errors, slack, .. } => {
@@ -773,6 +961,10 @@ fn a_misread_block_is_shown_as_unverified_text() {
 
 #[test]
 fn garbage_never_panics() {
+    // With the fewest sets a decode among many may erase by trial: the
+    // full budget spends a tenth of a second on every hopeless block,
+    // and there are thousands here.
+    let opts = DecodeOptions { trial_sets: qr_forensics::decode::rs::TRIAL_SETS_MIN, ..DecodeOptions::default() };
     let mut rng = Rng(0xF022);
     for (version, ec) in SAMPLES {
         let layout = layout(version, ec);
@@ -793,15 +985,9 @@ fn garbage_never_panics() {
                 pins.insert(rng.below(layout.codewords.len()), pin);
             }
             for mask in 0..version.mask_count() {
-                let report = decode(&grid, &layout, mask, &pins, &DecodeOptions::default());
+                let report = decode(&grid, &layout, mask, &pins, &opts);
                 let _ = report.text.plain();
-                let _ = qr_forensics::decode::padding::recover_padding(
-                    &grid,
-                    &layout,
-                    mask,
-                    &pins,
-                    &DecodeOptions::default(),
-                );
+                let _ = qr_forensics::decode::padding::recover_padding(&grid, &layout, mask, &pins, &opts);
             }
             let _ = qr_forensics::decode::pipeline::analyze(&grid, &layout.func);
         }
@@ -851,5 +1037,213 @@ fn brute_force_timing() {
             best.report.blocks_verified(),
             if best.report.text.plain() == text { "right" } else { "wrong" },
         );
+    }
+}
+
+#[test]
+fn errors_located_in_one_block_make_the_modules_beside_them_doubtful_in_another() {
+    // Damage is contiguous, and the blocks are interleaved, so a stain
+    // over a few modules lies across codewords of different blocks.
+    // Block A is wrong in three modules its code locates. Block B is
+    // wrong in one module more than its code corrects, every one read
+    // as solidly as the rest, two of them beside A's wrong modules.
+    // Alone B fails: nothing reads faint, so doubting and chasing by
+    // reliability pick modules by their index and miss. With A's errors
+    // located, the modules beside them are doubted first, and chasing
+    // the two of B's among them flips them and locates the rest.
+    let (version, ec, mask) = (SymbolVersion::Qr(5), EcLevel::Q, 3);
+    let (layout, clean, text) = sample(version, ec, mask, &mut Rng(0x5EA7));
+    let (a, b) = (&layout.blocks[0], &layout.blocks[1]);
+    let limit = b.ec_len / 2;
+    // Modules of A whose eight neighbours include modules of B, in two
+    // codewords of B that are not the first few, where chasing by index
+    // would reach them anyway.
+    let mut beside: Vec<((usize, usize), (usize, usize), usize)> = Vec::new();
+    for (i, &cw) in a.codewords.iter().enumerate().take(a.codewords.len() - 2) {
+        for pos in layout.codeword_modules(cw) {
+            let (x, y) = (pos.x as usize, pos.y as usize);
+            for ny in y.saturating_sub(1)..(y + 2).min(layout.func.height) {
+                for nx in x.saturating_sub(1)..(x + 2).min(layout.func.width) {
+                    let Some((other, _)) = layout.module_codeword(nx, ny) else { continue };
+                    let span = layout.codewords[other];
+                    if span.block as usize == 1 && span.index_in_block as usize >= 4 && (nx, ny) != (x, y) {
+                        beside.push(((x, y), (nx, ny), i));
+                    }
+                }
+            }
+        }
+    }
+    beside.dedup_by_key(|&mut (_, b, _)| b);
+    let mut picked: Vec<((usize, usize), (usize, usize), usize)> = Vec::new();
+    for item in beside {
+        let (_, (nx, ny), i) = item;
+        let (b_cw, _) = layout.module_codeword(nx, ny).unwrap();
+        let distinct_a = picked.iter().all(|&(_, _, j)| j != i);
+        let distinct_b = picked.iter().all(|&(_, (px, py), _)| layout.module_codeword(px, py).unwrap().0 != b_cw);
+        if distinct_a && distinct_b {
+            picked.push(item);
+        }
+        if picked.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(picked.len(), 2, "two modules of B beside modules of A");
+    let b_beside: Vec<usize> = picked.iter().map(|&(_, (nx, ny), _)| layout.module_codeword(nx, ny).unwrap().0).collect();
+    // The rest of B's wrong codewords: from the high end of the block,
+    // one module each.
+    let mut b_wrong: Vec<usize> = b_beside.clone();
+    for &cw in b.codewords.iter().rev() {
+        if b_wrong.len() == limit + 1 {
+            break;
+        }
+        if !b_wrong.contains(&cw) {
+            b_wrong.push(cw);
+        }
+    }
+    let mut rng = Rng(0xB51DE);
+    let mut paint = |grid: &mut ModuleGrid, with_a: bool| {
+        for y in 0..grid.height() {
+            for x in 0..grid.width() {
+                grid.set_sampled(x, y, clean.get(x, y), 200);
+            }
+        }
+        for &cw in &b_wrong {
+            let (x, y) = if let Some(&(_, (nx, ny), _)) = picked.iter().find(|&&(_, (nx, ny), _)| layout.module_codeword(nx, ny).unwrap().0 == cw) {
+                (nx, ny)
+            } else {
+                let modules = layout.codeword_modules(cw);
+                let pos = modules[2 + rng.below(modules.len() - 2)];
+                (pos.x as usize, pos.y as usize)
+            };
+            grid.set_sampled(x, y, clean.get(x, y).inverted(), 200);
+        }
+        if with_a {
+            for &((x, y), _, _) in &picked {
+                grid.set_sampled(x, y, clean.get(x, y).inverted(), 200);
+            }
+            let third = layout.codeword_modules(a.codewords[a.codewords.len() - 1])[3];
+            grid.set_sampled(third.x as usize, third.y as usize, clean.get(third.x as usize, third.y as usize).inverted(), 200);
+        }
+    };
+    // Without the trials of erasures, which reach one past the code on
+    // their own: what the located errors add is the point here.
+    let opts = DecodeOptions { erase_by_trial: false, ..DecodeOptions::default() };
+    let mut alone = clean.clone();
+    paint(&mut alone, false);
+    let report = decode(&alone, &layout, mask, &Pins::new(), &opts);
+    assert!(report.blocks[0].is_verified(), "A clean: {:?}", report.blocks[0].outcome);
+    assert!(!report.blocks[1].is_solved(), "B alone: {:?}", report.blocks[1].outcome);
+    assert_eq!(report.blocks[1].near_errors, 0);
+
+    let mut stained = clean.clone();
+    paint(&mut stained, true);
+    let report = decode(&stained, &layout, mask, &Pins::new(), &opts);
+    match report.blocks[0].outcome {
+        BlockOutcome::Solved { method: SolveMethod::ReedSolomon, errors: 3, .. } => {}
+        other => panic!("A: {other:?}"),
+    }
+    match report.blocks[1].outcome {
+        BlockOutcome::Solved { method: SolveMethod::Chase { flipped_bits: 2 }, errors, slack: 2, .. } => {
+            assert_eq!(errors, limit + 1, "B");
+        }
+        other => panic!("B beside A's errors: {other:?}"),
+    }
+    assert!(report.blocks[1].is_verified(), "B: {:?}", report.blocks[1].outcome);
+    assert!(report.blocks[1].near_errors >= 2, "B: {} modules doubted beside errors", report.blocks[1].near_errors);
+    assert!(report.is_trustworthy());
+    assert_eq!(report.text.plain(), text);
+    // The modules doubted are told with the solution: the two flipped.
+    let doubted: Vec<usize> = b.codewords.iter().copied().filter(|&cw| report.codewords[cw].doubted != 0).collect();
+    assert_eq!(doubted.len(), 2);
+    assert!(doubted.iter().all(|cw| b_beside.contains(cw)), "{doubted:?} among {b_beside:?}");
+}
+
+#[test]
+fn rivals_the_block_as_read_lies_as_near_to_are_told_apart_by_the_message() {
+    // Two codewords of the code, as far apart as any two are, and a
+    // block read halfway between them: as many codewords wrong by one as
+    // by the other, with as many bits overturned either way. Erasing by
+    // trial reaches both, with the same confirmation and the same
+    // distance from the block as read, and the block alone cannot say
+    // which it is. The message can: under one the stream parses to its
+    // terminator and the padding after it is the standard's, and under
+    // the other the header reads as noise.
+    use qr_forensics::decode::rs::{rs_generator, soft_distance};
+    let (version, ec, mask) = (SymbolVersion::Qr(1), EcLevel::H, 0);
+    let layout = layout(version, ec);
+    let text = "AB12CD";
+    let clean = encode(version, ec, Some(mask), &[Segment::alphanumeric(text).unwrap()]).unwrap();
+    let truth = decode_plain(&clean, &layout, mask);
+    assert!(truth.is_trustworthy());
+    let block = &layout.blocks[0];
+    let (n, ec_len) = (block.codewords.len(), block.ec_len);
+    let read: Vec<u8> = block.codewords.iter().map(|&cw| truth.codewords[cw].read).collect();
+    // The other codeword: the generator polynomial, times a constant,
+    // shifted to lie over the first eighteen positions of the block,
+    // which take in every data codeword and the header among them.
+    // Position i carries x^(n - 1 - i).
+    let generator = rs_generator(ec_len);
+    let span = ec_len + 1;
+    let difference = |c: u8| -> Vec<u8> {
+        (0..n)
+            .map(|i| {
+                let degree = n - 1 - i;
+                let shift = n - span;
+                if degree >= shift && degree - shift <= ec_len { qr_forensics::decode::gf256::mul(c, generator[degree - shift]) } else { 0 }
+            })
+            .collect()
+    };
+    // A split of the eighteen positions into nine and nine, the header's
+    // among the nine taken from the other codeword, overturning as many
+    // bits each way.
+    let limit = ec_len / 2;
+    let mut found = None;
+    'search: for c in 1..=255u8 {
+        let d = difference(c);
+        assert!(d[..span].iter().all(|&v| v != 0) && d[span..].iter().all(|&v| v == 0), "the generator has no zero coefficient");
+        let weights: Vec<u32> = d[..span].iter().map(|v| v.count_ones()).collect();
+        let total: u32 = weights.iter().sum();
+        for set in 0u32..1 << span {
+            if set.count_ones() as usize != limit + 1 || set & 1 == 0 {
+                continue;
+            }
+            let taken: u32 = (0..span).filter(|&i| set >> i & 1 != 0).map(|i| weights[i]).sum();
+            if 2 * taken == total {
+                found = Some((d, set));
+                break 'search;
+            }
+        }
+    }
+    let (d, set) = found.expect("a split that overturns as many bits each way");
+    let mut grid = clean.clone();
+    for i in (0..span).filter(|&i| set >> i & 1 != 0) {
+        let cw = block.codewords[i];
+        let offset = layout.codewords[cw].bit_offset as usize;
+        for (k, pos) in layout.codeword_modules(cw).iter().enumerate() {
+            if d[i] & (0x80 >> (offset + k)) != 0 {
+                let (x, y) = (pos.x as usize, pos.y as usize);
+                grid.set(x, y, grid.get(x, y).inverted());
+            }
+        }
+    }
+    assert!(!grid.has_reliability());
+    // Both codewords lie as far from the block as read.
+    let as_read: Vec<qr_forensics::decode::rs::CwRead> =
+        block.codewords.iter().map(|&cw| qr_forensics::decode::rs::CwRead::known(decode_plain(&grid, &layout, mask).codewords[cw].read)).collect();
+    let certain = vec![[CERTAIN; 8]; n];
+    let other: Vec<u8> = read.iter().zip(&d).map(|(r, v)| r ^ v).collect();
+    assert_eq!(soft_distance(&as_read, &certain, &read), soft_distance(&as_read, &certain, &other));
+
+    let report = decode_plain(&grid, &layout, mask);
+    match report.blocks[0].outcome {
+        BlockOutcome::Solved { method: SolveMethod::Trial { erased: 3 }, errors, .. } => assert_eq!(errors, limit + 1),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(report.blocks[0].rivals, 2, "told from one rival by the message");
+    assert!(report.blocks[0].is_verified());
+    assert!(report.is_trustworthy());
+    assert_eq!(report.text.plain(), text);
+    for (cw, want) in block.codewords.iter().zip(&read) {
+        assert_eq!(report.codewords[*cw].final_value, Some(*want));
     }
 }

@@ -7,7 +7,7 @@ mod common;
 use common::*;
 use qr_forensics::decode::bitstream::Certainty;
 use qr_forensics::decode::codewords::{PinSource, Pins};
-use qr_forensics::decode::known::{BEGINNINGS, Place, TextPinError, lay_over, text_pins, try_beginnings};
+use qr_forensics::decode::known::{BEGINNINGS, Place, TextPinError, ascii_pins, lay_over, text_pins, try_beginnings};
 use qr_forensics::decode::pipeline::{DecodeOptions, DecodeReport, decode};
 use qr_forensics::decode::text::Charset;
 use qr_forensics::symbol::grid::ModuleGrid;
@@ -18,6 +18,12 @@ use qrcode_generator::Segment;
 
 fn decode_pinned(grid: &ModuleGrid, layout: &SymbolLayout, mask: u8, pins: &Pins) -> DecodeReport {
     decode(grid, layout, mask, pins, &DecodeOptions::default())
+}
+
+/// Decoding without the trials of erasures, which reach a wrong codeword
+/// or two past the code on their own: for showing what pins do.
+fn unaided() -> DecodeOptions {
+    DecodeOptions { erase_by_trial: false, ..DecodeOptions::default() }
 }
 
 /// One module wrong in each of the data codewords `wrong`, by their
@@ -65,15 +71,86 @@ fn a_known_beginning_solves_a_block_past_error_correction() {
 }
 
 #[test]
+fn asserting_ascii_pins_the_high_bit_of_every_byte() {
+    use qr_forensics::symbol::grid::Module;
+    let (version, ec, mask) = (SymbolVersion::Qr(3), EcLevel::L, 2);
+    let layout = layout(version, ec);
+    let text = "https://example.com/q?id=7Q2M-XK4P-99AD";
+    let clean = encode(version, ec, Some(mask), &[Segment::bytes(text)]).unwrap();
+    // The byte segment's header is twelve bits, so byte k has its high
+    // bit at stream bit 12 + 8k.
+    let module_of = |bit: usize| {
+        let (cw, place) = layout.stream_bit_location(bit).unwrap();
+        let pos = layout.codeword_modules(cw)[place as usize];
+        (pos.x as usize, pos.y as usize)
+    };
+    // The high bit of every byte unknown, and ninety more bits of the
+    // message besides, scattered: more unknown bits than the block's
+    // hundred and twenty equations, in more codewords than its fifteen
+    // of error correction can erase.
+    let mut grid = clean.clone();
+    for k in 0..text.len() {
+        let (x, y) = module_of(12 + 8 * k);
+        grid.set(x, y, Module::Unknown);
+    }
+    let mut rng = Rng(0xA5C11);
+    let mut others = 0;
+    while others < 90 {
+        let bit = 12 + rng.below(8 * text.len());
+        let (x, y) = module_of(bit);
+        if bit % 8 == 4 || grid.get(x, y) == Module::Unknown {
+            continue;
+        }
+        grid.set(x, y, Module::Unknown);
+        others += 1;
+    }
+    let before = decode_plain(&grid, &layout, mask);
+    assert_eq!(before.blocks_solved(), 0);
+    let found = ascii_pins(&layout, &before, 0..text.len()).unwrap();
+    assert_eq!((found.pinned, found.left_out, found.contradicted), (text.len(), 0, 0));
+    assert!(found.pins.values().all(|pin| pin.source == PinSource::Text && pin.value & pin.mask == 0));
+    assert_eq!(found.pins.values().map(|pin| pin.mask.count_ones() as usize).sum::<usize>(), text.len());
+    assert_eq!(found.pins[&layout.data_stream[1]].mask, 0x08);
+    // Thirty-nine bits fewer to solve for leaves thirty equations to
+    // spare, and the block solves bit by bit.
+    let after = decode_pinned(&grid, &layout, mask, &found.pins);
+    assert!(after.is_trustworthy());
+    assert_eq!(after.text.plain(), text);
+    // A stretch of the message pins the bytes of those characters alone,
+    // and the stretch must lie within the message and hold something.
+    let part = ascii_pins(&layout, &before, 8..19).unwrap();
+    assert_eq!((part.pinned, part.contradicted), (11, 0));
+    assert_eq!(part.pins[&layout.data_stream[9]].mask, 0x08);
+    assert_eq!(ascii_pins(&layout, &before, 8..8), Err(TextPinError::Empty));
+    assert_eq!(ascii_pins(&layout, &before, 30..text.len() + 1), Err(TextPinError::NoSuchChar { len: text.len() }));
+
+    // A message with bytes above 127, read and confirmed, contradicts
+    // the assertion in each of them: the two of an accented letter, both
+    // of them pinned under the one character.
+    let accented = encode(version, ec, Some(mask), &[Segment::bytes("café at https://example.com/")]).unwrap();
+    let report = decode_plain(&accented, &layout, mask);
+    assert!(report.is_trustworthy());
+    let found = ascii_pins(&layout, &report, 0..report.text.sources.len()).unwrap();
+    assert_eq!((found.pinned, found.contradicted), (29, 2));
+    assert_eq!(ascii_pins(&layout, &report, 3..4).map(|f| (f.pinned, f.contradicted)), Ok((2, 2)));
+    assert_eq!(ascii_pins(&layout, &report, 8..28).map(|f| (f.pinned, f.contradicted)), Ok((20, 0)));
+    // No byte segment, nothing to pin.
+    let digits = encode(version, ec, Some(mask), &[Segment::numeric("0123456789").unwrap()]).unwrap();
+    assert_eq!(ascii_pins(&layout, &decode_plain(&digits, &layout, mask), 0..10), Err(TextPinError::NotBytes));
+}
+
+#[test]
 fn text_is_pinned_where_it_stands_in_the_message() {
     let (version, ec, mask) = (SymbolVersion::Qr(3), EcLevel::L, 2);
     let layout = layout(version, ec);
     let text = "https://example.com/q?id=7Q2M-XK4P-99AD";
     let clean = encode(version, ec, Some(mask), &[Segment::bytes(text)]).unwrap();
     // Eight wrong, one more than the block corrects, all under the host
-    // name: known from its ninth character on, it is restored.
+    // name: known from its ninth character on, it is restored. (The
+    // trials of erasures would reach the one more by themselves; here
+    // the pins are to do it.)
     let grid = damaged(&clean, &layout, 12..=19);
-    let before = decode_plain(&grid, &layout, mask);
+    let before = decode(&grid, &layout, mask, &Pins::new(), &unaided());
     assert_eq!(before.blocks_solved(), 0);
     let found = text_pins(&layout, &before, Place::Char(8), "example.com", Charset::Auto).unwrap();
     assert_eq!(found.pinned, 11);
@@ -206,14 +283,16 @@ fn a_message_whose_header_is_gone_is_pinned_from_its_start() {
 fn a_common_beginning_is_kept_only_when_error_correction_bears_it_out() {
     let (version, ec, mask) = (SymbolVersion::Qr(3), EcLevel::L, 2);
     let layout = layout(version, ec);
-    let opts = DecodeOptions::default();
+    // Without the trials of erasures, which reach a wrong codeword or two
+    // past the code by themselves: the beginnings are to do it here.
+    let opts = unaided();
     let none = Pins::new();
     // An address, with ten codewords wrong under its beginning: three
     // more than the block corrects.
     let text = "https://www.example.com/q?id=7Q2M-XK4P";
     let clean = encode(version, ec, Some(mask), &[Segment::bytes(text)]).unwrap();
     let grid = damaged(&clean, &layout, 2..=11);
-    let before = decode_plain(&grid, &layout, mask);
+    let before = decode(&grid, &layout, mask, &none, &opts);
     assert_eq!(before.blocks_solved(), 0);
     let found = try_beginnings(&grid, &layout, mask, &none, &opts, &before).expect("a beginning is borne out");
     // The longest of those that verify: `https://` verifies too.
@@ -232,7 +311,7 @@ fn a_common_beginning_is_kept_only_when_error_correction_bears_it_out() {
     let other = "Invoice 2026-1010 for the lathe, due on receipt.";
     let clean = encode(version, ec, Some(mask), &[Segment::bytes(other)]).unwrap();
     let grid = damaged(&clean, &layout, 2..=11);
-    let before = decode_plain(&grid, &layout, mask);
+    let before = decode(&grid, &layout, mask, &none, &opts);
     assert_eq!(before.blocks_solved(), 0);
     assert!(try_beginnings(&grid, &layout, mask, &none, &opts, &before).is_none());
     // A symbol that already decodes has no block left to verify.
@@ -245,7 +324,7 @@ fn a_common_beginning_is_kept_only_when_error_correction_bears_it_out() {
     let clean = encode(version, ec, Some(mask), &[Segment::bytes(wifi)]).unwrap();
     let mut grid = damaged(&clean, &layout, 4..=10);
     corrupt_codeword(&mut grid, &layout, layout.data_stream[0], 0);
-    let before = decode_plain(&grid, &layout, mask);
+    let before = decode(&grid, &layout, mask, &none, &opts);
     assert_eq!(before.blocks_solved(), 0);
     assert!(before.text.is_empty());
     let found = try_beginnings(&grid, &layout, mask, &none, &opts, &before).expect("a beginning is borne out");

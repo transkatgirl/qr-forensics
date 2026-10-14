@@ -525,10 +525,23 @@ pub struct Classified {
     /// threshold. Unknown only where a module could not be sampled or
     /// its neighbourhood had no contrast.
     pub decided: Vec<Module>,
-    /// How far each module is from its threshold as a share of the local
-    /// contrast, on a scale of 0..=254; zero where the module could not be
-    /// sampled or its neighbourhood had no contrast.
+    /// How far each module is from its threshold, as a share of half the
+    /// local contrast: nought on the threshold, one where a module of
+    /// full contrast lies. Nought where the module could not be sampled
+    /// or its neighbourhood had no contrast.
+    pub margin: Vec<f32>,
+    /// How sure each module's reading is, on the scale the decoder works
+    /// in: eight times the bits of likelihood the reading carries, less
+    /// eight, so that a module on its threshold is nought and one read
+    /// beyond doubt 254 ([`Calibration::reliability`]). From the margin
+    /// alone under [`Calibration::DEFAULT`], until the read is
+    /// [calibrated](Self::calibrate) against the modules whose colour
+    /// was known. Nought where the module could not be sampled or its
+    /// neighbourhood had no contrast.
     pub reliability: Vec<u8>,
+    /// The misread model the reliabilities were calibrated with, once
+    /// they were.
+    pub calibration: Option<Calibration>,
     /// The global threshold, automatic or as given.
     pub threshold: f32,
     /// How clearly the module luminances fall into two groups: how empty
@@ -551,11 +564,192 @@ impl Classified {
         grid
     }
 
+    /// The grid with every module at the colour it fell on, however
+    /// near its threshold, at the reliability it was read at: what the
+    /// unsure band would leave unknown goes in as a guess instead, which
+    /// the decoder may doubt as it doubts a module painted as one. A
+    /// codeword with a module left unknown is an erasure whole, and
+    /// spends a unit of redundancy however faint the one module was; the
+    /// same module kept at its colour spends nothing until the block
+    /// fails, and then an equation to doubt. Over blocks of simulated
+    /// noise the band never read more than this, and with a stain across
+    /// two codewords beside the noise it read far less: a 5-Q block at
+    /// six wrong bits in a hundred read 47 times in a hundred through
+    /// the band and 71 kept.
+    pub fn to_grid_as_decided(&self, width: usize, height: usize) -> ModuleGrid {
+        let mut grid = ModuleGrid::new(width, height);
+        for (i, (&module, &reliability)) in self.decided.iter().zip(&self.reliability).enumerate() {
+            grid.set_sampled(i % width, i / width, module, reliability);
+        }
+        grid
+    }
+
+    /// Modules the unsure band left unknown that were read at all.
+    pub fn unsure(&self) -> usize {
+        self.modules.iter().zip(&self.decided).filter(|&(&m, &d)| m == Module::Unknown && d != Module::Unknown).count()
+    }
+
     /// The luminances do not separate into two groups; the outline is
     /// probably off the symbol, or the photo too washed out to read.
     pub fn is_poorly_separated(&self) -> bool {
         self.separability < POOR_SEPARABILITY
     }
+
+    /// Calibrate the reliabilities against the modules whose colour is
+    /// known: `expected` is the colour of each module of the symbol,
+    /// row-major, where it is known, as the fixed patterns' are before
+    /// any decoding ([`crate::symbol::function_map::FunctionMap`]) and
+    /// every module's of a block that verified is after it
+    /// ([`crate::decode::repair::known_modules`]); `inverted` says the
+    /// photo shows the symbol light on dark, so that a module read dark
+    /// is right where the symbol is light.
+    ///
+    /// Each labelled module gives a signed margin, its margin toward
+    /// the colour it should have: a module read right lies about
+    /// [`Calibration::typical`] of half the contrast from its threshold,
+    /// one read wrong on the other side. The spread about the typical
+    /// margin, taken robustly so that a torn finder pattern does not set
+    /// it, is the photo's noise ([`Calibration::sigma`]), from which the
+    /// odds of a misread at any margin follow; and the modules read
+    /// wrong by more than that noise explains are the gross misreads
+    /// ([`Calibration::gross`]), specks and stains and tears, which no
+    /// margin protects against and which cap what any module's reading
+    /// may be believed. Every sampled module's reliability is then
+    /// recomputed from its margin under the model. Nothing is changed,
+    /// and `None` returned, with fewer than [`CALIBRATION_MIN_LABELLED`]
+    /// labelled modules, or when they read so poorly that the labels
+    /// are not to be trusted: the placement is off the symbol.
+    pub fn calibrate(&mut self, expected: &[Option<bool>], inverted: bool) -> Option<Calibration> {
+        let mut signed: Vec<f32> = expected
+            .iter()
+            .zip(&self.decided)
+            .zip(&self.margin)
+            .filter_map(|((want, got), &margin)| {
+                let (want, got) = ((*want)?, got.as_dark()?);
+                let right = (got != inverted) == want;
+                Some(if right { margin } else { -margin })
+            })
+            .collect();
+        if signed.len() < CALIBRATION_MIN_LABELLED {
+            return None;
+        }
+        let typical = median(&mut signed);
+        if typical < CALIBRATION_MIN_TYPICAL {
+            return None;
+        }
+        let mut deviations: Vec<f32> = signed.iter().map(|s| (s - typical).abs()).collect();
+        let sigma = (MAD_TO_SIGMA * median(&mut deviations)).clamp(CALIBRATION_MIN_SIGMA, CALIBRATION_MAX_SIGMA);
+        let misread = signed.iter().filter(|&&s| s < 0.0).count();
+        let gross = signed.iter().filter(|&&s| s < -2.0 * sigma).count() as f32 / signed.len() as f32;
+        let calibration = Calibration { typical, sigma, gross, labelled: signed.len(), misread };
+        for ((reliability, &margin), decided) in self.reliability.iter_mut().zip(&self.margin).zip(&self.decided) {
+            if *decided != Module::Unknown {
+                *reliability = calibration.reliability(margin);
+            }
+        }
+        self.calibration = Some(calibration);
+        Some(calibration)
+    }
+}
+
+/// The middle value of `values`, which are sorted to find it.
+fn median(values: &mut [f32]) -> f32 {
+    values.sort_by(f32::total_cmp);
+    let n = values.len();
+    if n == 0 {
+        0.0
+    } else if n % 2 == 1 {
+        values[n / 2]
+    } else {
+        (values[n / 2 - 1] + values[n / 2]) / 2.0
+    }
+}
+
+/// Fewest labelled modules a calibration is made on: the finder patterns
+/// alone of a Micro QR symbol are forty-nine.
+pub const CALIBRATION_MIN_LABELLED: usize = 32;
+/// The least a typical labelled module may lie from its threshold, as a
+/// share of half the contrast, for the labels to be believed: below it
+/// the fixed patterns are not where the placement puts them.
+pub const CALIBRATION_MIN_TYPICAL: f32 = 0.1;
+/// Bounds on the noise fitted, as a share of half the contrast: a photo
+/// is never cleaner than the first, which keeps a margin from being
+/// believed beyond all reason, nor noisier than the second, which is a
+/// photo of nothing.
+pub const CALIBRATION_MIN_SIGMA: f32 = 0.05;
+pub const CALIBRATION_MAX_SIGMA: f32 = 1.5;
+/// The standard deviation of a normal distribution from the median of
+/// absolute deviations about its median.
+const MAD_TO_SIGMA: f32 = 1.4826;
+
+/// How a module's reading is to be believed, as a function of how far
+/// from its threshold it was read: the misread model
+/// [`Classified::calibrate`] fits to a photo, or the default for one not
+/// yet fitted.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Calibration {
+    /// Where a module read right lies about its threshold, as a share of
+    /// half the local contrast: one on a sharp photo of a clean print,
+    /// less as blur draws dark and light together.
+    pub typical: f32,
+    /// How the readings spread about that, as a share of half the
+    /// contrast: the photo's noise.
+    pub sigma: f32,
+    /// The share of modules read wrong by more than the noise explains:
+    /// specks, stains and tears, against which no margin is proof. What
+    /// caps the belief in any reading.
+    pub gross: f32,
+    /// Modules whose colour was known that the fit was made on, and how
+    /// many of them read wrong.
+    pub labelled: usize,
+    pub misread: usize,
+}
+
+impl Calibration {
+    /// The model for a photo not yet fitted: the noise a photo of
+    /// middling quality shows, under which the reliability runs near
+    /// enough with the margin as the linear scale it replaced did, two
+    /// hundred and fifty-four at a module of full contrast and sixty-one
+    /// at a quarter of it.
+    pub const DEFAULT: Self = Self { typical: 1.0, sigma: 0.29, gross: 0.0, labelled: 0, misread: 0 };
+
+    /// The bits of likelihood that a module read `margin` from its
+    /// threshold was read right: minus the log of the odds it was
+    /// misread. Under the model a module's luminance lies about its
+    /// colour's mean, `typical` half-contrasts from the threshold, with
+    /// a spread of `sigma`, so the log odds of the two colours at a
+    /// reading `margin` to one side are `2 · margin · typical / sigma²`;
+    /// and besides that a share `gross` of modules are wrong whatever
+    /// their margin.
+    pub fn bits(&self, margin: f32) -> f32 {
+        let ratio = 2.0 * margin.max(0.0) * self.typical / (self.sigma * self.sigma * std::f32::consts::LN_2);
+        let wrong = self.gross + (1.0 - self.gross) / (1.0 + 2f32.powf(ratio.min(126.0)));
+        -wrong.max(f32::MIN_POSITIVE).log2()
+    }
+
+    /// Reliability for a module read `margin` from its threshold: eight
+    /// times the bits of likelihood less eight, so that a module on its
+    /// threshold, read right as often as not, is nought, and a module
+    /// whose reading is beyond doubt reaches the cap of 254, one short
+    /// of [`CERTAIN`], which is for modules painted by hand.
+    pub fn reliability(&self, margin: f32) -> u8 {
+        ((self.bits(margin) - 1.0) * 8.0).round().clamp(0.0, (CERTAIN - 1) as f32) as u8
+    }
+}
+
+/// The bits of likelihood a sampled module's reliability stands for, the
+/// scale [`Calibration::reliability`] puts it on read back: one bit at
+/// nought, a coin's toss, and a bit more for every eight. A reading
+/// believed to `b` bits is misread about once in `2^b` such readings
+/// ([`misread_odds`]).
+pub fn reliability_bits(reliability: u8) -> f32 {
+    f32::from(reliability.min(CERTAIN - 1)) / 8.0 + 1.0
+}
+
+/// How many readings at this reliability are misread, as one in so many:
+/// two to the bits of likelihood.
+pub fn misread_odds(reliability: u8) -> f64 {
+    2f64.powf(f64::from(reliability_bits(reliability)))
 }
 
 /// Below this the two groups are not believable: the valley between them
@@ -584,9 +778,10 @@ pub fn separability(values: impl Iterator<Item = f32>) -> f32 {
     (1.0 - middle as f32 / smaller as f32).clamp(0.0, 1.0)
 }
 
-/// Reliability for a relative margin from the threshold.
+/// Reliability for a relative margin from the threshold, before any
+/// calibration.
 fn quantize(margin: f32) -> u8 {
-    (margin.clamp(0.0, 1.0) * (CERTAIN - 1) as f32).round() as u8
+    Calibration::DEFAULT.reliability(margin)
 }
 
 /// Otsu's split of `values`, with how well it separates them: the
@@ -820,6 +1015,7 @@ pub fn classify(sampled: &Sampled, params: &SampleParams) -> Classified {
 
     let mut modules = Vec::with_capacity(w * h);
     let mut decided = Vec::with_capacity(w * h);
+    let mut margins = Vec::with_capacity(w * h);
     let mut reliability = Vec::with_capacity(w * h);
     let mut flat = 0;
     let mut neighbourhood: Vec<f32> = Vec::new();
@@ -827,6 +1023,7 @@ pub fn classify(sampled: &Sampled, params: &SampleParams) -> Classified {
         let Some(value) = sampled.luma[i] else {
             modules.push(Module::Unknown);
             decided.push(Module::Unknown);
+            margins.push(0.0);
             reliability.push(0);
             continue;
         };
@@ -849,6 +1046,7 @@ pub fn classify(sampled: &Sampled, params: &SampleParams) -> Classified {
                     // Nothing around here has contrast: no evidence either way.
                     modules.push(Module::Unknown);
                     decided.push(Module::Unknown);
+                    margins.push(0.0);
                     reliability.push(0);
                     flat += 1;
                     continue;
@@ -866,12 +1064,15 @@ pub fn classify(sampled: &Sampled, params: &SampleParams) -> Classified {
         let side = Module::from_dark(value < threshold);
         modules.push(if margin < params.band { Module::Unknown } else { side });
         decided.push(side);
+        margins.push(margin);
         reliability.push(quantize(margin));
     }
     Classified {
         modules,
         decided,
+        margin: margins,
         reliability,
+        calibration: None,
         threshold: global,
         separability,
         flat,
@@ -1418,5 +1619,100 @@ mod tests {
         let (read, done) = sample_modules_noting(&large, &map, mw, mh, Kernel::Area, true);
         assert_eq!(done, Sharpening { module_px: 10.0, ..Sharpening::default() });
         assert_eq!(read, sample_modules_noting(&large, &map, mw, mh, Kernel::Area, false).0);
+    }
+
+    #[test]
+    fn reliability_is_calibrated_against_the_modules_whose_colour_is_known() {
+        // A symbol's worth of readings: every module read right, as far
+        // from its threshold as its noise puts it, and a few read wrong
+        // outright, as under specks. The fixed patterns, whose colours
+        // are known, say how noisy the photo is and how often a module
+        // is wrong whatever its margin, and every module's reliability
+        // follows.
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0
+            }
+        }
+        let mut rng = Rng(0xCA11B);
+        let (w, h) = (25usize, 25usize);
+        let func = FunctionMap::new(SymbolVersion::Qr(2));
+        let expected = func.expected_modules().to_vec();
+        let truth: Vec<bool> = (0..w * h).map(|i| expected[i].unwrap_or_else(|| rng.next() % 2 == 0)).collect();
+        // Readings: a module lies 0.8 of half the contrast from the
+        // threshold on its own side, spread by 0.15, and one in forty is
+        // on the wrong side by a full margin.
+        let noise = |rng: &mut Rng| ((rng.next() % 2001) as f32 / 1000.0 - 1.0) * 0.15 * 1.7;
+        let mut speck = vec![false; w * h];
+        let mut luma: Vec<Option<f32>> = Vec::with_capacity(w * h);
+        for i in 0..w * h {
+            let side = if truth[i] { -1.0 } else { 1.0 };
+            let gross = rng.next() % 40 == 0;
+            speck[i] = gross;
+            let margin = if gross { -1.0 } else { 0.8 + noise(&mut rng) };
+            luma.push(Some(0.5 + side * margin * 0.4));
+        }
+        let sampled = Sampled { width: w, height: h, luma };
+        let params = SampleParams { local: false, band: 0.0, threshold: Some(0.5), ..SampleParams::default() };
+        let mut classified = classify(&sampled, &params);
+        assert!(classified.calibration.is_none());
+        let before = classified.reliability.clone();
+        let calibration = classified.calibrate(&expected, false).expect("enough fixed modules to calibrate on");
+        let labelled = expected.iter().flatten().count();
+        assert_eq!(calibration.labelled, labelled);
+        let misread = (0..w * h).filter(|&i| expected[i].is_some() && speck[i]).count();
+        assert_eq!(calibration.misread, misread);
+        // The margins are shares of half the contrast the readings
+        // themselves show, so a module read right lies about one of them
+        // from its threshold whatever the contrast; the noise, 0.15 of
+        // the full margin as laid down, is near 0.19 of that.
+        assert!((0.9..1.1).contains(&calibration.typical), "{calibration:?}");
+        assert!((0.12..0.26).contains(&calibration.sigma), "{calibration:?}");
+        assert!((calibration.gross - misread as f32 / labelled as f32).abs() < 1e-6, "{calibration:?}");
+        // Under the fit, a module's reliability grows with its margin,
+        // never beyond what the gross misreads allow, and the specks
+        // among the fixed patterns cap every module's reliability at
+        // the bits the gross rate is worth.
+        let cap = calibration.reliability(10.0);
+        let bits = -(calibration.gross).log2();
+        assert_eq!(cap, ((bits - 1.0) * 8.0).round() as u8, "{calibration:?}");
+        assert!(classified.reliability.iter().all(|&r| r <= cap));
+        let mut by_margin: Vec<(f32, u8)> = classified.margin.iter().copied().zip(classified.reliability.iter().copied()).collect();
+        by_margin.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert!(by_margin.windows(2).all(|pair| pair[0].1 <= pair[1].1), "monotone in the margin");
+        assert_ne!(classified.reliability, before);
+        // A photo with less noise believes the same margin more; the
+        // default model lies between.
+        let clean = Calibration { sigma: 0.05, gross: 0.0, ..calibration };
+        assert!(clean.reliability(0.3) > Calibration::DEFAULT.reliability(0.3));
+        assert!(Calibration::DEFAULT.reliability(0.3) > calibration.reliability(0.3));
+        assert_eq!((Calibration::DEFAULT.reliability(0.0), Calibration::DEFAULT.reliability(1.0)), (0, 254));
+        assert_eq!(Calibration::DEFAULT.reliability(0.25), 61);
+        // The scale read back: a coin's toss on the threshold, and a bit
+        // more for every eight, which is how often such a reading is
+        // misread.
+        assert_eq!((reliability_bits(0), reliability_bits(8), reliability_bits(120), reliability_bits(CERTAIN)), (1.0, 2.0, 16.0, reliability_bits(254)));
+        assert_eq!((misread_odds(0), misread_odds(120)), (2.0, 65536.0));
+        for margin in [0.1f32, 0.3, 0.6] {
+            let r = calibration.reliability(margin);
+            assert!((reliability_bits(r) - calibration.bits(margin)).abs() <= 0.07, "{margin}: {r} for {} bits", calibration.bits(margin));
+        }
+        // The symbol shown light on dark: the readings are the other way
+        // about, and the fit is the same once that is said.
+        let mut inverted = classify(&Sampled { width: w, height: h, luma: sampled.luma.iter().map(|v| v.map(|v| 1.0 - v)).collect() }, &params);
+        let fit = inverted.calibrate(&expected, true).expect("fits, read light on dark");
+        assert_eq!((fit.labelled, fit.misread), (calibration.labelled, calibration.misread));
+        assert!((fit.typical - calibration.typical).abs() < 1e-3 && (fit.sigma - calibration.sigma).abs() < 1e-3, "{fit:?} vs {calibration:?}");
+        assert!((fit.gross - calibration.gross).abs() < 1e-6, "{fit:?} vs {calibration:?}");
+        assert!(inverted.calibrate(&expected, false).is_none(), "read the wrong way round, the fixed patterns are not where they should be");
+        // Too few labelled modules, and nothing is fitted.
+        let few: Vec<Option<bool>> = expected.iter().enumerate().map(|(i, &e)| e.filter(|_| i < 40)).collect();
+        let mut sparse = classify(&sampled, &params);
+        assert_eq!(sparse.calibrate(&few, false), None);
+        assert_eq!(sparse.reliability, before);
     }
 }

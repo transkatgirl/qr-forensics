@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use eframe::egui;
 use qr_forensics::decode::codewords::{Pin, PinSource, Pins};
-use qr_forensics::decode::known::{Place, lay_over, text_pins, try_beginnings};
+use qr_forensics::decode::known::{Place, ascii_pins, lay_over, text_pins, try_beginnings};
 use qr_forensics::decode::padding::{Filler, clear_padding_pins, detect_padding, pin_padding_at, recover_padding};
 use qr_forensics::decode::pipeline::{Attempt, DecodeOptions, analyze, brute_force, brute_force_mirrored, decode, orientation_of};
 use qr_forensics::decode::repair::{quiet_zone, render_rgba, render_svg, repaired_grid};
@@ -166,6 +166,9 @@ pub(crate) enum Action {
     ReadFound,
     /// Pin the text the user knows, at the place the inspector gives.
     PinText,
+    /// Pin the high bit of every byte of the message at zero: the
+    /// message is ASCII.
+    PinAscii,
     /// Try the ways messages commonly begin and pin the one that error
     /// correction bears out.
     TryBeginnings,
@@ -341,6 +344,9 @@ struct ReadNote {
     /// Whether it sharpened the modules against their neighbours, as
     /// Sampling asked when the read began.
     sharpen_modules: bool,
+    /// Whether it kept the modules the unsure band would leave unknown
+    /// at the colour they fell on.
+    unsure_kept: bool,
     /// Blocks verified, of the blocks in the symbol.
     verified: usize,
     blocks: usize,
@@ -368,6 +374,10 @@ pub struct App {
     derived: Derived,
     dirty: bool,
     opts: DecodeOptions,
+    /// How long a notice that is no error stays in the status bar, in
+    /// seconds: [`NOTICE_SECONDS`], or for ever where no one is watching
+    /// the clock, as in a test.
+    notice_seconds: f32,
     brute: Option<BruteResults>,
     guesses: Option<Vec<VersionGuess>>,
     /// The projection for the current outline and anchors.
@@ -499,6 +509,7 @@ impl App {
             derived,
             dirty: false,
             opts,
+            notice_seconds: NOTICE_SECONDS,
             brute: None,
             guesses: None,
             model: None,
@@ -1150,7 +1161,8 @@ impl App {
             let params = &self.view.sample;
             let (sampled, sharpening) =
                 sample_modules_noting(&photo.luma, model.projection.as_ref(), func.width, func.height, params.kernel, params.sharpen_modules);
-            let classified = classify(&sampled, params);
+            let mut classified = classify(&sampled, params);
+            classified.calibrate(func.expected_modules(), false);
             let grid = classified.to_grid(func.width, func.height);
             let fixed = func.fixed_agreement(&grid);
             let turned = orientation_of(&grid, func);
@@ -1899,7 +1911,8 @@ impl App {
         let mut through = None;
         if decoded {
             let sharpen_modules = read.sharpen_modules;
-            self.view.sample = SampleParams { kernel: read.kernel, sharpen_modules, ..self.view.sample.under(read.rule) };
+            let band = if read.unsure_kept { 0.0 } else { self.view.sample.band };
+            self.view.sample = SampleParams { kernel: read.kernel, sharpen_modules, band, ..self.view.sample.under(read.rule) };
             through = self.adjust_as_read(read.enhance, read_enlarge);
         }
         // The stage is left as it is: a read loaded from the Align stage
@@ -2080,6 +2093,15 @@ impl App {
                 } else {
                     " It was read with its modules left as they read, so Sampling leaves them so again."
                 });
+            }
+            // A read that stands only with its unsure modules kept is
+            // sampled again with no band at all.
+            if read.trustworthy && read.unsure_kept && self.view.sample.band > 0.0 {
+                self.view.sample.band = 0.0;
+                text.push_str(
+                    " Only with the modules its unsure band would leave unknown kept at the colour they fell on did it \
+                     decode, so Sampling's unsure band is now nought: those modules are guesses the decoder doubts first.",
+                );
             }
         }
         if found.mirrored {
@@ -2428,6 +2450,7 @@ impl App {
             Action::CropToOutline => self.crop_to_outline(ctx),
             Action::ShowWholePhoto => self.show_whole_photo(ctx),
             Action::PinText => self.pin_text(),
+            Action::PinAscii => self.pin_ascii(),
             Action::TryBeginnings => self.pin_a_beginning(),
             Action::ClearTextPins => {
                 self.begin_edit();
@@ -2722,6 +2745,45 @@ impl App {
         self.notify(text);
     }
 
+    /// Pin the high bit of every byte of the characters the inspector
+    /// names at zero, asserting that stretch of the message is ASCII,
+    /// and say what that did.
+    fn pin_ascii(&mut self) {
+        let Some(chars) = self.view.ascii_range(self.derived.report.text.sources.len()) else {
+            self.fail("Give the first and last character of the stretch of the message you know to be plain ASCII before pinning it.");
+            return;
+        };
+        let found = match ascii_pins(&self.derived.layout, &self.derived.report, chars) {
+            Ok(found) => found,
+            Err(error) => {
+                self.fail(format!("Nothing was pinned as ASCII: {error}."));
+                return;
+            }
+        };
+        let before = self.derived.report.blocks_verified();
+        self.begin_edit();
+        if self.doc.pins_ec != Some(self.derived.ec) {
+            self.doc.pins.clear();
+            self.doc.pins_ec = Some(self.derived.ec);
+        }
+        lay_over(&mut self.doc.pins, &found.pins);
+        self.refresh();
+        let (after, total) = (self.derived.report.blocks_verified(), self.derived.report.blocks.len());
+        let progress = if after > before {
+            format!("{after} of {total} blocks now verify, up from {before}")
+        } else {
+            format!("{after} of {total} blocks verify, as before")
+        };
+        let mut text = format!("Pinned the high bit of {} bytes at zero, in {} codewords: {progress}.", found.pinned, found.pins.len());
+        if found.contradicted > 0 {
+            text.push_str(&format!(
+                " {} of them differ from bits error correction had confirmed: the message holds bytes above 127, so undo.",
+                found.contradicted
+            ));
+        }
+        self.notify(text);
+    }
+
     /// Try the ways messages commonly begin and pin the one that error
     /// correction bears out, when one is.
     fn pin_a_beginning(&mut self) {
@@ -2982,12 +3044,12 @@ impl App {
             let Some(notice) = &self.message else { return };
             // Errors stay until dismissed or the next edit; other notices fade.
             let age = notice.at.elapsed().as_secs_f32();
-            if !notice.is_error {
-                if age >= NOTICE_SECONDS {
+            if !notice.is_error && self.notice_seconds.is_finite() {
+                if age >= self.notice_seconds {
                     actions.push(Action::DismissNotice);
                     return;
                 }
-                ui.ctx().request_repaint_after(std::time::Duration::from_secs_f32(NOTICE_SECONDS - age));
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs_f32(self.notice_seconds - age));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("×").on_hover_text("Dismiss").clicked() {
@@ -3264,6 +3326,7 @@ fn read_note(result: &ReadResult) -> ReadNote {
         rule: result.rule,
         enhance: result.enhance,
         sharpen_modules: result.sharpen_modules,
+        unsure_kept: result.unsure_kept,
         verified: result.report.blocks_verified(),
         blocks: result.report.blocks.len(),
         trustworthy: result.is_trustworthy(),
@@ -3993,6 +4056,10 @@ mod tests {
         fn new() -> Self {
             let ctx = egui::Context::default();
             let mut app = App::blank();
+            // A notice is read by the test, not by someone watching the
+            // clock, and a frame of decoding on a hopeless grid takes
+            // seconds in a debug build: notices stay until the next edit.
+            app.notice_seconds = f32::INFINITY;
             let (w, h, pixels) = render_rgba(&painted_grid(), 10, 4);
             let image = image::RgbaImage::from_raw(w as u32, h as u32, pixels).expect("a render is an image");
             app.set_photo(&ctx, "render".into(), image);
@@ -4500,7 +4567,18 @@ mod tests {
         assert_ne!(before.rule(), Rule::Surface);
         let read = |trustworthy: bool, enhance: Enhance| {
             let (kernel, rule, verified) = (Kernel::Centre, Rule::Surface, usize::from(trustworthy));
-            let note = ReadNote { kernel, rule, enhance, sharpen_modules: true, verified, blocks: 1, trustworthy, padding_pinned: false, reinterpreted: None };
+            let note = ReadNote {
+                kernel,
+                rule,
+                enhance,
+                sharpen_modules: true,
+                unsure_kept: false,
+                verified,
+                blocks: 1,
+                trustworthy,
+                padding_pinned: false,
+                reinterpreted: None,
+            };
             Prepared { read: Some(note), ..prepared(detection(SymbolVersion::Qr(2), STRAIGHT)) }
         };
         let copy = Enhance { enlarge: 2, sharpen: Sharpen::Light };
@@ -4576,15 +4654,16 @@ mod tests {
         let mut bench = Bench::new();
         let ctx = bench.ctx.clone();
         // A version 3 symbol three pixels a module in a photo out of
-        // focus by seven tenths of a module: grey where a dark module
+        // focus by eight tenths of a module: grey where a dark module
         // has light neighbours, and its finders' rings run into their
-        // stones.
+        // stones. (Out of focus by seven tenths it read through the
+        // module centres once reliability was calibrated.)
         let message = "https://example.com/out-of-focus";
         let (w, h, pixels) = render_rgba(&symbol_of(message), 3, 4);
         let render = image::RgbaImage::from_raw(w as u32, h as u32, pixels).expect("a render is an image");
         let mut photo = image::RgbaImage::from_pixel(400, 360, image::Rgba([255; 4]));
         image::imageops::replace(&mut photo, &render, 150, 120);
-        bench.app.set_photo(&ctx, "blurred".into(), image::imageops::blur(&photo, 2.1));
+        bench.app.set_photo(&ctx, "blurred".into(), image::imageops::blur(&photo, 2.35));
         bench.app.doc.corners = square(145.0, 115.0, 121.0);
         // Find in outline reads it through a copy of the photo sharpened
         // and enlarged, and the photo is adjusted to match. The read is
@@ -5669,6 +5748,10 @@ mod tests {
         // lower sections are otherwise scrolled out of what is painted.
         bench.size = egui::vec2(1440.0, 3000.0);
         bench.act(Action::ClosePhoto);
+        // Without the trials of erasures, which reach a wrong codeword or
+        // two past the code by themselves: what pins and doubting do is
+        // the point here.
+        bench.app.opts.erase_by_trial = false;
         let text = "https://example.com/q?id=7Q2M-XK4P-99AD";
         let clean = symbol_of(text);
         bench.hold(clean.clone());
@@ -6500,6 +6583,10 @@ mod tests {
         let mut bench = Bench::new();
         bench.size = egui::vec2(1440.0, 3000.0);
         bench.act(Action::ClosePhoto);
+        // Without the trials of erasures, which reach a wrong codeword or
+        // two past the code by themselves: what pins and doubting do is
+        // the point here.
+        bench.app.opts.erase_by_trial = false;
         let text = "https://example.com/q?id=7Q2M-XK4P-99AD";
         let clean = symbol_of(text);
         bench.hold(clean.clone());

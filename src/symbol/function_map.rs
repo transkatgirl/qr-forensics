@@ -222,6 +222,12 @@ impl FunctionMap {
         self.expected[y * self.width + x]
     }
 
+    /// The colour of every fixed module, row-major over the symbol, and
+    /// `None` for every other.
+    pub fn expected_modules(&self) -> &[Option<bool>] {
+        &self.expected
+    }
+
     /// Number of modules that carry codeword bits.
     pub fn codeword_bits(&self) -> usize {
         self.data_path.len() - self.remainder_bits

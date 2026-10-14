@@ -865,6 +865,21 @@ fn sampling_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
              dark with light into greys. Watch it while moving a corner or a setting: it rises as the grid comes onto \
              the modules.",
         ));
+        if let Some(calibration) = preview.classified.calibration {
+            ui.weak(format!(
+                "Reliability calibrated on {} fixed modules: noise {:.2} of the contrast, {} of them read wrong",
+                calibration.labelled, calibration.sigma, calibration.misread
+            ))
+            .on_hover_text(format!(
+                "How far a module's reading is to be believed is learnt from the fixed patterns, whose colours are known: \
+                 a module read right lies about {:.2} of half the contrast from its threshold, the readings spread about \
+                 that by {:.2}, and {:.1}% of them are wrong by more than that spread explains, which no margin is proof \
+                 against. The decoder doubts the least reliable modules first, and weighs what a solution overturns by it.",
+                calibration.typical,
+                calibration.sigma,
+                100.0 * calibration.gross
+            ));
+        }
     }
     ui.checkbox(&mut app.view.auto_invert, "Invert photo automatically when sampling")
         .on_hover_text(
@@ -994,7 +1009,17 @@ fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     let mut opts = app.opts;
     ui.checkbox(&mut opts.bit_level, "Solve unknown bits individually").on_hover_text(
         "When a block has more unknown codewords than Reed-Solomon can restore, solve for the unknown \
-         modules one by one instead. Assumes every painted module is right.",
+         modules one by one instead. Assumes every painted module is right, but for a codeword or two that \
+         Erase codewords by trial may find wrong.",
+    );
+    ui.checkbox(&mut opts.erase_by_trial, "Erase codewords by trial").on_hover_text(
+        "When a block fails, take its codewords as unknown by trial, every set of the smallest size that goes \
+         past what its error correction corrects and then of the next, whatever the reliability of their \
+         modules, and keep a solution the rest of the block confirms. Reaches a block wrong in one codeword more \
+         than its error correction corrects, or two in a small block, and one whose unknown bits solve \
+         individually but for a wrong codeword or two or three: on a grid painted by hand as on one sampled. \
+         Many tries are many chances of a wrong answer, so a solution found this way needs more to confirm it, \
+         and where two disagree the message is asked which it is, or neither is kept.",
     );
     ui.checkbox(&mut opts.reliability, "Doubt the least reliable modules").on_hover_text(
         "When a block fails, treat its codewords with the faintest sampled modules as unknown, a few at a \
@@ -1016,9 +1041,11 @@ fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                 )
                 .on_disabled_hover_text("Needs Solve unknown bits individually");
             ui.checkbox(&mut opts.flip_bits, "Flip the faintest bits").on_hover_text(
-                "Flip the few least reliable modules every way and decode each: reaches a block wrong in a little more \
-                 than its error correction takes. Many tries are many chances of a wrong answer, so every pattern that \
-                 solves must agree; turn this off where a solution it reached looks wrong.",
+                "Flip the ten least reliable modules every way and decode each: reaches a block wrong in a little more \
+                 than its error correction takes. And where the block solves bit by bit but for a module or two or \
+                 three read solidly wrong, flip the ones the equations name. Many tries are many chances of a wrong \
+                 answer, so every pattern that solves must agree, or the message is asked which it is; turn this off \
+                 where a solution it reached looks wrong.",
             );
         });
     });

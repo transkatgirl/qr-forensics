@@ -4,7 +4,7 @@ use eframe::egui::{self, Color32, RichText};
 use qr_forensics::decode::bch::InfoRead;
 use qr_forensics::decode::bitstream::{Certainty, EndOfData, LostReason, SegmentContent};
 use qr_forensics::decode::codewords::PinSource;
-use qr_forensics::decode::known::{Place, TextPinError, text_pins};
+use qr_forensics::decode::known::{Place, TextPinError, ascii_pins, text_pins};
 use qr_forensics::decode::padding::{Filler, padding_at};
 use qr_forensics::decode::pipeline::{BlockOutcome, BlockReport, CodewordReport, CwStatus, SolveMethod};
 use qr_forensics::decode::rs::RsFailure;
@@ -480,6 +480,72 @@ fn known_text_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action
             actions.push(Action::ClearTextPins);
         }
     });
+    ascii_row(ui, app, actions);
+}
+
+/// The stretch of the message to assert is plain ASCII, and the button
+/// that pins it: a stretch must be named, since a pin asserts, and an
+/// address that is seven-bit throughout may be followed by a name with
+/// an accent in it.
+fn ascii_row(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
+    let warn = ui.visuals().warn_fg_color;
+    let length = app.derived.report.text.sources.len();
+    let trustworthy = app.derived.report.is_trustworthy();
+    let bytes = app.derived.report.parse.segments.iter().any(|s| matches!(s.content, SegmentContent::Bytes(_)));
+    let (view, derived) = (&mut app.view, &app.derived);
+    let found = view.ascii_range(length).map(|chars| ascii_pins(&derived.layout, &derived.report, chars));
+    ui.horizontal_wrapped(|ui| {
+        ui.label("ASCII from character");
+        ui.add_enabled(length > 0, egui::DragValue::new(&mut view.ascii_from).range(0..=length).speed(0.2))
+            .on_hover_text("The first character of the stretch you know to be plain ASCII; the first character of the message is 1. Click a character in the result to see its number.");
+        ui.label("to");
+        ui.add_enabled(length > 0, egui::DragValue::new(&mut view.ascii_to).range(0..=length).speed(0.2))
+            .on_hover_text("The last character of the stretch, counted the same way");
+        let ready = matches!(found, Some(Ok(_)));
+        if ui
+            .add_enabled(!trustworthy && ready, egui::Button::new("Pin as ASCII"))
+            .on_hover_text(
+                "Assert that these characters are plain ASCII text, as an address, a Wi-Fi label or a card is: the high \
+                 bit of every byte of them is pinned at zero, one bit a byte that need not be read, which is what tips \
+                 a block short of solving bit by bit. Name only the stretch you are sure of: a pin asserts, and an \
+                 accented letter or a raw byte under it would be pinned wrong. Undoable.",
+            )
+            .on_disabled_hover_text(if trustworthy {
+                "The message is decoded and verified already"
+            } else if !bytes {
+                "The message as read has no byte segment"
+            } else if length == 0 {
+                "No text was read to name a stretch of"
+            } else {
+                "Give the first and last character of the stretch that is ASCII, within the message as read"
+            })
+            .clicked()
+        {
+            actions.push(Action::PinAscii);
+        }
+    });
+    match &found {
+        Some(Ok(found)) => {
+            ui.small(format!("Pins the high bit of {} bytes, in {} codewords.", found.pinned, found.pins.len()));
+            if found.contradicted > 0 {
+                ui.colored_label(
+                    warn,
+                    format!(
+                        "{} of those bits differ from bits error correction has confirmed: the stretch holds a byte above \
+                         127, so it is not all ASCII.",
+                        found.contradicted
+                    ),
+                );
+            }
+        }
+        Some(Err(error)) => {
+            ui.colored_label(warn, format!("Cannot be pinned: {error}."));
+        }
+        None if length > 0 && bytes && !trustworthy => {
+            ui.small("Give the first and last character of the stretch you know to be plain ASCII, and pin it.");
+        }
+        None => {}
+    }
 }
 
 /// The message in one of the result modes, as a plain string.
@@ -827,6 +893,26 @@ fn outcome_text(block: &BlockReport) -> (String, bool) {
                 SolveMethod::Chase { flipped_bits } => format!(
                     "solved after flipping the {flipped_bits} least reliable bits: {errors} wrong, {erasures} unknown, {slack} to spare"
                 ),
+                SolveMethod::BitFlip { doubted_bits: 0, flipped_bits } => format!(
+                    "solved bit by bit after flipping {flipped_bits} bits read solidly wrong, which the equations named: {errors} \
+                     codewords changed, {confidence_bits} checks"
+                ),
+                SolveMethod::BitFlip { doubted_bits, flipped_bits } => format!(
+                    "solved bit by bit after flipping {flipped_bits} bits read solidly wrong, which the equations named, and doubting \
+                     the {doubted_bits} least reliable bits: {errors} codewords changed, {confidence_bits} checks"
+                ),
+                SolveMethod::Trial { erased } => format!(
+                    "solved after erasing {erased} codewords by trial, {} past what the code corrects: {errors} wrong, \
+                     {erasures} unknown, {slack} to spare",
+                    if erased > 2 { "two codewords" } else { "one codeword" }
+                ),
+                SolveMethod::BitTrial { doubted_bits: 0, erased } => format!(
+                    "solved bit by bit after erasing {erased} codewords by trial: {errors} codewords changed, {confidence_bits} checks"
+                ),
+                SolveMethod::BitTrial { doubted_bits, erased } => format!(
+                    "solved bit by bit after erasing {erased} codewords by trial and doubting the {doubted_bits} least reliable bits: \
+                     {errors} codewords changed, {confidence_bits} checks"
+                ),
                 SolveMethod::PinnedOnly => "solved from pins alone".to_owned(),
             };
             if beyond_standard {
@@ -843,6 +929,20 @@ fn outcome_text(block: &BlockReport) -> (String, bool) {
                     " — with the final four-bit codeword's missing nibble taken as ones: the symbol's encoder computed its \
                      error correction over that, not over the standard's zeros",
                 );
+            }
+            if block.rivals > 1 {
+                text.push_str(&format!(
+                    " — one of {} solutions the block as read lay as near to, told from the rest by the message: under it \
+                     alone the stream parses",
+                    block.rivals
+                ));
+            }
+            if block.near_errors > 0 {
+                text.push_str(&format!(
+                    " — after doubting {} modules of the block beside errors other blocks located: damage is contiguous, \
+                     and a module next to one the photo misread is one to doubt first",
+                    block.near_errors
+                ));
             }
             (text, true)
         }

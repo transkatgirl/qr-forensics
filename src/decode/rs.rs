@@ -1,7 +1,7 @@
 //! Reed-Solomon over GF(256) as used by QR, Micro QR and rMQR: generator
 //! roots α^0..α^(r-1), first codeword is the highest-degree coefficient.
 //!
-//! Four solvers are provided. [`rs_decode`] is the classical
+//! Seven solvers are provided. [`rs_decode`] is the classical
 //! errors-and-erasures decoder, where any codeword with an unknown bit is an
 //! erasure. [`solve_bit_erasures`] treats each unknown *bit* as an unknown
 //! over GF(2), which is far cheaper when damage is scattered, but assumes
@@ -9,11 +9,33 @@
 //! it assumes the least reliable codewords may be wrong and erases them
 //! until the block solves, and [`solve_bit_erasures_doubting`] does the
 //! same one bit at a time, which spends one equation per doubted bit
-//! instead of eight. [`rs_decode_chasing`] spends nothing: it flips the
-//! least reliable bits outright, every way, and decodes each result.
+//! instead of eight, and, when no count of doubted bits will do, flips a
+//! bit or two or three of those read solidly wrong, found by what the
+//! equations are left wanting rather than by trying every pattern.
+//! [`rs_decode_chasing`] spends nothing: it flips the least reliable
+//! bits outright, every way, and decodes each result. The last two ask
+//! nothing of reliability, and so reach a grid painted by hand, whose
+//! every module is certain: [`rs_decode_trying`] erases codewords by
+//! trial, every set of the smallest size that goes past the code and
+//! then of the next, and reaches a block wrong in one codeword more than
+//! the code corrects, or two in a small block, and
+//! [`solve_bit_erasures_trying`] does the same over GF(2), for a block
+//! whose scattered unknown bits would solve but for a wrong codeword or
+//! two or three among those read.
+//!
+//! The solvers that try many ways are list decoders: where their tries
+//! reach codewords the block as read lies as near to as each other, they
+//! return every one ([`nearest`]), for the caller to tell apart by what
+//! the block's data makes of the message, where one alone would have to
+//! give the block up.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 use super::gf256::{self, div, exp, mul, poly_degree, poly_eval, poly_mul};
 use crate::symbol::grid::CERTAIN;
+use crate::work;
 
 /// Confirming bits a solution needs before it counts as verified, when
 /// it is the decode the standard describes of a block read whole: every
@@ -86,6 +108,163 @@ pub const DOUBT_CONFIRMING_BITS: u32 = 2 * VERIFIED_BITS;
 /// one error in five still net their solution credit, and bits a solution
 /// agrees with by chance net it less than nothing.
 pub const OVERTURN_COST: u32 = 2;
+
+/// How much nearer the block as read, in bits weighed by reliability
+/// ([`soft_distance`]), the solution a solver that tries many ways keeps
+/// must lie than any other it found that names another codeword, for it
+/// to stand alone. Chasing and the trials of erasures are list decoders:
+/// several of their tries may each reach a codeword that verifies, and
+/// where they reach different ones the nearer to what was read is the
+/// likelier, since the bits it overturns are the fainter. A bit
+/// overturned costs its reliability and one: two hundred and fifty-six
+/// for a certain bit, a few for a faint one. Reliability is eight times
+/// the bits of likelihood a module's reading carries, once the sampler
+/// has calibrated it against the modules whose colour it knew
+/// ([`crate::imaging::sample::Classified::calibrate`]), so the margin
+/// is a likelihood ratio of two hundred and fifty-six to one between
+/// the two codewords, a quarter of a certain bit, as the format words
+/// are told apart ([`super::bch::WEIGHT_MARGIN`]): one certain bit, or
+/// one bit read well inside its colour against one read near the
+/// threshold, settles it; two faint bits of middling margin do not, and
+/// both codewords are returned for the message to tell apart.
+pub const DISTANCE_MARGIN: u32 = 64;
+
+/// Sets of codewords a solver erases by trial, at the most, over every
+/// size of set it tries: every codeword alone, every pair, which fit for
+/// any block, the largest having a hundred and fifty-three codewords
+/// and eleven thousand six hundred pairs, every triple up to
+/// seventy-three codewords and every four up to thirty. Each set is a
+/// decode of a few thousand field operations, and each is a fresh
+/// chance for a block of noise to solve, which what the solution
+/// confirms is charged for ([`RsSolution::among`]): sixteen bits for
+/// all of them, which is why the count stops here.
+pub const TRIAL_SETS: usize = 1 << 16;
+
+/// Fewest sets a solver may be given to erase by trial
+/// ([`Trials::sets`]): the pairs of the largest block, so that one
+/// codeword past the code is reached in any block however many tries
+/// the decode is one of.
+pub const TRIAL_SETS_MIN: usize = 12 * 1024;
+
+/// What the bit-level solvers may try beyond doubting bits by their
+/// reliability, and how far.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Trials {
+    /// Flip a bit or two or three read solidly, found by what the
+    /// equations are left wanting ([`BitSystem::flipping`]).
+    pub flips: bool,
+    /// Free a codeword or two or three by trial, whatever its
+    /// reliability ([`BitSystem::trying`]).
+    pub free: bool,
+    /// Sets of codewords the frees may try, over every size, at the
+    /// most: [`TRIAL_SETS`] or less.
+    pub sets: usize,
+}
+
+impl Trials {
+    /// Neither flips nor frees.
+    pub const NONE: Self = Self { flips: false, free: false, sets: TRIAL_SETS };
+    /// Both, as far as [`TRIAL_SETS`] goes.
+    pub const ALL: Self = Self { flips: true, free: true, sets: TRIAL_SETS };
+}
+
+/// Known bits a flip is looked for among in threes
+/// ([`BitSystem::flipping`]), at the most: the least reliable ones,
+/// which is every bit of a block of sixty-four codewords. Every single
+/// and every pair of a block's known bits is looked at, by what the
+/// equations are left wanting, which is one lookup a bit for the pairs;
+/// the triples are a lookup a pair, and the pairs of a block of a
+/// hundred and fifty codewords are seven hundred thousand. Fewer bits
+/// where the decode has fewer sets to spend ([`Trials::sets`]): as many
+/// as have no more pairs than four lookups a set, which is every bit of
+/// a block of sixty-four codewords at the full budget and of twenty-seven
+/// at the least ([`TRIAL_SETS_MIN`]).
+pub const FLIP_TRIPLE_BITS: usize = 512;
+
+/// How many sets of `size` among `n` there are, when no more than
+/// [`TRIAL_SETS`].
+pub fn sets_of(n: usize, size: usize) -> Option<usize> {
+    if size > n {
+        return Some(0);
+    }
+    let mut count: u128 = 1;
+    for k in 0..size {
+        count = count * (n - k) as u128 / (k + 1) as u128;
+    }
+    usize::try_from(count).ok().filter(|&count| count <= TRIAL_SETS)
+}
+
+/// Every set of `size` indices below `n`, in order, to `f`, until `f`
+/// says to stop, every so often asking whether the work was called off.
+fn each_set(n: usize, size: usize, mut f: impl FnMut(&[usize])) {
+    if size > n {
+        return;
+    }
+    let mut set: Vec<usize> = (0..size).collect();
+    let mut tried = 0usize;
+    loop {
+        f(&set);
+        tried += 1;
+        if tried % 256 == 0 && work::cancelled() {
+            return;
+        }
+        // The rightmost index that can still move up, and those after it
+        // in a row behind it.
+        let Some(k) = (0..size).rev().find(|&k| set[k] < n - size + k) else { return };
+        set[k] += 1;
+        for j in k + 1..size {
+            set[j] = set[j - 1] + 1;
+        }
+    }
+}
+
+/// What a solution picked among `tries` is charged, in bits: one for
+/// each doubling of them, since each try is a fresh chance for a block
+/// of noise to pass.
+pub fn tries_charge(tries: usize) -> u32 {
+    tries.max(1).next_power_of_two().trailing_zeros()
+}
+
+/// How far a solution lies from the block as read: the bits read as
+/// known that it overturns, each weighed by its reliability and one, so
+/// that a certain bit costs two hundred and fifty-six and a bit read on
+/// its threshold one. The Hamming distance, bit for bit, where nothing
+/// was sampled.
+pub fn soft_distance(block: &[CwRead], bit_reliability: &[[u8; 8]], corrected: &[u8]) -> u32 {
+    block
+        .iter()
+        .zip(bit_reliability)
+        .zip(corrected)
+        .map(|((cw, reliability), &c)| {
+            let overturned = (cw.value ^ c) & cw.known;
+            (0..8).filter(|&b| overturned >> b & 1 != 0).map(|b| u32::from(reliability[b]) + 1).sum::<u32>()
+        })
+        .sum()
+}
+
+/// Of the solutions a solver that tries many ways found, each with its
+/// [`soft_distance`] from the block as read, the nearest first, and
+/// after it every one that names another codeword and lies within
+/// [`DISTANCE_MARGIN`] of it: the rivals the tries cannot tell apart,
+/// which the caller may tell apart by what each makes of the message
+/// ([`super::pipeline::decode`]), or leave the block unsolved over. Of
+/// those naming the same codeword the one `better` prefers stands for
+/// them; those lying further off than the margin are dismissed. Empty
+/// when nothing was found, and one solution where it stands clear.
+fn nearest<T>(mut found: Vec<(u32, T)>, same: impl Fn(&T, &T) -> bool, better: impl Fn(&T, &T) -> bool) -> Vec<T> {
+    found.sort_by_key(|&(distance, _)| distance);
+    let mut kept: Vec<(u32, T)> = Vec::new();
+    for (distance, candidate) in found {
+        if let Some((_, held)) = kept.iter_mut().find(|(_, held)| same(held, &candidate)) {
+            if better(&candidate, held) {
+                *held = candidate;
+            }
+        } else if kept.first().is_none_or(|&(nearest, _)| distance < nearest + DISTANCE_MARGIN) {
+            kept.push((distance, candidate));
+        }
+    }
+    kept.into_iter().map(|(_, candidate)| candidate).collect()
+}
 
 /// What the agreement of doubted bits with a solution is worth: the
 /// bits that agree less those that do not, less three standard
@@ -217,8 +396,8 @@ impl RsSolution {
     /// tries. The slack and the known bits reproduced are left as they
     /// are, and the solvers that try many times ask more of those
     /// instead ([`DOUBT_CONFIRMING_BITS`], [`CHASE_MIN_SLACK`]).
-    fn among(mut self, tries: usize) -> Self {
-        self.located_bits = self.located_bits.saturating_sub(tries.max(1).next_power_of_two().trailing_zeros());
+    pub fn among(mut self, tries: usize) -> Self {
+        self.located_bits = self.located_bits.saturating_sub(tries_charge(tries));
         self
     }
 
@@ -323,8 +502,29 @@ fn rs_decode_doubted(
     ec_len: usize,
     reserved: usize,
 ) -> Result<RsSolution, RsFailure> {
+    let received: Vec<u8> = block.iter().map(|c| c.value & c.known).collect();
+    let syndromes = rs_syndromes(&received, ec_len);
+    rs_decode_core(block, doubted, ec_len, reserved, &syndromes)
+}
+
+/// What bit `1 << bit` of codeword `i` of a block of `n` adds to each of
+/// its `ec_len` syndromes: the syndromes of a block with that bit
+/// flipped are those of the block as read with this added, since the
+/// syndromes are linear in the block.
+fn syndrome_of_bit(n: usize, i: usize, bit: u8, ec_len: usize) -> Vec<u8> {
+    (0..ec_len).map(|j| mul(1 << bit, exp((n - 1 - i) * j))).collect()
+}
+
+/// [`rs_decode_doubted`], given the syndromes of the block as read, its
+/// unknown bits as zeros. Computing them is most of a decode, and a
+/// solver that decodes the block many ways over, a codeword or two
+/// erased or a bit flipped each time, has them once for all its tries:
+/// the erasures by trial change nothing of them, and a flipped bit adds
+/// [`syndrome_of_bit`].
+fn rs_decode_core(block: &[CwRead], doubted: &[usize], ec_len: usize, reserved: usize, syndromes: &[u8]) -> Result<RsSolution, RsFailure> {
     let n = block.len();
     assert!(n <= 255 && ec_len <= n, "block of {n} with {ec_len} EC codewords");
+    debug_assert_eq!(syndromes.len(), ec_len);
     let is_doubted = |i: usize| doubted.contains(&i);
     let is_erased = |i: usize| block[i].is_erasure() || is_doubted(i);
     let received: Vec<u8> = block.iter().map(|c| c.value & c.known).collect();
@@ -336,8 +536,6 @@ fn rs_decode_doubted(
     // Position i carries x^(n-1-i).
     let locator = |i: usize| exp(n - 1 - i);
     let locator_inv = |i: usize| exp(255 - (n - 1 - i) % 255);
-
-    let syndromes = rs_syndromes(&received, ec_len);
 
     let mut gamma = vec![1u8];
     for &i in &erased {
@@ -373,7 +571,7 @@ fn rs_decode_doubted(
     }
 
     let psi = poly_mul(&lambda, &gamma);
-    let mut omega = poly_mul(&syndromes, &psi);
+    let mut omega = poly_mul(syndromes, &psi);
     omega.truncate(ec_len);
     // Formal derivative in characteristic 2: only odd-degree terms survive.
     let psi_prime: Vec<u8> =
@@ -389,8 +587,17 @@ fn rs_decode_doubted(
         corrected[i] ^= mul(locator(i), div(poly_eval(&omega, x_inv), denom));
     }
 
-    if rs_syndromes(&corrected, ec_len).iter().any(|&s| s != 0) {
-        return Err(RsFailure::ResidualSyndrome);
+    // The syndromes of the corrected block are, by linearity, those of
+    // the block as read with the errata's added: zero, or the values
+    // found make no codeword of the code.
+    for (j, &s) in syndromes.iter().enumerate() {
+        let residual = erased
+            .iter()
+            .chain(&error_positions)
+            .fold(s, |acc, &i| acc ^ mul(corrected[i] ^ received[i], exp((n - 1 - i) * j)));
+        if residual != 0 {
+            return Err(RsFailure::ResidualSyndrome);
+        }
     }
 
     let slack = ec_len - f - 2 * l;
@@ -488,9 +695,25 @@ pub fn rs_decode_doubting(
     best
 }
 
-/// Bits [`rs_decode_chasing`] flips: every pattern of the least reliable
-/// ones is tried, so a block costs `2^CHASE_BITS` decodes at most.
-pub const CHASE_BITS: usize = 6;
+/// Bits [`rs_decode_chasing`] flips at the most: every pattern of the
+/// least reliable ones is tried, so a block costs `2^CHASE_BITS` decodes
+/// at most. Each is a decode from syndromes the pattern amends rather
+/// than computes, a few thousand field operations, so a thousand
+/// patterns are a few milliseconds for a block of a hundred and fifty
+/// codewords; and each is a chance of a misdecode, which the located
+/// errors are charged for ([`RsSolution::among`]): ten bits here. A
+/// decode that is one of many flips fewer ([`chase_bits`]).
+pub const CHASE_BITS: usize = 10;
+/// Fewest bits the chase flips, however many decodes it is one of.
+pub const CHASE_MIN_BITS: usize = 6;
+
+/// How many bits the chase flips in a decode that is one of `tries`: the
+/// most, less a bit for each doubling of the tries, since the patterns
+/// of every try are chances of a misdecode together and a search of
+/// every format has thirty-two decodes to spend them over.
+pub fn chase_bits(tries: usize) -> usize {
+    CHASE_BITS.saturating_sub(tries_charge(tries) as usize).max(CHASE_MIN_BITS)
+}
 /// Fewest EC codewords a chased solution must leave unused: the patterns
 /// tried are a power of two, and each is a fresh chance of a misdecode,
 /// which a second spare codeword makes two hundred and fifty-six times
@@ -505,7 +728,7 @@ pub const CHASE_BITS: usize = 6;
 pub const CHASE_MIN_SLACK: usize = 2;
 
 /// Decode by flipping: take the least reliable bits of the fully read
-/// codewords, at most [`CHASE_BITS`] of them, flip every non-empty subset
+/// codewords, at most `bits` of them, flip every non-empty subset
 /// in turn and decode what results as errors and erasures. Doubting a
 /// faint codeword erases it, which spends a unit of redundancy to let
 /// its bits be anything; flipping spends none, so a block with a few more
@@ -515,44 +738,53 @@ pub const CHASE_MIN_SLACK: usize = 2;
 ///
 /// Trying many patterns is list decoding, and a wrong pattern can land
 /// on a wrong codeword that verifies, so every pattern's verified
-/// solution within the standard is kept and they must all name the same
-/// codeword: a disagreement means the patterns cannot tell, and nothing
-/// is returned. Returns how many bits the best solution flipped, with the
-/// solution restated against the block as read: a flipped bit it kept is
-/// an erratum it found, and `errors` counts every codeword it changed.
-/// The slack stays that of the flipped block's decode, since the flipped
-/// bits were guessed, not located by the code, and so does what the
-/// errors that decode located confirm, less the cost of the patterns
-/// tried. Bits that are pinned, and bits at [`CERTAIN`], are never
-/// flipped.
+/// solution within the standard is kept, and where they name different
+/// codewords the one nearest the block as read, in bits weighed by
+/// their reliability, is kept over the rest only when it is nearer by a
+/// clear margin ([`nearest`]): the patterns flip the faintest bits, and
+/// of two codewords each within reach the one that overturns the fainter
+/// bits is the likelier, while two as near as each other mean the
+/// patterns cannot tell, and both are returned, the nearer first, for
+/// the message to tell apart. Each comes with how many bits its pattern
+/// flipped, and is restated against the block as read: a flipped bit it
+/// kept is an erratum it found, and `errors` counts every codeword it
+/// changed. The slack stays that of the flipped block's decode, since
+/// the flipped bits were guessed, not located by the code, and so does
+/// what the errors that decode located confirm, less the cost of the
+/// patterns tried. Bits that are pinned, and bits at [`CERTAIN`], are
+/// never flipped.
 ///
 /// A block whose every EC codeword the standard reserves for detection,
 /// as M1's two are, is not chased at all: flipping bits until the check
 /// passes is correction by another name, and with sixteen check bits and
-/// sixty-three patterns to try it passes on noise once in a thousand
-/// blocks.
+/// a thousand patterns to try it passes on noise once in sixty blocks.
 pub fn rs_decode_chasing(
     block: &[CwRead],
     bit_reliability: &[[u8; 8]],
     ec_len: usize,
     reserved: usize,
-) -> Option<(usize, RsSolution)> {
-    let (flipped, solution) = rs_decode_chasing_bits(block, bit_reliability, ec_len, reserved)?;
-    Some((flipped.iter().map(|bits| bits.count_ones() as usize).sum(), solution))
+    bits: usize,
+) -> Vec<(usize, RsSolution)> {
+    rs_decode_chasing_bits(block, bit_reliability, ec_len, reserved, bits)
+        .into_iter()
+        .map(|(flipped, solution)| (flipped.iter().map(|bits| bits.count_ones() as usize).sum(), solution))
+        .collect()
 }
 
-/// [`rs_decode_chasing`], with the bits of each codeword the best
-/// solution's pattern flipped in place of their count: for showing which
-/// they were.
+/// [`rs_decode_chasing`], with the bits of each codeword each
+/// solution's pattern flipped in place of their count: for showing
+/// which they were. `bits` is how many bits are flipped at the most,
+/// [`CHASE_BITS`] or fewer ([`chase_bits`]).
 pub fn rs_decode_chasing_bits(
     block: &[CwRead],
     bit_reliability: &[[u8; 8]],
     ec_len: usize,
     reserved: usize,
-) -> Option<(Vec<u8>, RsSolution)> {
+    bits: usize,
+) -> Vec<(Vec<u8>, RsSolution)> {
     assert_eq!(block.len(), bit_reliability.len());
     if reserved >= ec_len {
-        return None;
+        return Vec::new();
     }
     let mut doubtful: Vec<(u8, usize, u8)> = block
         .iter()
@@ -564,66 +796,171 @@ pub fn rs_decode_chasing_bits(
         .filter(|&(r, _, _)| r < CERTAIN)
         .collect();
     if doubtful.is_empty() {
-        return None;
+        return Vec::new();
     }
     doubtful.sort();
-    doubtful.truncate(CHASE_BITS);
+    doubtful.truncate(bits.clamp(1, CHASE_BITS));
 
+    let n = block.len();
     let received: Vec<u8> = block.iter().map(|c| c.value & c.known).collect();
+    let base = rs_syndromes(&received, ec_len);
+    let deltas: Vec<Vec<u8>> = doubtful.iter().map(|&(_, i, b)| syndrome_of_bit(n, i, b, ec_len)).collect();
     let patterns = (1usize << doubtful.len()) - 1;
-    let mut best: Option<(u32, RsSolution)> = None;
+    let mut found: Vec<(u32, (u32, RsSolution))> = Vec::new();
+    let mut trial = block.to_vec();
+    let mut syndromes = base.clone();
     for pattern in 1u32..1 << doubtful.len() {
-        let mut trial = block.to_vec();
+        if pattern % 256 == 0 && work::cancelled() {
+            break;
+        }
+        trial.copy_from_slice(block);
+        syndromes.copy_from_slice(&base);
         for (k, &(_, i, b)) in doubtful.iter().enumerate() {
             if pattern >> k & 1 != 0 {
                 trial[i].value ^= 1 << b;
+                for (s, d) in syndromes.iter_mut().zip(&deltas[k]) {
+                    *s ^= d;
+                }
             }
         }
-        let Ok(mut solution) = rs_decode_doubted(&trial, &[], ec_len, reserved).map(|s| s.among(patterns)) else { continue };
-        // Sixty-odd trials are sixty-odd chances for a wrong codeword to
-        // lie within reach of the flipped block, so a chased solution must
-        // show more redundancy than one found at the first try, and must
-        // reproduce every known bit of the erased codewords: one that
-        // overturns them has been read into the noise.
+        let Ok(solution) = rs_decode_core(&trial, &[], ec_len, reserved, &syndromes).map(|s| s.among(patterns)) else { continue };
+        // A thousand trials are a thousand chances for a wrong codeword
+        // to lie within reach of the flipped block, so a chased solution
+        // must show more redundancy than one found at the first try, and
+        // must reproduce every known bit of the erased codewords: one
+        // that overturns them has been read into the noise.
         if !solution.within_standard() || solution.slack < CHASE_MIN_SLACK || solution.flipped_known_bits > 0 {
             continue;
         }
-        if best.as_ref().is_some_and(|(_, kept)| kept.corrected != solution.corrected) {
-            return None;
-        }
-        solution.errata = (0..block.len())
-            .filter(|&i| block[i].is_erasure() || solution.corrected[i] != received[i])
-            .map(|i| Erratum {
-                index: i,
-                magnitude: solution.corrected[i] ^ received[i],
-                was_erasure: block[i].is_erasure(),
-            })
-            .collect();
-        solution.errors = solution.errata.iter().filter(|e| !e.was_erasure).count();
-        if best.as_ref().is_none_or(|(_, b)| solution.confidence_bits() > b.confidence_bits()) {
-            best = Some((pattern, solution));
-        }
+        let solution = restated(block, solution);
+        found.push((soft_distance(block, bit_reliability, &solution.corrected), (pattern, solution)));
     }
-    let (pattern, solution) = best?;
-    let mut flipped = vec![0u8; block.len()];
-    for (k, &(_, i, b)) in doubtful.iter().enumerate() {
-        if pattern >> k & 1 != 0 {
-            flipped[i] |= 1 << b;
-        }
-    }
-    Some((flipped, solution))
+    nearest(found, |a, b| a.1.corrected == b.1.corrected, |a, b| a.1.confidence_bits() > b.1.confidence_bits())
+        .into_iter()
+        .map(|(pattern, solution)| {
+            let mut flipped = vec![0u8; block.len()];
+            for (k, &(_, i, b)) in doubtful.iter().enumerate() {
+                if pattern >> k & 1 != 0 {
+                    flipped[i] |= 1 << b;
+                }
+            }
+            (flipped, solution)
+        })
+        .collect()
 }
 
-/// A block solved by doubting single bits.
+/// A solution of a block some of whose codewords were flipped or erased
+/// for the try, restated against the block as read: an erratum for every
+/// codeword the solution changed from what was read and for every one
+/// that could not be read, `errors` counting the former, `erasures` the
+/// latter. The slack stays that of the try's decode.
+fn restated(block: &[CwRead], mut solution: RsSolution) -> RsSolution {
+    let received: Vec<u8> = block.iter().map(|c| c.value & c.known).collect();
+    solution.errata = (0..block.len())
+        .filter(|&i| block[i].is_erasure() || solution.corrected[i] != received[i])
+        .map(|i| Erratum { index: i, magnitude: solution.corrected[i] ^ received[i], was_erasure: block[i].is_erasure() })
+        .collect();
+    solution.errors = solution.errata.iter().filter(|e| !e.was_erasure).count();
+    solution.erasures = solution.errata.len() - solution.errors;
+    solution
+}
+
+/// Decode by erasing codewords by trial: codewords read in full are
+/// taken as unknown besides those that are, a few at a time, and the
+/// block decoded as errors and erasures with them so. A codeword erased
+/// spends one unit of redundancy where a wrong one the code must locate
+/// spends two, so a block wrong in more codewords than the code corrects
+/// is reached when the wrong ones are among those erased: with `r` units
+/// of redundancy left after the erasures the block has, erasing `e`
+/// reaches `⌊(r - e) / 2⌋ + e` wrong codewords, one more than the code
+/// corrects at `e = 2` when `r` is even and at `e = 1` when it is odd,
+/// and one more again with two erased more. The sets of the smallest
+/// size that goes past the code are tried first, every one of them, and
+/// only when none solves the block the sets two larger, as far as
+/// [`TRIAL_SETS`] lets the sizes go: pairs for any block, which reaches
+/// one codeword past the code however large the block, and triples and
+/// fours for the smaller blocks, which reach two. This is as far as
+/// small sets go of the list decoding Guruswami and Sudan do by
+/// interpolation, and it asks nothing of reliability: it is for the grid
+/// painted by hand, whose every module is certain and which nothing that
+/// doubts or flips by reliability can touch. ZXing, zxing-cpp, quirc and
+/// ZBar correct to half the code's distance and no further.
+///
+/// Many tries are many chances for a wrong codeword to lie within reach,
+/// so what a solution's located errors confirm is charged for every set
+/// tried, of every size so far ([`RsSolution::among`]), a solution is
+/// kept only within the standard and with [`DOUBT_CONFIRMING_BITS`]
+/// behind it, and where the sets reach different codewords the one
+/// nearest the block as read is kept by a clear margin, or every one
+/// within the margin is returned, nearest first ([`nearest`]). Each
+/// comes with the codewords erased, restated against the block as read
+/// as a chased one is. A codeword pinned whole is never erased. `sets`
+/// is how many sets may be tried in all, [`TRIAL_SETS`] at the most: a
+/// decode that is one of many has less to spend on each
+/// ([`super::pipeline::DecodeOptions::trial_sets`]).
+pub fn rs_decode_trying(
+    block: &[CwRead],
+    bit_reliability: &[[u8; 8]],
+    ec_len: usize,
+    reserved: usize,
+    sets: usize,
+) -> Vec<(Vec<usize>, RsSolution)> {
+    assert_eq!(block.len(), bit_reliability.len());
+    let erasures = block.iter().filter(|c| c.is_erasure()).count();
+    let left = ec_len.saturating_sub(erasures);
+    let candidates: Vec<usize> = (0..block.len()).filter(|&i| !block[i].is_erasure() && block[i].pinned != 0xFF).collect();
+    let received: Vec<u8> = block.iter().map(|c| c.value & c.known).collect();
+    let syndromes = rs_syndromes(&received, ec_len);
+    let mut tried = 0;
+    let mut size = if left % 2 == 1 { 1 } else { 2 };
+    while size < left {
+        let budget = sets.min(TRIAL_SETS);
+        let Some(count) = sets_of(candidates.len(), size).filter(|&count| count > 0 && tried + count <= budget) else { break };
+        tried += count;
+        let mut found: Vec<(u32, (Vec<usize>, RsSolution))> = Vec::new();
+        each_set(candidates.len(), size, |set| {
+            let erased: Vec<usize> = set.iter().map(|&k| candidates[k]).collect();
+            let Ok(solution) = rs_decode_core(block, &erased, ec_len, reserved, &syndromes).map(|s| s.among(tried)) else { return };
+            if !solution.within_standard() || solution.confidence_bits() < DOUBT_CONFIRMING_BITS {
+                return;
+            }
+            let solution = restated(block, solution);
+            found.push((soft_distance(block, bit_reliability, &solution.corrected), (erased, solution)));
+        });
+        let kept = nearest(found, |a, b| a.1.corrected == b.1.corrected, |a, b| a.1.confidence_bits() > b.1.confidence_bits());
+        if !kept.is_empty() || work::cancelled() {
+            return kept;
+        }
+        size += 2;
+    }
+    Vec::new()
+}
+
+/// A block solved by doubting single bits, or by flipping a few bits
+/// read solidly, or by erasing codewords by trial, or more than one of
+/// these.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BitDoubt {
     pub solution: BitSolution,
-    /// How many bits, read as known, were doubted.
+    /// How many bits, read as known, were doubted for their reliability.
     pub doubted_bits: usize,
-    /// Which bits of each codeword were doubted.
+    /// Which bits of each codeword were doubted, flipped, or erased by
+    /// trial.
     pub doubted: Vec<u8>,
-    /// Which doubted bits of each codeword the solution overturned.
+    /// Which doubted bits of each codeword the solution overturned: every
+    /// flipped bit among them.
     pub changed: Vec<u8>,
+    /// Which bits of each codeword were flipped ([`BitSystem::flipping`]):
+    /// read solidly, and overturned to make the equations agree. None
+    /// where none was.
+    pub flipped: Vec<u8>,
+    /// Codewords erased by trial ([`solve_bit_erasures_trying`]), whose
+    /// bits are among `doubted`; none where none was.
+    pub erased: Vec<usize>,
+    /// Sets of codewords, or of bits, the trial tried, one where there
+    /// was none: what the spare equations are charged for
+    /// ([`tries_charge`]).
+    pub tries: usize,
 }
 
 impl BitDoubt {
@@ -639,11 +976,17 @@ impl BitDoubt {
         self.changed.iter().map(|&c| c.count_ones()).sum()
     }
 
-    /// Independent bits confirming the solution: the spare equations, and
-    /// the doubted bits' agreement beyond chance, as [`doubted_agreement`]
-    /// weighs it.
+    /// Bits read solidly that were flipped.
+    pub fn flipped_bits(&self) -> u32 {
+        self.flipped.iter().map(|&f| f.count_ones()).sum()
+    }
+
+    /// Independent bits confirming the solution: the spare equations,
+    /// less what the sets tried cost, and the doubted bits' agreement
+    /// beyond chance, as [`doubted_agreement`] weighs it.
     pub fn confidence_bits(&self) -> u32 {
-        self.solution.spare_equations as u32 + doubted_agreement(self.agreeing_bits(), self.changed_bits())
+        (self.solution.spare_equations as u32).saturating_sub(tries_charge(self.tries))
+            + doubted_agreement(self.agreeing_bits(), self.changed_bits())
     }
 
     /// Codewords the solution changed.
@@ -667,17 +1010,40 @@ impl BitDoubt {
 /// are never doubted. Neither ZXing nor ZBar has soft decoding; this is
 /// the classical ordered-erasure decoding of Forney's GMD, taken down to
 /// bits because the code is linear over GF(2).
+///
+/// With [`Trials::flips`], when no count of doubted bits leaves the
+/// known bits consistent, the counts are searched again with a bit or
+/// two or three of those read solidly flipped at each, found by what
+/// the equations are left wanting rather than by trying every pattern
+/// ([`BitSystem::flipping`]): a speck over a module reads solidly
+/// wrong, and no doubting by reliability reaches it. This is the
+/// reprocessing of ordered-statistics decoding, over the basis the
+/// doubted bits leave. With [`Trials::free`], the counts are searched again
+/// with a codeword erased by trial at each, then a pair, then a triple
+/// ([`solve_bit_erasures_trying`]): a stain over a codeword reads
+/// solidly wrong in several bits. The bits as read over every count
+/// first, then the flips, then the singles freed before the pairs over
+/// every count, since what spends fewer equations is the better
+/// confirmed: a codeword freed at a lower count spends eight equations
+/// where the single a few more doubted bits would have let do spends
+/// one each.
+///
+/// Returns the solutions of the first kind of search to find any, at
+/// the fewest doubted bits it finds any at: one where it stands clear,
+/// and the rivals the tries cannot tell apart besides, nearest first
+/// ([`nearest`]). Empty when nothing solves.
 pub fn solve_bit_erasures_doubting(
     block: &[CwRead],
     bit_reliability: &[[u8; 8]],
     ec_len: usize,
-) -> Option<BitDoubt> {
+    trials: Trials,
+) -> Vec<BitDoubt> {
     assert_eq!(block.len(), bit_reliability.len());
     let unknown_bits: usize = block.iter().map(|c| c.known.count_zeros() as usize).sum();
     let equations = 8 * ec_len;
     let budget = equations.saturating_sub(unknown_bits + DOUBT_SPARE_EQUATIONS);
     if budget == 0 {
-        return None;
+        return Vec::new();
     }
     let mut doubtful: Vec<(u8, usize, u8)> = block
         .iter()
@@ -690,60 +1056,138 @@ pub fn solve_bit_erasures_doubting(
         .filter(|&(r, _, _)| r < CERTAIN)
         .collect();
     if doubtful.is_empty() {
-        return None;
+        return Vec::new();
     }
     doubtful.sort();
     doubtful.truncate(budget);
 
-    let attempt = |k: usize| -> Option<BitDoubt> {
-        let mut trial = block.to_vec();
-        let mut doubted = vec![0u8; block.len()];
+    let n = block.len();
+
+    /// How a count of doubted bits is tried: as it is, with a few solid
+    /// bits flipped, or with codewords of this many freed by trial.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Trial {
+        Plain,
+        Flips,
+        Free(usize),
+    }
+
+    // The system of equations with the known bits carried, at each count
+    // of doubted bits it was built for: the flips and every size of free
+    // ask for the same one, and building it is most of a try. None where
+    // no trial can help: consistent, the known bits solve as they are,
+    // with too few equations to spare, since the count as it is found
+    // nothing; incomplete, a trial takes equations the unknown bits
+    // already lack.
+    let systems: RefCell<HashMap<usize, Option<Rc<(BitSystem, ZeroRows)>>>> = RefCell::new(HashMap::new());
+    let system_at = |k: usize, read: &[CwRead]| -> Option<Rc<(BitSystem, ZeroRows)>> {
+        systems
+            .borrow_mut()
+            .entry(k)
+            .or_insert_with(|| {
+                let system = BitSystem::build(read, ec_len, true);
+                if system.rank < system.unknown || system.consistent() {
+                    return None;
+                }
+                let zero = system.zero_rows();
+                Some(Rc::new((system, zero)))
+            })
+            .clone()
+    };
+
+    let attempt = |k: usize, trial: Trial| -> Option<Vec<BitDoubt>> {
+        let mut read = block.to_vec();
+        let mut doubted = vec![0u8; n];
         for &(_, i, b) in &doubtful[..k] {
-            trial[i].known &= !(1 << b);
-            trial[i].value &= !(1 << b);
+            read[i].known &= !(1 << b);
+            read[i].value &= !(1 << b);
             doubted[i] |= 1 << b;
         }
-        let solution = solve_bit_erasures(&trial, ec_len).ok().filter(BitSolution::is_complete)?;
-        if solution.spare_equations < DOUBT_SPARE_EQUATIONS {
-            return None;
-        }
-        let changed = solution.corrected.iter().zip(block).zip(&doubted).map(|((&got, cw), &m)| (got ^ cw.value) & m).collect();
-        Some(BitDoubt { solution, doubted_bits: k, doubted, changed })
+        // Each: the solution, the codewords freed, the bits flipped, and
+        // the sets tried.
+        let found: Vec<(BitSolution, Vec<usize>, Vec<u8>, usize)> = match trial {
+            Trial::Plain => {
+                let solution = solve_bit_erasures(&read, ec_len).ok().filter(BitSolution::is_complete)?;
+                vec![(solution, Vec::new(), vec![0; n], 1)]
+            }
+            Trial::Flips => {
+                let shared = system_at(k, &read)?;
+                let (system, zero) = &*shared;
+                let (tries, found) = system.flipping(zero, &read, bit_reliability, trials.sets);
+                found.into_iter().map(|(flipped, solution)| (solution, Vec::new(), flipped, tries)).collect()
+            }
+            Trial::Free(size) => {
+                let shared = system_at(k, &read)?;
+                let (system, zero) = &*shared;
+                let (tries, found) = system.trying(zero, &read, bit_reliability, size, trials.sets);
+                found.into_iter().map(|(erased, _, solution)| (solution, erased, vec![0; n], tries)).collect()
+            }
+        };
+        let doubts: Vec<BitDoubt> = found
+            .into_iter()
+            .filter(|(solution, _, _, tries)| solution.spare_equations.saturating_sub(tries_charge(*tries) as usize) >= DOUBT_SPARE_EQUATIONS)
+            .map(|(solution, erased, flipped, tries)| {
+                let mut doubted = doubted.clone();
+                for &i in &erased {
+                    doubted[i] |= block[i].known & !block[i].pinned;
+                }
+                for (d, &f) in doubted.iter_mut().zip(&flipped) {
+                    *d |= f;
+                }
+                let changed = solution.corrected.iter().zip(block).zip(&doubted).map(|((&got, cw), &m)| (got ^ cw.value) & m).collect();
+                BitDoubt { solution, doubted_bits: k, doubted, changed, flipped, erased, tries }
+            })
+            .collect();
+        (!doubts.is_empty()).then_some(doubts)
     };
 
     // Fewer doubted bits leave more spare equations, so the first count
     // that solves is the best: find it by growing the count geometrically
     // and then narrowing down between the last failure and that success.
-    let mut last_failed = 0;
-    let mut k = 1;
-    let mut found = None;
-    while k <= doubtful.len() {
-        match attempt(k) {
-            Some(doubt) => {
-                found = Some((k, doubt));
+    let search = |attempt: &dyn Fn(usize) -> Option<Vec<BitDoubt>>| -> Option<Vec<BitDoubt>> {
+        let mut last_failed = 0;
+        let mut k = 1;
+        let mut found = None;
+        while k <= doubtful.len() {
+            match attempt(k) {
+                Some(doubts) => {
+                    found = Some((k, doubts));
+                    break;
+                }
+                None => last_failed = k,
+            }
+            k = (k * 3 / 2 + 1).min(doubtful.len()).max(k + 1);
+            if last_failed == doubtful.len() {
                 break;
             }
-            None => last_failed = k,
         }
-        k = (k * 3 / 2 + 1).min(doubtful.len()).max(k + 1);
-        if last_failed == doubtful.len() {
-            break;
-        }
-    }
-    let (mut hi, mut best) = found?;
-    let mut lo = last_failed;
-    while hi - lo > 1 {
-        let mid = (lo + hi) / 2;
-        match attempt(mid) {
-            Some(doubt) => {
-                hi = mid;
-                best = doubt;
+        let (mut hi, mut best) = found?;
+        let mut lo = last_failed;
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            match attempt(mid) {
+                Some(doubts) => {
+                    hi = mid;
+                    best = doubts;
+                }
+                None => lo = mid,
             }
-            None => lo = mid,
         }
+        Some(best)
+    };
+    let mut kinds = vec![Trial::Plain];
+    if trials.flips {
+        kinds.push(Trial::Flips);
     }
-    Some(best)
+    if trials.free {
+        kinds.extend((1..=FREE_SIZES).map(Trial::Free));
+    }
+    kinds.iter().find_map(|&trial| search(&|k| attempt(k, trial))).unwrap_or_default()
 }
+
+/// Largest set of codewords the bit-level solvers free by trial: a
+/// triple, which is twenty-four bits of a [`Span`]'s combination.
+pub const FREE_SIZES: usize = 3;
 
 /// Shortest LFSR generating `s`; returns the connection polynomial and its
 /// claimed length.
@@ -826,12 +1270,7 @@ const PARTIAL_MARGIN: usize = 32;
 pub fn solve_bit_erasures(block: &[CwRead], ec_len: usize) -> Result<BitSolution, BitSolveFailure> {
     let n = block.len();
     assert!(n <= 255 && ec_len <= n);
-    let unknowns: Vec<(usize, u8)> = block
-        .iter()
-        .enumerate()
-        .flat_map(|(i, cw)| (0..8u8).filter(move |b| cw.known >> b & 1 == 0).map(move |b| (i, b)))
-        .collect();
-    let u = unknowns.len();
+    let u: usize = block.iter().map(|cw| cw.known.count_zeros() as usize).sum();
     let equations = 8 * ec_len;
     if u == 0 {
         return Err(BitSolveFailure::NoUnknowns);
@@ -839,87 +1278,460 @@ pub fn solve_bit_erasures(block: &[CwRead], ec_len: usize) -> Result<BitSolution
     if u > equations + PARTIAL_MARGIN {
         return Err(BitSolveFailure::TooManyUnknowns { unknown_bits: u, equations });
     }
-
-    let received: Vec<u8> = block.iter().map(|c| c.value & c.known).collect();
-    let syndromes = rs_syndromes(&received, ec_len);
-
-    // Row e = 8j + k is bit k of syndrome j; column u holds the right-hand side.
-    let words = u / 64 + 1;
-    let mut rows = vec![vec![0u64; words]; equations];
-    for (col, &(i, bit)) in unknowns.iter().enumerate() {
-        let x = exp(n - 1 - i);
-        for j in 0..ec_len {
-            let contribution = mul(1 << bit, gf256::pow(x, j));
-            for k in 0..8 {
-                if contribution >> k & 1 != 0 {
-                    rows[8 * j + k][col / 64] |= 1 << (col % 64);
-                }
-            }
-        }
-    }
-    for (j, &s) in syndromes.iter().enumerate() {
-        for k in 0..8 {
-            if s >> k & 1 != 0 {
-                rows[8 * j + k][u / 64] |= 1 << (u % 64);
-            }
-        }
-    }
-
-    let mut rank = 0;
-    let mut pivot_row = vec![usize::MAX; u];
-    for col in 0..u {
-        let Some(p) = (rank..equations).find(|&r| rows[r][col / 64] >> (col % 64) & 1 != 0) else {
-            continue;
-        };
-        rows.swap(rank, p);
-        let pivot = rows[rank].clone();
-        for (r, row) in rows.iter_mut().enumerate() {
-            if r != rank && row[col / 64] >> (col % 64) & 1 != 0 {
-                for (a, b) in row.iter_mut().zip(&pivot) {
-                    *a ^= b;
-                }
-            }
-        }
-        pivot_row[col] = rank;
-        rank += 1;
-    }
-
-    let rhs = |row: &[u64]| row[u / 64] >> (u % 64) & 1 != 0;
-    if rows[rank..].iter().any(|row| rhs(row)) {
+    let system = BitSystem::build(block, ec_len, false);
+    if !system.consistent() {
         return Err(BitSolveFailure::Inconsistent);
     }
+    let solution = system.solution(block, &vec![0; n], equations - system.rank);
+    if solution.solved_bits == 0 {
+        return Err(BitSolveFailure::Underdetermined { rank: system.rank, unknown_bits: u });
+    }
+    debug_assert!(solution.solved_bits < u || rs_syndromes(&solution.corrected, ec_len).iter().all(|&s| s == 0));
+    Ok(solution)
+}
 
-    // The rows are reduced, so a pivot's unknown is settled exactly when its
-    // row involves no other unknown.
-    let mut corrected = received;
-    let mut solved = vec![0u8; n];
-    let mut solved_bits = 0;
-    for (col, &(i, bit)) in unknowns.iter().enumerate() {
-        if pivot_row[col] == usize::MAX {
-            continue;
+/// Solve for unknown bits with a codeword or two or three of those read
+/// taken as unknown besides, by trial, when the known bits as read are
+/// not consistent: every codeword in turn, then every pair, then every
+/// triple, whatever its reliability, as far as [`TRIAL_SETS`] lets the
+/// sizes go. A block whose unknown bits are scattered over more
+/// codewords than there is redundancy to erase solves bit by bit as long
+/// as every bit read is right, and a stain that reads solidly wrong over
+/// one codeword puts every one of its equations out; here that codeword
+/// is found, among the few whose bits can be freed to make the equations
+/// agree, and the rest of the block solved as before. With
+/// [`Trials::flips`], a bit or two or three read solidly wrong is looked for first
+/// ([`BitSystem::flipping`]), which spends no equations where a
+/// codeword freed spends eight.
+///
+/// Each trial is a fresh chance for a block of noise to come out
+/// consistent, so the spare equations are charged for the sets tried
+/// ([`BitDoubt::confidence_bits`]), and where two sets reach different
+/// blocks the one nearest the block as read is kept by a clear margin,
+/// or every one within the margin is returned, nearest first
+/// ([`nearest`]). Pinned bits are never freed. Empty when the known
+/// bits are consistent as they are, which is [`solve_bit_erasures`]'s
+/// case, when the unknown bits are not all determined even before the
+/// trial, or when no set makes them agree.
+pub fn solve_bit_erasures_trying(block: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: usize, trials: Trials) -> Vec<BitDoubt> {
+    assert_eq!(block.len(), bit_reliability.len());
+    let unknown_bits: usize = block.iter().map(|c| c.known.count_zeros() as usize).sum();
+    if unknown_bits + DOUBT_SPARE_EQUATIONS >= 8 * ec_len {
+        return Vec::new();
+    }
+    let system = BitSystem::build(block, ec_len, true);
+    if system.rank < system.unknown || system.consistent() {
+        return Vec::new();
+    }
+    let n = block.len();
+    let keep = |(solution, erased, flipped, tries): (BitSolution, Vec<usize>, Vec<u8>, usize)| -> Option<BitDoubt> {
+        if solution.spare_equations.saturating_sub(tries_charge(tries) as usize) < DOUBT_SPARE_EQUATIONS {
+            return None;
         }
-        let row = &rows[pivot_row[col]];
-        let involved: u32 = (0..words)
-            .map(|w| {
-                // The right-hand side sits at column `u`; leave it out.
-                let mask = if w == u / 64 { (1u64 << (u % 64)) - 1 } else { u64::MAX };
-                (row[w] & mask).count_ones()
+        let doubted: Vec<u8> =
+            (0..n).map(|i| if erased.contains(&i) { block[i].known & !block[i].pinned } else { 0 } | flipped[i]).collect();
+        let changed = solution.corrected.iter().zip(block).zip(&doubted).map(|((&got, cw), &m)| (got ^ cw.value) & m).collect();
+        Some(BitDoubt { solution, doubted_bits: 0, doubted, changed, flipped, erased, tries })
+    };
+    let zero = system.zero_rows();
+    if trials.flips {
+        let (tries, found) = system.flipping(&zero, block, bit_reliability, trials.sets);
+        let doubts: Vec<BitDoubt> =
+            found.into_iter().filter_map(|(flipped, solution)| keep((solution, Vec::new(), flipped, tries))).collect();
+        if !doubts.is_empty() {
+            return doubts;
+        }
+    }
+    for size in 1..=FREE_SIZES {
+        if !trials.free {
+            break;
+        }
+        let (tries, found) = system.trying(&zero, block, bit_reliability, size, trials.sets);
+        let doubts: Vec<BitDoubt> =
+            found.into_iter().filter_map(|(erased, _, solution)| keep((solution, erased, vec![0; n], tries))).collect();
+        if !doubts.is_empty() {
+            return doubts;
+        }
+    }
+    Vec::new()
+}
+
+/// The equations of one block over GF(2), built and reduced: eight to a
+/// syndrome, a column to each bit taken as unknown, and on the right-hand
+/// side what the bits read as known make of the syndromes. With
+/// `with_known`, a column for every known bit that is not pinned is
+/// carried through the reduction beside the unknowns', so that a known
+/// bit can afterwards be taken as unknown without building the system
+/// again ([`BitSystem::trying`]): the rows no unknown has a pivot in say
+/// at once whether the block is consistent with that bit free.
+struct BitSystem {
+    /// Each column's bit, as (codeword, bit): the unknown bits first,
+    /// then the known ones where they are carried.
+    columns: Vec<(usize, u8)>,
+    /// How many of `columns` are unknown bits.
+    unknown: usize,
+    equations: usize,
+    /// Row `8 * j + k` is bit `k` of syndrome `j`; the right-hand side
+    /// sits at column `columns.len()`. Reduced on the unknown columns:
+    /// a pivot's column is set in its row alone, and the pivot rows come
+    /// first.
+    rows: Vec<Vec<u64>>,
+    /// Row holding each unknown column's pivot, `usize::MAX` for none.
+    pivot_row: Vec<usize>,
+    rank: usize,
+}
+
+impl BitSystem {
+    fn build(block: &[CwRead], ec_len: usize, with_known: bool) -> Self {
+        let n = block.len();
+        let equations = 8 * ec_len;
+        let mut columns: Vec<(usize, u8)> = block
+            .iter()
+            .enumerate()
+            .flat_map(|(i, cw)| (0..8u8).filter(move |b| cw.known >> b & 1 == 0).map(move |b| (i, b)))
+            .collect();
+        let unknown = columns.len();
+        if with_known {
+            columns.extend(block.iter().enumerate().flat_map(|(i, cw)| {
+                (0..8u8).filter(move |b| cw.known >> b & 1 != 0 && cw.pinned >> b & 1 == 0).map(move |b| (i, b))
+            }));
+        }
+        let rhs = columns.len();
+        let words = rhs / 64 + 1;
+        let mut rows = vec![vec![0u64; words]; equations];
+        for (col, &(i, bit)) in columns.iter().enumerate() {
+            let x = exp(n - 1 - i);
+            for j in 0..ec_len {
+                let contribution = mul(1 << bit, gf256::pow(x, j));
+                for k in 0..8 {
+                    if contribution >> k & 1 != 0 {
+                        rows[8 * j + k][col / 64] |= 1 << (col % 64);
+                    }
+                }
+            }
+        }
+        let received: Vec<u8> = block.iter().map(|c| c.value & c.known).collect();
+        for (j, &s) in rs_syndromes(&received, ec_len).iter().enumerate() {
+            for k in 0..8 {
+                if s >> k & 1 != 0 {
+                    rows[8 * j + k][rhs / 64] |= 1 << (rhs % 64);
+                }
+            }
+        }
+        let mut rank = 0;
+        let mut pivot_row = vec![usize::MAX; unknown];
+        for (col, pivot_of) in pivot_row.iter_mut().enumerate() {
+            let Some(p) = (rank..equations).find(|&r| Self::bit(&rows[r], col)) else { continue };
+            rows.swap(rank, p);
+            let pivot = rows[rank].clone();
+            for (r, row) in rows.iter_mut().enumerate() {
+                if r != rank && Self::bit(row, col) {
+                    for (a, b) in row.iter_mut().zip(&pivot) {
+                        *a ^= b;
+                    }
+                }
+            }
+            *pivot_of = rank;
+            rank += 1;
+        }
+        Self { columns, unknown, equations, rows, pivot_row, rank }
+    }
+
+    fn bit(row: &[u64], col: usize) -> bool {
+        row[col / 64] >> (col % 64) & 1 != 0
+    }
+
+    fn rhs(&self, row: &[u64]) -> bool {
+        Self::bit(row, self.columns.len())
+    }
+
+    /// Whether the known bits can all be right: no row without a pivot
+    /// has anything on its right-hand side.
+    fn consistent(&self) -> bool {
+        self.rows[self.rank..].iter().all(|row| !self.rhs(row))
+    }
+
+    /// Unknown columns set in a row.
+    fn unknowns_in(&self, row: &[u64]) -> u32 {
+        let full = self.unknown / 64;
+        let rest = self.unknown % 64;
+        row[..full].iter().map(|w| w.count_ones()).sum::<u32>() + (row[full] & ((1u64 << rest) - 1)).count_ones()
+    }
+
+    /// The block as the system solves it: the known bits as read, with
+    /// the bits of `changed` overturned, and every unknown bit the rows
+    /// determine, which a pivot's row does exactly when it involves no
+    /// other unknown. A known bit overturned moves the right-hand side
+    /// of every row its column is set in. `spare` is what the caller
+    /// knows the equations to have beyond the rank.
+    fn solution(&self, block: &[CwRead], changed: &[u8], spare: usize) -> BitSolution {
+        let moved: Vec<usize> = (self.unknown..self.columns.len())
+            .filter(|&col| {
+                let (i, b) = self.columns[col];
+                changed[i] >> b & 1 != 0
             })
-            .sum();
-        if involved != 1 {
-            continue;
+            .collect();
+        let mut corrected: Vec<u8> = block.iter().zip(changed).map(|(cw, &c)| (cw.value & cw.known) ^ c).collect();
+        let mut solved = vec![0u8; block.len()];
+        let mut solved_bits = 0;
+        for (col, &(i, bit)) in self.columns[..self.unknown].iter().enumerate() {
+            if self.pivot_row[col] == usize::MAX {
+                continue;
+            }
+            let row = &self.rows[self.pivot_row[col]];
+            if self.unknowns_in(row) != 1 {
+                continue;
+            }
+            solved[i] |= 1 << bit;
+            solved_bits += 1;
+            if self.rhs(row) ^ (moved.iter().filter(|&&m| Self::bit(row, m)).count() % 2 == 1) {
+                corrected[i] |= 1 << bit;
+            }
         }
-        solved[i] |= 1 << bit;
-        solved_bits += 1;
-        if rhs(row) {
-            corrected[i] |= 1 << bit;
+        BitSolution { corrected, solved, unknown_bits: self.unknown, solved_bits, spare_equations: spare }
+    }
+
+    /// A column, or the right-hand side, over the rows no unknown has a
+    /// pivot in: what the known bits must answer for by themselves.
+    fn over_zero(&self, col: usize) -> Vec<u64> {
+        let zero = self.equations - self.rank;
+        let mut v = vec![0u64; zero / 64 + 1];
+        for (k, row) in self.rows[self.rank..].iter().enumerate() {
+            if Self::bit(row, col) {
+                v[k / 64] |= 1 << (k % 64);
+            }
+        }
+        v
+    }
+
+    /// The rows no unknown has a pivot in, as every known column and
+    /// the right-hand side stand over them: computed once for the flips
+    /// and every size of free a block is tried with.
+    fn zero_rows(&self) -> ZeroRows {
+        ZeroRows {
+            residual: self.over_zero(self.columns.len()),
+            columns: (self.unknown..self.columns.len()).map(|col| self.over_zero(col)).collect(),
         }
     }
-    if solved_bits == 0 {
-        return Err(BitSolveFailure::Underdetermined { rank, unknown_bits: u });
+
+    /// The block solved with `size` codewords of those read freed, by
+    /// trial, for a system built with its known bits carried, whose
+    /// unknown bits are all determined and whose known bits are not
+    /// consistent. In the rows no unknown has a pivot in, what is left
+    /// of the right-hand side must be made up by the columns of the bits
+    /// freed: a codeword's columns there, in echelon form, say whether
+    /// they can, and how, and that they settle the codeword, which they
+    /// do when they are independent. Every set of `size` codewords is
+    /// tried, when the sets of that size and every smaller one fit
+    /// `budget` between them, [`TRIAL_SETS`] at the most. Returns the sets tried, of this size
+    /// and the smaller ones, and the solutions found, each with the
+    /// codewords freed and the bits of each codeword it overturned, the
+    /// nearest first and the rivals within the margin after it
+    /// ([`nearest`]).
+    fn trying(
+        &self,
+        over: &ZeroRows,
+        block: &[CwRead],
+        bit_reliability: &[[u8; 8]],
+        size: usize,
+        budget: usize,
+    ) -> (usize, Vec<(Vec<usize>, Vec<u8>, BitSolution)>) {
+        debug_assert!(self.rank == self.unknown && !self.consistent());
+        let n = block.len();
+        let zero = self.equations - self.rank;
+        let mut columns_of: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for col in self.unknown..self.columns.len() {
+            columns_of[self.columns[col].0].push(col);
+        }
+        let candidates: Vec<usize> = (0..n).filter(|&i| !columns_of[i].is_empty()).collect();
+        let c = candidates.len();
+        let tries: Option<usize> = (1..=size).map(|s| sets_of(c, s)).sum();
+        let Some(tries) = tries.filter(|&tries| tries <= budget.min(TRIAL_SETS)) else { return (0, Vec::new()) };
+        if size == 0 || size > c || zero < 8 * size + DOUBT_SPARE_EQUATIONS {
+            return (tries, Vec::new());
+        }
+        let residual = &over.residual;
+        let vectors: Vec<Vec<&[u64]>> =
+            candidates.iter().map(|&i| columns_of[i].iter().map(|&col| over.columns[col - self.unknown].as_slice()).collect()).collect();
+        let mut found: Vec<(u32, (Vec<usize>, Vec<u8>, BitSolution))> = Vec::new();
+        each_set(c, size, |set| {
+            let mut span = Span::default();
+            let mut freed = 0;
+            for (which, &k) in set.iter().enumerate() {
+                for (b, &v) in vectors[k].iter().enumerate() {
+                    span.add(v.to_vec(), 1 << (8 * which + b));
+                    freed += 1;
+                }
+            }
+            if span.rows.len() != freed {
+                return;
+            }
+            let Some(combination) = span.express(residual.clone()) else { return };
+            let mut changed = vec![0u8; n];
+            for (which, &k) in set.iter().enumerate() {
+                let i = candidates[k];
+                for (b, &col) in columns_of[i].iter().enumerate() {
+                    if combination >> (8 * which + b) & 1 != 0 {
+                        changed[i] |= 1 << self.columns[col].1;
+                    }
+                }
+            }
+            let solution = self.solution(block, &changed, zero - freed);
+            debug_assert!(solution.is_complete());
+            let erased = set.iter().map(|&k| candidates[k]).collect();
+            found.push((soft_distance(block, bit_reliability, &solution.corrected), (erased, changed, solution)));
+        });
+        (tries, nearest(found, |a, b| a.2.corrected == b.2.corrected, |a, b| a.2.spare_equations > b.2.spare_equations))
     }
-    debug_assert!(solved_bits < u || rs_syndromes(&corrected, ec_len).iter().all(|&s| s == 0));
-    Ok(BitSolution { corrected, solved, unknown_bits: u, solved_bits, spare_equations: equations - rank })
+
+    /// The block solved with a bit, or two, or three of those read
+    /// solidly flipped, for a system built with its known bits carried,
+    /// whose unknown bits are all determined and whose known bits are
+    /// not consistent. A flipped bit moves the right-hand side by its
+    /// column, so the bits to flip are those whose columns over the rows
+    /// no unknown has a pivot in add up to what is left there: every
+    /// bit is looked at for the singles, every bit against a table of
+    /// the rest for the pairs, and every pair of the
+    /// [`FLIP_TRIPLE_BITS`] least reliable bits against the table for
+    /// the triples, or as many of them as have no more pairs than four
+    /// lookups a set of `budget`. Only bits sampled from a photo are
+    /// flipped, as only
+    /// they are doubted: a bit painted by hand is certain. Returns the
+    /// sets of bits looked at and the solutions found, each with the
+    /// bits of each codeword it flipped, the nearest first and the
+    /// rivals within the margin after it ([`nearest`]).
+    fn flipping(&self, over: &ZeroRows, block: &[CwRead], bit_reliability: &[[u8; 8]], budget: usize) -> (usize, Vec<(Vec<u8>, BitSolution)>) {
+        debug_assert!(self.rank == self.unknown && !self.consistent());
+        let n = block.len();
+        let zero = self.equations - self.rank;
+        let mut cols: Vec<(u8, usize)> = (self.unknown..self.columns.len())
+            .filter_map(|col| {
+                let (i, b) = self.columns[col];
+                let reliability = bit_reliability[i][b as usize];
+                (reliability < CERTAIN).then_some((reliability, col))
+            })
+            .collect();
+        cols.sort();
+        let c = cols.len();
+        if c == 0 || zero < DOUBT_SPARE_EQUATIONS + tries_charge(c) as usize {
+            return (0, Vec::new());
+        }
+        let residual = &over.residual;
+        let vectors: Vec<&[u64]> = cols.iter().map(|&(_, col)| over.columns[col - self.unknown].as_slice()).collect();
+        let mut sets: Vec<Vec<usize>> = Vec::new();
+        let mut tries = c;
+        for (k, &v) in vectors.iter().enumerate() {
+            if v == residual.as_slice() {
+                sets.push(vec![k]);
+            }
+        }
+        let pairs = c * (c - 1) / 2;
+        if c >= 2 && zero >= DOUBT_SPARE_EQUATIONS + tries_charge(tries + pairs) as usize {
+            tries += pairs;
+            let mut by_vector: HashMap<&[u64], Vec<usize>> = HashMap::new();
+            let xor = |a: &[u64], b: &[u64]| -> Vec<u64> { a.iter().zip(b).map(|(x, y)| x ^ y).collect() };
+            for (k, &v) in vectors.iter().enumerate() {
+                if let Some(others) = by_vector.get(xor(residual, v).as_slice()) {
+                    sets.extend(others.iter().map(|&a| vec![a, k]));
+                }
+                by_vector.entry(v).or_default().push(k);
+            }
+            // As many of the least reliable bits as have no more pairs
+            // than four lookups a set of the budget: a lookup is a hash of
+            // a few words where a set erased is a decode.
+            let s = c.min(FLIP_TRIPLE_BITS).min((8 * budget.min(TRIAL_SETS)).isqrt());
+            let triples: usize = (0..s).map(|a| (a + 1..s).map(|b| c - b - 1).sum::<usize>()).sum();
+            if c >= 3 && zero >= DOUBT_SPARE_EQUATIONS + tries_charge(tries + triples) as usize {
+                tries += triples;
+                for a in 0..s {
+                    for b in a + 1..s {
+                        let target = xor(&xor(residual, vectors[a]), vectors[b]);
+                        if let Some(others) = by_vector.get(target.as_slice()) {
+                            sets.extend(others.iter().filter(|&&k| k > b).map(|&k| vec![a, b, k]));
+                        }
+                    }
+                }
+            }
+        }
+        let found: Vec<(u32, (Vec<u8>, BitSolution))> = sets
+            .into_iter()
+            .map(|set| {
+                let mut flipped = vec![0u8; n];
+                for &k in &set {
+                    let (i, b) = self.columns[cols[k].1];
+                    flipped[i] |= 1 << b;
+                }
+                let solution = self.solution(block, &flipped, zero);
+                debug_assert!(solution.is_complete());
+                (soft_distance(block, bit_reliability, &solution.corrected), (flipped, solution))
+            })
+            .collect();
+        (tries, nearest(found, |a, b| a.1.corrected == b.1.corrected, |a, b| a.1.spare_equations > b.1.spare_equations))
+    }
+}
+
+/// The rows of a [`BitSystem`] no unknown has a pivot in, as the known
+/// columns and the right-hand side stand over them ([`BitSystem::zero_rows`]).
+struct ZeroRows {
+    /// The right-hand side: what the known bits as read leave wanting.
+    residual: Vec<u64>,
+    /// Each known column, by its place among the known columns.
+    columns: Vec<Vec<u64>>,
+}
+
+/// Vectors over GF(2) in fully reduced echelon form, each with the
+/// combination of the vectors added that it is made of, so that a vector
+/// the span holds can be expressed in them.
+#[derive(Clone, Default)]
+struct Span {
+    /// Each row with the index of its pivot bit and its combination.
+    rows: Vec<(Vec<u64>, usize, u32)>,
+}
+
+impl Span {
+    fn bit(v: &[u64], at: usize) -> bool {
+        v[at / 64] >> (at % 64) & 1 != 0
+    }
+
+    fn xor(v: &mut [u64], w: &[u64]) {
+        for (a, b) in v.iter_mut().zip(w) {
+            *a ^= b;
+        }
+    }
+
+    /// Add a vector, `combination` naming it; false when it lay in the
+    /// span already.
+    fn add(&mut self, mut v: Vec<u64>, mut combination: u32) -> bool {
+        for (row, pivot, c) in &self.rows {
+            if Self::bit(&v, *pivot) {
+                Self::xor(&mut v, row);
+                combination ^= c;
+            }
+        }
+        let Some(word) = v.iter().position(|&w| w != 0) else { return false };
+        let pivot = 64 * word + v[word].trailing_zeros() as usize;
+        for (row, _, c) in &mut self.rows {
+            if Self::bit(row, pivot) {
+                Self::xor(row, &v);
+                *c ^= combination;
+            }
+        }
+        self.rows.push((v, pivot, combination));
+        true
+    }
+
+    /// The combination of the vectors added that makes `target`, when
+    /// the span holds it.
+    fn express(&self, mut target: Vec<u64>) -> Option<u32> {
+        let mut combination = 0;
+        for (row, pivot, c) in &self.rows {
+            if Self::bit(&target, *pivot) {
+                Self::xor(&mut target, row);
+                combination ^= c;
+            }
+        }
+        target.iter().all(|&w| w == 0).then_some(combination)
+    }
 }
 
 #[cfg(test)]
@@ -966,6 +1778,12 @@ mod tests {
         let ec = rs_encode(&block, ec_len);
         block.extend(ec);
         block
+    }
+
+    /// The one solution a solver that tries many ways found, when it
+    /// found exactly one: rivals it could not tell apart count as none.
+    fn only<T>(mut found: Vec<T>) -> Option<T> {
+        if found.len() == 1 { found.pop() } else { None }
     }
 
     #[test]
@@ -1365,8 +2183,8 @@ mod tests {
         read[1].value ^= 0x04;
         let mut reliability = vec![[200u8; 8]; block.len()];
         reliability[1][2] = 3;
-        assert_eq!(rs_decode_chasing(&read, &reliability, 2, 2), None);
-        assert!(rs_decode_chasing(&read, &reliability, 2, 0).is_some_and(|(_, s)| s.corrected == block));
+        assert!(rs_decode_chasing(&read, &reliability, 2, 2, CHASE_BITS).is_empty());
+        assert!(only(rs_decode_chasing(&read, &reliability, 2, 0, CHASE_BITS)).is_some_and(|(_, s)| s.corrected == block));
     }
 
     #[test]
@@ -1458,7 +2276,7 @@ mod tests {
             if let Some((_, sol)) = rs_decode_doubting(&read, &by_codeword, ec_len, 0) {
                 assert_ne!(sol.corrected, block, "round {round}");
             }
-            let doubt = solve_bit_erasures_doubting(&read, &reliability, ec_len).unwrap_or_else(|| panic!("round {round}"));
+            let doubt = only(solve_bit_erasures_doubting(&read, &reliability, ec_len, Trials::NONE)).unwrap_or_else(|| panic!("round {round}"));
             assert_eq!(doubt.solution.corrected, block, "round {round}");
             assert!(doubt.doubted_bits >= wrong && doubt.doubted_bits <= wrong + 3, "round {round}: {}", doubt.doubted_bits);
             assert_eq!(doubt.errors(), wrong);
@@ -1472,12 +2290,12 @@ mod tests {
         let block = codeword(&mut rng, 20, ec_len);
         let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
         read[4].value ^= 0x08;
-        assert_eq!(solve_bit_erasures_doubting(&read, &vec![[CERTAIN; 8]; block.len()], ec_len), None);
+        assert!(solve_bit_erasures_doubting(&read, &vec![[CERTAIN; 8]; block.len()], ec_len, Trials::NONE).is_empty());
         let mut reliability = vec![[200u8; 8]; block.len()];
         reliability[4][3] = 1;
-        assert!(solve_bit_erasures_doubting(&read, &reliability, ec_len).is_some());
+        assert!(!solve_bit_erasures_doubting(&read, &reliability, ec_len, Trials::NONE).is_empty());
         read[4].pinned = 0x08;
-        assert!(solve_bit_erasures_doubting(&read, &reliability, ec_len).is_none_or(|d| d.doubted[4] & 0x08 == 0));
+        assert!(solve_bit_erasures_doubting(&read, &reliability, ec_len, Trials::NONE).iter().all(|d| d.doubted[4] & 0x08 == 0));
     }
 
     #[test]
@@ -1506,26 +2324,315 @@ mod tests {
         assert!(rs_decode(&read, ec_len).is_err());
         let by_codeword: Vec<u8> = reliability.iter().map(|r| *r.iter().min().unwrap()).collect();
         assert_eq!(rs_decode_doubting(&read, &by_codeword, ec_len, 0), None);
-        assert_eq!(solve_bit_erasures_doubting(&read, &reliability, ec_len), None);
-        let (flipped, sol) = rs_decode_chasing(&read, &reliability, ec_len, 0).unwrap();
+        assert!(solve_bit_erasures_doubting(&read, &reliability, ec_len, Trials::NONE).is_empty());
+        let (flipped, sol) = only(rs_decode_chasing(&read, &reliability, ec_len, 0, CHASE_BITS)).unwrap();
         assert_eq!(sol.corrected, block);
         assert_eq!((flipped, sol.errors, sol.erasures, sol.slack), (3, 7, 0, 2));
         // Two codewords spare, and the four solid errors the code located
-        // among the forty read, less six bits for the sixty-three
-        // patterns of the six faintest bits that were tried.
-        assert_eq!(sol.located_bits, located_error_bits(40, 4) - 6);
-        assert_eq!(sol.confidence_bits(), 16 + 9);
+        // among the forty read, less ten bits for the thousand and
+        // twenty-three patterns of the ten faintest bits that were tried.
+        assert_eq!(sol.located_bits, located_error_bits(40, 4) - 10);
+        assert_eq!(sol.confidence_bits(), 16 + 5);
         assert_eq!(sol.errata.len(), 7);
         for e in &sol.errata {
             assert!(!e.was_erasure && e.magnitude == read[e.index].value ^ block[e.index]);
         }
         // Certain bits are never flipped; with three codewords reserved
         // the solution is beyond the standard and not offered.
-        assert_eq!(rs_decode_chasing(&read, &vec![[CERTAIN; 8]; block.len()], ec_len, 0), None);
-        assert_eq!(rs_decode_chasing(&read, &reliability, ec_len, 3), None);
+        assert!(rs_decode_chasing(&read, &vec![[CERTAIN; 8]; block.len()], ec_len, 0, CHASE_BITS).is_empty());
+        assert!(rs_decode_chasing(&read, &reliability, ec_len, 3, CHASE_BITS).is_empty());
+        // One of many decodes flips fewer bits, and never fewer than six.
+        assert_eq!((chase_bits(1), chase_bits(2), chase_bits(32), chase_bits(1 << 20)), (10, 9, 6, 6));
         // A pinned bit is never flipped either, however faint.
         read[picked[4]].pinned = 1 << 4;
-        assert!(rs_decode_chasing(&read, &reliability, ec_len, 0).is_none_or(|(_, s)| s.corrected != block));
+        assert!(rs_decode_chasing(&read, &reliability, ec_len, 0, CHASE_BITS).iter().all(|(_, s)| s.corrected != block));
+    }
+
+    #[test]
+    fn the_nearest_of_solutions_that_disagree_wins_by_a_clear_margin_or_not_at_all() {
+        // A certain bit overturned costs 256, a faint one its reliability
+        // and one, and a bit that was not read nothing.
+        let block = [CwRead::known(0b1010_1010), CwRead { value: 0x0F, known: 0x0F, pinned: 0 }];
+        let certain = [[CERTAIN; 8]; 2];
+        assert_eq!(soft_distance(&block, &certain, &[0b1010_1010, 0x0F]), 0);
+        assert_eq!(soft_distance(&block, &certain, &[0b1010_1011, 0xFF]), 256);
+        let mut faint = certain;
+        faint[0][0] = 9;
+        faint[1][1] = 0;
+        assert_eq!(soft_distance(&block, &faint, &[0b1010_1011, 0x0D]), 11);
+
+        let same = |a: &u8, b: &u8| a == b;
+        let never = |_: &u8, _: &u8| false;
+        assert_eq!(nearest(vec![(300, 1u8), (10, 2), (10, 2)], same, never), vec![2]);
+        // Two within the margin of each other are both returned, the
+        // nearer first, and a third beyond it is not.
+        assert_eq!(nearest(vec![(10 + DISTANCE_MARGIN - 1, 2u8), (10, 1), (10 + DISTANCE_MARGIN, 3)], same, never), vec![1, 2]);
+        assert_eq!(nearest(vec![(10 + DISTANCE_MARGIN, 2u8), (10, 1)], same, never), vec![1]);
+        assert_eq!(nearest(Vec::<(u32, u8)>::new(), same, never), Vec::<u8>::new());
+        // Of those naming the same codeword, the one preferred.
+        let better = |a: &(u8, u8), b: &(u8, u8)| a.1 > b.1;
+        assert_eq!(nearest(vec![(5, (1, 1)), (5, (1, 7)), (5, (1, 3))], |a, b| a.0 == b.0, better), vec![(1, 7)]);
+    }
+
+    #[test]
+    fn erasing_by_trial_reaches_one_wrong_codeword_past_the_code() {
+        let mut rng = Rng(0x7B1A1);
+        for &(data_len, ec_len) in &[(16usize, 18usize), (32, 18), (16, 28), (24, 22), (9, 17)] {
+            for round in 0..30 {
+                let block = codeword(&mut rng, data_len, ec_len);
+                let n = block.len();
+                let limit = ec_len / 2;
+                let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+                let wrong = rng.distinct(limit + 2, n);
+                for &i in &wrong[..limit + 1] {
+                    read[i].value ^= rng.nonzero();
+                }
+                let what = format!("({data_len},{ec_len}) round {round}");
+                assert!(rs_decode(&read, ec_len).is_err(), "{what}");
+                let certain = vec![[CERTAIN; 8]; n];
+                let (erased, solution) = only(rs_decode_trying(&read, &certain, ec_len, 0, TRIAL_SETS)).unwrap_or_else(|| panic!("{what}"));
+                assert_eq!(solution.corrected, block, "{what}");
+                assert_eq!(erased.len(), 2 - ec_len % 2, "{what}");
+                assert!(erased.iter().all(|i| wrong[..limit + 1].contains(i)), "{what}");
+                assert_eq!((solution.errors, solution.erasures), (limit + 1, 0), "{what}");
+                assert!(solution.confidence_bits() >= AIDED_VERIFIED_BITS, "{what}: {}", solution.confidence_bits());
+                // One more is reached by the sets two larger, where the
+                // block is small enough for those to fit the budget with
+                // the smaller sets before them, and past the trials where
+                // it is not.
+                read[wrong[limit + 1]].value ^= rng.nonzero();
+                let size = 2 - ec_len % 2;
+                let fits = sets_of(n, size).zip(sets_of(n, size + 2)).is_some_and(|(small, large)| small + large <= TRIAL_SETS);
+                let found = rs_decode_trying(&read, &certain, ec_len, 0, TRIAL_SETS);
+                if fits {
+                    let (erased, solution) = only(found).unwrap_or_else(|| panic!("{what} and one more"));
+                    assert_eq!(solution.corrected, block, "{what} and one more");
+                    assert_eq!((erased.len(), solution.errors), (size + 2, limit + 2), "{what} and one more");
+                    assert!(erased.iter().all(|i| wrong.contains(i)), "{what} and one more");
+                } else {
+                    assert!(found.is_empty(), "{what} and one more");
+                }
+                // Two more are past every size that fits.
+                let extra = (0..n).find(|i| !wrong.contains(i)).unwrap();
+                read[extra].value ^= rng.nonzero();
+                assert!(rs_decode_trying(&read, &certain, ec_len, 0, TRIAL_SETS).is_empty(), "{what} and two more");
+            }
+        }
+        // A pinned codeword is never erased.
+        let block = codeword(&mut rng, 16, 18);
+        let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+        for cw in &mut read[..10] {
+            cw.value ^= rng.nonzero();
+            cw.pinned = 0xFF;
+        }
+        assert!(rs_decode_trying(&read, &vec![[CERTAIN; 8]; 34], 18, 0, TRIAL_SETS).is_empty());
+        // The pairs of the largest block fit the budget, so a block of a
+        // hundred and thirty codewords is reached one past the code; its
+        // triples do not, so with an odd redundancy it is reached no
+        // further than one codeword erased takes it.
+        let block = codeword(&mut rng, 100, 30);
+        let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+        for cw in &mut read[..16] {
+            cw.value ^= rng.nonzero();
+        }
+        let certain = vec![[CERTAIN; 8]; 130];
+        let (erased, solution) = only(rs_decode_trying(&read, &certain, 30, 0, TRIAL_SETS)).expect("pairs of a large block");
+        assert_eq!((erased.len(), solution.errors, solution.corrected == block), (2, 16, true));
+        assert_eq!(sets_of(130, 3), None);
+        let block = codeword(&mut rng, 101, 29);
+        let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+        for cw in &mut read[..15] {
+            cw.value ^= rng.nonzero();
+        }
+        assert_eq!(only(rs_decode_trying(&read, &certain, 29, 0, TRIAL_SETS)).map(|(erased, s)| (erased.len(), s.errors)), Some((1, 15)));
+        read[15].value ^= rng.nonzero();
+        assert!(rs_decode_trying(&read, &certain, 29, 0, TRIAL_SETS).is_empty());
+    }
+
+    #[test]
+    fn freeing_a_codeword_by_trial_mends_a_bit_solve_a_stain_put_out() {
+        let mut rng = Rng(0x5A1B);
+        for &(data_len, ec_len) in &[(16usize, 18usize), (32, 18), (16, 28)] {
+            for round in 0..30 {
+                let block = codeword(&mut rng, data_len, ec_len);
+                let n = block.len();
+                let stains = 1 + round % 2;
+                // A bit unknown in more codewords than there is redundancy
+                // to erase, and a codeword or two wrong throughout.
+                let unknown = ec_len + 3;
+                let picked = rng.distinct(unknown + stains, n);
+                let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+                for &i in &picked[..unknown] {
+                    let b = rng.below(8);
+                    read[i].known &= !(1 << b);
+                    read[i].value &= !(1 << b);
+                }
+                for &i in &picked[unknown..] {
+                    read[i].value ^= rng.nonzero();
+                }
+                let what = format!("({data_len},{ec_len}) round {round}, {stains} stained");
+                assert!(rs_decode(&read, ec_len).is_err(), "{what}");
+                assert_eq!(solve_bit_erasures(&read, ec_len), Err(BitSolveFailure::Inconsistent), "{what}");
+                let certain = vec![[CERTAIN; 8]; n];
+                let doubt = only(solve_bit_erasures_trying(&read, &certain, ec_len, Trials { free: true, ..Trials::NONE })).unwrap_or_else(|| panic!("{what}"));
+                assert_eq!(doubt.solution.corrected, block, "{what}");
+                assert_eq!(doubt.erased.len(), stains, "{what}");
+                assert!(doubt.erased.iter().all(|i| picked[unknown..].contains(i)), "{what}");
+                assert_eq!((doubt.doubted_bits, doubt.errors()), (0, stains), "{what}");
+                assert!(doubt.confidence_bits() >= DOUBT_SPARE_EQUATIONS as u32, "{what}: {}", doubt.confidence_bits());
+                for &i in &doubt.erased {
+                    assert_eq!(doubt.doubted[i], 0xFF, "{what}");
+                    assert_eq!(doubt.changed[i], read[i].value ^ block[i], "{what}");
+                }
+                // Three stains are reached by the triples, and four are
+                // past them.
+                if stains == 2 {
+                    let third = (0..n).find(|i| !picked.contains(i)).unwrap();
+                    read[third].value ^= rng.nonzero();
+                    let doubt = only(solve_bit_erasures_trying(&read, &certain, ec_len, Trials { free: true, ..Trials::NONE })).unwrap_or_else(|| panic!("{what} and a third"));
+                    assert_eq!(doubt.solution.corrected, block, "{what} and a third");
+                    assert_eq!(doubt.erased.len(), 3, "{what} and a third");
+                    assert!(doubt.erased.contains(&third), "{what} and a third");
+                    let fourth = (0..n).find(|i| !picked.contains(i) && *i != third).unwrap();
+                    read[fourth].value ^= rng.nonzero();
+                    assert!(solve_bit_erasures_trying(&read, &certain, ec_len, Trials { free: true, ..Trials::NONE }).is_empty(), "{what} and a fourth");
+                }
+            }
+        }
+        // Consistent as read, there is nothing to free.
+        let block = codeword(&mut rng, 16, 18);
+        let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+        read[3].known = 0xF0;
+        assert!(solve_bit_erasures_trying(&read, &vec![[CERTAIN; 8]; 34], 18, Trials::ALL).is_empty());
+    }
+
+    #[test]
+    fn flipping_finds_the_solid_misreads_the_equations_name() {
+        // A bit unknown in more codewords than there is redundancy to
+        // erase, and a bit or two or three read wrong as solidly as the
+        // rest: no doubting by reliability reaches them, and freeing
+        // codewords by trial spends eight equations on each where a flip
+        // spends none. The equations say which bits, by what they are
+        // left wanting.
+        let mut rng = Rng(0xF11B);
+        // Blocks of sixty-four codewords at the most, every bit of
+        // which the triples take in.
+        for &(data_len, ec_len) in &[(16usize, 18usize), (32, 18), (16, 28), (40, 24)] {
+            for round in 0..30 {
+                let block = codeword(&mut rng, data_len, ec_len);
+                let n = block.len();
+                let flips = 1 + round % 3;
+                let unknown = ec_len + 3;
+                let picked = rng.distinct(unknown + flips, n);
+                let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+                let reliability = vec![[200u8; 8]; n];
+                for &i in &picked[..unknown] {
+                    let b = rng.below(8);
+                    read[i].known &= !(1 << b);
+                    read[i].value &= !(1 << b);
+                }
+                let mut wrong = vec![0u8; n];
+                for &i in &picked[unknown..] {
+                    let b = rng.below(8);
+                    // A bit that is known: the unknown ones are elsewhere.
+                    read[i].value ^= 1 << b;
+                    wrong[i] |= 1 << b;
+                }
+                let what = format!("({data_len},{ec_len}) round {round}, {flips} flipped");
+                assert!(rs_decode(&read, ec_len).is_err(), "{what}");
+                assert_eq!(solve_bit_erasures(&read, ec_len), Err(BitSolveFailure::Inconsistent), "{what}");
+                // Nothing faint to doubt, and without flips only the frees
+                // reach it, at eight equations a codeword.
+                assert!(solve_bit_erasures_trying(&read, &reliability, ec_len, Trials::NONE).is_empty(), "{what}");
+                let flipping = Trials { flips: true, ..Trials::NONE };
+                let doubt = only(solve_bit_erasures_trying(&read, &reliability, ec_len, flipping)).unwrap_or_else(|| panic!("{what}"));
+                assert_eq!(doubt.solution.corrected, block, "{what}");
+                assert_eq!(doubt.flipped, wrong, "{what}");
+                assert_eq!((doubt.flipped_bits() as usize, doubt.errors(), doubt.erased.len(), doubt.doubted_bits), (flips, flips, 0, 0), "{what}");
+                assert_eq!(doubt.solution.spare_equations, 8 * ec_len - unknown, "{what}");
+                assert!(doubt.confidence_bits() >= DOUBT_SPARE_EQUATIONS as u32, "{what}: {}", doubt.confidence_bits());
+                // The frees reach the same block, spending more; the
+                // flips are preferred, and so is a flip to a free when
+                // both are allowed.
+                let both = only(solve_bit_erasures_trying(&read, &reliability, ec_len, Trials::ALL)).unwrap_or_else(|| panic!("{what}"));
+                assert_eq!((both.flipped, both.erased.len()), (wrong, 0), "{what}");
+                // Painted by hand, every bit is certain and none is
+                // flipped; the frees are all there is.
+                let certain = vec![[CERTAIN; 8]; n];
+                assert!(solve_bit_erasures_trying(&read, &certain, ec_len, flipping).is_empty(), "{what}");
+                let freed = solve_bit_erasures_trying(&read, &certain, ec_len, Trials::ALL);
+                assert!(freed.iter().all(|d| d.erased.len() == flips && d.flipped_bits() == 0), "{what}");
+            }
+        }
+        // With faint bits besides, doubted by their reliability, the
+        // flips are found at the count of doubted bits that lets them.
+        let (data_len, ec_len) = (16, 18);
+        for round in 0..20 {
+            let block = codeword(&mut rng, data_len, ec_len);
+            let n = block.len();
+            let faint = ec_len + 2;
+            // The solid misreads in the last two codewords, which doubting
+            // by index does not reach within its budget of equations.
+            let picked = rng.distinct(faint, n - 2);
+            let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+            let mut reliability = vec![[200u8; 8]; n];
+            for &i in &picked {
+                let b = rng.below(8);
+                read[i].value ^= 1 << b;
+                reliability[i][b] = 5 + rng.below(20) as u8;
+            }
+            for i in [n - 2, n - 1] {
+                read[i].value ^= 1 << rng.below(8);
+            }
+            let what = format!("round {round}");
+            assert!(solve_bit_erasures_doubting(&read, &reliability, ec_len, Trials::NONE).is_empty(), "{what}");
+            let flipping = Trials { flips: true, ..Trials::NONE };
+            let doubt = only(solve_bit_erasures_doubting(&read, &reliability, ec_len, flipping)).unwrap_or_else(|| panic!("{what}"));
+            assert_eq!(doubt.solution.corrected, block, "{what}");
+            // The two solid bits are flipped, and now and then a faint one
+            // not yet doubted with them, at a count of doubted bits one
+            // short of it.
+            let flipped = doubt.flipped_bits() as usize;
+            assert!((2..=3).contains(&flipped), "{what}: flipped {flipped}");
+            assert!(doubt.doubted_bits + flipped >= faint + 2, "{what}: doubted {} bits", doubt.doubted_bits);
+            assert_eq!(doubt.errors(), faint + 2, "{what}");
+            assert!(doubt.confidence_bits() >= DOUBT_SPARE_EQUATIONS as u32, "{what}: {}", doubt.confidence_bits());
+        }
+    }
+
+    #[test]
+    fn doubting_bits_frees_a_stain_by_trial_among_faint_misreads() {
+        // One faint wrong bit in more codewords than there is redundancy
+        // to erase, which doubting the bits reaches, and one codeword
+        // wrong throughout at full reliability, which it never doubts:
+        // nothing solves until the stain is freed by trial.
+        let mut rng = Rng(0x0DB7);
+        let (data_len, ec_len) = (16, 18);
+        for round in 0..30 {
+            let block = codeword(&mut rng, data_len, ec_len);
+            let n = block.len();
+            let faint = ec_len + 2;
+            let picked = rng.distinct(faint + 1, n);
+            let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+            let mut reliability = vec![[CERTAIN; 8]; n];
+            for &i in &picked[..faint] {
+                let b = rng.below(8);
+                read[i].value ^= 1 << b;
+                reliability[i][b] = 5 + rng.below(20) as u8;
+            }
+            let stain = picked[faint];
+            read[stain].value ^= rng.nonzero();
+            let what = format!("round {round}");
+            assert!(solve_bit_erasures_doubting(&read, &reliability, ec_len, Trials::NONE).is_empty(), "{what}");
+            let free = Trials { free: true, ..Trials::NONE };
+            let doubt = only(solve_bit_erasures_doubting(&read, &reliability, ec_len, free)).unwrap_or_else(|| panic!("{what}"));
+            assert_eq!(doubt.solution.corrected, block, "{what}");
+            assert_eq!(doubt.erased, vec![stain], "{what}");
+            assert!(doubt.doubted_bits >= faint, "{what}: doubted {} bits", doubt.doubted_bits);
+            assert_eq!(doubt.doubted[stain], 0xFF, "{what}");
+            assert_eq!(doubt.errors(), faint + 1, "{what}");
+            assert!(doubt.confidence_bits() >= DOUBT_SPARE_EQUATIONS as u32, "{what}: {}", doubt.confidence_bits());
+        }
     }
 
     #[test]

@@ -8,6 +8,7 @@ use qr_forensics::decode::codewords::PinSource;
 use qr_forensics::decode::pipeline::CwStatus;
 use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::binarize::binarize;
+use qr_forensics::imaging::sample::{misread_odds, reliability_bits};
 use qr_forensics::imaging::detect::{Anchor, AnchorKind, anchor_sites, edge_sites};
 use qr_forensics::imaging::projection::{CORNER_CLEARANCE, Project, Projection};
 use qr_forensics::symbol::function_map::Role;
@@ -46,10 +47,31 @@ const ANCHOR_HIT: f32 = 9.0;
 const CORNER_HIT: f32 = 13.0;
 /// Radius of a corner handle's ring, in screen points.
 const CORNER_RING: f32 = 9.0;
-/// Reliability (distance from the threshold, 0..=254) at which the
-/// heatmap's tint has faded out: a module this far from the threshold is
-/// not in doubt.
+/// Reliability (0..=254, eight times the bits of likelihood a module's
+/// reading carries, less eight) at which the heatmap's tint has faded
+/// out: a module read with sixteen bits of likelihood behind it, one
+/// misread in sixty-five thousand, is not in doubt.
 const RELIABILITY_FADE: u8 = 120;
+
+/// One misread in so many, said roundly: "1/200", "1/65.5 thousand",
+/// "1/4.3 billion".
+fn one_in(odds: f64) -> String {
+    let (scale, word) = if odds >= 1e12 {
+        (1e12, " trillion")
+    } else if odds >= 1e9 {
+        (1e9, " billion")
+    } else if odds >= 1e6 {
+        (1e6, " million")
+    } else if odds >= 1e4 {
+        (1e3, " thousand")
+    } else {
+        (1.0, "")
+    };
+    let count = odds / scale;
+    // Two figures of a count that is not a round number of its unit.
+    let shown = if count >= 100.0 || scale == 1.0 { format!("{count:.0}") } else { format!("{count:.1}").trim_end_matches(".0").to_owned() };
+    format!("1/{shown}{word}")
+}
 
 pub(super) fn show(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     toolbar(ui, app, actions);
@@ -120,9 +142,16 @@ fn toolbar(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                 });
                 if app.view.overlay == Overlay::Reliability {
                     ui.weak(format!(
-                        "Red: painted as a guess, or sampled close to the threshold, fading out by a margin of {:.2}; other painted modules untinted",
-                        RELIABILITY_FADE as f32 / (CERTAIN - 1) as f32
-                    ));
+                        "Red: painted as a guess, or sampled with little to believe the reading by, fading out at {:.0} bits of likelihood \
+                         ({} misread); other painted modules untinted",
+                        reliability_bits(RELIABILITY_FADE),
+                        one_in(misread_odds(RELIABILITY_FADE))
+                    ))
+                    .on_hover_text(
+                        "How far each sampled module's reading is to be believed, on the scale the Sampling section calibrates \
+                         against the fixed patterns: the bits of likelihood the reading carries, and so how many such readings \
+                         are misread. The decoder doubts the least believed modules first.",
+                    );
                 } else if app.view.overlay == Overlay::Photo && app.preview.is_none() {
                     ui.weak("Load a photo and place the corners to compare the grid with it");
                 } else if app.view.overlay == Overlay::Photo
@@ -981,10 +1010,11 @@ fn edit_stage(ui: &mut egui::Ui, app: &mut App, response: &egui::Response, paint
     match app.view.overlay {
         Overlay::None => {}
         Overlay::Reliability => {
-            // Red where a sampled module sat near its threshold, fading
-            // with the margin, and where a module was painted as a guess,
-            // which has no margin at all; other painted modules are
-            // certain and unknown ones are shown as they are.
+            // Red where a sampled module's reading has little to believe
+            // it by, fading as the bits of likelihood behind it grow, and
+            // where a module was painted as a guess, which has none;
+            // other painted modules are certain and unknown ones are
+            // shown as they are.
             if grid.has_reliability() {
                 let mut mesh = egui::Mesh::default();
                 for y in y_range.clone() {
@@ -1361,9 +1391,10 @@ pub(super) fn describe_module(derived: &Derived, doc: &Document, x: usize, y: us
     let reliability = doc.grid.reliability(x, y);
     if reliability < CERTAIN && doc.grid.get(x, y) != Module::Unknown {
         match reliability {
-            // Nothing tells a guess from a module read right on its threshold.
-            0 => text.push_str("  ·  a guess, or sampled on its threshold"),
-            _ => text.push_str(&format!("  ·  sampled, margin {:.2}", reliability as f32 / (CERTAIN - 1) as f32)),
+            // Nothing tells a guess from a module read right on its
+            // threshold, and either is one.
+            0 => text.push_str("  ·  a guess (1/2 misread)"),
+            _ => text.push_str(&format!("  ·  reliability {:.1} bits ({} misread)", reliability_bits(reliability), one_in(misread_odds(reliability)))),
         }
     }
     match role {
@@ -1402,4 +1433,23 @@ pub(super) fn describe_module(derived: &Derived, doc: &Document, x: usize, y: us
         }
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn misread_odds_are_said_roundly() {
+        assert_eq!(one_in(2.0), "1/2");
+        assert_eq!(one_in(misread_odds(0)), "1/2");
+        assert_eq!(one_in(misread_odds(56)), "1/256");
+        assert_eq!(one_in(9999.0), "1/9999");
+        assert_eq!(one_in(misread_odds(120)), "1/65.5 thousand");
+        assert_eq!(one_in(2f64.powi(20)), "1/1 million");
+        assert_eq!(one_in(4.3e9), "1/4.3 billion");
+        assert_eq!(one_in(misread_odds(254)), "1/7.2 billion");
+        assert_eq!(one_in(7.2e12), "1/7.2 trillion");
+        assert_eq!(one_in(250e6), "1/250 million");
+    }
 }

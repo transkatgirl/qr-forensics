@@ -1589,17 +1589,21 @@ fn a_symbol_out_of_focus_reads_through_the_photo_sharpened() {
 }
 
 #[test]
-fn a_blurred_symbol_in_failing_light_reads_against_the_threshold_surface() {
+fn a_blurred_symbol_in_failing_light_reads_once_a_stained_codeword_a_block_is_freed() {
     // A version 6 symbol out of focus by half a module, under light
     // that fails to a fourteenth from its left edge to its right. The
     // paper at the dark end is darker than the ink at the light end,
     // and no one split of the symbol tells them apart; the blur has run
     // the modules together, and each read against its neighbourhood has
-    // too many of them unsure for the blocks to solve. A threshold that
-    // lies as a surface across the symbol follows the light and asks
-    // nothing of a module's neighbours, as BoofCV reads every symbol;
-    // it was read against only when asked for, and a read now comes to
-    // it of itself and says so.
+    // too many of them unsure for the blocks to solve, and in three
+    // blocks of the four a codeword whose modules the blur has carried
+    // over their thresholds with margin, which no doubting by
+    // reliability reaches. Erased by trial, that codeword frees its
+    // block, and the neighbourhood reads the symbol; a read comes to
+    // that of itself, before the other rules. A threshold that lies as
+    // a surface across the symbol follows the light and asks nothing of
+    // a module's neighbours, as BoofCV reads every symbol, and reads it
+    // with nothing freed, as it did when it was all that could.
     let (version, ec) = (SymbolVersion::Qr(6), EcLevel::M);
     let grid = symbol(version, ec);
     let layout = layout(version, ec);
@@ -1613,18 +1617,40 @@ fn a_blurred_symbol_in_failing_light_reads_against_the_threshold_surface() {
     let read = read_outline(&image, SymbolVersion::Qr(2), loosen(quad, 1.12, [1.0, -1.0]), &params, &opts).expect("found");
     assert!(read.is_trustworthy(), "{:?} of {} blocks", read.report.blocks_verified(), read.report.blocks.len());
     assert_eq!(read.text(), text);
-    assert_eq!((read.version(), read.rule), (version, Rule::Surface));
-    // Through the very placement that read, no kernel reads under
-    // either of the other rules.
+    assert_eq!((read.version(), read.rule, read.unsure_kept), (version, Rule::Neighbourhood, false));
+    // Freed whole, or, where the blur carried only a bit or two or three
+    // of it over, those bits flipped by what the equations were left
+    // wanting, which spends nothing where a codeword freed spends eight.
+    let freed = read
+        .report
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.outcome, BlockOutcome::Solved { method: SolveMethod::BitTrial { .. } | SolveMethod::BitFlip { .. }, .. }))
+        .count();
+    assert_eq!(freed, 3, "{:?}", read.report.blocks.iter().map(|b| b.outcome).collect::<Vec<_>>());
+    // Through the very placement that read, with nothing freed by trial
+    // and no solid bit flipped, no kernel reads under either of the
+    // rules that split the symbol, through the band or with the unsure
+    // modules kept at their colour: the codewords the blur carried over
+    // are wrong either way. The surface reads it with nothing freed or
+    // flipped.
     let map = read.detection.projection().expect("the placement maps");
+    let reads = |rule: Rule, kernel: Kernel, band: f32, aided: bool| {
+        let how = SampleParams { kernel, band, ..params.under(rule) };
+        let sampled = sample_modules_with(&image, &map, grid.width(), grid.height(), kernel);
+        let other = classify(&sampled, &how).to_grid(grid.width(), grid.height());
+        let opts = DecodeOptions { erase_by_trial: aided, flip_bits: aided, ..opts };
+        decode(&other, &layout, 0, &Pins::new(), &opts).is_trustworthy()
+    };
     for rule in [Rule::Neighbourhood, Rule::Level] {
         for kernel in Kernel::ALL {
-            let how = SampleParams { kernel, ..params.under(rule) };
-            let sampled = sample_modules_with(&image, &map, grid.width(), grid.height(), kernel);
-            let other = classify(&sampled, &how).to_grid(grid.width(), grid.height());
-            assert!(!decode(&other, &layout, 0, &Pins::new(), &opts).is_trustworthy(), "{rule:?} with {kernel:?} reads it too");
+            for band in [params.band, 0.0] {
+                assert!(!reads(rule, kernel, band, false), "{rule:?} with {kernel:?} at a band of {band} reads it with nothing freed or flipped");
+            }
         }
     }
+    assert!(reads(Rule::Neighbourhood, read.kernel, params.band, true));
+    assert!(reads(Rule::Surface, params.kernel, params.band, false));
 }
 
 #[test]

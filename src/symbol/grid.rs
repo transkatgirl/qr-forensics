@@ -156,9 +156,11 @@ pub struct ModuleGrid {
     height: usize,
     cells: Vec<Module>,
     /// How sure each module's colour is: [`CERTAIN`] unless it was sampled
-    /// from a photo, in which case its distance from the threshold on a
-    /// scale of 0..=254, or painted as a guess, which is 0. `None` until
-    /// something is sampled or guessed.
+    /// from a photo, in which case eight times the bits of likelihood its
+    /// reading carries less eight, on a scale of 0..=254
+    /// ([`crate::imaging::sample::Calibration::reliability`]), or painted
+    /// as a guess, which is 0. `None` until something is sampled or
+    /// guessed.
     reliability: Option<Vec<u8>>,
 }
 
@@ -196,8 +198,8 @@ impl ModuleGrid {
         }
     }
 
-    /// Set a module read from a photo, with how far it was from the
-    /// threshold on a scale of 0..=254.
+    /// Set a module read from a photo, with how far its reading is to be
+    /// believed on a scale of 0..=254.
     pub fn set_sampled(&mut self, x: usize, y: usize, module: Module, reliability: u8) {
         let i = y * self.width + x;
         self.cells[i] = module;

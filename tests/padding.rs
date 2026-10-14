@@ -180,10 +180,14 @@ fn padding_misread_as_data_is_corrected_for_free() {
     for i in 0..14 {
         corrupt_codeword(&mut grid, &layout, block.codewords[3 * i], i);
     }
-    let before = decode_plain(&grid, &layout, mask);
+    // One past the code is reached by the trials of erasures by
+    // themselves; without them the block fails, and the padding pinned
+    // is what solves it.
+    let unaided = DecodeOptions { erase_by_trial: false, ..DecodeOptions::default() };
+    let before = decode(&grid, &layout, mask, &Pins::new(), &unaided);
     assert!(matches!(before.blocks[3].outcome, BlockOutcome::Failed(_)));
 
-    let recovery = recover(&grid, &layout, mask).unwrap();
+    let recovery = recover_padding(&grid, &layout, mask, &Pins::new(), &unaided).unwrap();
     assert!(recovery.confirmed);
     assert_eq!(recovery.solved_after, 5);
     assert!(recovery.candidate.mismatches >= 14);

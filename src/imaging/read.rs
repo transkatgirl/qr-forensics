@@ -179,6 +179,22 @@ pub struct ReadResult {
     /// for: with the kernel and the rule, what a sampling must be made
     /// with to give this grid again.
     pub sharpen_modules: bool,
+    /// The modules the unsure band would have left unknown were kept at
+    /// the colour they fell on, at their reliability, for the decoder to
+    /// doubt rather than erase ([`Classified::to_grid_as_decided`]): a
+    /// sampling must have no band to give this grid again.
+    pub unsure_kept: bool,
+}
+
+/// One way of reading a placement: the kernel its modules are sampled
+/// with, the threshold rule they are judged by, and whether the modules
+/// the unsure band would leave unknown are kept at the colour they fell
+/// on instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Variant {
+    kernel: Kernel,
+    rule: Rule,
+    unsure_kept: bool,
 }
 
 impl ReadResult {
@@ -339,6 +355,9 @@ fn read_outline_plain(
     // The detector's placements, best fit first, each with every way of
     // sampling it: the reads of each, up to the one that settles it.
     let candidates = seated(image, detect_candidates_by(image, version, region, params, climb), params);
+    // Each read is one of about as many as there are placements and
+    // turns of the photo, times the ways of sampling each.
+    let opts = &opts.among(candidates.len() + 3);
     let reads_of = |found: &Detection| {
         let mut reads = Vec::new();
         if work::cancelled() {
@@ -374,9 +393,10 @@ fn read_outline_plain(
         let turned_region = rotate_outline_cw(region, quarters, image.width, image.height);
         let Some(found) = detect_candidates_by(&turned, version, turned_region, params, climb).into_iter().next() else { return reads };
         let Some(prepared) = prepare(&turned, seat(&turned, found, params), params) else { return reads };
+        let opts = &opts.among(variants.len());
         work::first_then_in_turn(
             &variants,
-            |&(kernel, rule)| if work::cancelled() { None } else { read_prepared(&turned, &prepared, kernel, rule, params, opts) },
+            |&variant| if work::cancelled() { None } else { read_prepared(&turned, &prepared, variant, params, opts) },
             |result| {
                 let Some(mut result) = result else { return false };
                 unturn(&mut result.detection, quarters, image.width, image.height, region);
@@ -395,11 +415,29 @@ fn read_outline_plain(
 
 /// The ways of sampling a placement a read tries, in order: the kernel
 /// and threshold rule asked for, then the other rules with that kernel
-/// ([`SampleParams::rules`]), then each other kernel under every rule.
-/// The rule comes before the kernels because it decides more often: see
-/// the module's account.
-fn variants_of(params: &SampleParams) -> Vec<(Kernel, Rule)> {
-    params.kernel.retries().flat_map(|kernel| params.rules().map(move |rule| (kernel, rule))).collect()
+/// ([`SampleParams::rules`]); then, when the unsure band would leave
+/// any module unknown, the kernel asked for under every rule again with
+/// those modules kept at the colour they fell on
+/// ([`Classified::to_grid_as_decided`]); then each other kernel under
+/// every rule. The rule comes before the kernels because it decides more
+/// often: see the module's account. The unsure modules come between
+/// because keeping them changes the least of what is read: a module in
+/// the band is unknown to the exact decoder either way, as a codeword it
+/// erases or as a bit the fallbacks doubt before any other, and what
+/// differs is that the erasure spends a unit of redundancy on the whole
+/// codeword where the doubt spends an equation on the bit. Over blocks
+/// of simulated noise the band read no more than the colours kept, and
+/// with a stain beside the noise far less; on the photographs it is
+/// tried second, since what the band leaves unknown on them is often a
+/// module the grid straddles, which reads as nothing in either colour.
+fn variants_of(params: &SampleParams) -> Vec<Variant> {
+    let under = |kernel: Kernel, unsure_kept: bool| params.rules().map(move |rule| Variant { kernel, rule, unsure_kept });
+    let mut variants: Vec<Variant> = under(params.kernel, false).collect();
+    if params.band > 0.0 {
+        variants.extend(under(params.kernel, true));
+    }
+    variants.extend(params.kernel.retries().skip(1).flat_map(|kernel| under(kernel, false)));
+    variants
 }
 
 /// The margin, as a share of its size, of the outline a symbol the
@@ -508,15 +546,16 @@ const DOUBT_MODULES: f64 = 0.35;
 fn read_placement(
     image: &Luma,
     prepared: &Prepared,
-    variants: &[(Kernel, Rule)],
+    variants: &[Variant],
     params: &SampleParams,
     opts: &DecodeOptions,
     keep: &mut dyn FnMut(ReadResult) -> bool,
 ) -> bool {
+    let opts = &opts.among(variants.len());
     let mut verified = 0;
     let settled = work::first_then_in_turn(
         variants,
-        |&(kernel, rule)| if work::cancelled() { None } else { read_prepared(image, prepared, kernel, rule, params, opts) },
+        |&variant| if work::cancelled() { None } else { read_prepared(image, prepared, variant, params, opts) },
         |result| {
             result.is_some_and(|result| {
                 verified = verified.max(result.report.blocks_verified());
@@ -538,8 +577,8 @@ fn read_placement(
         && let Some(detection) = seen_from_behind(image, found, params)
     {
         let behind = Prepared { detection, agreement: prepared.agreement };
-        for &(kernel, rule) in few {
-            if let Some(result) = read_prepared(image, &behind, kernel, rule, params, opts)
+        for &variant in few {
+            if let Some(result) = read_prepared(image, &behind, variant, params, opts)
                 && result.report.blocks_verified() > verified
             {
                 verified = result.report.blocks_verified();
@@ -558,8 +597,8 @@ fn read_placement(
         }
         let Some(k) = doubtful_anchor(&doubted.detection) else { break };
         doubted.detection.anchors.remove(k);
-        for &(kernel, rule) in few {
-            if let Some(result) = read_prepared(image, &doubted, kernel, rule, params, opts) {
+        for &variant in few {
+            if let Some(result) = read_prepared(image, &doubted, variant, params, opts) {
                 verified = verified.max(result.report.blocks_verified());
                 if keep(result) {
                     return true;
@@ -679,22 +718,28 @@ fn prepare(image: &Luma, mut found: Detection, params: &SampleParams) -> Option<
     Some(Prepared { detection: found, agreement })
 }
 
-/// Sample a prepared detection with `kernel`, classify it under the
-/// threshold rule `rule`, and decode what it reads.
-fn read_prepared(
-    image: &Luma,
-    prepared: &Prepared,
-    kernel: Kernel,
-    rule: Rule,
-    params: &SampleParams,
-    opts: &DecodeOptions,
-) -> Option<ReadResult> {
+/// Sample a prepared detection with the variant's kernel, classify it
+/// under its threshold rule, with the unsure modules kept at their
+/// colour when it says so, and decode what it reads. `None` for a
+/// variant that keeps the unsure modules when the band left none
+/// unknown: the read would be the one already made.
+fn read_prepared(image: &Luma, prepared: &Prepared, variant: Variant, params: &SampleParams, opts: &DecodeOptions) -> Option<ReadResult> {
     let found = &prepared.detection;
     let func = Arc::new(FunctionMap::new(found.version));
     let projection = found.projection()?;
-    let sampling = SampleParams { kernel, ..params.under(rule) };
+    let Variant { kernel, rule, unsure_kept } = variant;
+    let banded = SampleParams { kernel, ..params.under(rule) };
+    let sampling = SampleParams { band: if unsure_kept { 0.0 } else { params.band }, ..banded };
     let sampled = sample_modules_noting(image, &projection, func.width, func.height, kernel, params.sharpen_modules).0;
-    let mut grid = classify(&sampled, &sampling).to_grid(func.width, func.height);
+    let mut classified = classify(&sampled, &banded);
+    // How far a reading is to be believed is learnt from the fixed
+    // patterns, whose colours are known before anything is decoded.
+    classified.calibrate(func.expected_modules(), found.inverted);
+    if unsure_kept && classified.unsure() == 0 {
+        return None;
+    }
+    let mut grid =
+        if unsure_kept { classified.to_grid_as_decided(func.width, func.height) } else { classified.to_grid(func.width, func.height) };
     if found.inverted {
         grid = grid.inverted();
     }
@@ -734,6 +779,7 @@ fn read_prepared(
         reinterpreted,
         enhance: Enhance::NONE,
         sharpen_modules: params.sharpen_modules,
+        unsure_kept,
     };
     Some(if result.is_trustworthy() || work::cancelled() { result } else { refit_by_decode(image, result, &sampling, opts) })
 }
@@ -877,7 +923,12 @@ fn feedback_round(image: &Luma, current: &ReadResult, params: &SampleParams, opt
     let controls: Vec<ControlPoint> = anchors.iter().map(|a| a.control_point()).collect();
     let projection = Projection::new(func.width, func.height, corners, &controls)?;
     let sampled = sample_modules_noting(image, &projection, func.width, func.height, current.kernel, params.sharpen_modules).0;
-    let mut grid = classify(&sampled, params).to_grid(func.width, func.height);
+    let mut classified = classify(&sampled, params);
+    // The template has every module of the blocks that verified besides
+    // the fixed patterns: hundreds of labelled modules to learn the
+    // photo's misreads from, where the fixed patterns gave tens.
+    classified.calibrate(&template.expected, found.inverted);
+    let mut grid = classified.to_grid(func.width, func.height);
     if found.inverted {
         grid = grid.inverted();
     }
@@ -903,6 +954,7 @@ fn feedback_round(image: &Luma, current: &ReadResult, params: &SampleParams, opt
         reinterpreted: current.reinterpreted,
         enhance: current.enhance,
         sharpen_modules: current.sharpen_modules,
+        unsure_kept: current.unsure_kept,
     })
 }
 
@@ -1052,8 +1104,9 @@ fn rival_decode(grid: &ModuleGrid, func: &Arc<FunctionMap>, format: &FormatAnaly
     let borne_out = |report: &DecodeReport| {
         report.blocks.iter().filter(|b| b.is_verified()).map(|b| b.outcome.confidence_bits()).sum::<u32>() >= AIDED_VERIFIED_BITS
     };
-    let two_passes = opts.reliability && grid.has_reliability();
-    let first_pass = DecodeOptions { reliability: opts.reliability && !two_passes, ..*opts };
+    let opts = &opts.among(rivals.len() + 1);
+    let two_passes = (opts.reliability && grid.has_reliability()) || opts.erase_by_trial;
+    let first_pass = DecodeOptions { reliability: opts.reliability && !two_passes, erase_by_trial: false, ..*opts };
     let mut found: Option<DecodeReport> = None;
     for rival in rivals {
         let Some(layout) = SymbolLayout::new(func.clone(), rival.fields.ec) else { continue };
@@ -1208,7 +1261,8 @@ mod tests {
         let (top_left, top_right, bottom_left) = (centre(tl, [1.0, 1.0]), centre(tr, [-1.0, 1.0]), centre(bl, [1.0, -1.0]));
         let read = |found: Detection| {
             let prepared = prepare(&image, found, &params).expect("an outline");
-            read_prepared(&image, &prepared, params.kernel, params.rule(), &params, &opts).expect("a decode")
+            let variant = Variant { kernel: params.kernel, rule: params.rule(), unsure_kept: false };
+            read_prepared(&image, &prepared, variant, &params, &opts).expect("a decode")
         };
 
         // The right way up, a placement is left as it is, and reads.

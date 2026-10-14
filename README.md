@@ -131,7 +131,16 @@ Sampling reads a colour for each module off the photo.
   a **Threshold surface** that varies smoothly across the symbol, for a
   shadow or light that fails toward one side.
 - **Unsure band** leaves modules that fall too close to the threshold
-  unknown instead of guessing them.
+  unknown instead of guessing them. A read that does not decode so is
+  made again with those modules kept at the colour they fell on, as
+  guesses the decoder doubts first, and a read that decodes only that
+  way says so and sets the band to nought.
+- How far each module's reading is to be believed is learnt from the
+  photo itself: the fixed patterns, whose colours are known, say how far
+  a module read right lies from its threshold, how much the readings
+  spread, and how many are wrong by more than that spread explains, as
+  specks and stains are. The section reports the fit, and the decoder
+  doubts the least reliable modules first by it.
 - **Kernel** chooses how a module's luminance is taken: the average over its
   middle, its centre point alone, or a vote of five points.
 
@@ -176,7 +185,7 @@ Overlays colour the grid by what the decoder knows:
 | Module roles | Finder, timing, alignment, format and version modules, each in its own colour |
 | RS blocks | Which Reed-Solomon block each module belongs to, with unsolved blocks marked red |
 | Corrections | Each module as error correction has it: green rim where it was unknown, red where it was painted otherwise |
-| Reliability | Red where a module was sampled close to its threshold, or painted as a guess |
+| Reliability | Red where a module's reading is least to be believed: sampled close to its threshold, on a photo whose fixed patterns read poorly, or painted as a guess. The status bar says to how many bits a sampled module's reading is believed, and how many such readings are misread |
 | Mask pattern | Where the mask in effect swaps dark and light |
 | Unmasked data | The data bits themselves, with the mask taken off |
 | Codeword status | Green: corrected or filled in. Amber: read but unconfirmed. Red: unknown. Violet rim: doubted to solve the block |
@@ -221,11 +230,35 @@ short of solving.
 - **Codewords.** Pin a selected codeword to a hex value, or pin its bits one
   at a time.
 
+- **Pin as ASCII** asserts that a stretch of the message, from one
+  character to another as read, is plain seven-bit text, as an address
+  or a Wi-Fi label is, and pins the high bit of every byte of it at
+  zero: one bit a byte that need not be read, which is what tips a block
+  short of solving bit by bit. The stretch must be named, since a pin
+  asserts: an address that is ASCII throughout may be followed by a name
+  with an accent in it.
+
 The **Decoding** section on the left sets what is tried on a block that
-fails: solving unknown bits one by one, and doubting the least reliable
+fails: solving unknown bits one by one, doubting the least reliable
 sampled modules as whole codewords, as single bits, or by flipping the
-faintest. Modules painted by hand are never doubted, unless they were
-painted as a guess.
+faintest every way, flipping a bit or two or three read solidly wrong
+where the equations name them, and erasing codewords by trial, every
+set of the smallest size that goes past the code and then of the next,
+whatever their reliability. Modules painted by hand are never doubted,
+unless they were painted as a guess; the trials of erasures are what
+reach a hand-painted block wrong in one codeword more than its error
+correction corrects, or two in a small block, and a block whose unknown
+bits solve bit by bit but for a stain over a codeword or two or three.
+
+Two more things happen between the blocks. Where a solver that tries
+many ways reaches two solutions the block as read lies as near to, the
+message tells them apart: the stream is parsed under each, and the one
+it parses best under is taken, where before the block was given up.
+And the blocks that verify say where the photo misread: a module an
+error was located in was read wrong, and the modules beside it, in the
+blocks that did not verify, are doubted first when those are solved
+again, since a stain or a tear takes neighbouring modules together.
+Blocks says when a block was solved either way.
 
 ### 8. Take the result out
 
