@@ -4,9 +4,9 @@ use eframe::egui::{self, Color32, RichText};
 use qr_forensics::decode::bch::InfoRead;
 use qr_forensics::decode::bitstream::{Certainty, EndOfData, LostReason, SegmentContent};
 use qr_forensics::decode::codewords::PinSource;
-use qr_forensics::decode::known::{Place, TextPinError, ascii_pins, text_pins};
+use qr_forensics::decode::known::{Place, TextPinError, text_pins};
 use qr_forensics::decode::padding::{Filler, padding_at};
-use qr_forensics::decode::pipeline::{BlockOutcome, BlockReport, CodewordReport, CwStatus, SolveMethod};
+use qr_forensics::decode::pipeline::{BlockOutcome, BlockReport, CodewordReport, CwStatus, SolveMethod, VERIFIED_RISK_BITS};
 use qr_forensics::decode::rs::RsFailure;
 use qr_forensics::decode::sequence::ParityCheck;
 use qr_forensics::decode::text::{Charset, TextReport, UNKNOWN_CHAR, control_picture};
@@ -94,6 +94,22 @@ fn result_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     } else {
         ui.colored_label(visuals.error_fg_color, RichText::new(format!("{solved} of {total} blocks solved")).strong());
         ui.label("Text from unsolved blocks is shown as read. See Blocks for what each one needs.");
+    }
+    if let Some(bits) = report.message_risk_bits().filter(|&bits| bits > 0) {
+        if report.message_risk_falls_short() {
+            ui.colored_label(
+                visuals.warn_fg_color,
+                format!(
+                    "Every block is confirmed, but their combined chance of being wrong is 1 in 2^{bits}, worse than \
+                     the 1 in 2^{VERIFIED_RISK_BITS} required of each block. Check the text against what you expect, \
+                     or pin what you know."
+                ),
+            );
+        } else if total == 1 {
+            ui.weak(format!("At most a 1 in 2^{bits} chance the message is wrong."));
+        } else {
+            ui.weak(format!("At most a 1 in 2^{bits} chance the message is wrong, summed over {total} blocks."));
+        }
     }
     if app.derived.analysis.inverted {
         ui.colored_label(
@@ -480,72 +496,6 @@ fn known_text_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action
             actions.push(Action::ClearTextPins);
         }
     });
-    ascii_row(ui, app, actions);
-}
-
-/// The stretch of the message to assert is plain ASCII, and the button
-/// that pins it: a stretch must be named, since a pin asserts, and an
-/// address that is seven-bit throughout may be followed by a name with
-/// an accent in it.
-fn ascii_row(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
-    let warn = ui.visuals().warn_fg_color;
-    let length = app.derived.report.text.sources.len();
-    let trustworthy = app.derived.report.is_trustworthy();
-    let bytes = app.derived.report.parse.segments.iter().any(|s| matches!(s.content, SegmentContent::Bytes(_)));
-    let (view, derived) = (&mut app.view, &app.derived);
-    let found = view.ascii_range(length).map(|chars| ascii_pins(&derived.layout, &derived.report, chars));
-    ui.horizontal_wrapped(|ui| {
-        ui.label("ASCII from character");
-        ui.add_enabled(length > 0, egui::DragValue::new(&mut view.ascii_from).range(0..=length).speed(0.2))
-            .on_hover_text("The first character of the stretch you know to be plain ASCII; the first character of the message is 1. Click a character in the result to see its number.");
-        ui.label("to");
-        ui.add_enabled(length > 0, egui::DragValue::new(&mut view.ascii_to).range(0..=length).speed(0.2))
-            .on_hover_text("The last character of the stretch, counted the same way");
-        let ready = matches!(found, Some(Ok(_)));
-        if ui
-            .add_enabled(!trustworthy && ready, egui::Button::new("Pin as ASCII"))
-            .on_hover_text(
-                "Assert that these characters are plain ASCII text, as an address, a Wi-Fi label or a card is: the high \
-                 bit of every byte of them is pinned at zero, one bit a byte that need not be read, which is what tips \
-                 a block short of solving bit by bit. Name only the stretch you are sure of: a pin asserts, and an \
-                 accented letter or a raw byte under it would be pinned wrong. Undoable.",
-            )
-            .on_disabled_hover_text(if trustworthy {
-                "The message is decoded and verified already"
-            } else if !bytes {
-                "The message as read has no byte segment"
-            } else if length == 0 {
-                "No text was read to name a stretch of"
-            } else {
-                "Give the first and last character of the stretch that is ASCII, within the message as read"
-            })
-            .clicked()
-        {
-            actions.push(Action::PinAscii);
-        }
-    });
-    match &found {
-        Some(Ok(found)) => {
-            ui.small(format!("Pins the high bit of {} bytes, in {} codewords.", found.pinned, found.pins.len()));
-            if found.contradicted > 0 {
-                ui.colored_label(
-                    warn,
-                    format!(
-                        "{} of those bits differ from bits error correction has confirmed: the stretch holds a byte above \
-                         127, so it is not all ASCII.",
-                        found.contradicted
-                    ),
-                );
-            }
-        }
-        Some(Err(error)) => {
-            ui.colored_label(warn, format!("Cannot be pinned: {error}."));
-        }
-        None if length > 0 && bytes && !trustworthy => {
-            ui.small("Give the first and last character of the stretch you know to be plain ASCII, and pin it.");
-        }
-        None => {}
-    }
 }
 
 /// The message in one of the result modes, as a plain string.
@@ -953,9 +903,16 @@ fn outcome_text(block: &BlockReport) -> (String, bool) {
             }
             if block.near_errors > 0 {
                 text.push_str(&format!(
-                    " — after doubting {} modules of the block beside errors other blocks located: damage is contiguous, \
-                     and a module next to one the photo misread is one to doubt first",
+                    " — after doubting {} modules next to errors found in other blocks, as strongly as those blocks \
+                     showed errors to cluster",
                     block.near_errors
+                ));
+            }
+            if block.message_evidence > 0 {
+                text.push_str(&format!(
+                    " — found using the message as a prior on {} of its bits, which guided the search but does not \
+                     count toward confirming it",
+                    block.message_evidence
                 ));
             }
             (text, true)
@@ -1072,6 +1029,29 @@ fn blocks_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         }
     });
     app.view.wheel.place(InnerList::Blocks, laid_out(&shown));
+    if let Some(clustering) = report.clustering {
+        let [one, more] = clustering.gross;
+        let odds = |share: f64| (1.0 / share).round() as u64;
+        ui.small(format!(
+            "Error clustering, from {} misread modules the confirmed blocks located: a module next to one is also misread \
+             about 1 in {} beyond what its reading suggests, next to two or more about 1 in {}. Unconfirmed blocks were \
+             retried with those neighbours doubted that much.",
+            clustering.located,
+            odds(one),
+            odds(more),
+        ))
+        .on_hover_text(format!(
+            "Measured on the confirmed blocks' own modules: next to one misread module, {} of {} were misread, against \
+             {:.1} expected from their readings; next to two or more, {} of {}, against {:.1}. With little evidence the \
+             estimate stays near 1 in 8.",
+            clustering.beside[0].misread,
+            clustering.beside[0].modules,
+            clustering.beside[0].expected,
+            clustering.beside[1].misread,
+            clustering.beside[1].modules,
+            clustering.beside[1].expected,
+        ));
+    }
     if report.blocks.iter().any(|b| !b.is_solved()) {
         ui.small("A block is solved once its unknown codewords, plus twice its wrong ones, fit inside its EC count.");
     }

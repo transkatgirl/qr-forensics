@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use eframe::egui;
 use qr_forensics::decode::codewords::{Pin, PinSource, Pins};
-use qr_forensics::decode::known::{Place, ascii_pins, lay_over, text_pins, try_beginnings};
+use qr_forensics::decode::known::{Place, lay_over, text_pins, try_beginnings};
 use qr_forensics::decode::padding::{Filler, clear_padding_pins, detect_padding, pin_padding_at, recover_padding};
 use qr_forensics::decode::pipeline::{Attempt, DecodeOptions, analyze, brute_force, brute_force_mirrored, decode, orientation_of};
 use qr_forensics::decode::repair::{quiet_zone, render_rgba, render_svg, repaired_grid};
@@ -166,9 +166,6 @@ pub(crate) enum Action {
     ReadFound,
     /// Pin the text the user knows, at the place the inspector gives.
     PinText,
-    /// Pin the high bit of every byte of the message at zero: the
-    /// message is ASCII.
-    PinAscii,
     /// Try the ways messages commonly begin and pin the one that error
     /// correction bears out.
     TryBeginnings,
@@ -2460,7 +2457,6 @@ impl App {
             Action::CropToOutline => self.crop_to_outline(ctx),
             Action::ShowWholePhoto => self.show_whole_photo(ctx),
             Action::PinText => self.pin_text(),
-            Action::PinAscii => self.pin_ascii(),
             Action::TryBeginnings => self.pin_a_beginning(),
             Action::ClearTextPins => {
                 self.begin_edit();
@@ -2749,45 +2745,6 @@ impl App {
             text.push_str(&format!(
                 " {} of the bits pinned differ from bits error correction had confirmed: check the text and where it \
                  starts, or undo.",
-                found.contradicted
-            ));
-        }
-        self.notify(text);
-    }
-
-    /// Pin the high bit of every byte of the characters the inspector
-    /// names at zero, asserting that stretch of the message is ASCII,
-    /// and say what that did.
-    fn pin_ascii(&mut self) {
-        let Some(chars) = self.view.ascii_range(self.derived.report.text.sources.len()) else {
-            self.fail("Give the first and last character of the stretch of the message you know to be plain ASCII before pinning it.");
-            return;
-        };
-        let found = match ascii_pins(&self.derived.layout, &self.derived.report, chars) {
-            Ok(found) => found,
-            Err(error) => {
-                self.fail(format!("Nothing was pinned as ASCII: {error}."));
-                return;
-            }
-        };
-        let before = self.derived.report.blocks_verified();
-        self.begin_edit();
-        if self.doc.pins_ec != Some(self.derived.ec) {
-            self.doc.pins.clear();
-            self.doc.pins_ec = Some(self.derived.ec);
-        }
-        lay_over(&mut self.doc.pins, &found.pins);
-        self.refresh();
-        let (after, total) = (self.derived.report.blocks_verified(), self.derived.report.blocks.len());
-        let progress = if after > before {
-            format!("{after} of {total} blocks now verify, up from {before}")
-        } else {
-            format!("{after} of {total} blocks verify, as before")
-        };
-        let mut text = format!("Pinned the high bit of {} bytes at zero, in {} codewords: {progress}.", found.pinned, found.pins.len());
-        if found.contradicted > 0 {
-            text.push_str(&format!(
-                " {} of them differ from bits error correction had confirmed: the message holds bytes above 127, so undo.",
                 found.contradicted
             ));
         }

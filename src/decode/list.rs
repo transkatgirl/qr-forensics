@@ -90,7 +90,7 @@ const LIST_SIZE_MAX: usize = 32;
 /// the scale of [`crate::imaging::sample::reliability_bits`] read back, a
 /// coin's toss at nought and a bit of likelihood more for every eight,
 /// and never for a module painted by hand ([`CERTAIN`]).
-fn misread(reliability: u8) -> f64 {
+pub(super) fn misread(reliability: u8) -> f64 {
     if reliability == CERTAIN { 0.0 } else { (-(f64::from(reliability) / 8.0 + 1.0)).exp2() }
 }
 

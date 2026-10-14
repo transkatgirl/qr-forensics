@@ -48,11 +48,15 @@ use std::f32::consts::LN_2;
 
 use super::gf256::{exp, mul};
 use super::rs::{
-    CHASE_MAX_BITS, CwRead, DOUBT_CONFIRMING_BITS, RsSolution, Trials, list_solution_bits, nearest, preferring_the_standard,
-    rs_decode_chasing_bits, rs_decode_core, rs_syndromes, settle, soft_count_bits, soft_distance, solve_bit_erasures_doubting, tries_charge,
+    CHASE_MAX_BITS, CwRead, RsSolution, Trials, accounted, nearest, preferring_the_standard, rs_decode_chasing_bits, rs_decode_core,
+    rs_syndromes, soft_distance, solve_bit_erasures_doubting,
 };
 use crate::symbol::grid::CERTAIN;
 use crate::work;
+
+/// A solution found: the rounds it took, the bits of each codeword the
+/// propagation overturned, and the solution itself.
+pub type Propagated = (usize, Vec<u8>, RsSolution);
 
 /// Rounds of adapting and propagating a block is given at the most.
 /// Each is a reduction of the parity-check matrix and a pass over it,
@@ -75,8 +79,8 @@ const LLR_CLAMP: f32 = 32.0;
 /// The log of the odds that a module read at `reliability` was read
 /// right: the scale of [`crate::imaging::sample::reliability_bits`]
 /// read back, a bit of likelihood more for every eight.
-fn log_odds(reliability: u8) -> f32 {
-    if reliability >= CERTAIN {
+pub(super) fn log_odds(reliability: u8) -> f32 {
+    if reliability == CERTAIN {
         return LLR_FIXED;
     }
     let bits = f32::from(reliability) / 8.0 + 1.0;
@@ -86,7 +90,7 @@ fn log_odds(reliability: u8) -> f32 {
 
 /// The reliability, on the sampler's scale, of a bit believed at `llr`
 /// log-odds either way.
-fn reliability_at(llr: f32) -> u8 {
+pub(super) fn reliability_at(llr: f32) -> u8 {
     let llr = llr.abs();
     let bits = if llr > 40.0 { llr / LN_2 } else { (1.0 + llr.exp()).log2() };
     ((bits - 1.0) * 8.0).round().clamp(0.0, f32::from(CERTAIN - 1)) as u8
@@ -213,43 +217,28 @@ fn hard_decision(block: &[CwRead], llr: &[f32]) -> Vec<CwRead> {
         .collect()
 }
 
-/// What one codeword found confirms, against the block as read: the
-/// hard count of [`list_solution_bits`] for the codewords it changes of
-/// those read in full, or the soft count of [`soft_count_bits`] for the
-/// bits it overturns weighed by their reliability, whichever is the
-/// more, less one for the choice between them, each charged for
-/// `tries`, with the known bits of the erased codewords weighed as
-/// [`settle`] weighs them. The propagation reaches a block wrong in
-/// more codewords than the hard count can confirm, each in a bit or
-/// two that read faintly; the soft count is what confirms those. The
-/// bits the propagation overturned that the solution keeps are its
-/// `flipped`. `None` for a solution refused, or one with less than
-/// [`DOUBT_CONFIRMING_BITS`] behind it.
+/// What one codeword found confirms, against the block as read
+/// ([`accounted`]): the hard count for the codewords it changes of
+/// those read in full, or the soft count for the bits it overturns
+/// weighed by their reliability, whichever is the more. The propagation
+/// reaches a block wrong in more codewords than the hard count can
+/// confirm, each in a bit or two that read faintly; the soft count is
+/// what confirms those. The bits the propagation overturned that the
+/// solution keeps are its `flipped`. `None` for a solution refused, or
+/// one with less than [`DOUBT_CONFIRMING_BITS`] behind it.
 #[allow(clippy::too_many_arguments)]
 fn account(
     block: &[CwRead],
     bit_reliability: &[[u8; 8]],
-    erased: &[usize],
-    read: usize,
-    redundancy: usize,
+    ec_len: usize,
     corrected: Vec<u8>,
     reserved: usize,
     tries: usize,
     refined: &[CwRead],
     rounds: usize,
-) -> Option<(u32, (usize, Vec<u8>, RsSolution))> {
+) -> Option<(u32, Propagated)> {
     let n = block.len();
-    let errors = (0..n).filter(|&i| !block[i].is_erasure() && corrected[i] != block[i].value).count();
-    let unknown: usize = block.iter().map(|c| c.known.count_zeros() as usize).sum();
-    let hard = list_solution_bits(read, redundancy, errors);
-    let soft = soft_count_bits(block, bit_reliability, (8 * (redundancy + erased.len())).saturating_sub(unknown), soft_distance(block, bit_reliability, &corrected));
-    let bits = hard.max(soft).saturating_sub(1).saturating_sub(tries_charge(tries));
-    let slack = redundancy.saturating_sub(2 * errors).min(bits as usize / 8);
-    let located = bits - 8 * slack as u32;
-    let solution = settle(block, &[], erased, corrected, errors, slack, located, reserved).ok()?;
-    if solution.confidence_bits() < DOUBT_CONFIRMING_BITS {
-        return None;
-    }
+    let solution = accounted(block, bit_reliability, ec_len, reserved, corrected, tries)?;
     let flipped: Vec<u8> =
         (0..n).map(|i| (solution.corrected[i] ^ block[i].value) & (refined[i].value ^ block[i].value) & block[i].known).collect();
     Some((soft_distance(block, bit_reliability, &solution.corrected), (rounds, flipped, solution)))
@@ -281,7 +270,7 @@ pub fn rs_decode_propagating(
     rounds: usize,
     trials: Trials,
     chase_bits: usize,
-) -> Vec<(usize, Vec<u8>, RsSolution)> {
+) -> Vec<Propagated> {
     propagating_damped(block, bit_reliability, ec_len, reserved, rounds, trials, chase_bits, ABP_DAMPING)
 }
 
@@ -297,7 +286,7 @@ fn propagating_damped(
     trials: Trials,
     chase_bits: usize,
     damping: f32,
-) -> Vec<(usize, Vec<u8>, RsSolution)> {
+) -> Vec<Propagated> {
     assert_eq!(block.len(), bit_reliability.len());
     let n = block.len();
     if rounds == 0 || ec_len == 0 || ec_len >= n || reserved >= ec_len {
@@ -308,13 +297,12 @@ fn propagating_damped(
     if f >= ec_len {
         return Vec::new();
     }
-    let (read, redundancy) = (n - f, ec_len - f);
-    let mut found: Vec<(u32, (usize, Vec<u8>, RsSolution))> = Vec::new();
+    let mut found: Vec<(u32, Propagated)> = Vec::new();
     let Some(beliefs) = believe(block, bit_reliability, ec_len, rounds, damping, |round, refined| {
         let received: Vec<u8> = refined.iter().map(|c| c.value & c.known).collect();
         let syndromes = rs_syndromes(&received, ec_len);
         if let Ok(solution) = rs_decode_core(refined, &[], ec_len, reserved, &syndromes)
-            && let Some(kept) = account(block, bit_reliability, &erased, read, redundancy, solution.corrected, reserved, round, refined, round)
+            && let Some(kept) = account(block, bit_reliability, ec_len, solution.corrected, reserved, round, refined, round)
         {
             found.push(kept);
         }
@@ -328,7 +316,7 @@ fn propagating_damped(
         let refined_bits = beliefs.reliabilities();
         for doubt in solve_bit_erasures_doubting(&refined, &refined_bits, ec_len, trials) {
             if let Some(kept) =
-                account(block, bit_reliability, &erased, read, redundancy, doubt.solution.corrected, reserved, done + doubt.tries, &refined, done)
+                account(block, bit_reliability, ec_len, doubt.solution.corrected, reserved, done + doubt.tries, &refined, done)
             {
                 found.push(kept);
             }
@@ -338,7 +326,7 @@ fn propagating_damped(
             let patterns = (1usize << bits) - 1;
             for (_, solution) in rs_decode_chasing_bits(&refined, &refined_bits, ec_len, reserved, bits) {
                 if let Some(kept) =
-                    account(block, bit_reliability, &erased, read, redundancy, solution.corrected, reserved, done + patterns, &refined, done)
+                    account(block, bit_reliability, ec_len, solution.corrected, reserved, done + patterns, &refined, done)
                 {
                     found.push(kept);
                 }
@@ -392,14 +380,13 @@ fn believe(
     let mut fixed = vec![false; cols];
     let mut movable = 0;
     for (i, cw) in block.iter().enumerate() {
-        for b in 0..8 {
+        for (b, &reliability) in bit_reliability[i].iter().enumerate() {
             if cw.known >> b & 1 == 0 {
                 continue;
             }
             let col = 8 * i + b;
             let set = cw.value >> b & 1 != 0;
-            let reliability = bit_reliability[i][b];
-            let fix = cw.pinned >> b & 1 != 0 || reliability >= CERTAIN;
+            let fix = cw.pinned >> b & 1 != 0 || reliability == CERTAIN;
             let odds = if fix { LLR_FIXED } else { log_odds(reliability) };
             llr[col] = if set { -odds } else { odds };
             fixed[col] = fix;
@@ -480,7 +467,7 @@ mod tests {
         for &value in block {
             let mut cw = CwRead::known(0);
             let mut bits = [0u8; 8];
-            for b in 0..8 {
+            for (b, bit) in bits.iter_mut().enumerate() {
                 let mut sent = if value >> b & 1 != 0 { -1.0 } else { 1.0 };
                 if rng.unit() < gross && rng.unit() < 0.5 {
                     sent = -sent;
@@ -492,7 +479,7 @@ mod tests {
                 let odds = (2.0 * level.abs() / (sigma * sigma)).min(87.0);
                 let wrong = gross + (1.0 - gross) / (1.0 + odds.exp());
                 let likelihood = -wrong.max(f32::MIN_POSITIVE).log2();
-                bits[b] = ((likelihood - 1.0) * 8.0).round().clamp(0.0, f32::from(CERTAIN - 1)) as u8;
+                *bit = ((likelihood - 1.0) * 8.0).round().clamp(0.0, f32::from(CERTAIN - 1)) as u8;
             }
             read.push(cw);
             reliability.push(bits);

@@ -32,15 +32,19 @@
 //! light-on-dark symbol's grid is dark where the symbol prints dark.
 //!
 //! `--details` adds what the decode settled on the way to the message:
-//! the error correction level and mask, the character set the bytes were
-//! read in, the symbology identifier, the symbol's place in a
-//! structured append sequence when it has one, and how many codewords
-//! of padding were pinned when the read took that, and as what when the
-//! padding is not the standard's, and what the photo was read through
-//! when that was not the photo as it is, enlarged or sharpened, and
-//! `threshold surface` when its modules were read against one, as
-//! OpenCV's detector hands back each symbol's ECI and BoofCV its level,
-//! mask and encoding.
+//! the error correction level and mask, `risk 1 in 2^n` once every block
+//! is solved (an upper bound on the chance the message is wrong: the sum
+//! of the blocks' own chances), the character set the bytes were read
+//! in, the symbology identifier, the symbol's place in a structured
+//! append sequence when it has one, and how many codewords of padding
+//! were pinned when the read took that, and as what when the padding is
+//! not the standard's, and what the photo was read through when that was
+//! not the photo as it is, enlarged or sharpened, and `threshold surface`
+//! when its modules were read against one, as OpenCV's detector hands
+//! back each symbol's ECI and BoofCV its level, mask and encoding.
+//! If every block is confirmed but their combined risk is worse than the
+//! 1 in 2^8 each block must meet, the read still stands, and a warning
+//! is printed to standard error; the read's own line is unchanged.
 //! `--charset` names the character set to read byte data in when the
 //! symbol declares none, where it is otherwise guessed: `utf-8`,
 //! `iso-8859-1`, `windows-1252`, `shift_jis`, `gb18030`, `big5`, `euc-kr`,
@@ -152,7 +156,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use qr_forensics::decode::padding::{Filler, pinned_filler};
-use qr_forensics::decode::pipeline::DecodeOptions;
+use qr_forensics::decode::pipeline::{DecodeOptions, VERIFIED_RISK_BITS};
 use qr_forensics::decode::sequence::{ParityCheck, Part, Sequence};
 use qr_forensics::decode::text::Charset;
 use qr_forensics::imaging::Luma;
@@ -422,6 +426,9 @@ fn details(result: &ReadResult) -> String {
     if version.mask_count() > 1 {
         parts.push(format!("mask {}", report.mask));
     }
+    if let Some(bits) = report.message_risk_bits() {
+        parts.push(format!("risk 1 in 2^{bits}"));
+    }
     parts.extend(report.text.encoding.clone());
     parts.extend(report.text.symbology.clone());
     if let Some(part) = Part::from_report(report, String::new()) {
@@ -446,6 +453,25 @@ fn details(result: &ReadResult) -> String {
         parts.push("unsure modules kept".to_owned());
     }
     parts.join(", ")
+}
+
+/// The warning for a read whose every block is confirmed by itself and
+/// whose message, the blocks' chances of being wrong added up, is not
+/// ([`DecodeReport::message_risk_falls_short`]): printed to standard
+/// error, so that the line the read prints is as it was. None for any
+/// other read.
+fn risk_warning(path: &Path, result: &ReadResult) -> Option<String> {
+    let report = &result.report;
+    if !result.is_trustworthy() || !report.message_risk_falls_short() {
+        return None;
+    }
+    let bits = report.message_risk_bits()?;
+    Some(format!(
+        "{}: warning: all {} blocks are confirmed, but their combined chance of being wrong is 1 in 2^{bits}, \
+         worse than the 1 in 2^{VERIFIED_RISK_BITS} required of each block",
+        path.display(),
+        report.blocks.len()
+    ))
 }
 
 /// One symbol's line: the image, what was found, how the read stands,
@@ -624,6 +650,9 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
         for result in results.iter().filter(|r| r.is_trustworthy() || !any_read || options.partial) {
             if writeln!(out, "{}", describe(path, result, &options, times)).is_err() {
                 return status;
+            }
+            if let Some(warning) = risk_warning(path, result) {
+                eprintln!("{warning}");
             }
             if options.grid {
                 for line in grid_lines(result) {

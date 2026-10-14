@@ -7,8 +7,8 @@ mod common;
 use common::*;
 use qr_forensics::decode::bitstream::Certainty;
 use qr_forensics::decode::codewords::{PinSource, Pins};
-use qr_forensics::decode::known::{BEGINNINGS, Place, TextPinError, ascii_pins, lay_over, text_pins, try_beginnings};
-use qr_forensics::decode::pipeline::{DecodeOptions, DecodeReport, decode};
+use qr_forensics::decode::known::{BEGINNINGS, Place, TextPinError, lay_over, text_pins, try_beginnings};
+use qr_forensics::decode::pipeline::{BlockOutcome, DecodeOptions, DecodeReport, decode};
 use qr_forensics::decode::text::Charset;
 use qr_forensics::symbol::grid::ModuleGrid;
 use qr_forensics::symbol::layout::SymbolLayout;
@@ -71,7 +71,7 @@ fn a_known_beginning_solves_a_block_past_error_correction() {
 }
 
 #[test]
-fn asserting_ascii_pins_the_high_bit_of_every_byte() {
+fn the_unread_high_bit_of_every_byte_leans_toward_ascii_without_a_pin() {
     use qr_forensics::symbol::grid::Module;
     let (version, ec, mask) = (SymbolVersion::Qr(3), EcLevel::L, 2);
     let layout = layout(version, ec);
@@ -88,55 +88,92 @@ fn asserting_ascii_pins_the_high_bit_of_every_byte() {
     // message besides, scattered: more unknown bits than the block's
     // hundred and twenty equations, in more codewords than its fifteen
     // of error correction can erase.
-    let mut grid = clean.clone();
-    for k in 0..text.len() {
-        let (x, y) = module_of(12 + 8 * k);
-        grid.set(x, y, Module::Unknown);
-    }
-    let mut rng = Rng(0xA5C11);
-    let mut others = 0;
-    while others < 90 {
-        let bit = 12 + rng.below(8 * text.len());
-        let (x, y) = module_of(bit);
-        if bit % 8 == 4 || grid.get(x, y) == Module::Unknown {
-            continue;
+    let unread = |text: &str, clean: &ModuleGrid| {
+        let mut grid = clean.clone();
+        for k in 0..text.len() {
+            let (x, y) = module_of(12 + 8 * k);
+            grid.set(x, y, Module::Unknown);
         }
-        grid.set(x, y, Module::Unknown);
-        others += 1;
-    }
-    let before = decode_plain(&grid, &layout, mask);
+        let mut rng = Rng(0xA5C11);
+        let mut others = 0;
+        while others < 90 {
+            let bit = 12 + rng.below(8 * text.len());
+            let (x, y) = module_of(bit);
+            if bit % 8 == 4 || grid.get(x, y) == Module::Unknown {
+                continue;
+            }
+            grid.set(x, y, Module::Unknown);
+            others += 1;
+        }
+        grid
+    };
+    let grid = unread(text, &clean);
+    let without = DecodeOptions { message_evidence: false, ..DecodeOptions::default() };
+    let before = decode(&grid, &layout, mask, &Pins::new(), &without);
     assert_eq!(before.blocks_solved(), 0);
-    let found = ascii_pins(&layout, &before, 0..text.len()).unwrap();
-    assert_eq!((found.pinned, found.left_out, found.contradicted), (text.len(), 0, 0));
-    assert!(found.pins.values().all(|pin| pin.source == PinSource::Text && pin.value & pin.mask == 0));
-    assert_eq!(found.pins.values().map(|pin| pin.mask.count_ones() as usize).sum::<usize>(), text.len());
-    assert_eq!(found.pins[&layout.data_stream[1]].mask, 0x08);
-    // Thirty-nine bits fewer to solve for leaves thirty equations to
-    // spare, and the block solves bit by bit.
-    let after = decode_pinned(&grid, &layout, mask, &found.pins);
-    assert!(after.is_trustworthy());
+    // Taking each unread high bit at the lean of a byte, nought but one
+    // time in sixteen, leaves thirty equations to spare, and the block
+    // solves bit by bit, with nothing pinned.
+    let after = decode_plain(&grid, &layout, mask);
+    assert!(after.is_trustworthy(), "{:?}", after.blocks[0].outcome);
     assert_eq!(after.text.plain(), text);
-    // A stretch of the message pins the bytes of those characters alone,
-    // and the stretch must lie within the message and hold something.
-    let part = ascii_pins(&layout, &before, 8..19).unwrap();
-    assert_eq!((part.pinned, part.contradicted), (11, 0));
-    assert_eq!(part.pins[&layout.data_stream[9]].mask, 0x08);
-    assert_eq!(ascii_pins(&layout, &before, 8..8), Err(TextPinError::Empty));
-    assert_eq!(ascii_pins(&layout, &before, 30..text.len() + 1), Err(TextPinError::NoSuchChar { len: text.len() }));
+    assert!(after.blocks[0].message_evidence >= text.len(), "{}", after.blocks[0].message_evidence);
+    // Confirmed by the thirty equations left over once the high bits are
+    // taken at their lean, less what the search and the leans cost, and
+    // no more: the known bits the solution was solved from are not
+    // counted again as checks of it.
+    assert!(matches!(after.blocks[0].outcome, BlockOutcome::Solved { risk_bits: 8..=20, .. }), "{:?}", after.blocks[0].outcome);
+    assert!(after.codewords.iter().all(|cw| cw.pin.is_none()));
 
-    // A message with bytes above 127, read and confirmed, contradicts
-    // the assertion in each of them: the two of an accented letter, both
-    // of them pinned under the one character.
-    let accented = encode(version, ec, Some(mask), &[Segment::bytes("café at https://example.com/")]).unwrap();
-    let report = decode_plain(&accented, &layout, mask);
-    assert!(report.is_trustworthy());
-    let found = ascii_pins(&layout, &report, 0..report.text.sources.len()).unwrap();
-    assert_eq!((found.pinned, found.contradicted), (29, 2));
-    assert_eq!(ascii_pins(&layout, &report, 3..4).map(|f| (f.pinned, f.contradicted)), Ok((2, 2)));
-    assert_eq!(ascii_pins(&layout, &report, 8..28).map(|f| (f.pinned, f.contradicted)), Ok((20, 0)));
-    // No byte segment, nothing to pin.
-    let digits = encode(version, ec, Some(mask), &[Segment::numeric("0123456789").unwrap()]).unwrap();
-    assert_eq!(ascii_pins(&layout, &decode_plain(&digits, &layout, mask), 0..10), Err(TextPinError::NotBytes));
+    // A message with bytes above 127 leans the same way and is wrong in
+    // the two bytes of its accented letter: it reads as it is, or is
+    // left unconfirmed, and never stands confirmed as something else.
+    let accented = "café at https://example.com/";
+    let clean = encode(version, ec, Some(mask), &[Segment::bytes(accented)]).unwrap();
+    let report = decode_plain(&unread(accented, &clean), &layout, mask);
+    assert!(!report.is_trustworthy() || report.text.plain() == accented, "{:?}", report.text.plain());
+}
+
+/// The lean the evidence of `report` puts on the high bit of byte `k` of
+/// its first segment, and the block that bit lies in.
+fn high_bit_lean(layout: &SymbolLayout, report: &DecodeReport, k: usize) -> (f32, usize) {
+    use qr_forensics::decode::evidence::MessageEvidence;
+    let evidence = MessageEvidence::of(layout, &report.stream, &report.parse).expect("the message leans on its bits");
+    let bit = report.parse.segments[0].payload.start + 8 * k;
+    let (cw, place) = layout.stream_bit_location(bit).unwrap();
+    (evidence.lean(cw, 7 - place), layout.codewords[cw].block as usize)
+}
+
+#[test]
+fn a_block_leans_toward_what_the_other_blocks_hold() {
+    use qr_forensics::symbol::grid::Module;
+    // 5-Q: four blocks of fifteen and sixteen data codewords. The last
+    // block unread altogether, and the message's bytes in the other
+    // three say what its bytes likely hold.
+    let (version, ec, mask) = (SymbolVersion::Qr(5), EcLevel::Q, 1);
+    let layout = layout(version, ec);
+    let last = layout.blocks.len() - 1;
+    let lean_in_last = |text: &str| {
+        let mut grid = encode(version, ec, Some(mask), &[Segment::bytes(text)]).unwrap();
+        for &cw in &layout.blocks[last].codewords {
+            for pos in layout.codeword_modules(cw) {
+                grid.set(pos.x as usize, pos.y as usize, Module::Unknown);
+            }
+        }
+        let report = decode(&grid, &layout, mask, &Pins::new(), &DecodeOptions { message_evidence: false, ..DecodeOptions::default() });
+        assert!(!report.blocks[last].is_solved() && report.blocks[..last].iter().all(|b| b.is_verified()));
+        // A byte whose high bit lies in the last block.
+        let k = (0..text.len()).find(|&k| high_bit_lean(&layout, &report, k).1 == last).expect("a byte in the last block");
+        high_bit_lean(&layout, &report, k).0
+    };
+    // By nature alone a byte's high bit is set one time in sixteen.
+    let nature = 15f32.ln();
+    // Plain ASCII in the other blocks: leans toward nought harder.
+    let ascii = lean_in_last("https://example.com/path/to/a/page?with=query&and=more&q=1");
+    assert!(ascii > nature, "{ascii}");
+    // UTF-8 Cyrillic, every byte of a letter above 127: toward one.
+    let cyrillic = lean_in_last("Съешь же ещё этих мягких булок");
+    assert!(cyrillic < 0.0, "{cyrillic}");
 }
 
 #[test]
@@ -147,11 +184,14 @@ fn text_is_pinned_where_it_stands_in_the_message() {
     let clean = encode(version, ec, Some(mask), &[Segment::bytes(text)]).unwrap();
     // Eight wrong, one more than the block corrects, all under the host
     // name: known from its ninth character on, it is restored. (The
-    // trials of erasures would reach the one more by themselves; here
-    // the pins are to do it.)
+    // trials of erasures would reach the one more by themselves, and
+    // the curve of list decoding reaches it spending the codeword the
+    // standard reserves, which is offered unconfirmed; here the pins
+    // are to confirm it.)
     let grid = damaged(&clean, &layout, 12..=19);
     let before = decode(&grid, &layout, mask, &Pins::new(), &unaided());
-    assert_eq!(before.blocks_solved(), 0);
+    assert_eq!(before.blocks_verified(), 0);
+    assert!(!before.is_trustworthy());
     let found = text_pins(&layout, &before, Place::Char(8), "example.com", Charset::Auto).unwrap();
     assert_eq!(found.pinned, 11);
     let after = decode_pinned(&grid, &layout, mask, &found.pins);

@@ -222,7 +222,12 @@ Overlays colour the grid by what the decoder knows:
   unconfirmed characters in the warning colour, unreadable ones marked.
   Show it as text, with control characters escaped, as hex, with ECI
   designators, or as GS1 element strings. Click a character to outline the
-  modules it is made of.
+  modules it is made of. Once every block is solved, it also shows the
+  chance the message is wrong, as at most 1 in 2^n. That is the sum of
+  the blocks' own chances, since one wrong block makes the message
+  wrong. If many blocks each only just pass, the sum can be worse than
+  the 1 in 256 each block must meet, and Result warns about that even
+  though every block is confirmed.
 - **Format and version.** Each copy of the format bits as read, the format
   words they lie nearest, and the EC level and mask in effect. Words are
   ranked likeliest first, by their differing bits over both copies, each
@@ -260,13 +265,9 @@ short of solving.
 - **Codewords.** Pin a selected codeword to a hex value, or pin its bits one
   at a time.
 
-- **Pin as ASCII** asserts that a stretch of the message, from one
-  character to another as read, is plain seven-bit text, as an address
-  or a Wi-Fi label is, and pins the high bit of every byte of it at
-  zero: one bit a byte that need not be read, which is what tips a block
-  short of solving bit by bit. The stretch must be named, since a pin
-  asserts: an address that is ASCII throughout may be followed by a name
-  with an accent in it.
+You don't need to pin what the characters are likely to be, such as an
+address being plain ASCII. The decoder uses that as a soft prior itself
+(see **Use the message as a prior**, below).
 
 The **Decoding** section on the left sets what is tried on a block that
 fails:
@@ -321,15 +322,40 @@ changes. Pins are kept only when they solve or confirm another block.
 They show under Pins as the decoder's own; **Pin the padding** adds them
 to yours.
 
-Two more things happen between the blocks. Where a solver that tries
-many ways reaches two solutions the block as read lies as near to, the
-message tells them apart: the stream is parsed under each, and the one
-it parses best under is taken, where before the block was given up.
-And the blocks that verify say where the photo misread: a module an
-error was located in was read wrong, and the modules beside it, in the
-blocks that did not verify, are doubted first when those are solved
-again, since a stain or a tear takes neighbouring modules together.
-Blocks says when a block was solved either way.
+**Use the message as a prior**, also under Decoding, retries a block
+that still fails, using a prior on its bits taken from the rest of the
+message. Each character group (a byte, a group of digits or
+alphanumerics, or a Kanji character) biases each of its bits toward
+what the message's other readable groups of the same kind hold at that
+position. Bytes start out biased toward plain ASCII (high bit set 1
+time in 16) until the message shows otherwise, so a message in UTF-8
+Cyrillic soon flips that bias. Digit groups are biased toward the
+values they can hold, so a lone digit never exceeds nine. A module read
+against the prior is doubted sooner, and an unreadable one is solved
+for at the prior, as a pin would do, but without asserting anything.
+The prior only guides the search: a solution is still confirmed
+against the modules as read, so a good prior finds the answer faster
+without making it more certain.
+
+Three more fallbacks use the rest of the symbol:
+
+- **Tie-breaking.** When a solver that tries many candidates finds two
+  solutions equally close to the block as read, the stream is parsed
+  under each and the one that parses best is kept, rather than giving
+  up on the block.
+- **Error clustering.** A confirmed block shows exactly which of its
+  modules were misread. Stains and tears hit neighbouring modules
+  together, so when unconfirmed blocks are retried, modules next to a
+  known misread are doubted first. How strongly is estimated from the
+  confirmed blocks: among their own modules next to a misread one, how
+  many more were misread than their readings predict. Scattered specks
+  give a low rate, leaving neighbours nearly as read; a stain gives a
+  high one, and its edges are doubted before anything else. With little
+  evidence the rate stays near 1 in 8. Blocks shows the estimate.
+- **Message prior.** As more of the stream parses, the message prior
+  above is rebuilt from it for the next retry.
+
+Blocks says when a block was solved in any of these ways.
 
 ### 8. Take the result out
 

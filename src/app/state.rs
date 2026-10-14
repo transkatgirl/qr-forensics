@@ -954,24 +954,9 @@ pub struct ViewState {
     pub known_from_start: bool,
     pub known_at: usize,
     pub known_mode: Mode,
-    /// The stretch of the message as read that Pin as ASCII asserts is
-    /// seven-bit: its first and last characters, counted from one, and
-    /// nought until they are given. A pin asserts, so the stretch is
-    /// named rather than taken to be the whole message.
-    pub ascii_from: usize,
-    pub ascii_to: usize,
     /// A press of the paste shortcut has already been answered: the
     /// release that follows it is not a second request.
     pub pasted_on_press: bool,
-}
-
-impl ViewState {
-    /// The characters Pin as ASCII would assert, counted from nought, in
-    /// a message of `length` characters: `None` until a stretch within
-    /// the message is given.
-    pub fn ascii_range(&self, length: usize) -> Option<std::ops::Range<usize>> {
-        (self.ascii_from >= 1 && self.ascii_from <= self.ascii_to && self.ascii_to <= length).then(|| self.ascii_from - 1..self.ascii_to)
-    }
 }
 
 impl ViewState {
@@ -1041,8 +1026,6 @@ impl Default for ViewState {
             known_from_start: false,
             known_at: 0,
             known_mode: Mode::Byte,
-            ascii_from: 0,
-            ascii_to: 0,
             pasted_on_press: false,
         }
     }

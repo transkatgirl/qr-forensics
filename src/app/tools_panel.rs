@@ -1151,6 +1151,14 @@ fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
          solve or verify another block, or the segment headers confirm them. They show under Pins and in the Pins \
          overlay; Pin the padding, under Padding recovery, adds them to the document.",
     );
+    ui.checkbox(&mut opts.message_evidence, "Use the message as a prior").on_hover_text(
+        "When a block fails, retry it with a prior on its bits taken from the rest of the message. Each byte, group \
+         of digits or alphanumerics, or Kanji character biases its bits toward what the message's other readable \
+         groups of the same kind hold there. Bytes start out biased toward plain ASCII, and a digit never exceeds \
+         nine. A module read against the prior is doubted sooner, and an unreadable one is solved for at the prior. \
+         The prior only guides the search: a solution is still confirmed against the modules as read. Blocks says \
+         when a block was solved this way.",
+    );
     ui.checkbox(&mut opts.reliability, "Doubt the least reliable modules").on_hover_text(
         "When a block fails, treat its codewords with the faintest sampled modules as unknown, a few at a \
          time, until it solves with something to spare. Modules painted by hand are never doubted unless they \

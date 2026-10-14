@@ -21,6 +21,16 @@ fn sample(version: SymbolVersion, ec: EcLevel, mask: u8, rng: &mut Rng) -> (Symb
     (layout, grid, text)
 }
 
+/// Decoding without what the message makes likely of its bits: error
+/// correction and the doubting of what was read, on their own, for the
+/// tests that look at how far one way of solving reaches. The message's
+/// evidence takes the high bit of every unread byte of the lowercase
+/// text these symbols hold ([`sample`]) at nought, an equation a byte,
+/// and reaches past them.
+fn unguided() -> DecodeOptions {
+    DecodeOptions { message_evidence: false, ..DecodeOptions::default() }
+}
+
 const SAMPLES: [(SymbolVersion, EcLevel); 10] = [
     (SymbolVersion::Qr(1), EcLevel::H),
     (SymbolVersion::Qr(4), EcLevel::M),
@@ -63,7 +73,7 @@ fn recovers_exactly_within_capacity() {
             }
 
             let what = format!("{version}-{ec:?} round {round}");
-            let report = decode_plain(&grid, &layout, mask);
+            let report = decode(&grid, &layout, mask, &Pins::new(), &unguided());
             let mut confirmed = true;
             for (b, (erasures, errors, picked)) in plan.iter().enumerate() {
                 let block = &layout.blocks[b];
@@ -284,7 +294,7 @@ fn a_solution_with_little_to_spare_is_improved_by_flipping_the_faint_bit() {
     };
     let grid = torn(block.ec_len - 3);
 
-    let strict = DecodeOptions { reliability: false, ..Default::default() };
+    let strict = DecodeOptions { reliability: false, message_evidence: false, ..Default::default() };
     let exact = decode(&grid, &layout, 5, &Pins::new(), &strict);
     match exact.blocks[0].outcome {
         BlockOutcome::Solved { method: SolveMethod::ReedSolomon, errors: 1, erasures: 15, slack: 1, .. } => {}
@@ -293,7 +303,7 @@ fn a_solution_with_little_to_spare_is_improved_by_flipping_the_faint_bit() {
     assert!(!exact.blocks[0].is_verified());
     assert_eq!(exact.text.plain(), text);
 
-    let report = decode_plain(&grid, &layout, 5);
+    let report = decode(&grid, &layout, 5, &Pins::new(), &unguided());
     match report.blocks[0].outcome {
         BlockOutcome::Solved { method: SolveMethod::Chase { flipped_bits: 1 }, errors: 1, erasures: 15, slack: 3, .. } => {}
         other => panic!("{other:?}"),
@@ -308,7 +318,7 @@ fn a_solution_with_little_to_spare_is_improved_by_flipping_the_faint_bit() {
     // let a block of noise pass once in a thousand. The block is still
     // solved so, to the right values, and stands unconfirmed.
     let grid = torn(block.ec_len - 2);
-    let report = decode_plain(&grid, &layout, 5);
+    let report = decode(&grid, &layout, 5, &Pins::new(), &unguided());
     match report.blocks[0].outcome {
         BlockOutcome::Solved { method: SolveMethod::Chase { flipped_bits: 1 }, errors: 1, erasures: 16, slack: 2, confidence_bits: 16, .. } => {}
         other => panic!("{other:?}"),
@@ -386,13 +396,21 @@ fn a_block_filled_with_one_codeword_to_spare_is_no_read() {
 #[test]
 fn erasures_past_capacity_fail_deterministically() {
     let mut rng = Rng(0xFA11);
+    let mut reached = 0;
     for (version, ec) in SAMPLES {
-        let (layout, mut grid, _) = sample(version, ec, 0, &mut rng);
+        let (layout, mut grid, text) = sample(version, ec, 0, &mut rng);
         let block = &layout.blocks[0];
         for i in rng.distinct(block.ec_len + 1, block.codewords.len()) {
             erase_codeword(&mut grid, &layout, block.codewords[i]);
         }
-        let report = decode_plain(&grid, &layout, 0);
+        // The message's evidence takes the high bit of each erased byte
+        // at nought, an equation more a byte, which may reach a codeword
+        // past the capacity: what it reads is the message, or nothing
+        // confirmed.
+        let guided = decode_plain(&grid, &layout, 0);
+        assert!(!guided.is_trustworthy() || guided.text.plain() == text, "{version}-{ec:?}");
+        reached += usize::from(guided.blocks[0].is_verified());
+        let report = decode(&grid, &layout, 0, &Pins::new(), &unguided());
         assert_eq!(
             report.blocks[0].outcome,
             BlockOutcome::Failed(RsFailure::TooManyErasures { erasures: block.ec_len + 1, capacity: block.ec_len }),
@@ -402,6 +420,9 @@ fn erasures_past_capacity_fail_deterministically() {
         assert!(report.blocks[1..].iter().all(|b| b.is_verified()));
         assert!(!report.is_complete());
     }
+    // Where enough of the erased codewords are bytes of the message: a
+    // large block, as 15-L's is.
+    assert!(reached >= 1, "{reached}");
 }
 
 #[test]
@@ -466,7 +487,7 @@ fn partly_readable_codewords_past_capacity_still_yield_inferred_bits() {
             }
         }
         let what = format!("{version}-{ec:?}");
-        let report = decode_plain(&grid, &layout, mask);
+        let report = decode(&grid, &layout, mask, &Pins::new(), &unguided());
         let first = &report.blocks[0];
         assert_eq!(first.unknown_bits, 8 * block.ec_len + 1, "{what}");
         assert!(!first.is_solved(), "{what}");
@@ -757,9 +778,9 @@ fn erasing_by_trial_frees_a_wrong_codeword_among_scattered_unknown_bits() {
                 }
             }
             let what = format!("{version}-{ec:?} with {unknown} unknown bits and {stains} stained codewords");
-            let no_trial = DecodeOptions { erase_by_trial: false, list_decode: false, ..Default::default() };
+            let no_trial = DecodeOptions { erase_by_trial: false, list_decode: false, ..unguided() };
             assert!(!decode(&grid, &layout, mask, &Pins::new(), &no_trial).blocks[0].is_solved(), "{what}");
-            let report = decode_plain(&grid, &layout, mask);
+            let report = decode(&grid, &layout, mask, &Pins::new(), &unguided());
             match report.blocks[0].outcome {
                 BlockOutcome::Solved { method: SolveMethod::BitTrial { doubted_bits: 0, erased }, errors, .. } => {
                     assert_eq!((erased, errors), (stains, stains), "{what}");
@@ -813,7 +834,7 @@ fn doubting_bits_recovers_faint_modules_in_more_codewords_than_erasures_allow() 
         // Without reliability only the trials and the hard-decision
         // algebra can reach it, and they reach it in the smallest
         // blocks alone.
-        let strict = DecodeOptions { reliability: false, ..Default::default() };
+        let strict = DecodeOptions { reliability: false, ..unguided() };
         let unaided = decode(&grid, &layout, mask, &Pins::new(), &strict).blocks[0].outcome;
         assert!(
             matches!(
@@ -841,7 +862,7 @@ fn doubting_bits_recovers_faint_modules_in_more_codewords_than_erasures_allow() 
         // With the bit-level solver off there is nothing to doubt bits
         // with, and only chasing, which flips ten at the most, can reach
         // the block.
-        let no_bits = DecodeOptions { bit_level: false, belief_propagation: false, ..Default::default() };
+        let no_bits = DecodeOptions { bit_level: false, belief_propagation: false, ..unguided() };
         let chased = decode(&grid, &layout, mask, &Pins::new(), &no_bits).blocks[0].outcome;
         assert!(
             matches!(chased, BlockOutcome::Failed(_) | BlockOutcome::Solved { method: SolveMethod::Chase { .. }, .. }),
@@ -1423,4 +1444,168 @@ fn a_fallback_spends_the_reserve_as_the_plain_decoder_does() {
     }
     let report = decode_plain(&grid, &layout, 1);
     assert!(matches!(report.blocks[0].outcome, BlockOutcome::Failed(_)), "{:?}", report.blocks[0].outcome);
+}
+
+#[test]
+fn the_chances_of_the_blocks_being_wrong_add_up_for_the_message() {
+    use qr_forensics::decode::pipeline::combined_risk_bits;
+    // Two blocks each at one in 2^8 make the message one in 2^7.
+    assert_eq!(combined_risk_bits([Some(8), Some(8)]), Some(7));
+    // The eighty-one blocks of a version 40-H symbol each at one in 2^8
+    // make it worse than one in four, though no further than one in two.
+    assert_eq!(combined_risk_bits(vec![Some(8); 81]), Some(1));
+    // A block far surer than the rest costs the whole nothing, however
+    // sure: its chance is not lost to the arithmetic either.
+    assert_eq!(combined_risk_bits([Some(8), Some(200)]), Some(8));
+    assert_eq!(combined_risk_bits([Some(2000), Some(3000)]), Some(2000));
+    // A block unconfirmed leaves nothing to confirm the message, and one
+    // unsolved leaves no message to be wrong about yet.
+    assert_eq!(combined_risk_bits([Some(0), Some(50)]), Some(0));
+    assert_eq!(combined_risk_bits([Some(8), None]), None);
+}
+
+#[test]
+fn a_clean_message_is_as_sure_as_its_least_sure_block_or_nearly() {
+    let (version, ec, mask) = (SymbolVersion::Qr(5), EcLevel::Q, 3);
+    let (layout, clean, _) = sample(version, ec, mask, &mut Rng(0xC1EA));
+    let report = decode(&clean, &layout, mask, &Pins::new(), &DecodeOptions::default());
+    assert!(report.is_trustworthy() && !report.message_risk_falls_short());
+    let least = report.blocks.iter().map(|b| b.outcome.risk_bits()).min().unwrap();
+    let message = report.message_risk_bits().unwrap();
+    // Four blocks: no more than two bits short of the least sure.
+    assert!(message <= least && message + 2 >= least, "{message} of {least}");
+}
+
+/// A grid of `version` sampled at a solid reliability everywhere, with
+/// block `failing` wrong in one solidly misread module of each of its
+/// codewords from the high end, one more than its code corrects, so
+/// that it fails, and every module of `misread` misread solidly too:
+/// what the blocks that verify have to learn from.
+fn with_misreads(layout: &SymbolLayout, clean: &ModuleGrid, failing: usize, misread: &[(usize, usize)]) -> ModuleGrid {
+    let mut grid = clean.clone();
+    for y in 0..grid.height() {
+        for x in 0..grid.width() {
+            grid.set_sampled(x, y, clean.get(x, y), 200);
+        }
+    }
+    let spec = &layout.blocks[failing];
+    for &cw in spec.codewords.iter().rev().take(spec.ec_len / 2 + 1) {
+        let pos = layout.codeword_modules(cw)[3];
+        let (x, y) = (pos.x as usize, pos.y as usize);
+        grid.set_sampled(x, y, clean.get(x, y).inverted(), 200);
+    }
+    for &(x, y) in misread {
+        grid.set_sampled(x, y, clean.get(x, y).inverted(), 200);
+    }
+    grid
+}
+
+#[test]
+fn how_far_misreads_spread_is_learnt_from_the_blocks_that_verify() {
+    // 5-Q: four blocks of eighteen error correction codewords. The last
+    // fails; the other three verify, each with misreads to learn from.
+    let (version, ec, mask) = (SymbolVersion::Qr(5), EcLevel::Q, 3);
+    let (layout, clean, _) = sample(version, ec, mask, &mut Rng(0x57A1));
+    let failing = layout.blocks.len() - 1;
+    let in_verified = |x: usize, y: usize| layout.module_codeword(x, y).is_some_and(|(cw, _)| (layout.codewords[cw].block as usize) < failing);
+    // Without the trials, the curve or the message's evidence, which
+    // reach the failing block on their own: the point is what the other
+    // blocks teach.
+    let opts = DecodeOptions { erase_by_trial: false, list_decode: false, message_evidence: false, ..DecodeOptions::default() };
+
+    // Two stains of two by two modules, in the verified blocks alone.
+    let (width, height) = (layout.func.width, layout.func.height);
+    let mut stains: Vec<(usize, usize)> = Vec::new();
+    'search: for y in (0..height - 1).step_by(5) {
+        for x in (0..width - 1).step_by(7) {
+            let square = [(x, y), (x + 1, y), (x, y + 1), (x + 1, y + 1)];
+            if square.iter().all(|&(x, y)| in_verified(x, y)) {
+                stains.extend(square);
+                if stains.len() == 8 {
+                    break 'search;
+                }
+            }
+        }
+    }
+    assert_eq!(stains.len(), 8, "two stains");
+    let report = decode(&with_misreads(&layout, &clean, failing, &stains), &layout, mask, &Pins::new(), &opts);
+    assert!(report.blocks[..failing].iter().all(|b| b.is_verified()), "{:?}", report.blocks);
+    let stained = report.clustering.expect("learnt from the verified blocks");
+    assert_eq!(stained.located, 8);
+    // Beside two or more misread modules, a third of them were misread
+    // too: far more than one in eight.
+    assert!(stained.gross[1] > 0.2, "{stained:?}");
+
+    // As many specks, none beside another: what spreads is next to
+    // nothing, and the modules beside a speck are doubted far less than
+    // the one in eight that stood before anything was learnt.
+    let mut specks: Vec<(usize, usize)> = Vec::new();
+    for y in (1..height - 1).step_by(4) {
+        for x in (1..width - 1).step_by(4) {
+            if specks.len() < 8 && in_verified(x, y) {
+                specks.push((x, y));
+            }
+        }
+    }
+    let report = decode(&with_misreads(&layout, &clean, failing, &specks), &layout, mask, &Pins::new(), &opts);
+    assert!(report.blocks[..failing].iter().all(|b| b.is_verified()), "{:?}", report.blocks);
+    let specked = report.clustering.expect("learnt from the verified blocks");
+    assert!(specked.gross[0] < 1.0 / 32.0, "{specked:?}");
+    assert!(specked.gross[0] < stained.gross[0] && specked.gross[1] <= stained.gross[1]);
+}
+
+#[test]
+fn noise_under_the_message_evidence_passes_no_oftener_than_its_risk_says() {
+    // 3-L: one block of 55 data and 15 error correction codewords, read
+    // as the evidence test reads a real message, the high bit of every
+    // byte and ninety bits more unread, but with everything after the
+    // byte segment's header noise. Taking the high bits at their lean
+    // leaves thirty equations, and noise is consistent with them once in
+    // 2^30; doubting the leans to make it consistent costs a lean's
+    // worth of likelihood each, which the confirmation is charged. So a
+    // block that verifies here is a wrong codeword, and must do so no
+    // oftener than a block's risk, one in 2^8 at the most, says.
+    use qr_forensics::symbol::grid::Module;
+    let (version, ec) = (SymbolVersion::Qr(3), EcLevel::L);
+    let layout = layout(version, ec);
+    let text = "https://example.com/q?id=7Q2M-XK4P-99AD";
+    let block = &layout.blocks[0];
+    let module_of = |bit: usize| {
+        let (cw, place) = layout.stream_bit_location(bit).unwrap();
+        let pos = layout.codeword_modules(cw)[place as usize];
+        (pos.x as usize, pos.y as usize)
+    };
+    let mut rng = Rng(0x0153);
+    let (trials, mut passed, mut solved) = (256, 0, 0);
+    for _ in 0..trials {
+        let mask = rng.below(8) as u8;
+        let mut grid = encode(version, ec, Some(mask), &[Segment::bytes(text)]).unwrap();
+        // The header is in the first two codewords: the rest is noise.
+        for &cw in &block.codewords[2..] {
+            for pos in layout.codeword_modules(cw) {
+                let noise = if rng.below(2) == 0 { Module::Dark } else { Module::Light };
+                grid.set(pos.x as usize, pos.y as usize, noise);
+            }
+        }
+        for k in 0..text.len() {
+            let (x, y) = module_of(12 + 8 * k);
+            grid.set(x, y, Module::Unknown);
+        }
+        let mut others = 0;
+        while others < 90 {
+            let bit = 16 + rng.below(8 * text.len() - 4);
+            let (x, y) = module_of(bit);
+            if bit % 8 == 4 || grid.get(x, y) == Module::Unknown {
+                continue;
+            }
+            grid.set(x, y, Module::Unknown);
+            others += 1;
+        }
+        let report = decode_plain(&grid, &layout, mask);
+        solved += usize::from(report.blocks[0].is_solved());
+        passed += usize::from(report.blocks[0].is_verified());
+    }
+    // Two hundred and fifty-six blocks at one in 2^8 each: one expected
+    // at the most, and none at all with the risks they would claim.
+    assert!(passed <= 2, "{passed} of {trials} blocks of noise verified, {solved} solved");
 }

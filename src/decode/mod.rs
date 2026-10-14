@@ -4,7 +4,9 @@
 pub mod abp;
 pub mod bch;
 pub mod bitstream;
+pub mod clustering;
 pub mod codewords;
+pub mod evidence;
 pub mod gf256;
 pub mod known;
 pub mod list;

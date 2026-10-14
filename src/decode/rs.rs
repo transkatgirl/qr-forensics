@@ -386,11 +386,11 @@ pub fn soft_count_bits(block: &[CwRead], bit_reliability: &[[u8; 8]], redundancy
     ways[0] = 1.0;
     let mut scaled = 0i64;
     for (cw, reliability) in block.iter().zip(bit_reliability) {
-        for b in 0..8 {
+        for (b, &reliability) in reliability.iter().enumerate() {
             if cw.known >> b & 1 == 0 || cw.pinned >> b & 1 != 0 {
                 continue;
             }
-            let cost = usize::from(reliability[b]) + 1;
+            let cost = usize::from(reliability) + 1;
             if cost > reach {
                 continue;
             }
@@ -776,6 +776,114 @@ pub(super) fn settle(
         .collect();
 
     Ok(RsSolution { corrected, errata, errors, erasures: erased.len(), slack, check_bits, flipped_known_bits, located_bits, reserved })
+}
+
+/// A codeword of the code, however it was found, confirmed against the
+/// block as read: the hard count of [`list_solution_bits`] for the
+/// codewords read in full that it changes, or the soft count of
+/// [`soft_count_bits`] for the bits it overturns weighed by
+/// `bit_reliability`, whichever is the more, less one for the choice
+/// between them and the charge for `tries` ([`tries_charge`]), with the
+/// known bits of the codewords that could not be read weighed as
+/// [`settle`] weighs them. For a solver that searched from something
+/// other than the block as read: the beliefs propagation leaves
+/// ([`super::abp`]), or the block with what the message makes likely
+/// laid over it ([`super::evidence`]). What it searched from says
+/// nothing here, since the search carries its word toward some codeword
+/// whatever the block holds; only how rarely a block of noise lies so
+/// near a codeword does. `None` for a codeword refused, or one with less
+/// than [`DOUBT_CONFIRMING_BITS`] behind it.
+pub(super) fn accounted(
+    block: &[CwRead],
+    bit_reliability: &[[u8; 8]],
+    ec_len: usize,
+    reserved: usize,
+    corrected: Vec<u8>,
+    tries: usize,
+) -> Option<RsSolution> {
+    let n = block.len();
+    let erased: Vec<usize> = (0..n).filter(|&i| block[i].is_erasure()).collect();
+    let (read, redundancy) = (n - erased.len(), ec_len.saturating_sub(erased.len()));
+    let errors = (0..n).filter(|&i| !block[i].is_erasure() && corrected[i] != block[i].value).count();
+    let unknown: usize = block.iter().map(|c| c.known.count_zeros() as usize).sum();
+    let hard = list_solution_bits(read, redundancy, errors);
+    let soft = soft_count_bits(block, bit_reliability, (8 * ec_len).saturating_sub(unknown), soft_distance(block, bit_reliability, &corrected));
+    let bits = hard.max(soft).saturating_sub(1).saturating_sub(tries_charge(tries));
+    let slack = redundancy.saturating_sub(2 * errors).min(bits as usize / 8);
+    let located = bits - 8 * slack as u32;
+    let solution = settle(block, &[], &erased, corrected, errors, slack, located, reserved).ok()?;
+    (solution.confidence_bits() >= DOUBT_CONFIRMING_BITS).then_some(solution)
+}
+
+/// A codeword of the code found by searching something other than
+/// `block`, judged against `block` alone ([`super::evidence::Laid`]):
+/// how rarely a block of noise has a codeword as near, counted codeword
+/// by codeword or bit by bit, whichever counts the more, less one for
+/// the choice between them and the charge for `tries`.
+///
+/// Codeword by codeword is as a decode of errors and erasures has it
+/// ([`list_solution_bits`], [`settle`]): the redundancy left after the
+/// codewords that could not be read, the errors located among those
+/// that were, and the known bits of the erased codewords it reproduces,
+/// which are checks only while the codewords read in full fix the
+/// erased ones, no more of them erased than the block has error
+/// correction codewords. Past that the erased codewords' known bits are
+/// what the codeword was solved from, and bit by bit is the one count.
+/// Bit by bit is the soft count ([`soft_count_bits`]): every known bit
+/// at its reliability, against the equations the unknown bits leave,
+/// among which the known bits of the erased codewords already stand. So
+/// the two are never added, as [`accounted`] adds them: a search that
+/// solved bit by bit used every known bit to find its codeword, and its
+/// agreeing with them is what the soft count measures, once. A bit by
+/// bit count's slack is the codewords' worth of it, which is what the
+/// codewords the standard reserves are held to. `None` for a codeword
+/// that overturns a pin, or with less than [`DOUBT_CONFIRMING_BITS`]
+/// behind it.
+pub(super) fn judged(
+    block: &[CwRead],
+    bit_reliability: &[[u8; 8]],
+    ec_len: usize,
+    reserved: usize,
+    corrected: Vec<u8>,
+    tries: usize,
+) -> Option<RsSolution> {
+    if block.iter().zip(&corrected).any(|(cw, &c)| (cw.value ^ c) & cw.pinned != 0) {
+        return None;
+    }
+    let n = block.len();
+    let erased: Vec<usize> = (0..n).filter(|&i| block[i].is_erasure()).collect();
+    let (read, redundancy) = (n - erased.len(), ec_len.saturating_sub(erased.len()));
+    let errors = (0..n).filter(|&i| !block[i].is_erasure() && corrected[i] != block[i].value).count();
+    let unknown: usize = block.iter().map(|c| c.known.count_zeros() as usize).sum();
+    let charge = 1 + tries_charge(tries);
+    let hard = list_solution_bits(read, redundancy, errors).saturating_sub(charge);
+    let slack = redundancy.saturating_sub(2 * errors).min(hard as usize / 8);
+    let by_codeword = (erased.len() <= ec_len)
+        .then(|| settle(block, &[], &erased, corrected.clone(), errors, slack, hard - 8 * slack as u32, reserved).ok())
+        .flatten();
+    let distance = soft_distance(block, bit_reliability, &corrected);
+    let soft = soft_count_bits(block, bit_reliability, (8 * ec_len).saturating_sub(unknown), distance).saturating_sub(charge);
+    let solution = match by_codeword {
+        Some(solution) if solution.confidence_bits() >= soft => solution,
+        _ => {
+            let slack = soft as usize / 8;
+            let flipped_known_bits =
+                erased.iter().map(|&i| ((corrected[i] ^ block[i].value) & block[i].known).count_ones()).sum();
+            let solution = RsSolution {
+                corrected,
+                errata: Vec::new(),
+                errors,
+                erasures: erased.len(),
+                slack,
+                check_bits: 0,
+                flipped_known_bits,
+                located_bits: soft - 8 * slack as u32,
+                reserved,
+            };
+            restated(block, solution)
+        }
+    };
+    (solution.confidence_bits() >= DOUBT_CONFIRMING_BITS).then_some(solution)
 }
 
 /// Decode by doubting: erase the least reliable fully read codewords, one

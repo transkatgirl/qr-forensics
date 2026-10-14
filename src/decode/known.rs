@@ -27,7 +27,6 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::ops::Range;
 
 use super::bitstream::{Certainty, SegmentContent, alphanumeric_value, hanzi_value, kanji_value};
 use super::codewords::{Pin, PinSource, Pins, codeword_bit_mask};
@@ -74,9 +73,6 @@ pub enum TextPinError {
     /// digits or two alphanumeric characters to a group, and a group is
     /// fixed only by all of its characters.
     NothingWhole,
-    /// None of the characters named is byte data, and only a byte has a
-    /// high bit to pin as ASCII.
-    NotBytes,
 }
 
 impl fmt::Display for TextPinError {
@@ -99,9 +95,6 @@ impl fmt::Display for TextPinError {
                 "digits are packed three to a group and alphanumeric characters two, and a group is fixed only by all of its \
                  characters: give the characters beside these as well"
             ),
-            TextPinError::NotBytes => {
-                write!(f, "none of the characters there is byte data, and only a byte has a high bit to pin as ASCII")
-            }
         }
     }
 }
@@ -284,54 +277,6 @@ fn pins_at(layout: &SymbolLayout, report: &DecodeReport, mut bits: Vec<(usize, b
     }
     pins.retain(|_, pin| pin.mask != 0);
     (pins, contradicted)
-}
-
-/// The pins that assert the characters `chars` of the message as read,
-/// the first being 0, are ASCII: the high bit of every byte of them, at
-/// zero. An address, a Wi-Fi label, a card or a serial number is
-/// seven-bit throughout, and that is a bit of every byte that need not
-/// be read: one equation a byte to the good of the solver that works
-/// bit by bit, where a block short of solving by a few is tipped. The
-/// stretch is named rather than the whole message, since a message
-/// that is ASCII through its address may carry a name with an accent
-/// after it, and a pin asserts. A character read as several bytes, or
-/// as none that the character set knows, has every byte of it pinned:
-/// the assertion is that there are no such characters there. The
-/// segments are taken as the message reads them, so the assertion is
-/// only as good as their headers, and a bit it pins against one error
-/// correction has confirmed is counted as contradicted, as known text's
-/// are: the message holds a byte above 127 there after all. Characters
-/// of other modes, which have no high bit, are passed over, and it is
-/// an error when none of the characters is byte data.
-pub fn ascii_pins(layout: &SymbolLayout, report: &DecodeReport, chars: Range<usize>) -> Result<TextPins, TextPinError> {
-    if chars.is_empty() {
-        return Err(TextPinError::Empty);
-    }
-    let sources = &report.text.sources;
-    if chars.end > sources.len() {
-        return Err(TextPinError::NoSuchChar { len: sources.len() });
-    }
-    let segments = &report.parse.segments;
-    let mut bits = Vec::new();
-    for at in chars {
-        let source = &sources[at];
-        let segment = &segments[source.segment];
-        let SegmentContent::Bytes(cells) = &segment.content else { continue };
-        // The character's bytes: from its first cell to the next
-        // character's in the segment, or to the segment's end.
-        let end = sources.get(at + 1).filter(|next| next.segment == source.segment).map_or(cells.len(), |next| next.cell);
-        bits.extend(
-            (source.cell..end.min(cells.len())).map(|k| segment.payload.start + 8 * k).filter(|&bit| bit < layout.data_bits).map(|bit| (bit, false)),
-        );
-    }
-    if bits.is_empty() {
-        return Err(TextPinError::NotBytes);
-    }
-    bits.sort_unstable();
-    bits.dedup();
-    let pinned = bits.len();
-    let (pins, contradicted) = pins_at(layout, report, bits);
-    Ok(TextPins { pins, pinned, left_out: 0, contradicted })
 }
 
 /// Lay `more` over `pins`: every bit `more` asserts takes the place of
