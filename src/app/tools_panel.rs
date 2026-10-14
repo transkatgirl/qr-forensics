@@ -1177,14 +1177,6 @@ fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                  many chances of a wrong answer, so every pattern that solves must agree, or the message is asked which \
                  it is; turn this off where a solution it reached looks wrong.",
             );
-            ui.checkbox(&mut opts.belief_propagation, "Belief propagation").on_hover_text(
-                "Run adaptive belief propagation (Jiang and Narayanan): over several rounds, the block's parity checks \
-                 update each bit's reliability from the other bits in the same checks, and the block is decoded from \
-                 the updated reliabilities. Each round the checks are rearranged so the least reliable bits each sit \
-                 in a check of their own. Finds faint misreads among more faint but correct modules than doubting can \
-                 treat as unknown, and more misreads than Flip the faintest bits tries. A solution is confirmed by how \
-                 rarely random data lands that close to a codeword; the bits it flipped add nothing to that.",
-            );
             if opts.flip_bits {
                 ui.add(egui::Slider::new(&mut opts.chase_bits, 1..=CHASE_MAX_BITS).text("bits flipped")).on_hover_text(
                     "How many of the least reliable bits to try every pattern of: n bits is 2^n decodes. The default, 10, \
@@ -1193,6 +1185,14 @@ fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                      under many formats or samplings, fewer are flipped, but never fewer than 6.",
                 );
             }
+            ui.checkbox(&mut opts.belief_propagation, "Belief propagation").on_hover_text(
+                "Run adaptive belief propagation (Jiang and Narayanan): over several rounds, the block's parity checks \
+                 update each bit's reliability from the other bits in the same checks, and the block is decoded from \
+                 the updated reliabilities. Each round the checks are rearranged so the least reliable bits each sit \
+                 in a check of their own. Finds faint misreads among more faint but correct modules than doubting can \
+                 treat as unknown, and more misreads than Flip the faintest bits tries. A solution is confirmed by how \
+                 rarely random data lands that close to a codeword; the bits it flipped add nothing to that.",
+            );
         });
     });
     if opts != app.opts {
