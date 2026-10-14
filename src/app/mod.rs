@@ -30,7 +30,7 @@ use qr_forensics::imaging::detect::{
 use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline};
 use qr_forensics::imaging::refine::{Refinement, refine_corners, refine_corners_holding};
 use qr_forensics::imaging::Luma;
-use qr_forensics::imaging::enhance::Enhance;
+use qr_forensics::imaging::enhance::{Enhance, Sharpen};
 use qr_forensics::imaging::sample::{
     Classified, Kernel, Rule, SampleParams, VersionGuess, read_modules, suggest_versions,
 };
@@ -1039,9 +1039,12 @@ impl App {
     /// and whatever was found go with the photo to its new size. A
     /// large photo is not enlarged for it, which would make it many
     /// times the pixels to hold with no one having asked: that is left
-    /// to the user, and said. Returns what to tell the user; `None` for
-    /// a read of the photo as it is, or when the photo is so adjusted
-    /// already. The caller has taken the undo point.
+    /// to the user, and said. A photo blurred under Sharpen stays so
+    /// through a read that only enlarged its copy, which was made of
+    /// the photo blurred; one that sharpened its copy has Sharpen set
+    /// to that, in place of the blur. Returns what to tell the user;
+    /// `None` for a read of the photo as it is, or when the photo is so
+    /// adjusted already. The caller has taken the undo point.
     fn adjust_as_read(&mut self, enhance: Enhance, base: Enlarge) -> Option<String> {
         if enhance.is_none() {
             return None;
@@ -1055,7 +1058,7 @@ impl App {
         let left = before.enlarge < wanted && !wanted.fits_unasked(own_width, own_height);
         let adjust = Adjust {
             enlarge: if left { before.enlarge } else { before.enlarge.max(wanted) },
-            sharpen: before.sharpen.max(enhance.sharpen.amount()),
+            sharpen: if enhance.sharpen == Sharpen::Off { before.sharpen } else { before.sharpen.max(enhance.sharpen.amount()) },
             ..before
         };
         let set = match (adjust.enlarge != before.enlarge, adjust.sharpen != before.sharpen) {
@@ -4513,6 +4516,66 @@ mod tests {
         bench.act(Action::Undo);
         bench.step();
         assert_eq!(bench.drawn(), plain);
+    }
+
+    #[test]
+    fn the_sharpen_slider_blurs_the_photo_below_nought() {
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        bench.app.set_photo(&ctx, "red".into(), red_render());
+        bench.app.doc.corners = STRAIGHT;
+        bench.step();
+        bench.step();
+        // Ink in the middle of the first finder's stone, paper in the
+        // quiet zone, and the first pixel of ink along the stone's left
+        // edge, with the ring's light module beside it.
+        let (ink, paper, edge) = (75 * 330 + 75, 20 * 330 + 20, 75 * 330 + 60);
+        let plain = bench.drawn();
+        assert_eq!((plain[ink], plain[paper], plain[edge]), ([200, 30, 40], [255; 3], [200, 30, 40]));
+        // A press at the start of the rail is the furthest below nought
+        // the slider goes: one step of undo.
+        let rail = bench.rail_beside("Sharpen");
+        bench.click(egui::pos2(rail.left() + 3.0, rail.center().y), egui::PointerButton::Primary);
+        let photo = bench.app.photo.as_ref().expect("the photo is loaded");
+        assert_eq!((bench.app.doc.adjust.sharpen, photo.adjust.sharpen, photo.width, photo.height), (-1.0, -1.0, 330, 330));
+        // The photo is the size it was, and still in its colours: flat
+        // ink and flat paper as they were, and the edge between them run
+        // together, part ink and part paper.
+        let blurred = bench.drawn();
+        assert_eq!((blurred[ink], blurred[paper]), ([200, 30, 40], [255; 3]));
+        assert!(blurred[edge][0] > 210 && blurred[edge][1] > 100 && blurred[edge][1] < 200, "{:?}", blurred[edge]);
+        assert!(blurred[edge][0] > blurred[edge][1] + 50, "still red: {:?}", blurred[edge]);
+        // What is read is the luminance of what is shown.
+        let shown = |[r, g, b]: [u8; 3]| (0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b)) / 255.0;
+        assert!(blurred.iter().zip(&photo.luma.data).all(|(&pixel, &luma)| (shown(pixel) - luma).abs() < 1e-4));
+        // Nothing moved, and the symbol still reads through the blur.
+        let (matching, fixed) = bench.app.preview.as_ref().expect("the outline makes a grid").fixed;
+        assert_eq!(matching, fixed);
+        bench.act(Action::Undo);
+        bench.step();
+        assert_eq!((bench.app.doc.adjust.sharpen, bench.drawn()), (0.0, plain));
+        assert!(!bench.app.history.can_undo(&bench.app.doc));
+    }
+
+    #[test]
+    fn a_blurred_photo_stays_blurred_through_a_read_that_only_enlarged_its_copy() {
+        let mut bench = Bench::new();
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { sharpen: -0.5, ..bench.app.doc.adjust }));
+        // The copy was made of the photo blurred, and enlarged: the
+        // photo is enlarged with the blur it had, and nothing is said of
+        // Sharpen.
+        let text = bench.app.adjust_as_read(Enhance { enlarge: 2, sharpen: Sharpen::Off }, Enlarge::NONE).expect("the photo is enlarged");
+        assert!(text.contains("so under Photo Enlarge was set to 2×, and Sample reads it that way.") && !text.contains("Sharpen"), "{text}");
+        assert_eq!(bench.app.doc.adjust, Adjust { enlarge: Enlarge::times(2), sharpen: -0.5, ..Adjust::default() });
+        assert_eq!(bench.app.photo.as_ref().map(|photo| (photo.width, photo.adjust.sharpen)), Some((660, -0.5)));
+        // A copy sharpened decoded where the photo blurred did not: the
+        // sharpening takes the blur's place.
+        let text = bench.app.adjust_as_read(Enhance { enlarge: 1, sharpen: Sharpen::Light }, Enlarge::times(2)).expect("the photo is sharpened");
+        assert!(text.contains("so under Photo Sharpen was set to 0.50, and Sample reads it that way."), "{text}");
+        assert_eq!(bench.app.doc.adjust, Adjust { enlarge: Enlarge::times(2), sharpen: 0.5, ..Adjust::default() });
+        // Set so, a read through the same copy has nothing to add.
+        assert_eq!(bench.app.adjust_as_read(Enhance { enlarge: 1, sharpen: Sharpen::Light }, Enlarge::times(2)), None);
     }
 
     #[test]

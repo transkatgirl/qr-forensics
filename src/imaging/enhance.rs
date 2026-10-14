@@ -100,18 +100,27 @@ impl Sharpen {
 /// a half times over, and 1.0 the strong one, two pixels wide and two
 /// and a half times over; between them, and below the light one down
 /// to a mask half a pixel wide that adds nothing back, the two run
-/// straight. `None` for no sharpening at all.
+/// straight.
+///
+/// Below nought the mask blurs the photo instead, with the same
+/// Gaussian, as far as -1.0: what the blur takes is taken, so many
+/// times over as the second number is below nought, and at -1.0 and
+/// beyond the whole of it, which leaves the photo as the blur alone.
+/// The blur is as wide as the mask the same way up: half a pixel just
+/// below nought, where a part of it is taken, a pixel at -0.5, where
+/// the whole of it is, and two pixels at -1.0. `None` for neither.
 pub fn mask_for(amount: f32) -> Option<(f64, f32)> {
-    let amount = amount.clamp(0.0, 1.0);
-    if amount.is_nan() || amount <= 0.0 {
+    if amount.is_nan() || amount == 0.0 {
         return None;
     }
-    Some(if amount <= 0.5 {
-        let t = amount / 0.5;
-        (0.5 + 0.5 * f64::from(t), 1.5 * t)
+    let blur = amount < 0.0;
+    let how_far = amount.abs().min(1.0);
+    Some(if how_far <= 0.5 {
+        let t = how_far / 0.5;
+        (0.5 + 0.5 * f64::from(t), if blur { -t } else { 1.5 * t })
     } else {
-        let t = (amount - 0.5) / 0.5;
-        (1.0 + f64::from(t), 1.5 + t)
+        let t = (how_far - 0.5) / 0.5;
+        (1.0 + f64::from(t), if blur { -1.0 } else { 1.5 + t })
     })
 }
 
@@ -529,7 +538,7 @@ mod tests {
     #[test]
     fn the_masks_run_from_none_through_the_light_one_to_the_strong() {
         assert_eq!(mask_for(0.0), None);
-        assert_eq!(mask_for(-1.0), None);
+        assert_eq!(mask_for(-0.0), None);
         assert_eq!(mask_for(f32::NAN), None);
         // The two a read tries lie half way and at the end.
         assert_eq!((Sharpen::Off.amount(), Sharpen::Light.amount(), Sharpen::Strong.amount()), (0.0, 0.5, 1.0));
@@ -542,6 +551,44 @@ mod tests {
         let masks: Vec<(f64, f32)> = (1..=20).map(|step| mask_for(step as f32 / 20.0).unwrap()).collect();
         assert!(masks.windows(2).all(|pair| pair[0].0 < pair[1].0 && pair[0].1 < pair[1].1), "{masks:?}");
         assert!(masks[0].0 > 0.5 && masks[0].1 < 0.2, "{:?}", masks[0]);
+    }
+
+    #[test]
+    fn below_nought_the_mask_blurs_as_wide_as_it_sharpens_above() {
+        // The whole blur, a pixel wide half way down and two at the end,
+        // as the masks are wide the same way up.
+        assert_eq!(mask_for(-0.5), Some((1.0, -1.0)));
+        assert_eq!(mask_for(-1.0), Some((2.0, -1.0)));
+        assert_eq!(mask_for(-7.0), mask_for(-1.0));
+        assert_eq!(mask_for(f32::NEG_INFINITY), mask_for(-1.0));
+        for step in 1..=20 {
+            let amount = step as f32 / 20.0;
+            assert_eq!(mask_for(-amount).unwrap().0, mask_for(amount).unwrap().0, "{amount}");
+        }
+        // Over the first half a greater part of the blur is taken each
+        // step, and next to none at first, so that the photo changes
+        // smoothly through nought; over the second the whole of it,
+        // wider each step.
+        let blurs: Vec<(f64, f32)> = (1..=20).map(|step| mask_for(-(step as f32) / 20.0).unwrap()).collect();
+        assert!(blurs.windows(2).all(|pair| pair[0].0 < pair[1].0 && pair[0].1 >= pair[1].1), "{blurs:?}");
+        assert!(blurs[0].1 > -0.2 && blurs[0].1 < 0.0, "{:?}", blurs[0]);
+        assert!(blurs[9..].iter().all(|&(_, taken)| taken == -1.0), "{blurs:?}");
+        // Laid on a soft edge, it softens the edge further and leaves
+        // flat tone alone, and takes nothing past black or white.
+        let photo = soft_edge(40, 12);
+        let (sigma, amount) = mask_for(-1.0).unwrap();
+        let blurred = unsharp(&photo.data, 40, 12, 1, sigma, amount);
+        let row = &blurred[5 * 40..6 * 40];
+        assert!((row[3] - 0.1).abs() < 1e-3 && (row[36] - 0.9).abs() < 1e-3, "{row:?}");
+        assert!(row[20] - row[19] < 0.2, "{} to {}", row[19], row[20]);
+        assert!(row[17] > 0.15 && row[22] < 0.85, "{row:?}");
+        assert!(blurred.iter().all(|v| (0.1 - 1e-5..=0.9 + 1e-5).contains(v)));
+        // The whole blur is the Gaussian alone: the edge pixels come to
+        // the weighted mean of their neighbours.
+        let weights = gaussian(sigma);
+        let reach = weights.len() / 2;
+        let by_hand: f32 = weights.iter().enumerate().map(|(k, w)| w * photo.data[5 * 40 + (19 + k).saturating_sub(reach)]).sum();
+        assert!((row[19] - by_hand).abs() < 1e-5, "{} by the mask, {by_hand} by hand", row[19]);
     }
 
     #[test]

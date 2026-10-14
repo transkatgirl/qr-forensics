@@ -185,12 +185,15 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         note(ui.add(egui::Slider::new(&mut adjust.contrast, -1.0..=1.0)).changed());
         ui.end_row();
         ui.label("Sharpen");
-        let sharpen = ui.add(egui::Slider::new(&mut adjust.sharpen, 0.0..=1.0)).on_hover_text(
+        let sharpen = ui.add(egui::Slider::new(&mut adjust.sharpen, -1.0..=1.0)).on_hover_text(
             "Sharpens the photo with an unsharp mask, in its colours: for a symbol out of focus, or modules a pixel or two \
              across that the lens has run together, which read as grey as their neighbours. The mask is wider and \
-             stronger the further this is set, a pixel wide at 0.5 and two at 1. Find in outline tries the photo \
-             sharpened and enlarged of itself when it does not decode as it is, and sets this and Enlarge to what \
-             decoded.",
+             stronger the further this is set, a pixel wide at 0.5 and two at 1. Below nought it blurs the photo \
+             instead, with the same Gaussian, in its colours and before the tone: for grain, the dots of a halftone \
+             screen, or the halos a camera's own sharpening leaves along edges. The blur is a part of the way at \
+             first, the whole of it and a pixel wide at -0.5, and two pixels wide at -1. Find in outline tries the \
+             photo sharpened and enlarged of itself when it does not decode as it is, and sets this and Enlarge to \
+             what decoded.",
         );
         note(sharpen.changed());
         ui.end_row();

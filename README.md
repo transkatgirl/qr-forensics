@@ -117,9 +117,11 @@ When detection fails or lands slightly off, place the grid yourself.
   finder search sees it. Hold **H** to see the photo with nothing over it.
 
 The **Photo** section adjusts what is read: colour channel, brightness,
-contrast, sharpening, enlargement, radial lens correction (with an
-**Estimate** from the corners and anchors), a median, dot-closing or blur
-filter, and **Invert photo** for light symbols on a dark background.
+contrast, sharpening (or, with **Sharpen** set below nought, a Gaussian
+blur of the photo in its colours), enlargement, radial lens correction
+(with an **Estimate** from the corners and anchors), a median, dot-closing
+or blur filter, and **Invert photo** for light symbols on a dark
+background.
 
 ### 4. Sample the modules
 

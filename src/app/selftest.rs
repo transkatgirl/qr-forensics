@@ -41,7 +41,7 @@
 //! enlarge <n>                 the photo's Enlarge: n times its own size,
 //!                             0.25, 0.5 or a whole number, as far as its
 //!                             size allows; the outline goes with it
-//! sharpen <amount>            the photo's Sharpen, from 0 to 1
+//! sharpen <amount>            the photo's Sharpen, from -1 (blurred) to 1
 //! grey on|off                 show the photo in greyscale, or in colour
 //! invert photo|grid           toggle the photo's inversion, or swap dark
 //!                             and light in the grid
@@ -240,7 +240,7 @@ impl App {
             "sharpen" => {
                 assert!(self.photo.is_some(), "selftest: sharpen needs a photo");
                 self.checkpoint();
-                actions.push(Action::SetAdjust(Adjust { sharpen: (number(0) as f32).clamp(0.0, 1.0), ..self.doc.adjust }));
+                actions.push(Action::SetAdjust(Adjust { sharpen: (number(0) as f32).clamp(-1.0, 1.0), ..self.doc.adjust }));
             }
             "grey" => self.view.greyscale = word(0) == "on",
             "refine" => actions.push(Action::RefineCorners),

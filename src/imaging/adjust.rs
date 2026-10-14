@@ -2,9 +2,9 @@
 //! size, its sharpness, its tone, and a filter over each pixel's
 //! neighbourhood.
 //!
-//! A photo is enlarged or reduced, and sharpened, as it is toned: the
-//! whole of it, in its colours, so that what is shown is what the
-//! pipeline reads. Both were once steps of their own, the enlargement a
+//! A photo is enlarged or reduced, and sharpened or blurred, as it is
+//! toned: the whole of it, in its colours, so that what is shown is
+//! what the pipeline reads. Both were once steps of their own, the enlargement a
 //! part of loading a small photo and the two together a copy made about
 //! one symbol for the sampling to read off ([`super::enhance`]), in
 //! grey; a read that does not decode still makes itself such copies,
@@ -400,9 +400,10 @@ pub struct Adjust {
     /// anchors are in the pixels it comes to.
     pub enlarge: Enlarge,
     /// How far the photo is sharpened by an unsharp mask, from 0.0 for
-    /// not at all to 1.0: see [`mask_for`]. The mask is laid on the photo
-    /// at the smaller of its own size and the size it is worked on at:
-    /// before it is enlarged, or after it is reduced.
+    /// not at all to 1.0, or below nought blurred instead, with the
+    /// mask's own Gaussian, as far as -1.0: see [`mask_for`]. The mask
+    /// is laid on the photo at the smaller of its own size and the size
+    /// it is worked on at: before it is enlarged, or after it is reduced.
     pub sharpen: f32,
 }
 
@@ -626,7 +627,8 @@ impl Adjust {
     /// wide is as wide as what a lens blurred and the enlargement is the
     /// better for the mask's overshoot, which it holds its own result
     /// to; or reduced and then sharpened, at the size the reduction left
-    /// it. The tone comes after, a curve for each pixel alone, and the
+    /// it. A blur, the mask the other way up, is laid at the same size.
+    /// The tone comes after, a curve for each pixel alone, and the
     /// filter last, whose neighbourhood is measured in the pixels the
     /// photo is worked on at.
     ///
@@ -919,6 +921,78 @@ mod tests {
         let (display, luma) = Adjust { enlarge: Enlarge::HALF, ..sharp }.apply(&large, 80, 64);
         assert_eq!((luma.width, luma.height), (40, 32));
         assert_eq!(display, sharp.apply(&reduced, 40, 32).0);
+    }
+
+    #[test]
+    fn a_photo_is_blurred_in_its_colours_below_nought() {
+        // The soft edge from red ink to white paper of the sharpening
+        // test, with specks of paper in the ink and of ink in the paper.
+        let soft = |x: usize, width: usize| match (x + 1).cmp(&(width / 2)) {
+            std::cmp::Ordering::Less => 0.0,
+            std::cmp::Ordering::Equal => 1.0 / 3.0,
+            std::cmp::Ordering::Greater if x == width / 2 => 2.0 / 3.0,
+            std::cmp::Ordering::Greater => 1.0,
+        };
+        let edge = |width: usize, height: usize| {
+            pixels(width, height, |x, y| {
+                let speck = (x, y) == (8, 5) || (x, y) == (31, 5);
+                let t = if speck { 1.0 - soft(x, width) } else { soft(x, width) };
+                [220, (40.0 + 180.0 * t) as u8, (60.0 + 160.0 * t) as u8]
+            })
+        };
+        let photo = edge(40, 12);
+        let pixel = |display: &[u8], x: usize| [display[(5 * 40 + x) * 4], display[(5 * 40 + x) * 4 + 1], display[(5 * 40 + x) * 4 + 2]];
+        assert_eq!((pixel(&photo, 8), pixel(&photo, 31)), ([220, 220, 220], [220, 40, 60]), "the specks");
+        let mut spreads = Vec::new();
+        let mut specks = Vec::new();
+        for sharpen in [-0.25, -0.5, -1.0] {
+            let (display, luma) = Adjust { sharpen, ..Default::default() }.apply(&photo, 40, 12);
+            // Flat tone far from the edge and the specks keeps its
+            // colour; the channel with no edge in it is as it was all
+            // the way across; the others step no more steeply between
+            // the two pixels of the edge, and run out past them into
+            // the flat tone either side, which the edge did not; and
+            // the specks fade toward their surroundings, in their
+            // colours.
+            assert_eq!((pixel(&display, 3), pixel(&display, 36)), ([220, 40, 60], [220, 220, 220]), "{sharpen}");
+            assert!((0..40).all(|x| pixel(&display, x)[0] == 220), "{sharpen}");
+            let green = |x: usize| i32::from(pixel(&display, x)[1]);
+            let step = green(20) - green(19);
+            assert!(step > 0 && step <= 60, "{sharpen}: {step}");
+            assert!(green(18) > 40 && green(21) < 220, "{sharpen}: {} and {}", green(18), green(21));
+            spreads.push(green(21) - green(18));
+            let speck = pixel(&display, 8);
+            assert!(speck[1] < 220 && speck[1] > 40 && speck[2] < 220 && speck[2] > 60, "{sharpen}: {speck:?}");
+            assert!(speck[1] < speck[2], "{sharpen}: in its colours, {speck:?}");
+            specks.push(speck[1]);
+            // Nothing overshoots: every channel lies between the tones
+            // about it.
+            assert!(display.as_chunks::<4>().0.iter().all(|&[_, g, b, _]| (40..=220).contains(&g) && (60..=220).contains(&b)), "{sharpen}");
+            // What is sampled is the luminance of what is shown.
+            assert_eq!(luma, Adjust::default().apply(&display, 40, 12).1);
+        }
+        assert!(spreads.windows(2).all(|pair| pair[0] > pair[1]), "the further down the softer: {spreads:?}");
+        assert!(specks.windows(2).all(|pair| pair[0] > pair[1]), "and the fainter the specks: {specks:?}");
+        // Half way down is the whole of a Gaussian blur a pixel wide:
+        // a speck a pixel across on flat ground keeps the middle weight
+        // of the blur, across and down, over the ground, and no more.
+        let (display, _) = Adjust { sharpen: -0.5, ..Default::default() }.apply(&photo, 40, 12);
+        let middle = 1.0 / (1.0 + 2.0 * ((-0.5f32).exp() + (-2.0f32).exp() + (-4.5f32).exp()));
+        let want = 40.0 + 180.0 * middle * middle;
+        assert!((f32::from(pixel(&display, 8)[1]) - want).abs() < 1.0, "{} against {want}", pixel(&display, 8)[1]);
+        // Blurred at its own size and then enlarged, with the photo at
+        // its own size, blurred, beside it; and reduced and then
+        // blurred, at the size the reduction left.
+        let blur = Adjust { sharpen: -0.5, ..Default::default() };
+        let (display, luma) = Adjust { enlarge: Enlarge::times(3), ..blur }.apply(&photo, 40, 12);
+        assert_eq!((display.len(), luma.width, luma.height), (120 * 36 * 4, 120, 36));
+        assert_eq!(luma.unenlarged.as_deref(), Some(&blur.apply(&photo, 40, 12).1));
+        assert_eq!(&display[(15 * 120 + 9) * 4..(15 * 120 + 9) * 4 + 4], &[220, 40, 60, 255]);
+        let large = edge(80, 64);
+        let reduced = Adjust { enlarge: Enlarge::HALF, ..Default::default() }.apply(&large, 80, 64).0;
+        let (display, luma) = Adjust { enlarge: Enlarge::HALF, ..blur }.apply(&large, 80, 64);
+        assert_eq!((luma.width, luma.height), (40, 32));
+        assert_eq!(display, blur.apply(&reduced, 40, 32).0);
     }
 
     #[test]
