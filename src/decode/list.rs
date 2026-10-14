@@ -47,7 +47,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-use super::gf256::{self, div, exp, mul, poly_eval};
+use super::gf256::{self, Scale, div, exp, mul, poly_eval};
 use super::rs::{CwRead, DOUBT_CONFIRMING_BITS, RsSolution, doubted_agreement, list_solution_bits, nearest, preferring_the_standard, settle, soft_distance};
 use crate::symbol::grid::CERTAIN;
 use crate::work;
@@ -284,19 +284,21 @@ impl Curve {
     /// bits lie within the upper's.
     fn hasse(&self, a: usize, b: usize, xpow: &[u8], ypow: &[u8]) -> u8 {
         let mut total = 0u8;
-        for (t, poly) in self.coef.iter().enumerate().skip(b) {
-            if t & b != b {
-                continue;
-            }
+        // The powers whose bits hold the order's, in turn: the next after
+        // `t` is `(t + 1) | b`.
+        let mut t = b;
+        while t < self.coef.len() {
+            let poly = &self.coef[t];
             let mut inner = 0u8;
-            for (d, &c) in poly.iter().enumerate().skip(a) {
-                if c != 0 && d & a == a {
-                    inner ^= mul(c, xpow[d - a]);
-                }
+            let mut d = a;
+            while d < poly.len() {
+                inner ^= mul(poly[d], xpow[d - a]);
+                d = (d + 1) | a;
             }
             if inner != 0 {
                 total ^= mul(inner, ypow[t - b]);
             }
+            t = (t + 1) | b;
         }
         total
     }
@@ -311,13 +313,12 @@ impl Curve {
         if self.coef.len() < other.coef.len() {
             self.coef.resize(other.coef.len(), Vec::new());
         }
+        let times_c = Scale::new(c);
         for (mine, theirs) in self.coef.iter_mut().zip(&other.coef) {
             if mine.len() < theirs.len() {
                 mine.resize(theirs.len(), 0);
             }
-            for (m, &t) in mine.iter_mut().zip(theirs) {
-                *m ^= mul(c, t);
-            }
+            times_c.add_into(mine, theirs);
             trim(mine);
         }
     }
@@ -325,16 +326,26 @@ impl Curve {
     /// `self *= (X - x)`, in place: from the top, each coefficient
     /// moves up a degree and leaves `x` times itself behind.
     fn times_x_minus(&mut self, x: u8) {
+        let times_x = Scale::new(x);
         for poly in &mut self.coef {
             if poly.is_empty() {
                 continue;
             }
+            // Coefficient `d` becomes `x` times itself and the one below
+            // it: from the top, eight at a time, each reading only what
+            // has not been written yet.
             poly.push(0);
-            for d in (0..poly.len() - 1).rev() {
-                let c = poly[d];
-                poly[d + 1] ^= c;
-                poly[d] = mul(c, x);
+            let mut top = poly.len();
+            while top >= 9 {
+                let word = |at: usize| u64::from_le_bytes(poly[at..at + 8].try_into().expect("eight bytes"));
+                let raised = times_x.word(word(top - 8)) ^ word(top - 9);
+                poly[top - 8..top].copy_from_slice(&raised.to_le_bytes());
+                top -= 8;
             }
+            for d in (1..top).rev() {
+                poly[d] = times_x.byte(poly[d]) ^ poly[d - 1];
+            }
+            poly[0] = times_x.byte(poly[0]);
             trim(poly);
         }
     }
@@ -424,27 +435,38 @@ fn list_size(cost: usize, w: usize) -> (usize, usize) {
 /// and raising it by `(X - x)`. `None` when the work was called off.
 fn interpolate(constraints: &[(u8, u8, usize)], w: usize, list_size: usize) -> Option<Curve> {
     let mut curves: Vec<Curve> = (0..=list_size).map(Curve::monomial).collect();
+    // Each curve's leading monomial and degree in `x`, kept as the curves
+    // change: a constraint changes only the curves that fail it.
+    let mut leading: Vec<Option<(usize, usize)>> = curves.iter().map(|c| c.leading(w)).collect();
+    let mut degrees: Vec<usize> = curves.iter().map(Curve::x_degree).collect();
+    let mut d = vec![0u8; list_size + 1];
     let mut met = 0usize;
     for &(x, y, m) in constraints {
         let ypow = powers(y, list_size + 1);
         let mut xpow = powers(x, 1);
         for a in 0..m {
             for b in 0..m - a {
-                let degree = curves.iter().map(Curve::x_degree).max().unwrap_or(1);
+                let degree = degrees.iter().copied().max().unwrap_or(1);
                 while xpow.len() <= degree {
                     xpow.push(mul(*xpow.last().expect("a power"), x));
                 }
-                let d: Vec<u8> = curves.iter().map(|c| c.hasse(a, b, &xpow, &ypow)).collect();
-                let Some(pivot) = (0..=list_size).filter(|&j| d[j] != 0).min_by_key(|&j| curves[j].leading(w)) else { continue };
+                for (dj, curve) in d.iter_mut().zip(&curves) {
+                    *dj = curve.hasse(a, b, &xpow, &ypow);
+                }
+                let Some(pivot) = (0..=list_size).filter(|&j| d[j] != 0).min_by_key(|&j| leading[j]) else { continue };
                 let pivot_curve = std::mem::take(&mut curves[pivot]);
                 for j in 0..=list_size {
                     if j != pivot && d[j] != 0 {
                         let c = div(d[j], d[pivot]);
                         curves[j].add_scaled(&pivot_curve, c);
+                        leading[j] = curves[j].leading(w);
+                        degrees[j] = curves[j].x_degree();
                     }
                 }
                 curves[pivot] = pivot_curve;
                 curves[pivot].times_x_minus(x);
+                leading[pivot] = curves[pivot].leading(w);
+                degrees[pivot] = curves[pivot].x_degree();
                 met += 1;
                 if met.is_multiple_of(64) && work::cancelled() {
                     return None;

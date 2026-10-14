@@ -36,7 +36,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::gf256::{self, div, exp, exp_of_sum, log, mul, poly_degree, poly_eval, poly_mul};
+use super::gf256::{div, exp, exp_of_sum, log, mul, poly_degree, poly_eval, poly_mul};
 use crate::symbol::grid::CERTAIN;
 use crate::work;
 
@@ -394,10 +394,23 @@ pub fn soft_count_bits(block: &[CwRead], bit_reliability: &[[u8; 8]], redundancy
             if cost > reach {
                 continue;
             }
-            for d in (cost..=reach).rev() {
-                ways[d] += ways[d - cost];
+            // `ways[d] += ways[d - cost]` from the top down, which reads
+            // only counts not yet added to: so done a stretch of `cost` at
+            // a time, each stretch from the one below it, which it does
+            // not overlap. The counts below `cost` are as they were, and
+            // were no larger than the bound the last time round.
+            let mut peak = 0f64;
+            let mut end = reach + 1;
+            while end > cost {
+                let start = (end - cost).max(cost);
+                let (below, from) = ways.split_at_mut(start);
+                for (w, &add) in from[..end - start].iter_mut().zip(&below[start - cost..end - cost]) {
+                    *w += add;
+                    peak = peak.max(*w);
+                }
+                end = start;
             }
-            if ways.iter().any(|&w| w > 2f64.powi(500)) {
+            if peak > 2f64.powi(500) {
                 for w in &mut ways {
                     *w *= 2f64.powi(-500);
                 }
@@ -1134,18 +1147,32 @@ struct Locator {
     c: Vec<u8>,
     b: Vec<u8>,
     previous: Vec<u8>,
+    /// The locator's nonzero coefficients past the first, with their
+    /// logarithms.
+    logs: Vec<(usize, usize)>,
     /// Positions of the block the locator is searched for roots over.
     n: usize,
-    /// `powers[j * n + i]` is `j · (n - 1 - i) mod 255`: the logarithm
-    /// of the `j`th power of position `i`'s locator, so that the locator
-    /// is evaluated at a position by a lookup a coefficient.
-    powers: Vec<u16>,
+    /// `inverse[i * (ec_len + 1) + j]` is `255 - j · (n - 1 - i) mod 255`:
+    /// the logarithm of the `j`th power of the inverse of position `i`'s
+    /// locator, so that the locator is evaluated at a position by a
+    /// lookup a coefficient, a position's powers side by side.
+    inverse: Vec<u16>,
+    stride: usize,
 }
 
 impl Locator {
     fn new(ec_len: usize, n: usize) -> Self {
-        let powers = (0..=ec_len).flat_map(|j| (0..n).map(move |i| ((j * (n - 1 - i)) % 255) as u16)).collect();
-        Self { c: Vec::with_capacity(ec_len + 2), b: Vec::with_capacity(ec_len + 2), previous: Vec::with_capacity(ec_len + 2), n, powers }
+        let stride = ec_len + 1;
+        let inverse = (0..n).flat_map(|i| (0..stride).map(move |j| (255 - (j * (n - 1 - i)) % 255) as u16)).collect();
+        Self {
+            c: Vec::with_capacity(ec_len + 2),
+            b: Vec::with_capacity(ec_len + 2),
+            previous: Vec::with_capacity(ec_len + 2),
+            logs: Vec::with_capacity(ec_len + 1),
+            n,
+            inverse,
+            stride,
+        }
     }
 
     /// Whether the Forney syndromes `s` of a try have an error locator
@@ -1156,8 +1183,8 @@ impl Locator {
     /// [`berlekamp_massey`] grows it, and the try given up the moment
     /// it grows past `max_len`, since it never shrinks.
     fn locates(&mut self, s: &[u8], max_len: usize, erased: &[usize]) -> bool {
-        let Self { c, b, previous, n, powers } = self;
-        let n = *n;
+        let Self { c, b, previous, logs, n, inverse, stride } = self;
+        let (n, stride) = (*n, *stride);
         c.clear();
         c.push(1);
         b.clear();
@@ -1205,20 +1232,27 @@ impl Locator {
         // The locator at the inverse of each position's locator, which
         // is where a root lies for an error there: `c[0]`, which is one,
         // plus each coefficient times the position's locator to the
-        // minus `j`, by the logarithms.
-        let logs: Vec<(usize, usize)> = (1..=l).filter(|&j| c[j] != 0).map(|j| (j, log(c[j]))).collect();
-        let mut roots = 0;
+        // minus `j`, by the logarithms. Past `n - l` positions that are
+        // no root, the locator cannot have its `l`.
+        logs.clear();
+        logs.extend((1..=l).filter(|&j| c[j] != 0).map(|j| (j, log(c[j]))));
+        let (mut roots, mut misses) = (0, 0);
         for i in 0..n {
+            let at = &inverse[i * stride..(i + 1) * stride];
             let mut value = c[0];
-            for &(j, lg) in &logs {
-                // α^(-j·p) is α^(255 - j·p mod 255).
-                value ^= exp_of_sum(lg + 255 - usize::from(powers[j * n + i]));
+            for &(j, lg) in logs.iter() {
+                value ^= exp_of_sum(lg + usize::from(at[j]));
             }
             if value == 0 {
                 if erased.binary_search(&i).is_ok() {
                     return false;
                 }
                 roots += 1;
+            } else {
+                misses += 1;
+                if misses > n - l {
+                    return false;
+                }
             }
         }
         roots == l
@@ -1791,8 +1825,9 @@ struct BitSystem {
     /// Row `8 * j + k` is bit `k` of syndrome `j`; the right-hand side
     /// sits at column `columns.len()`. Reduced on the unknown columns:
     /// a pivot's column is set in its row alone, and the pivot rows come
-    /// first.
-    rows: Vec<Vec<u64>>,
+    /// first. The rows lie end to end, `words` words each.
+    rows: Vec<u64>,
+    words: usize,
     /// Row holding each unknown column's pivot, `usize::MAX` for none.
     pivot_row: Vec<usize>,
     rank: usize,
@@ -1815,15 +1850,25 @@ impl BitSystem {
         }
         let rhs = columns.len();
         let words = rhs / 64 + 1;
-        let mut rows = vec![vec![0u64; words]; equations];
-        for (col, &(i, bit)) in columns.iter().enumerate() {
-            let x = exp(n - 1 - i);
-            for j in 0..ec_len {
-                let contribution = mul(1 << bit, gf256::pow(x, j));
+        let mut rows = vec![0u64; equations * words];
+        // What each column adds to syndrome `j`: its bit times its
+        // codeword's locator to the `j`th power, a byte whose bit `k`
+        // goes to row `8 * j + k`. Eight columns' bytes at a time are
+        // turned about, so that each byte of the result is one row's bits
+        // across the eight.
+        let locators: Vec<u8> = columns.iter().map(|&(i, _)| exp(n - 1 - i)).collect();
+        let mut powers = vec![1u8; rhs];
+        let mut contributions = vec![0u8; rhs.next_multiple_of(8)];
+        for j in 0..ec_len {
+            for (col, &(_, bit)) in columns.iter().enumerate() {
+                contributions[col] = mul(1 << bit, powers[col]);
+                powers[col] = mul(powers[col], locators[col]);
+            }
+            for (m, &eight) in contributions.as_chunks::<8>().0.iter().enumerate() {
+                let turned = transpose_bits(u64::from_le_bytes(eight));
+                let (word, shift) = (m / 8, 8 * (m % 8));
                 for k in 0..8 {
-                    if contribution >> k & 1 != 0 {
-                        rows[8 * j + k][col / 64] |= 1 << (col % 64);
-                    }
+                    rows[(8 * j + k) * words + word] |= (turned >> (8 * k) & 0xFF) << shift;
                 }
             }
         }
@@ -1831,19 +1876,29 @@ impl BitSystem {
         for (j, &s) in rs_syndromes(&received, ec_len).iter().enumerate() {
             for k in 0..8 {
                 if s >> k & 1 != 0 {
-                    rows[8 * j + k][rhs / 64] |= 1 << (rhs % 64);
+                    rows[(8 * j + k) * words + rhs / 64] |= 1 << (rhs % 64);
                 }
             }
         }
         let mut rank = 0;
         let mut pivot_row = vec![usize::MAX; unknown];
+        let mut pivot = vec![0u64; words];
         for (col, pivot_of) in pivot_row.iter_mut().enumerate() {
-            let Some(p) = (rank..equations).find(|&r| Self::bit(&rows[r], col)) else { continue };
-            rows.swap(rank, p);
-            let pivot = rows[rank].clone();
-            for (r, row) in rows.iter_mut().enumerate() {
-                if r != rank && Self::bit(row, col) {
-                    for (a, b) in row.iter_mut().zip(&pivot) {
+            let (word, bit) = (col / 64, 1u64 << (col % 64));
+            let Some(p) = (rank..equations).find(|&r| rows[r * words + word] & bit != 0) else { continue };
+            if p != rank {
+                let (head, tail) = rows.split_at_mut(p * words);
+                head[rank * words..(rank + 1) * words].swap_with_slice(&mut tail[..words]);
+            }
+            // The pivot row is nought in every column before its own: a
+            // column with a pivot was cleared from every other row, and
+            // one without is nought in every row from the rank on. So the
+            // words before its own add nothing.
+            debug_assert!(rows[rank * words..rank * words + word].iter().all(|&w| w == 0));
+            pivot[word..].copy_from_slice(&rows[rank * words + word..(rank + 1) * words]);
+            for (r, row) in rows.chunks_exact_mut(words).enumerate() {
+                if r != rank && row[word] & bit != 0 {
+                    for (a, b) in row[word..].iter_mut().zip(&pivot[word..]) {
                         *a ^= b;
                     }
                 }
@@ -1851,7 +1906,11 @@ impl BitSystem {
             *pivot_of = rank;
             rank += 1;
         }
-        Self { columns, unknown, equations, rows, pivot_row, rank }
+        Self { columns, unknown, equations, rows, words, pivot_row, rank }
+    }
+
+    fn row(&self, r: usize) -> &[u64] {
+        &self.rows[r * self.words..(r + 1) * self.words]
     }
 
     fn bit(row: &[u64], col: usize) -> bool {
@@ -1865,7 +1924,7 @@ impl BitSystem {
     /// Whether the known bits can all be right: no row without a pivot
     /// has anything on its right-hand side.
     fn consistent(&self) -> bool {
-        self.rows[self.rank..].iter().all(|row| !self.rhs(row))
+        self.rows[self.rank * self.words..].chunks_exact(self.words).all(|row| !self.rhs(row))
     }
 
     /// Unknown columns set in a row.
@@ -1895,7 +1954,7 @@ impl BitSystem {
             if self.pivot_row[col] == usize::MAX {
                 continue;
             }
-            let row = &self.rows[self.pivot_row[col]];
+            let row = self.row(self.pivot_row[col]);
             if self.unknowns_in(row) != 1 {
                 continue;
             }
@@ -1908,27 +1967,38 @@ impl BitSystem {
         BitSolution { corrected, solved, unknown_bits: self.unknown, solved_bits, spare_equations: spare }
     }
 
-    /// A column, or the right-hand side, over the rows no unknown has a
-    /// pivot in: what the known bits must answer for by themselves.
-    fn over_zero(&self, col: usize) -> Vec<u64> {
+    /// The rows no unknown has a pivot in, as every known column and
+    /// the right-hand side stand over them, what the known bits must
+    /// answer for by themselves: computed once for the flips and every
+    /// size of free a block is tried with, a row at a time, each setting
+    /// its bit in the columns it holds.
+    fn zero_rows(&self) -> ZeroRows {
         let zero = self.equations - self.rank;
-        let mut v = vec![0u64; zero / 64 + 1];
-        for (k, row) in self.rows[self.rank..].iter().enumerate() {
-            if Self::bit(row, col) {
-                v[k / 64] |= 1 << (k % 64);
+        let words = zero / 64 + 1;
+        let (first, end) = (self.unknown, self.columns.len());
+        let mut columns = vec![0u64; (end - first) * words];
+        let mut residual = vec![0u64; words];
+        for (k, row) in self.rows[self.rank * self.words..].chunks_exact(self.words).enumerate() {
+            let (word, bit) = (k / 64, 1u64 << (k % 64));
+            if self.rhs(row) {
+                residual[word] |= bit;
+            }
+            for (w, &held) in row.iter().enumerate().take(end.div_ceil(64)).skip(first / 64) {
+                let mut held = held;
+                if w == first / 64 {
+                    held &= !0u64 << (first % 64);
+                }
+                if w == end / 64 {
+                    held &= (1u64 << (end % 64)) - 1;
+                }
+                while held != 0 {
+                    let col = 64 * w + held.trailing_zeros() as usize;
+                    columns[(col - first) * words + word] |= bit;
+                    held &= held - 1;
+                }
             }
         }
-        v
-    }
-
-    /// The rows no unknown has a pivot in, as every known column and
-    /// the right-hand side stand over them: computed once for the flips
-    /// and every size of free a block is tried with.
-    fn zero_rows(&self) -> ZeroRows {
-        ZeroRows {
-            residual: self.over_zero(self.columns.len()),
-            columns: (self.unknown..self.columns.len()).map(|col| self.over_zero(col)).collect(),
-        }
+        ZeroRows { words, residual, columns }
     }
 
     /// The block solved with `size` codewords of those read freed, by
@@ -1968,23 +2038,20 @@ impl BitSystem {
         if size == 0 || size > c || zero < 8 * size + DOUBT_SPARE_EQUATIONS {
             return (tries, Vec::new());
         }
-        let residual = &over.residual;
-        let vectors: Vec<Vec<&[u64]>> =
-            candidates.iter().map(|&i| columns_of[i].iter().map(|&col| over.columns[col - self.unknown].as_slice()).collect()).collect();
+        // Each candidate's known columns over the zero rows, laid end to
+        // end in the order of the candidates.
+        let mut starts = Vec::with_capacity(c + 1);
+        starts.push(0);
+        let mut vectors = Vec::new();
+        for &i in &candidates {
+            for &col in &columns_of[i] {
+                vectors.extend_from_slice(over.column(col - self.unknown));
+            }
+            starts.push(starts[starts.len() - 1] + columns_of[i].len());
+        }
         let mut found: Vec<(u32, (Vec<usize>, Vec<u8>, BitSolution))> = Vec::new();
-        each_set(c, size, |set| {
-            let mut span = Span::default();
-            let mut freed = 0;
-            for (which, &k) in set.iter().enumerate() {
-                for (b, &v) in vectors[k].iter().enumerate() {
-                    span.add(v.to_vec(), 1 << (8 * which + b));
-                    freed += 1;
-                }
-            }
-            if span.rows.len() != freed {
-                return;
-            }
-            let Some(combination) = span.express(residual.clone()) else { return };
+        each_freeing(&starts, &vectors, &over.residual, size, |set, combination| {
+            let freed: usize = set.iter().map(|&k| starts[k + 1] - starts[k]).sum();
             let mut changed = vec![0u8; n];
             for (which, &k) in set.iter().enumerate() {
                 let i = candidates[k];
@@ -2035,7 +2102,7 @@ impl BitSystem {
             return (0, Vec::new());
         }
         let residual = &over.residual;
-        let vectors: Vec<&[u64]> = cols.iter().map(|&(_, col)| over.columns[col - self.unknown].as_slice()).collect();
+        let vectors: Vec<&[u64]> = cols.iter().map(|&(_, col)| over.column(col - self.unknown)).collect();
         let mut sets: Vec<Vec<usize>> = Vec::new();
         let mut tries = c;
         for (k, &v) in vectors.iter().enumerate() {
@@ -2046,13 +2113,50 @@ impl BitSystem {
         let pairs = c * (c - 1) / 2;
         if c >= 2 && zero >= DOUBT_SPARE_EQUATIONS + tries_charge(tries + pairs) as usize {
             tries += pairs;
-            let mut by_vector: HashMap<&[u64], Vec<usize>> = HashMap::new();
-            let xor = |a: &[u64], b: &[u64]| -> Vec<u64> { a.iter().zip(b).map(|(x, y)| x ^ y).collect() };
-            for (k, &v) in vectors.iter().enumerate() {
-                if let Some(others) = by_vector.get(xor(residual, v).as_slice()) {
-                    sets.extend(others.iter().map(|&a| vec![a, k]));
+            // Every bit by a fingerprint of its column, those sharing one
+            // in their order: a pair is a bit and one before it whose
+            // column makes up the rest, a triple two bits and one after
+            // them that does. The fingerprint is linear, so that of what
+            // is left wanting is the sum of the fingerprints, and a column
+            // whose fingerprint matches is held to the vector itself.
+            let fingerprint = |v: &[u64]| v.iter().enumerate().fold(0u64, |f, (w, &x)| f ^ x.rotate_left((23 * w % 64) as u32));
+            let prints: Vec<u64> = vectors.iter().map(|v| fingerprint(v)).collect();
+            let mut by_print: HashMap<u64, Vec<usize>, WordHash> = HashMap::with_capacity_and_hasher(c, WordHash::default());
+            // And which fingerprints there are at all, by sixteen bits of
+            // them, which the triples ask after hundreds of thousands of
+            // times a block and nearly always in vain: most are answered
+            // here, without the map.
+            let slot = |print: u64| (print.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48) as usize;
+            let mut present = vec![0u64; 1 << 10];
+            for (k, &print) in prints.iter().enumerate() {
+                by_print.entry(print).or_default().push(k);
+                present[slot(print) / 64] |= 1 << (slot(print) % 64);
+            }
+            let maybe = |print: u64| present[slot(print) / 64] >> (slot(print) % 64) & 1 != 0;
+            let wanting = fingerprint(residual);
+            let mut target = vec![0u64; residual.len()];
+            // The bits among `found` whose column is `residual` plus those
+            // of `with`.
+            let mut matching = |found: &[usize], with: &[&[u64]], keep: &mut dyn FnMut(usize)| {
+                target.copy_from_slice(residual);
+                for v in with {
+                    for (t, x) in target.iter_mut().zip(*v) {
+                        *t ^= x;
+                    }
                 }
-                by_vector.entry(v).or_default().push(k);
+                for &k in found {
+                    if vectors[k] == target.as_slice() {
+                        keep(k);
+                    }
+                }
+            };
+            for (k, &v) in vectors.iter().enumerate() {
+                if let Some(others) = by_print.get(&(wanting ^ prints[k])) {
+                    let before = &others[..others.partition_point(|&a| a < k)];
+                    if !before.is_empty() {
+                        matching(before, &[v], &mut |a| sets.push(vec![a, k]));
+                    }
+                }
             }
             // As many of the least reliable bits as have no more pairs
             // than four lookups a set of the budget: a lookup is a hash of
@@ -2062,10 +2166,17 @@ impl BitSystem {
             if c >= 3 && zero >= DOUBT_SPARE_EQUATIONS + tries_charge(tries + triples) as usize {
                 tries += triples;
                 for a in 0..s {
+                    let partial = wanting ^ prints[a];
                     for b in a + 1..s {
-                        let target = xor(&xor(residual, vectors[a]), vectors[b]);
-                        if let Some(others) = by_vector.get(target.as_slice()) {
-                            sets.extend(others.iter().filter(|&&k| k > b).map(|&k| vec![a, b, k]));
+                        let print = partial ^ prints[b];
+                        if !maybe(print) {
+                            continue;
+                        }
+                        if let Some(others) = by_print.get(&print) {
+                            let after = &others[others.partition_point(|&k| k <= b)..];
+                            if !after.is_empty() {
+                                matching(after, &[vectors[a], vectors[b]], &mut |k| sets.push(vec![a, b, k]));
+                            }
                         }
                     }
                 }
@@ -2088,67 +2199,373 @@ impl BitSystem {
     }
 }
 
+/// An eight by eight matrix of bits turned about its diagonal: bit `c`
+/// of byte `r` becomes bit `r` of byte `c`. Three exchanges, of the
+/// corners of each two by two block, then of each four by four, then of
+/// the whole.
+fn transpose_bits(mut x: u64) -> u64 {
+    let t = (x ^ (x >> 7)) & 0x00AA_00AA_00AA_00AA;
+    x ^= t ^ (t << 7);
+    let t = (x ^ (x >> 14)) & 0x0000_CCCC_0000_CCCC;
+    x ^= t ^ (t << 14);
+    let t = (x ^ (x >> 28)) & 0x0000_0000_F0F0_F0F0;
+    x ^= t ^ (t << 28);
+    x
+}
+
+/// A hasher for the fingerprints of the columns of a [`BitSystem`] over
+/// its zero rows ([`BitSystem::flipping`]): a rotate and a multiply a
+/// word. The columns are a code's, as good as random, and a map of them
+/// is looked into hundreds of thousands of times a block, where the
+/// standard library's hasher, made to withstand keys chosen to collide,
+/// costs several times as much.
+#[derive(Clone, Copy, Default)]
+struct WordHasher(u64);
+
+impl std::hash::Hasher for WordHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, rest) = bytes.as_chunks::<8>();
+        for &word in words {
+            self.write_u64(u64::from_le_bytes(word));
+        }
+        for &byte in rest {
+            self.write_u64(u64::from(byte));
+        }
+    }
+
+    fn write_u64(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+}
+
+type WordHash = std::hash::BuildHasherDefault<WordHasher>;
+
 /// The rows of a [`BitSystem`] no unknown has a pivot in, as the known
 /// columns and the right-hand side stand over them ([`BitSystem::zero_rows`]).
 struct ZeroRows {
+    /// Words each vector over the rows takes.
+    words: usize,
     /// The right-hand side: what the known bits as read leave wanting.
     residual: Vec<u64>,
-    /// Each known column, by its place among the known columns.
-    columns: Vec<Vec<u64>>,
+    /// Each known column, by its place among the known columns, laid end
+    /// to end.
+    columns: Vec<u64>,
 }
 
-/// Vectors over GF(2) in fully reduced echelon form, each with the
-/// combination of the vectors added that it is made of, so that a vector
-/// the span holds can be expressed in them.
-#[derive(Clone, Default)]
-struct Span {
-    /// Each row with the index of its pivot bit and its combination.
-    rows: Vec<(Vec<u64>, usize, u32)>,
+impl ZeroRows {
+    /// The `k`th known column.
+    fn column(&self, k: usize) -> &[u64] {
+        &self.columns[k * self.words..(k + 1) * self.words]
+    }
 }
 
-impl Span {
-    fn bit(v: &[u64], at: usize) -> bool {
-        v[at / 64] >> (at % 64) & 1 != 0
+/// Vectors over GF(2) of `W` words in fully reduced echelon form, each
+/// with the combination of the vectors added that it is made of, so that
+/// a vector the span holds can be expressed in them: no more than `R` of
+/// them. Every row is nought at every other row's pivot, so whether a
+/// row is added to a vector being reduced is read off the vector as it
+/// came, for every row at once, rather than off what the rows before it
+/// left, one after another; and is added under a mask rather than a
+/// branch, since it is a coin's toss which no predictor guesses. The
+/// combinations are kept only where `TRACK`, since the search of
+/// [`each_freeing`] asks for one only of a set that solves, which few do.
+struct Span<const W: usize, const R: usize, const TRACK: bool> {
+    rows: [[u64; W]; R],
+    /// Each row's pivot, its lowest bit, as a vector of that bit alone,
+    /// and as its word and the bit in it.
+    pivots: [[u64; W]; R],
+    pivot_at: [(usize, u64); R],
+    combinations: [u32; R],
+    len: usize,
+}
+
+impl<const W: usize, const R: usize, const TRACK: bool> Span<W, R, TRACK> {
+    fn new() -> Self {
+        Self { rows: [[0; W]; R], pivots: [[0; W]; R], pivot_at: [(0, 0); R], combinations: [0; R], len: 0 }
     }
 
-    fn xor(v: &mut [u64], w: &[u64]) {
-        for (a, b) in v.iter_mut().zip(w) {
-            *a ^= b;
-        }
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// All ones where `v` holds the bit of `pivot`, else nought.
+    fn holds(v: &[u64; W], pivot: &[u64; W]) -> u64 {
+        let any = v.iter().zip(pivot).fold(0, |any, (a, b)| any | (a & b));
+        0u64.wrapping_sub(u64::from(any != 0))
     }
 
     /// Add a vector, `combination` naming it; false when it lay in the
     /// span already.
-    fn add(&mut self, mut v: Vec<u64>, mut combination: u32) -> bool {
-        for (row, pivot, c) in &self.rows {
-            if Self::bit(&v, *pivot) {
-                Self::xor(&mut v, row);
-                combination ^= c;
+    fn add(&mut self, mut v: [u64; W], mut combination: u32) -> bool {
+        debug_assert!(self.len < R);
+        self.reduce(&mut v, &mut combination);
+        let Some(word) = v.iter().position(|&x| x != 0) else { return false };
+        let mut pivot = [0u64; W];
+        pivot[word] = v[word].isolate_lowest_one();
+        for r in 0..self.len {
+            let mask = Self::holds(&self.rows[r], &pivot);
+            for (a, b) in self.rows[r].iter_mut().zip(&v) {
+                *a ^= b & mask;
+            }
+            if TRACK {
+                self.combinations[r] ^= combination & mask as u32;
             }
         }
-        let Some(word) = v.iter().position(|&w| w != 0) else { return false };
-        let pivot = 64 * word + v[word].trailing_zeros() as usize;
-        for (row, _, c) in &mut self.rows {
-            if Self::bit(row, pivot) {
-                Self::xor(row, &v);
-                *c ^= combination;
-            }
-        }
-        self.rows.push((v, pivot, combination));
+        self.rows[self.len] = v;
+        self.pivots[self.len] = pivot;
+        self.pivot_at[self.len] = (word, pivot[word]);
+        self.combinations[self.len] = combination;
+        self.len += 1;
         true
     }
 
-    /// The combination of the vectors added that makes `target`, when
-    /// the span holds it.
-    fn express(&self, mut target: Vec<u64>) -> Option<u32> {
-        let mut combination = 0;
-        for (row, pivot, c) in &self.rows {
-            if Self::bit(&target, *pivot) {
-                Self::xor(&mut target, row);
-                combination ^= c;
+    /// `v` modulo the span, in place, with the combination of the rows
+    /// added to it added to `combination`: nought exactly when the span
+    /// holds `v`, and `combination` then what makes it.
+    fn reduce(&self, v: &mut [u64; W], combination: &mut u32) {
+        let came = *v;
+        for r in 0..self.len {
+            let mask = Self::holds(&came, &self.pivots[r]);
+            for (a, b) in v.iter_mut().zip(&self.rows[r]) {
+                *a ^= b & mask;
+            }
+            if TRACK {
+                *combination ^= self.combinations[r] & mask as u32;
             }
         }
-        target.iter().all(|&w| w == 0).then_some(combination)
+    }
+}
+
+/// Every set of `size` codewords whose freed columns are independent and
+/// make up `residual`, as [`BitSystem::trying`] looks for them, to `f`
+/// with the combination that does: bit `8 * which + b` for the `b`th
+/// column of the `which`th codeword of the set. The `k`th codeword's
+/// columns are `vectors` from `starts[k]` to `starts[k + 1]`, each of the
+/// residual's length, eight to a codeword at the most. The sets come in
+/// the order [`each_set`] makes them, and the work asks every so often
+/// whether it was called off.
+///
+/// A set is reduced a codeword at a time. The columns of the codewords
+/// chosen so far span a space, and every codeword after them is taken
+/// modulo it once, for all the sets that begin so; whether a codeword's
+/// columns add as many dimensions as it has columns, and whether what is
+/// left of the residual lies among them, is then an elimination among its
+/// own few. A prefix whose columns are dependent already is so in every
+/// set it begins, and those are passed over. Columns that are independent
+/// make a vector one way only, so the combination of a set that solves is
+/// found afterwards from its own columns, and is the one a reduction of
+/// the whole set at once finds. The vectors are held in as few whole
+/// words as hold them, the words past their end nought, which leaves
+/// every pivot where it was.
+fn each_freeing(starts: &[usize], vectors: &[u64], residual: &[u64], size: usize, f: impl FnMut(&[usize], u32)) {
+    match residual.len() {
+        0 | 1 => Freeing::<1>::new(starts, vectors, residual, size).each(f),
+        2 => Freeing::<2>::new(starts, vectors, residual, size).each(f),
+        3 | 4 => Freeing::<4>::new(starts, vectors, residual, size).each(f),
+        5..=9 => Freeing::<9>::new(starts, vectors, residual, size).each(f),
+        _ => Freeing::<32>::new(starts, vectors, residual, size).each(f),
+    }
+}
+
+/// A vector of `W` words folded into one, by a map that is linear: the
+/// folds of vectors that are dependent are dependent, so folds that are
+/// independent say the vectors are.
+fn fold<const W: usize>(v: &[u64; W]) -> u64 {
+    v.iter().enumerate().fold(0, |f, (w, &x)| f ^ x.rotate_left((17 * w % 64) as u32))
+}
+
+/// Whether the words `vs`, and `last` after them, are independent: a
+/// word at a time reduced by those before it, nought when it is not.
+fn independent_words(vs: &[u64], last: u64) -> bool {
+    let (mut rows, mut pivots, mut len) = ([0u64; 9], [0u64; 9], 0);
+    for &v in vs.iter().chain(std::iter::once(&last)) {
+        let mut v = v;
+        for r in 0..len {
+            v ^= rows[r] & 0u64.wrapping_sub(u64::from(v & pivots[r] != 0));
+        }
+        if v == 0 {
+            return false;
+        }
+        rows[len] = v;
+        pivots[len] = v.isolate_lowest_one();
+        len += 1;
+    }
+    true
+}
+
+/// The state of [`each_freeing`] over vectors of `W` words.
+struct Freeing<'a, const W: usize> {
+    starts: &'a [usize],
+    size: usize,
+    /// For each depth `d` short of the last: every vector modulo the
+    /// columns of the first `d` codewords of the set. Only the vectors of
+    /// the codewords after the `d`th are kept up to date. At the last
+    /// depth only their folds are kept, below, and a codeword's vectors
+    /// are reduced in full only where its folds do not settle the set.
+    vectors: Vec<Vec<[u64; W]>>,
+    /// For each depth, every vector's fold ([`fold`]).
+    folds: Vec<Vec<u64>>,
+    /// For each depth, the residual so.
+    residuals: Vec<[u64; W]>,
+    /// The columns of the codeword before the last, modulo those before
+    /// it: what the last depth's vectors are the depth before's modulo.
+    prefix: Span<W, 8, false>,
+    /// The columns of the codeword in hand, modulo those before it.
+    span: Span<W, 8, false>,
+    set: Vec<usize>,
+    /// Sets of full size looked at, for asking every so often whether
+    /// the work was called off.
+    looked: usize,
+}
+
+impl<'a, const W: usize> Freeing<'a, W> {
+    fn new(starts: &'a [usize], vectors: &[u64], residual: &[u64], size: usize) -> Self {
+        let words = residual.len();
+        assert!(words <= W, "vectors of {words} words held in {W}");
+        let widen = |v: &[u64]| {
+            let mut out = [0u64; W];
+            out[..words].copy_from_slice(v);
+            out
+        };
+        let count = starts[starts.len() - 1];
+        let first: Vec<[u64; W]> = vectors.chunks_exact(words.max(1)).map(widen).collect();
+        debug_assert_eq!(first.len(), count);
+        let mut folds = vec![first.iter().map(fold).collect::<Vec<u64>>()];
+        folds.resize(size.max(1), vec![0; count]);
+        let mut levels = vec![first];
+        levels.resize(size.saturating_sub(1).max(1), vec![[0; W]; count]);
+        let mut residuals = vec![[0; W]; size.max(1)];
+        residuals[0] = widen(residual);
+        Self { starts, size, vectors: levels, folds, residuals, prefix: Span::new(), span: Span::new(), set: vec![0; size], looked: 0 }
+    }
+
+    fn each(mut self, mut f: impl FnMut(&[usize], u32)) {
+        let c = self.starts.len() - 1;
+        if self.size == 0 || self.size > c {
+            return;
+        }
+        if self.size == 1 {
+            self.leaves(0, 0, &mut f);
+        } else {
+            self.descend(0, 0, &mut f);
+        }
+    }
+
+    /// The sets whose first `depth` codewords are those chosen, the next
+    /// one from `from` on, short of the last. False once the work was
+    /// called off.
+    fn descend(&mut self, depth: usize, from: usize, f: &mut impl FnMut(&[usize], u32)) -> bool {
+        let c = self.starts.len() - 1;
+        for k in from..=c - (self.size - depth) {
+            if work::cancelled() {
+                return false;
+            }
+            // The codeword's columns modulo those chosen before it.
+            self.span.clear();
+            if !self.vectors[depth][self.starts[k]..self.starts[k + 1]].iter().all(|&v| self.span.add(v, 0)) {
+                continue;
+            }
+            self.set[depth] = k;
+            let mut residual = self.residuals[depth];
+            self.span.reduce(&mut residual, &mut 0);
+            self.residuals[depth + 1] = residual;
+            // Everything after it, modulo it as well: in full, or, for
+            // the last depth, the folds alone, which are linear, so that
+            // a vector's is its own and those of the rows it takes.
+            let after = self.starts[k + 1];
+            let (done, next) = self.folds.split_at_mut(depth + 1);
+            let (folds, next_folds) = (&done[depth][after..], &mut next[0][after..]);
+            let more = if depth + 2 == self.size {
+                let span = &self.span;
+                let row_folds: [u64; 8] = std::array::from_fn(|r| if r < span.len { fold(&span.rows[r]) } else { 0 });
+                let pivots = &span.pivot_at[..span.len];
+                for ((out, &folded), v) in next_folds.iter_mut().zip(folds).zip(&self.vectors[depth][after..]) {
+                    *out = pivots.iter().zip(&row_folds).fold(folded, |out, (&(word, bit), &row)| out ^ row & 0u64.wrapping_sub(u64::from(v[word] & bit != 0)));
+                }
+                std::mem::swap(&mut self.prefix, &mut self.span);
+                self.leaves(depth + 1, k + 1, f)
+            } else {
+                let (done, next) = self.vectors.split_at_mut(depth + 1);
+                for ((out, folded), &v) in next[0][after..].iter_mut().zip(next_folds).zip(&done[depth][after..]) {
+                    let mut v = v;
+                    self.span.reduce(&mut v, &mut 0);
+                    *out = v;
+                    *folded = fold(&v);
+                }
+                self.descend(depth + 1, k + 1, f)
+            };
+            if !more {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The sets whose first `depth` codewords are those chosen, the last
+    /// one from `from` on. False once the work was called off.
+    ///
+    /// Most sets fail, the residual lying outside their span, which their
+    /// folds ([`fold`]) mostly show at once: the folds of the last
+    /// codeword's columns and of the residual independent, the vectors
+    /// are, and the residual is not among the columns. Only where the
+    /// folds are dependent, which every set that solves is, is the set
+    /// reduced in full: the codeword's columns at the depth before,
+    /// modulo the codeword chosen there, in `prefix`.
+    fn leaves(&mut self, depth: usize, from: usize, f: &mut impl FnMut(&[usize], u32)) -> bool {
+        let c = self.starts.len() - 1;
+        let residual_fold = fold(&self.residuals[depth]);
+        for k in from..c {
+            self.looked += 1;
+            if self.looked.is_multiple_of(256) && work::cancelled() {
+                return false;
+            }
+            if independent_words(&self.folds[depth][self.starts[k]..self.starts[k + 1]], residual_fold) {
+                continue;
+            }
+            self.span.clear();
+            let before = depth.saturating_sub(1);
+            let independent = self.vectors[before][self.starts[k]..self.starts[k + 1]].iter().all(|&v| {
+                let mut v = v;
+                if depth > 0 {
+                    self.prefix.reduce(&mut v, &mut 0);
+                }
+                self.span.add(v, 0)
+            });
+            if !independent {
+                continue;
+            }
+            let mut residual = self.residuals[depth];
+            self.span.reduce(&mut residual, &mut 0);
+            if residual.iter().all(|&x| x == 0) {
+                self.set[depth] = k;
+                f(&self.set, self.combination());
+            }
+        }
+        true
+    }
+
+    /// The combination of the columns of the set in hand that makes the
+    /// residual, which they do, and in one way only.
+    fn combination(&self) -> u32 {
+        let mut whole: Span<W, 24, true> = Span::new();
+        for (which, &k) in self.set.iter().enumerate() {
+            for (b, &v) in self.vectors[0][self.starts[k]..self.starts[k + 1]].iter().enumerate() {
+                let independent = whole.add(v, 1 << (8 * which + b));
+                debug_assert!(independent);
+            }
+        }
+        let (mut residual, mut combination) = (self.residuals[0], 0);
+        whole.reduce(&mut residual, &mut combination);
+        debug_assert!(residual.iter().all(|&x| x == 0));
+        combination
     }
 }
 
@@ -3218,10 +3635,11 @@ mod tests {
             let block = codeword(&mut rng, data_len, ec_len);
             let n = block.len();
             let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
-            let erasures = rng.below(ec_len.min(n) / 2 + 1);
+            let mut erasures = rng.below(ec_len.min(n) / 2 + 1);
             let wrong = rng.below(ec_len / 2 + 2);
             for &i in &rng.distinct((erasures + wrong).min(n), n) {
                 if erasures > 0 && read[i].known == 0xFF && rng.below(2) == 0 {
+                    erasures -= 1;
                     read[i] = CwRead::unknown();
                 } else {
                     read[i].value ^= rng.nonzero();
@@ -3364,5 +3782,120 @@ mod tests {
             let expected = f64::from(blocks) / 2f64.powi(located as i32 + 1);
             assert!(f64::from(solved_at_the_limit) >= expected / 2.0, "{len} codewords, {ec_len} EC: {solved_at_the_limit} at the limit, {expected} expected");
         }
+    }
+
+    #[test]
+    fn bits_are_turned_about_the_diagonal() {
+        let mut rng = Rng(0x7AA5);
+        for _ in 0..1000 {
+            let x = rng.next();
+            let turned = transpose_bits(x);
+            for r in 0..8 {
+                for c in 0..8 {
+                    assert_eq!(turned >> (8 * c + r) & 1, x >> (8 * r + c) & 1, "{x:#x}: ({r}, {c})");
+                }
+            }
+            assert_eq!(transpose_bits(turned), x);
+        }
+    }
+
+    #[test]
+    fn freeing_finds_what_a_reduction_of_each_whole_set_finds() {
+        // Every set of codewords, its columns reduced from nothing in a
+        // plain elimination, against the sets [`each_freeing`] reports:
+        // over vectors of every width it holds, codewords of fewer than
+        // eight columns among them, and columns that repeat or are
+        // nought, so that dependent sets and prefixes turn up.
+        fn bit_at(v: &[u64], at: usize) -> bool {
+            v[at / 64] >> (at % 64) & 1 != 0
+        }
+        fn xor_into(v: &mut [u64], w: &[u64]) {
+            v.iter_mut().zip(w).for_each(|(a, b)| *a ^= b);
+        }
+        fn reference(starts: &[usize], vectors: &[u64], residual: &[u64], size: usize) -> Vec<(Vec<usize>, u32)> {
+            let words = residual.len();
+            let mut out = Vec::new();
+            each_set(starts.len() - 1, size, |set| {
+                let mut rows: Vec<(Vec<u64>, u32)> = Vec::new();
+                for (which, &k) in set.iter().enumerate() {
+                    for j in starts[k]..starts[k + 1] {
+                        let mut v = vectors[j * words..(j + 1) * words].to_vec();
+                        let mut combination = 1u32 << (8 * which + j - starts[k]);
+                        for (row, c) in &rows {
+                            let pivot = row.iter().position(|&x| x != 0).map(|w| 64 * w + row[w].trailing_zeros() as usize).unwrap();
+                            if bit_at(&v, pivot) {
+                                xor_into(&mut v, row);
+                                combination ^= c;
+                            }
+                        }
+                        if v.iter().all(|&x| x == 0) {
+                            return;
+                        }
+                        rows.push((v, combination));
+                    }
+                }
+                let mut target = residual.to_vec();
+                let mut combination = 0;
+                for (row, c) in &rows {
+                    let pivot = row.iter().position(|&x| x != 0).map(|w| 64 * w + row[w].trailing_zeros() as usize).unwrap();
+                    if bit_at(&target, pivot) {
+                        xor_into(&mut target, row);
+                        combination ^= c;
+                    }
+                }
+                if target.iter().all(|&x| x == 0) {
+                    out.push((set.to_vec(), combination));
+                }
+            });
+            out
+        }
+        let mut rng = Rng(0xF4EE);
+        let mut found = 0;
+        for &(bits, codewords) in &[(20usize, 7usize), (40, 9), (64, 8), (100, 10), (200, 8), (300, 7), (600, 6)] {
+            let words = bits / 64 + 1;
+            let top = if bits % 64 == 0 { 0 } else { (1u64 << (bits % 64)) - 1 };
+            for round in 0..12 {
+                let mut starts = vec![0];
+                let mut vectors: Vec<u64> = Vec::new();
+                for _ in 0..codewords {
+                    let count = 1 + rng.below(8);
+                    for _ in 0..count {
+                        let mut v: Vec<u64> = (0..words).map(|_| rng.next()).collect();
+                        // Few bits where the space is small, so that sets
+                        // do make up the residual.
+                        v[words - 1] &= top;
+                        if rng.below(12) == 0 {
+                            v.iter_mut().for_each(|x| *x = 0);
+                        } else if rng.below(10) == 0 && vectors.len() >= words {
+                            v.copy_from_slice(&vectors[vectors.len() - words..]);
+                        }
+                        vectors.extend(v);
+                    }
+                    starts.push(vectors.len() / words);
+                }
+                for size in 1..=FREE_SIZES {
+                    // A residual some set makes up, or one at random.
+                    let mut residual = vec![0u64; words];
+                    if round % 3 != 0 {
+                        for k in rng.distinct(size.min(codewords), codewords) {
+                            for j in starts[k]..starts[k + 1] {
+                                if rng.below(2) == 0 {
+                                    xor_into(&mut residual, &vectors[j * words..(j + 1) * words]);
+                                }
+                            }
+                        }
+                    } else {
+                        residual.iter_mut().for_each(|x| *x = rng.next());
+                        residual[words - 1] &= top;
+                    }
+                    let mut got = Vec::new();
+                    each_freeing(&starts, &vectors, &residual, size, |set, combination| got.push((set.to_vec(), combination)));
+                    let want = reference(&starts, &vectors, &residual, size);
+                    assert_eq!(got, want, "{bits} bits, round {round}, size {size}");
+                    found += got.len();
+                }
+            }
+        }
+        assert!(found > 100, "{found} sets found in all");
     }
 }

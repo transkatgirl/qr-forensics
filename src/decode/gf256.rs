@@ -24,6 +24,26 @@ const fn build_tables() -> ([u8; 510], [u8; 256]) {
 
 static TABLES: ([u8; 510], [u8; 256]) = build_tables();
 
+const fn build_products() -> [[u8; 256]; 256] {
+    let (exp, log) = build_tables();
+    let mut out = [[0u8; 256]; 256];
+    let mut a = 1;
+    while a < 256 {
+        let mut b = 1;
+        while b < 256 {
+            out[a][b] = exp[log[a] as usize + log[b] as usize];
+            b += 1;
+        }
+        a += 1;
+    }
+    out
+}
+
+/// Every product, `PRODUCTS[a][b] = a·b`: a multiplication is one lookup,
+/// with no logarithm taken and no test for nought, and a loop that
+/// multiplies many elements by one reads one row of it.
+static PRODUCTS: [[u8; 256]; 256] = build_products();
+
 /// α^i, for any non-negative exponent.
 #[inline]
 pub fn exp(i: usize) -> u8 {
@@ -47,7 +67,13 @@ pub fn log(x: u8) -> usize {
 
 #[inline]
 pub fn mul(a: u8, b: u8) -> u8 {
-    if a == 0 || b == 0 { 0 } else { TABLES.0[log(a) + log(b)] }
+    PRODUCTS[a as usize][b as usize]
+}
+
+/// The products of `a` with every element: `products(a)[b]` is `a·b`.
+#[inline]
+pub fn products(a: u8) -> &'static [u8; 256] {
+    &PRODUCTS[a as usize]
 }
 
 /// `a / b`. `b` must be non-zero.
@@ -60,6 +86,53 @@ pub fn div(a: u8, b: u8) -> u8 {
 #[inline]
 pub fn inv(a: u8) -> u8 {
     div(1, a)
+}
+
+/// Multiplication by one element, eight elements a word at a time.
+/// Multiplying by `c` is linear over the bits, `c · t` the sum of
+/// `c · 2^b` over the bits `b` of `t`: each bit of every byte of a word
+/// is widened to a byte of ones, and `c · 2^b` kept where it is set.
+pub struct Scale {
+    by_bit: [u64; 8],
+    times_c: &'static [u8; 256],
+}
+
+impl Scale {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+
+    pub fn new(c: u8) -> Self {
+        Self { by_bit: std::array::from_fn(|b| u64::from(mul(c, 1 << b)) * Self::ONES), times_c: products(c) }
+    }
+
+    /// The eight elements of `w`, one a byte, each times `c`.
+    #[inline]
+    pub fn word(&self, w: u64) -> u64 {
+        let mut out = 0;
+        for (b, &times) in self.by_bit.iter().enumerate() {
+            let set = w >> b & Self::ONES;
+            out ^= (set << 8).wrapping_sub(set) & times;
+        }
+        out
+    }
+
+    /// One element times `c`.
+    #[inline]
+    pub fn byte(&self, t: u8) -> u8 {
+        self.times_c[usize::from(t)]
+    }
+
+    /// `acc[i] += c · src[i]` for every `i`, the shorter of the two long.
+    pub fn add_into(&self, acc: &mut [u8], src: &[u8]) {
+        let len = acc.len().min(src.len());
+        let (acc_words, acc_rest) = acc[..len].as_chunks_mut::<8>();
+        let (src_words, src_rest) = src[..len].as_chunks::<8>();
+        for (a, &s) in acc_words.iter_mut().zip(src_words) {
+            *a = (u64::from_le_bytes(*a) ^ self.word(u64::from_le_bytes(s))).to_le_bytes();
+        }
+        for (a, &s) in acc_rest.iter_mut().zip(src_rest) {
+            *a ^= self.byte(s);
+        }
+    }
 }
 
 pub fn pow(a: u8, n: usize) -> u8 {
@@ -135,6 +208,28 @@ mod tests {
         for a in 0..=255u16 {
             for b in 0..=255u16 {
                 assert_eq!(mul(a as u8, b as u8), slow(a, b));
+            }
+        }
+    }
+
+    #[test]
+    fn scaling_a_word_multiplies_each_byte() {
+        let mut word = 0x0123_4567_89AB_CDEFu64;
+        for c in 0..=255u8 {
+            let scale = Scale::new(c);
+            for _ in 0..64 {
+                word = word.rotate_left(13).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ u64::from(c);
+                let bytes = word.to_le_bytes();
+                let want: Vec<u8> = bytes.iter().map(|&t| mul(c, t)).collect();
+                assert_eq!(scale.word(word).to_le_bytes().to_vec(), want, "{c} times {word:#x}");
+            }
+            // Every length, across a word's end and short of one.
+            for len in 0..20usize {
+                let src: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(37) ^ c).collect();
+                let mut acc: Vec<u8> = (0..len + 3).map(|i| (i as u8).wrapping_mul(91)).collect();
+                let want: Vec<u8> = acc.iter().enumerate().map(|(i, &a)| if i < len { a ^ mul(c, src[i]) } else { a }).collect();
+                scale.add_into(&mut acc, &src);
+                assert_eq!(acc, want, "{c}, {len} long");
             }
         }
     }
