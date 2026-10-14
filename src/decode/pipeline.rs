@@ -6,11 +6,12 @@ use std::sync::Arc;
 use super::bch::{self, FormatAnalysis, VersionAnalysis};
 use super::bitstream::{self, Certainty, EndOfData, ParseReport, StreamBits};
 use super::codewords::{Pin, Pins, apply_pins, codeword_bit_mask, read_codewords};
+use super::list::{LIST_COST, LIST_COST_MIN, rs_decode_listing};
 use super::padding::{self, TailCheck};
 use super::rs::{
-    AIDED_VERIFIED_BITS, BitDoubt, BitSolveFailure, CwRead, RsFailure, RsSolution, TRIAL_SETS, TRIAL_SETS_MIN, Trials, VERIFIED_BITS,
-    chase_bits, rs_decode_chasing_bits, rs_decode_doubting, rs_decode_reserving, rs_decode_trying, solve_bit_erasures,
-    solve_bit_erasures_doubting, solve_bit_erasures_trying,
+    AIDED_VERIFIED_BITS, BitDoubt, BitSolveFailure, CHASE_BITS, CwRead, RsFailure, RsSolution, TRIAL_SETS, TRIAL_SETS_MIN, Trials,
+    VERIFIED_BITS, chase_bits_among, rs_decode_chasing_bits, rs_decode_doubting, rs_decode_reserving, rs_decode_trying,
+    solve_bit_erasures, solve_bit_erasures_doubting, solve_bit_erasures_trying,
 };
 use super::text::{self, Charset, TextReport};
 use crate::symbol::EcLevel;
@@ -64,8 +65,38 @@ pub struct DecodeOptions {
     /// decode that is one of many ([`Self::among`]) has less to spend on
     /// each, and never less than the pairs of the largest block
     /// ([`super::rs::TRIAL_SETS_MIN`]), so that one codeword past the
-    /// code is reached in any block.
+    /// code is reached in any block. Set by hand up to
+    /// [`super::rs::TRIAL_SETS_MAX`].
     pub trial_sets: usize,
+    /// Least reliable bits the chase flips every way
+    /// ([`super::rs::CHASE_BITS`]), from one to
+    /// [`super::rs::CHASE_MAX_BITS`]: every pattern is a decode, and a
+    /// chance of a misdecode, so there are two to the power of this many
+    /// of each. Less by a bit for each doubling of the tries a decode is
+    /// one of.
+    pub chase_bits: usize,
+    /// When a block fails, decode it by algebraic soft-decision list
+    /// decoding ([`super::list`], [`SolveMethod::List`]): a curve
+    /// interpolated through the block's codewords weighed by their
+    /// reliability, and every codeword of the code read off it, which
+    /// reaches past half the code's distance, further on a block of low
+    /// rate, and bends toward the other colour of every faint module at
+    /// once.
+    pub list_decode: bool,
+    /// Constraints the list decoder's curve is given
+    /// ([`super::list::LIST_COST`]): how far it reaches, and what it
+    /// costs. A decode that is one of many has less, and never less than
+    /// [`super::list::LIST_COST_MIN`].
+    pub list_cost: usize,
+    /// When the decode is no read, find the padding, terminator and
+    /// headers the stream shows, pin them, and solve again the blocks
+    /// the pins touch, to a fixed point, as padding recovery does by
+    /// hand: a pinned codeword costs no error correction, and the pins
+    /// are kept when they solve or verify a block more, or the segment
+    /// headers confirm them ([`DecodeReport::derived_pins`]). The
+    /// decodes padding recovery itself makes never derive, nor does the
+    /// first pass of a brute-force search.
+    pub derive_pins: bool,
 }
 
 impl Default for DecodeOptions {
@@ -80,6 +111,10 @@ impl Default for DecodeOptions {
             erase_by_trial: true,
             tries: 1,
             trial_sets: TRIAL_SETS,
+            chase_bits: CHASE_BITS,
+            list_decode: true,
+            list_cost: LIST_COST,
+            derive_pins: false,
         }
     }
 }
@@ -87,10 +122,16 @@ impl Default for DecodeOptions {
 impl DecodeOptions {
     /// These options for a decode that is one of `tries` the caller
     /// makes of the grid, keeping the best, besides those already
-    /// counted.
+    /// counted: the budgets of the dear solvers are shared out over the
+    /// tries, down to their floors.
     pub fn among(self, tries: usize) -> Self {
         let tries = self.tries.max(1) * tries.max(1);
-        Self { tries, trial_sets: (TRIAL_SETS / tries).clamp(TRIAL_SETS_MIN, self.trial_sets.max(TRIAL_SETS_MIN)), ..self }
+        Self {
+            tries,
+            trial_sets: (self.trial_sets / tries).clamp(TRIAL_SETS_MIN.min(self.trial_sets), self.trial_sets),
+            list_cost: (self.list_cost / tries).clamp(LIST_COST_MIN.min(self.list_cost), self.list_cost),
+            ..self
+        }
     }
 }
 
@@ -121,6 +162,10 @@ pub enum SolveMethod {
     /// trial, and the `doubted_bits` least reliable bits besides, when
     /// any were.
     BitTrial { doubted_bits: usize, erased: usize },
+    /// Read off a curve interpolated through the block's codewords
+    /// weighed by their reliability, with a point of this multiplicity
+    /// at the most ([`super::list`]).
+    List { multiplicity: usize },
     /// Everything except pinned codewords treated as erased.
     PinnedOnly,
 }
@@ -349,6 +394,11 @@ pub struct DecodeReport {
     pub tail: Option<TailCheck>,
     pub text: TextReport,
     pub score: AttemptScore,
+    /// Pins the decode placed itself, beyond those it was given, on the
+    /// padding, terminator and headers the stream showed
+    /// ([`DecodeOptions::derive_pins`]), and decoded under: they show in
+    /// `codewords` as any pin does. Empty where it placed none.
+    pub derived_pins: Pins,
 }
 
 impl DecodeReport {
@@ -386,6 +436,7 @@ impl Candidate {
     }
 }
 
+#[derive(Clone, Debug)]
 struct BlockSolve {
     outcome: BlockOutcome,
     corrected: Option<Vec<u8>>,
@@ -602,13 +653,42 @@ fn solve_block(
     // block as read is kept only by a clear margin, and the rest kept as
     // rivals.
     if flips {
-        let found = rs_decode_chasing_bits(block, bit_reliability, ec_len, reserved, chase_bits(opts.tries))
+        let found = rs_decode_chasing_bits(block, bit_reliability, ec_len, reserved, chase_bits_among(opts.chase_bits, opts.tries))
             .into_iter()
             .map(|(flipped, solution)| {
                 let solution = solution.among(opts.tries);
                 let flipped_bits = flipped.iter().map(|bits| bits.count_ones() as usize).sum();
                 let outcome = rs_outcome(SolveMethod::Chase { flipped_bits }, &solution);
                 Candidate { outcome, corrected: solution.corrected, doubted: flipped }
+            })
+            .collect();
+        offer(&mut best, &mut rivals, found);
+    }
+
+    // A curve through the block's codewords, weighed by their
+    // reliability, and every codeword of the code read off it: reaches
+    // past half the code's distance where the trials of small sets stop,
+    // and bends toward the other colour of every faint module at once
+    // where the chase flips ten. Before the trials of erasures, which
+    // are dearer, and only while nothing has verified the block; and, as
+    // the trials, only for a block the exact decoder cannot solve at all,
+    // since within half the distance the curve reaches the codeword the
+    // exact decoder found and no other. With doubting by reliability
+    // turned off every bit is as certain as painted, and the curve is
+    // the hard decision one.
+    if opts.list_decode && opts.list_cost > 0 && exact_failed && !verified_so_far(&best) {
+        let certain = vec![[CERTAIN; 8]; block.len()];
+        let weighed = if opts.reliability { bit_reliability } else { &certain[..] };
+        let found = rs_decode_listing(block, weighed, ec_len, reserved, opts.list_cost)
+            .into_iter()
+            .map(|(multiplicity, solution)| {
+                let solution = solution.among(opts.tries);
+                let outcome = rs_outcome(SolveMethod::List { multiplicity }, &solution);
+                let mut which = vec![0u8; block.len()];
+                for erratum in solution.errata.iter().filter(|e| !e.was_erasure) {
+                    which[erratum.index] = erratum.magnitude & block[erratum.index].known;
+                }
+                Candidate { outcome, corrected: solution.corrected, doubted: which }
             })
             .collect();
         offer(&mut best, &mut rivals, found);
@@ -996,105 +1076,248 @@ fn lowered_beside(module_reliability: &[u8], lying: &[(usize, usize)], width: us
     lowered
 }
 
-pub fn decode(
-    grid: &ModuleGrid,
+/// The exact decode of a block, when it verifies within the standard:
+/// the first thing [`solve_block`] tries, and all a sound block needs,
+/// made alone before the hard blocks are shared over the cores, since
+/// it is microseconds and a thread is more.
+fn exact_solve(block: &[CwRead], ec_len: usize, reserved: usize, opts: &DecodeOptions) -> Option<BlockSolve> {
+    let solution = rs_decode_reserving(block, ec_len, reserved).ok()?.among(opts.tries);
+    let outcome = BlockOutcome::Solved {
+        method: SolveMethod::ReedSolomon,
+        errors: solution.errors,
+        erasures: solution.erasures,
+        slack: solution.slack,
+        confidence_bits: solution.confidence_bits(),
+        beyond_standard: !solution.within_standard(),
+    };
+    let candidate = Candidate { outcome, corrected: solution.corrected, doubted: Vec::new() };
+    candidate.rank().0.then(|| BlockSolve::solved(candidate))
+}
+
+/// What one block was last solved from, and what came of it.
+#[derive(Clone)]
+struct Solved {
+    reads: Vec<CwRead>,
+    bits: Vec<[u8; 8]>,
+    solve: BlockSolve,
+}
+
+/// Every block of the layout solved from the codewords as pinned and the
+/// reliability of every bit. A block solved before from the same reads
+/// and reliabilities, as `solved` remembers each, is not solved again:
+/// a decode made again under more pins solves only the blocks the pins
+/// touch, and the rounds of lowering reliabilities beside located errors
+/// solve only the blocks whose reliabilities moved. Of the rest, the
+/// exact decoder settles the sound ones alone, and the hard ones, each
+/// a search of its fallbacks, are solved side by side on the spare
+/// cores ([`work::map`]).
+fn solve_blocks(
     layout: &SymbolLayout,
-    mask: u8,
-    pins: &Pins,
     opts: &DecodeOptions,
-) -> DecodeReport {
-    let raw = read_codewords(grid, layout, mask);
-    let pinned = apply_pins(layout, &raw, pins);
-    let (width, height) = (layout.func.width, layout.func.height);
-    let module_reliability: Vec<u8> = (0..width * height).map(|i| grid.reliability(i % width, i / width)).collect();
-    let bit_reliability = bit_reliabilities(layout, &module_reliability);
+    solved: &mut [Option<Solved>],
+    pinned: &[CwRead],
+    bit_reliability: &[[u8; 8]],
+) -> Vec<BlockSolve> {
+    let inputs = |spec: &BlockSpec| -> (Vec<CwRead>, Vec<[u8; 8]>) {
+        (spec.codewords.iter().map(|&cw| pinned[cw]).collect(), spec.codewords.iter().map(|&cw| bit_reliability[cw]).collect())
+    };
+    let mut hard = Vec::new();
+    let mut out: Vec<Option<BlockSolve>> = Vec::with_capacity(layout.blocks.len());
+    for (b, spec) in layout.blocks.iter().enumerate() {
+        let (reads, bits) = inputs(spec);
+        if let Some(before) = &solved[b]
+            && before.reads == reads
+            && before.bits == bits
+        {
+            out.push(Some(before.solve.clone()));
+            continue;
+        }
+        match exact_solve(&reads, spec.ec_len, spec.reserved, opts) {
+            Some(solve) => {
+                solved[b] = Some(Solved { reads, bits, solve: solve.clone() });
+                out.push(Some(solve));
+            }
+            None => {
+                hard.push(b);
+                out.push(None);
+            }
+        }
+    }
+    let solves: Vec<BlockSolve> = if hard.len() >= 2 {
+        work::map(&hard, |&b| solve_spec(layout, &layout.blocks[b], pinned, bit_reliability, opts))
+    } else {
+        hard.iter().map(|&b| solve_spec(layout, &layout.blocks[b], pinned, bit_reliability, opts)).collect()
+    };
+    for (&b, solve) in hard.iter().zip(solves) {
+        let (reads, bits) = inputs(&layout.blocks[b]);
+        solved[b] = Some(Solved { reads, bits, solve: solve.clone() });
+        out[b] = Some(solve);
+    }
+    out.into_iter().map(|solve| solve.expect("every block solved")).collect()
+}
 
-    let mut codewords: Vec<CodewordReport> = (0..raw.len())
-        .map(|cw| CodewordReport {
-            read: raw[cw].value,
-            known: raw[cw].known,
-            pin: pins.get(&cw).copied(),
-            pinned_value: pinned[cw].value,
-            pinned_known: pinned[cw].known,
-            inferred_value: 0,
-            inferred_known: 0,
-            final_value: None,
-            doubted: 0,
-            status: CwStatus::Unresolved,
-        })
-        .collect();
+/// A decode of one grid under one layout and mask, kept so that it can
+/// be made again under more pins with only the blocks the pins touch
+/// solved anew: what [`decode`] does to pin the padding it finds
+/// ([`DecodeOptions::derive_pins`]).
+pub struct Decoding<'a> {
+    layout: &'a SymbolLayout,
+    mask: u8,
+    opts: &'a DecodeOptions,
+    has_reliability: bool,
+    raw: Vec<CwRead>,
+    module_reliability: Vec<u8>,
+    bit_reliability: Vec<[u8; 8]>,
+    /// Each block as last solved, from whatever reads and reliabilities.
+    solved: Vec<Option<Solved>>,
+}
 
-    let mut solves: Vec<BlockSolve> = layout.blocks.iter().map(|spec| solve_spec(layout, spec, &pinned, &bit_reliability, opts)).collect();
-    let mut blocks: Vec<BlockReport> =
-        layout.blocks.iter().zip(&solves).map(|(spec, solve)| report_block(layout, spec, solve, &raw, &pinned, &mut codewords)).collect();
-    arbitrate(layout, &raw, &pinned, &mut solves, &mut codewords, &mut blocks, opts.charset);
-
-    // The blocks that verified say where the photo misread: an error
-    // located is a module read as known and overturned, and the modules
-    // beside it, in the blocks that did not verify, are doubted first
-    // when those are solved again. Only a grid sampled from a photo has
-    // modules to doubt.
-    if grid.has_reliability() && opts.reliability {
-        for _ in 0..NEAR_ERROR_ROUNDS {
-            if blocks.iter().all(BlockReport::is_verified) || work::cancelled() {
-                break;
-            }
-            let lying = lying_modules(layout, &raw, &codewords, &blocks);
-            if lying.is_empty() {
-                break;
-            }
-            let lowered = lowered_beside(&module_reliability, &lying, width, height);
-            let lowered_bits = bit_reliabilities(layout, &lowered);
-            let mut improved = false;
-            for (b, spec) in layout.blocks.iter().enumerate() {
-                if blocks[b].is_verified() {
-                    continue;
-                }
-                let near_errors = spec
-                    .codewords
-                    .iter()
-                    .flat_map(|&cw| layout.codeword_modules(cw))
-                    .filter(|p| lowered[p.y as usize * width + p.x as usize] < module_reliability[p.y as usize * width + p.x as usize])
-                    .count();
-                if near_errors == 0 {
-                    continue;
-                }
-                let mut again = solve_spec(layout, spec, &pinned, &lowered_bits, opts);
-                again.near_errors = near_errors;
-                if again.rank() > solves[b].rank() || (again.rank() == solves[b].rank() && again.rivals.len() > solves[b].rivals.len()) {
-                    solves[b] = again;
-                    improved = true;
-                }
-            }
-            if !improved {
-                break;
-            }
-            blocks = layout.blocks.iter().zip(&solves).map(|(spec, solve)| report_block(layout, spec, solve, &raw, &pinned, &mut codewords)).collect();
-            arbitrate(layout, &raw, &pinned, &mut solves, &mut codewords, &mut blocks, opts.charset);
+impl<'a> Decoding<'a> {
+    pub fn new(grid: &ModuleGrid, layout: &'a SymbolLayout, mask: u8, opts: &'a DecodeOptions) -> Self {
+        let raw = read_codewords(grid, layout, mask);
+        let (width, height) = (layout.func.width, layout.func.height);
+        let module_reliability: Vec<u8> = (0..width * height).map(|i| grid.reliability(i % width, i / width)).collect();
+        let bit_reliability = bit_reliabilities(layout, &module_reliability);
+        Self {
+            layout,
+            mask,
+            opts,
+            has_reliability: grid.has_reliability(),
+            raw,
+            module_reliability,
+            bit_reliability,
+            solved: vec![None; layout.blocks.len()],
         }
     }
 
-    let Assembled { stream, parse, tail, text, stream_valid, tail_plausible } = assemble(layout, &codewords, &blocks, &pinned, opts.charset);
-    let blocks_solved = blocks.iter().filter(|b| b.is_solved()).count();
-    let blocks_verified = blocks.iter().filter(|b| b.is_verified()).count();
-    let errata = codewords.iter().filter(|c| matches!(c.status, CwStatus::Corrected | CwStatus::Filled)).count();
-    let confidence_bits = blocks.iter().map(|b| b.outcome.confidence_bits()).sum();
-    // Every block "verified" yet nothing parsed, not even the first
-    // segment's header: the verification is the false solve of a wrong
-    // placement, as [`AttemptScore`] explains, and ranks as none.
-    let all_verified = blocks_verified == blocks.len();
-    let contradicted = all_verified && !stream_valid && parse.segments.is_empty();
-    let score = AttemptScore {
-        stream_valid,
-        all_verified: all_verified && !contradicted,
-        tail_plausible,
-        blocks_verified: if contradicted { 0 } else { blocks_verified },
-        blocks_solved,
-        confidence_bits,
-        neg_errata: -(errata as i64),
-    };
+    /// The grid decoded under `pins`.
+    pub fn solve(&mut self, pins: &Pins) -> DecodeReport {
+        let (layout, opts) = (self.layout, self.opts);
+        let raw = &self.raw;
+        let pinned = apply_pins(layout, raw, pins);
+        let (width, height) = (layout.func.width, layout.func.height);
 
-    DecodeReport { ec: layout.ec, mask, codewords, blocks, stream, parse, tail, text, score }
+        let mut codewords: Vec<CodewordReport> = (0..raw.len())
+            .map(|cw| CodewordReport {
+                read: raw[cw].value,
+                known: raw[cw].known,
+                pin: pins.get(&cw).copied(),
+                pinned_value: pinned[cw].value,
+                pinned_known: pinned[cw].known,
+                inferred_value: 0,
+                inferred_known: 0,
+                final_value: None,
+                doubted: 0,
+                status: CwStatus::Unresolved,
+            })
+            .collect();
+
+        let mut solves = solve_blocks(layout, opts, &mut self.solved, &pinned, &self.bit_reliability);
+        let mut blocks: Vec<BlockReport> =
+            layout.blocks.iter().zip(&solves).map(|(spec, solve)| report_block(layout, spec, solve, raw, &pinned, &mut codewords)).collect();
+        arbitrate(layout, raw, &pinned, &mut solves, &mut codewords, &mut blocks, opts.charset);
+
+        // The blocks that verified say where the photo misread: an error
+        // located is a module read as known and overturned, and the modules
+        // beside it, in the blocks that did not verify, are doubted first
+        // when those are solved again. Only a grid sampled from a photo has
+        // modules to doubt.
+        if self.has_reliability && opts.reliability {
+            for _ in 0..NEAR_ERROR_ROUNDS {
+                if blocks.iter().all(BlockReport::is_verified) || work::cancelled() {
+                    break;
+                }
+                let lying = lying_modules(layout, raw, &codewords, &blocks);
+                if lying.is_empty() {
+                    break;
+                }
+                let lowered = lowered_beside(&self.module_reliability, &lying, width, height);
+                let lowered_bits = bit_reliabilities(layout, &lowered);
+                // Every block is asked of the memory; those with modules
+                // lowered and not yet solved so are solved anew.
+                let again = solve_blocks(layout, opts, &mut self.solved, &pinned, &lowered_bits);
+                let mut improved = false;
+                for (b, spec) in layout.blocks.iter().enumerate() {
+                    if blocks[b].is_verified() {
+                        continue;
+                    }
+                    let near_errors = spec
+                        .codewords
+                        .iter()
+                        .flat_map(|&cw| layout.codeword_modules(cw))
+                        .filter(|p| lowered[p.y as usize * width + p.x as usize] < self.module_reliability[p.y as usize * width + p.x as usize])
+                        .count();
+                    if near_errors == 0 {
+                        continue;
+                    }
+                    let mut again = again[b].clone();
+                    again.near_errors = near_errors;
+                    if again.rank() > solves[b].rank() || (again.rank() == solves[b].rank() && again.rivals.len() > solves[b].rivals.len()) {
+                        solves[b] = again;
+                        improved = true;
+                    }
+                }
+                if !improved {
+                    break;
+                }
+                blocks = layout.blocks.iter().zip(&solves).map(|(spec, solve)| report_block(layout, spec, solve, raw, &pinned, &mut codewords)).collect();
+                arbitrate(layout, raw, &pinned, &mut solves, &mut codewords, &mut blocks, opts.charset);
+            }
+        }
+
+        let Assembled { stream, parse, tail, text, stream_valid, tail_plausible } = assemble(layout, &codewords, &blocks, &pinned, opts.charset);
+        let blocks_solved = blocks.iter().filter(|b| b.is_solved()).count();
+        let blocks_verified = blocks.iter().filter(|b| b.is_verified()).count();
+        let errata = codewords.iter().filter(|c| matches!(c.status, CwStatus::Corrected | CwStatus::Filled)).count();
+        let confidence_bits = blocks.iter().map(|b| b.outcome.confidence_bits()).sum();
+        // Every block "verified" yet nothing parsed, not even the first
+        // segment's header: the verification is the false solve of a wrong
+        // placement, as [`AttemptScore`] explains, and ranks as none.
+        let all_verified = blocks_verified == blocks.len();
+        let contradicted = all_verified && !stream_valid && parse.segments.is_empty();
+        let score = AttemptScore {
+            stream_valid,
+            all_verified: all_verified && !contradicted,
+            tail_plausible,
+            blocks_verified: if contradicted { 0 } else { blocks_verified },
+            blocks_solved,
+            confidence_bits,
+            neg_errata: -(errata as i64),
+        };
+
+        DecodeReport { ec: layout.ec, mask: self.mask, codewords, blocks, stream, parse, tail, text, score, derived_pins: Pins::new() }
+    }
+}
+
+pub fn decode(grid: &ModuleGrid, layout: &SymbolLayout, mask: u8, pins: &Pins, opts: &DecodeOptions) -> DecodeReport {
+    let mut decoding = Decoding::new(grid, layout, mask, opts);
+    let report = decoding.solve(pins);
+    if !opts.derive_pins || report.is_trustworthy() || work::cancelled() {
+        return report;
+    }
+    derive_pins(&mut decoding, pins, report)
+}
+
+/// The decode made again with the padding, terminator and headers the
+/// stream shows pinned, by padding recovery over the decode in hand,
+/// each round solving anew only the blocks its pins touch: taken, with
+/// the pins it placed noted, when the pins solve or verify a block more
+/// or the segment headers confirm where the padding was placed, and the
+/// decode ranks no worse; else the decode as it was. Pins asserted on
+/// what the pad pattern alone showed, that solve nothing more, are not
+/// taken: they would stand for nothing but themselves.
+fn derive_pins(decoding: &mut Decoding, pins: &Pins, report: DecodeReport) -> DecodeReport {
+    let layout = decoding.layout;
+    let Some(recovery) = padding::recover_padding_with(layout, pins, &report, |more| decoding.solve(more)) else { return report };
+    let helped = recovery.solved_after > recovery.solved_before
+        || recovery.report.blocks_verified() > report.blocks_verified()
+        || recovery.confirmed;
+    if !helped || recovery.report.score < report.score {
+        return report;
+    }
+    let mut taken = recovery.report;
+    taken.derived_pins = recovery.pins.into_iter().filter(|(cw, pin)| pins.get(cw) != Some(pin)).collect();
+    taken
 }
 
 /// What the grid says about itself before any decoding.
@@ -1254,8 +1477,8 @@ pub fn brute_force(
     let format = bch::analyze_format(grid, func);
     let no_pins = Pins::new();
     let opts = &opts.among(func.version.ec_levels().len() * func.version.mask_count() as usize);
-    let two_passes = (opts.reliability && grid.has_reliability()) || opts.erase_by_trial;
-    let first_pass = DecodeOptions { reliability: opts.reliability && !two_passes, erase_by_trial: false, ..*opts };
+    let two_passes = (opts.reliability && grid.has_reliability()) || opts.erase_by_trial || opts.list_decode || opts.derive_pins;
+    let first_pass = DecodeOptions { reliability: opts.reliability && !two_passes, erase_by_trial: false, list_decode: false, derive_pins: false, ..*opts };
     let mut layouts: Vec<(EcLevel, Arc<SymbolLayout>)> = Vec::new();
     let mut attempts = Vec::new();
     for &ec in func.version.ec_levels() {

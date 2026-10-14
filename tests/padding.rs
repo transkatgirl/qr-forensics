@@ -181,9 +181,9 @@ fn padding_misread_as_data_is_corrected_for_free() {
         corrupt_codeword(&mut grid, &layout, block.codewords[3 * i], i);
     }
     // One past the code is reached by the trials of erasures by
-    // themselves; without them the block fails, and the padding pinned
-    // is what solves it.
-    let unaided = DecodeOptions { erase_by_trial: false, ..DecodeOptions::default() };
+    // themselves, and by the algebra; without them the block fails, and
+    // the padding pinned is what solves it.
+    let unaided = DecodeOptions { erase_by_trial: false, list_decode: false, ..DecodeOptions::default() };
     let before = decode(&grid, &layout, mask, &Pins::new(), &unaided);
     assert!(matches!(before.blocks[3].outcome, BlockOutcome::Failed(_)));
 
@@ -676,4 +676,48 @@ fn a_read_of_a_photo_pins_the_padding_when_that_is_what_it_takes() {
     let (image, whole) = photo_of(&taped);
     let read = read_outline(&image, SymbolVersion::Qr(2), whole, &params, &opts);
     assert!(read.is_none_or(|read| !read.is_trustworthy() && !read.padding_pinned()));
+}
+
+#[test]
+fn the_decoder_pins_the_padding_it_finds_when_asked_to() {
+    // The symbol of `rescues_blocks_whose_damage_is_in_the_padding`: a
+    // short message in a 10-M symbol, four blocks of padding with thirty
+    // data codewords each erased. Asked to derive pins, the decode finds
+    // the padding from the headers, pins it, and solves the blocks the
+    // pins touch anew, as padding recovery does by hand.
+    let (version, ec, mask) = (SymbolVersion::Qr(10), EcLevel::M, 4);
+    let layout = layout(version, ec);
+    let text = "short message";
+    let clean = encode(version, ec, Some(mask), &[Segment::bytes(text)]).unwrap();
+    let mut grid = clean.clone();
+    for block in 1..5 {
+        erase_data_tail(&mut grid, &layout, block, 30);
+    }
+    let plain = decode_plain(&grid, &layout, mask);
+    assert_eq!(plain.blocks_solved(), 1);
+    assert!(plain.derived_pins.is_empty(), "nothing is derived unless asked");
+
+    let deriving = DecodeOptions { derive_pins: true, ..DecodeOptions::default() };
+    let report = decode(&grid, &layout, mask, &Pins::new(), &deriving);
+    assert_eq!(report.blocks_solved(), 5, "{:?}", report.blocks);
+    assert!(report.is_trustworthy());
+    assert_eq!(report.text.plain(), text);
+    assert!(!report.derived_pins.is_empty());
+    assert!(report.derived_pins.values().all(|p| matches!(p.source, PinSource::Padding | PinSource::Terminator | PinSource::Header)));
+    assert!(report.derived_pins.values().any(|p| p.source == PinSource::Padding));
+    // The pins show on the codewords, as pins given would.
+    for (&cw, pin) in &report.derived_pins {
+        assert_eq!(report.codewords[cw].pin, Some(*pin));
+    }
+    // What padding recovery by hand would have placed over the same
+    // decode, it placed.
+    let by_hand = recover(&grid, &layout, mask).unwrap();
+    assert_eq!(by_hand.pins, report.derived_pins);
+
+    // A decode that reads as it stands derives nothing, and pins given
+    // are not counted as derived.
+    let sound = decode(&clean, &layout, mask, &Pins::new(), &deriving);
+    assert!(sound.is_trustworthy() && sound.derived_pins.is_empty());
+    let again = decode(&grid, &layout, mask, &report.derived_pins, &deriving);
+    assert!(again.is_trustworthy() && again.derived_pins.is_empty(), "{:?}", again.derived_pins);
 }

@@ -97,7 +97,7 @@ use eframe::egui;
 use qr_forensics::decode::padding::Filler;
 use qr_forensics::decode::pipeline::DecodeOptions;
 use qr_forensics::imaging::adjust::{Adjust, Enlarge};
-use qr_forensics::symbol::grid::Module;
+use qr_forensics::symbol::grid::{CERTAIN, Module};
 use qr_forensics::symbol::tables::Mode;
 use qr_forensics::symbol::{EcLevel, SymbolVersion};
 
@@ -325,10 +325,19 @@ impl App {
                     "light" => Ink::Module(Module::Light),
                     "unknown" => Ink::Module(Module::Unknown),
                     "photo" => Ink::Photo,
+                    "doubt" => Ink::Doubt,
                     _ => Ink::Module(Module::Dark),
                 }
             }
-            "guess" => self.view.paint_as_guess = word(0) == "on",
+            // `guess on` paints guesses, `guess off` certain modules, and
+            // `guess <n>` at a reliability of n.
+            "guess" => {
+                self.view.paint_reliability = match word(0) {
+                    "on" => 0,
+                    "off" => CERTAIN,
+                    _ => number(0).clamp(0.0, 255.0) as u8,
+                }
+            }
             "invert" => match word(0) {
                 "photo" => {
                     assert!(self.photo.is_some(), "selftest: invert photo needs a photo");

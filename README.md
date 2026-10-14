@@ -171,21 +171,29 @@ The Edit stage shows the grid, with the photo rectified beneath it when
 there is one. **Both**, **Photo** and **Grid** choose the layers, with
 opacity sliders for blending.
 
-Paint with the **Brush** or the **Rectangle**, in one of four inks:
-**Dark**, **Light**, **Unknown**, or **From photo**, which samples just the
-modules you paint over. The left button paints the ink, the right button
-paints the other of dark and light, and Shift paints unknown.
+Paint with the **Brush** or the **Rectangle**, in one of five inks:
+**Dark**, **Light**, **Unknown**, **From photo**, which samples just the
+modules you paint over, and **Doubtful**, which keeps each module's colour
+but lowers its reliability. The left button paints the ink, the right
+button paints the other of dark and light (with Doubtful, it makes modules
+certain again), and Shift paints unknown.
 
 When you cannot tell what a module is, paint it unknown. A block solves once
 its unknown codewords, plus twice its wrong ones, fit inside its
 error-correction count, so a wrong guess costs twice what an honest blank
 does.
 
-When you can half tell, tick **Paint as a guess**. Dark, light and From photo
-then go in at the lowest reliability, like a module sampled right on its
-threshold, and the decoder may doubt them when a block fails (see
-**Decoding**, below). Paint over a module again in dark or light with the
-box unticked to make it certain.
+When you can half tell, lower the **painted reliability** slider. It runs
+from a guess (misread 1 in 2, like a module sampled right on its
+threshold) up to 8 bits (1 in 256), then certain. Dark, light and From
+photo are painted at that reliability, the same as a module sampled at
+it, and the decoder may doubt them when a block fails (see **Decoding**,
+below). Certain modules are never doubted; paint over a module with the
+slider at certain to make it certain again.
+
+For a stain, tear or fold over modules you can read but don't fully
+trust, brush them with **Doubtful** at the reliability you'd give them,
+and the decoder will doubt them first.
 
 **Lock fixed patterns** keeps finder, timing and alignment patterns at the
 colours the standard gives them. If the grid was painted inverted, mirrored
@@ -199,7 +207,7 @@ Overlays colour the grid by what the decoder knows:
 | Module roles | Finder, timing, alignment, format and version modules, each in its own colour |
 | RS blocks | Which Reed-Solomon block each module belongs to, with unsolved blocks marked red |
 | Corrections | Each module as error correction has it: green rim where it was unknown, red where it was painted otherwise |
-| Reliability | Red where a module's reading is least to be believed: sampled close to its threshold, on a photo whose fixed patterns read poorly, or painted as a guess. The status bar says to how many bits a sampled module's reading is believed, and how many such readings are misread |
+| Reliability | Red where a module's reading is least to be believed: sampled close to its threshold, on a photo whose fixed patterns read poorly, or painted below certain. The status bar says to how many bits a sampled module's reading is believed, and how many such readings are misread |
 | Mask pattern | Where the mask in effect swaps dark and light |
 | Unmasked data | The data bits themselves, with the mask taken off |
 | Codeword status | Green: corrected or filled in. Amber: read but unconfirmed. Red: unknown. Violet rim: doubted to solve the block |
@@ -216,9 +224,13 @@ Overlays colour the grid by what the decoder knows:
   designators, or as GS1 element strings. Click a character to outline the
   modules it is made of.
 - **Format and version.** Each copy of the format bits as read, the format
-  words they lie nearest, and the EC level and mask in effect. Choose them
-  from the format bits or by hand. **Brute force** decodes under every EC
-  level and mask and ranks the results.
+  words they lie nearest, and the EC level and mask in effect. Words are
+  ranked likeliest first, by their differing bits over both copies, each
+  weighted by its reliability. The count of bits differing from the
+  cleanest word the two copies assemble shows whether the read is within
+  what the code corrects. Choose them from the format bits or by hand.
+  **Brute force** decodes under every EC level and mask and ranks the
+  results.
 - **Blocks.** Each Reed-Solomon block: how it was solved, or what it still
   needs. **Show** outlines its unknown codewords on the grid, or the modules
   that were doubted to solve it, and **Sample** re-reads that block alone
@@ -253,16 +265,40 @@ short of solving.
   with an accent in it.
 
 The **Decoding** section on the left sets what is tried on a block that
-fails: solving unknown bits one by one, doubting the least reliable
-sampled modules as whole codewords, as single bits, or by flipping the
-faintest every way, flipping a bit or two or three read solidly wrong
-where the equations name them, and erasing codewords by trial, every
-set of the smallest size that goes past the code and then of the next,
-whatever their reliability. Modules painted by hand are never doubted,
-unless they were painted as a guess; the trials of erasures are what
-reach a hand-painted block wrong in one codeword more than its error
-correction corrects, or two in a small block, and a block whose unknown
-bits solve bit by bit but for a stain over a codeword or two or three.
+fails:
+
+- solving unknown bits one by one;
+- doubting the least reliable modules, as whole codewords, as single
+  bits, or by flipping the faintest every way;
+- flipping a bit or two or three read solidly wrong, where the equations
+  name them;
+- erasing codewords by trial: every set of the smallest size that goes
+  past what the code corrects, then the next size, whatever their
+  reliability;
+- soft-decision list decoding, which weights each codeword by its
+  reliability and finds every valid codeword close enough to the block as
+  read.
+
+Modules painted by hand are never doubted unless they were painted below
+certain. Erasing by trial is what reaches a hand-painted block with one
+codeword more wrong than its error correction corrects (two in a small
+block), or a block whose unknown bits solve bit by bit except for a stain
+over a few codewords. List decoding goes further the lower the block's
+rate: up to 11 wrong codewords in a version 1-H block, where the usual
+limit is 8, and 19 in a 40-H block, where it is 15; at level L it gains
+nothing. Sliders set how much the expensive solvers try: sets erased,
+bits flipped, and the list decoder's constraint budget. Every extra try
+is another chance of a wrong answer, so solutions found with a bigger
+budget need more to confirm them.
+
+**Pin the padding and headers found**, also under Decoding, does what
+Padding recovery does by hand, on every decode: it finds where the
+padding starts (from the segment headers or the pad pattern), pins the
+pad codewords, the terminator and any header bits with only one possible
+reading, and re-solves the blocks those pins touch until nothing more
+changes. Pins are kept only when they solve or confirm another block.
+They show under Pins as the decoder's own; **Pin the padding** adds them
+to yours.
 
 Two more things happen between the blocks. Where a solver that tries
 many ways reaches two solutions the block as read lies as near to, the
@@ -301,9 +337,9 @@ Ctrl is ⌘ on macOS. Shortcuts are off while a text field has the keyboard.
 | F | Fit to window |
 | H (hold) | Show the bare photo |
 | B, R, I | Brush, Rectangle, Inspect |
-| 1, 2, 3, 4 | Dark, Light, Unknown, From photo ink |
+| 1, 2, 3, 4, 5 | Dark, Light, Unknown, From photo, Doubtful ink |
 | X | Swap the ink between dark and light |
-| Right button | Paint the other of dark and light |
+| Right button | Paint the other of dark and light; with Doubtful, make modules certain |
 | Shift while painting | Paint unknown |
 | Arrow keys, pointer over the Align canvas | Nudge the last corner touched one pixel; ten with Shift, a tenth with Alt |
 | Right-click an anchor handle | Remove the anchor |

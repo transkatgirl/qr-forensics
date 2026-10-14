@@ -150,11 +150,14 @@ fn a_block_corrected_to_the_limit_of_its_error_correction_is_confirmed() {
         assert_eq!(report.text.plain(), text, "{what}");
 
         corrupt_codeword(&mut grid, &layout, spare[0], rng.below(8));
-        let no_trial = DecodeOptions { erase_by_trial: false, ..Default::default() };
+        let no_trial = DecodeOptions { erase_by_trial: false, list_decode: false, ..Default::default() };
         let report = decode(&grid, &layout, mask, &Pins::new(), &no_trial);
         assert!(!report.blocks[0].is_verified(), "{what}: {:?}", report.blocks[0].outcome);
         assert!(!report.is_trustworthy(), "{what}");
-        let report = decode_plain(&grid, &layout, mask);
+        // The trials alone: the algebra reaches the same block, and is
+        // tried first, so it is turned off to see them.
+        let no_list = DecodeOptions { list_decode: false, ..Default::default() };
+        let report = decode(&grid, &layout, mask, &Pins::new(), &no_list);
         let limit = (layout.blocks[0].ec_len - layout.blocks[0].reserved) / 2;
         match report.blocks[0].outcome {
             BlockOutcome::Solved { method: SolveMethod::Trial { erased }, errors, erasures: 0, .. } => {
@@ -533,10 +536,16 @@ fn doubting_recovers_from_misread_sampled_modules() {
             grid.set_sampled(x, y, grid.get(x, y).inverted(), 5 + rng.below(20) as u8);
         }
         let what = format!("{version}-{ec:?} with {wrong} misread");
+        // Without reliability only the trials and the hard-decision
+        // algebra can reach it, and they reach it in the smallest
+        // blocks alone.
         let strict = DecodeOptions { reliability: false, ..Default::default() };
         let unaided = decode(&grid, &layout, mask, &Pins::new(), &strict).blocks[0].outcome;
         assert!(
-            matches!(unaided, BlockOutcome::Failed(_) | BlockOutcome::Solved { method: SolveMethod::Trial { .. }, .. }),
+            matches!(
+                unaided,
+                BlockOutcome::Failed(_) | BlockOutcome::Solved { method: SolveMethod::Trial { .. } | SolveMethod::List { .. }, .. }
+            ),
             "{what}: {unaided:?}"
         );
         let report = decode_plain(&grid, &layout, mask);
@@ -586,7 +595,7 @@ fn doubting_recovers_from_misread_sampled_modules() {
         // Each of the three ways is left out by itself: with none of
         // them the block fails as it does with doubting off, and with
         // one alone it solves that way or not at all.
-        let none = DecodeOptions { doubt_codewords: false, doubt_bits: false, flip_bits: false, ..Default::default() };
+        let none = DecodeOptions { doubt_codewords: false, doubt_bits: false, flip_bits: false, list_decode: false, ..Default::default() };
         let unaided = decode(&grid, &layout, mask, &Pins::new(), &none).blocks[0].outcome;
         assert!(
             matches!(unaided, BlockOutcome::Failed(_) | BlockOutcome::Solved { method: SolveMethod::Trial { .. }, .. }),
@@ -649,9 +658,12 @@ fn erasing_by_trial_reaches_one_wrong_codeword_past_the_code() {
         }
         let what = format!("{version}-{ec:?} with {} wrong", limit + 1);
         assert!(!grid.has_reliability());
-        let no_trial = DecodeOptions { erase_by_trial: false, ..Default::default() };
+        let no_trial = DecodeOptions { erase_by_trial: false, list_decode: false, ..Default::default() };
         assert!(matches!(decode(&grid, &layout, mask, &Pins::new(), &no_trial).blocks[0].outcome, BlockOutcome::Failed(_)), "{what}");
-        let report = decode_plain(&grid, &layout, mask);
+        // The trials alone, the algebra turned off: it reaches the same
+        // block and is tried first.
+        let no_list = DecodeOptions { list_decode: false, ..Default::default() };
+        let report = decode(&grid, &layout, mask, &Pins::new(), &no_list);
         let smallest = 2 - block.ec_len % 2;
         let erased = match report.blocks[0].outcome {
             BlockOutcome::Solved { method: SolveMethod::Trial { erased }, errors, erasures: 0, beyond_standard: false, .. } => {
@@ -687,9 +699,9 @@ fn erasing_by_trial_reaches_one_wrong_codeword_past_the_code() {
         reached += 1;
 
         corrupt_codeword(&mut grid, &layout, block.codewords[picked[limit + 1]], rng.below(8));
-        let past = decode_plain(&grid, &layout, mask);
+        let past = decode(&grid, &layout, mask, &Pins::new(), &no_list);
         let smallest = 2 - block.ec_len % 2;
-        let fits = sets_of(n, smallest).zip(sets_of(n, smallest + 2)).is_some_and(|(small, large)| small + large <= TRIAL_SETS);
+        let fits = sets_of(n, smallest, TRIAL_SETS).zip(sets_of(n, smallest + 2, TRIAL_SETS)).is_some_and(|(small, large)| small + large <= TRIAL_SETS);
         match past.blocks[0].outcome {
             BlockOutcome::Solved { method: SolveMethod::Trial { erased: again }, errors, .. } if fits => {
                 assert_eq!((again, errors), (erased + 2, limit + 2), "{what} and one more");
@@ -736,7 +748,7 @@ fn erasing_by_trial_frees_a_wrong_codeword_among_scattered_unknown_bits() {
                 }
             }
             let what = format!("{version}-{ec:?} with {unknown} unknown bits and {stains} stained codewords");
-            let no_trial = DecodeOptions { erase_by_trial: false, ..Default::default() };
+            let no_trial = DecodeOptions { erase_by_trial: false, list_decode: false, ..Default::default() };
             assert!(!decode(&grid, &layout, mask, &Pins::new(), &no_trial).blocks[0].is_solved(), "{what}");
             let report = decode_plain(&grid, &layout, mask);
             match report.blocks[0].outcome {
@@ -789,10 +801,16 @@ fn doubting_bits_recovers_faint_modules_in_more_codewords_than_erasures_allow() 
             grid.set_sampled(x, y, grid.get(x, y).inverted(), 5 + rng.below(20) as u8);
         }
         let what = format!("{version}-{ec:?} with {wrong} misread");
+        // Without reliability only the trials and the hard-decision
+        // algebra can reach it, and they reach it in the smallest
+        // blocks alone.
         let strict = DecodeOptions { reliability: false, ..Default::default() };
         let unaided = decode(&grid, &layout, mask, &Pins::new(), &strict).blocks[0].outcome;
         assert!(
-            matches!(unaided, BlockOutcome::Failed(_) | BlockOutcome::Solved { method: SolveMethod::Trial { .. }, .. }),
+            matches!(
+                unaided,
+                BlockOutcome::Failed(_) | BlockOutcome::Solved { method: SolveMethod::Trial { .. } | SolveMethod::List { .. }, .. }
+            ),
             "{what}: {unaided:?}"
         );
         let report = decode_plain(&grid, &layout, mask);
@@ -874,7 +892,10 @@ fn chasing_flips_faint_bits_where_erasing_them_costs_too_much() {
         let strict = DecodeOptions { reliability: false, ..Default::default() };
         let unaided = decode(&grid, &layout, mask, &Pins::new(), &strict).blocks[0].outcome;
         assert!(
-            matches!(unaided, BlockOutcome::Failed(_) | BlockOutcome::Solved { method: SolveMethod::Trial { .. }, .. }),
+            matches!(
+                unaided,
+                BlockOutcome::Failed(_) | BlockOutcome::Solved { method: SolveMethod::Trial { .. } | SolveMethod::List { .. }, .. }
+            ),
             "{what}: {unaided:?}"
         );
         let report = decode_plain(&grid, &layout, mask);
@@ -896,15 +917,23 @@ fn chasing_flips_faint_bits_where_erasing_them_costs_too_much() {
     }
     assert!(chased >= 1, "no block was solved by chasing");
     // Painted by hand, every module is certain: nothing to flip, and the
-    // same count of wrong codewords stays a failure.
+    // same count of wrong codewords stays a failure, but for the algebra,
+    // which reaches thirteen wrong of the forty codewords of an 8-Q block
+    // from the bits as painted, at the edge of its bound, given four
+    // times the usual budget.
     let (version, ec, mask) = (SymbolVersion::Qr(8), EcLevel::Q, 2);
-    let (layout, mut grid, _) = sample(version, ec, mask, &mut rng);
+    let (layout, mut grid, text) = sample(version, ec, mask, &mut rng);
     let block = &layout.blocks[0];
     for i in 0..block.ec_len / 2 + 2 {
         corrupt_codeword(&mut grid, &layout, block.codewords[i], i);
     }
     assert!(!grid.has_reliability());
-    assert!(matches!(decode_plain(&grid, &layout, mask).blocks[0].outcome, BlockOutcome::Failed(_)));
+    let no_list = DecodeOptions { list_decode: false, ..Default::default() };
+    assert!(matches!(decode(&grid, &layout, mask, &Pins::new(), &no_list).blocks[0].outcome, BlockOutcome::Failed(_)));
+    let listing = DecodeOptions { list_cost: 8192, ..Default::default() };
+    let report = decode(&grid, &layout, mask, &Pins::new(), &listing);
+    assert!(matches!(report.blocks[0].outcome, BlockOutcome::Solved { method: SolveMethod::List { .. }, errors: 13, .. }), "{:?}", report.blocks[0].outcome);
+    assert!(report.blocks[0].is_verified() && report.text.plain() == text);
 }
 
 #[test]
@@ -1125,9 +1154,10 @@ fn errors_located_in_one_block_make_the_modules_beside_them_doubtful_in_another(
             grid.set_sampled(third.x as usize, third.y as usize, clean.get(third.x as usize, third.y as usize).inverted(), 200);
         }
     };
-    // Without the trials of erasures, which reach one past the code on
-    // their own: what the located errors add is the point here.
-    let opts = DecodeOptions { erase_by_trial: false, ..DecodeOptions::default() };
+    // Without the trials of erasures or the algebra, which reach one
+    // past the code on their own: what the located errors add is the
+    // point here.
+    let opts = DecodeOptions { erase_by_trial: false, list_decode: false, ..DecodeOptions::default() };
     let mut alone = clean.clone();
     paint(&mut alone, false);
     let report = decode(&alone, &layout, mask, &Pins::new(), &opts);
@@ -1246,4 +1276,72 @@ fn rivals_the_block_as_read_lies_as_near_to_are_told_apart_by_the_message() {
     for (cw, want) in block.codewords.iter().zip(&read) {
         assert_eq!(report.codewords[*cw].final_value, Some(*want));
     }
+}
+
+#[test]
+fn list_decoding_reaches_a_block_wrong_in_more_codewords_than_the_trials_reach() {
+    // A version 5-H block: thirty-three codewords, twenty-two of error
+    // correction, so half the distance is eleven; erasing codewords by
+    // trial reaches twelve by the pairs and thirteen by the fours; the
+    // curve through the codewords reaches fourteen, which is the bound
+    // of the algebra for the block, and wants a multiplicity of fifteen
+    // to reach it with room to spare: twice the usual budget. Painted by
+    // hand, every module is certain, and nothing that doubts by
+    // reliability has anything to go on.
+    let mut rng = Rng(0x115D);
+    let (version, ec, mask) = (SymbolVersion::Qr(5), EcLevel::H, 2);
+    let (layout, clean, text) = sample(version, ec, mask, &mut rng);
+    let block = &layout.blocks[0];
+    assert_eq!((block.codewords.len(), block.data_len, block.ec_len), (33, 11, 22));
+    let listing = DecodeOptions { list_cost: 4096, ..DecodeOptions::default() };
+    for round in 0..5 {
+        let mut grid = clean.clone();
+        for &i in &rng.distinct(14, 33) {
+            corrupt_codeword(&mut grid, &layout, block.codewords[i], rng.below(8));
+        }
+        let what = format!("round {round}");
+        let no_list = DecodeOptions { list_decode: false, ..DecodeOptions::default() };
+        let without = decode(&grid, &layout, mask, &Pins::new(), &no_list);
+        assert!(!without.blocks[0].is_verified(), "{what}: {:?}", without.blocks[0].outcome);
+        let report = decode(&grid, &layout, mask, &Pins::new(), &listing);
+        match report.blocks[0].outcome {
+            BlockOutcome::Solved { method: SolveMethod::List { multiplicity }, errors, erasures: 0, beyond_standard: false, .. } => {
+                assert_eq!(errors, 14, "{what}");
+                assert!(multiplicity >= 15, "{what}: multiplicity {multiplicity}");
+            }
+            other => panic!("{what}: {other:?}"),
+        }
+        assert!(report.blocks[0].is_verified(), "{what}");
+        assert!(report.is_trustworthy(), "{what}");
+        assert_eq!(report.text.plain(), text, "{what}");
+        // The Corrections overlay has the codewords it changed.
+        let corrected = report.codewords.iter().filter(|c| c.status == CwStatus::Corrected).count();
+        assert_eq!(corrected, 14, "{what}");
+        assert!(report.codewords.iter().filter(|c| c.doubted != 0).count() == 14, "{what}");
+    }
+    // Sampled faintly, the faint modules' other colours are points of
+    // their own: a block wrong in sixteen codewords, each in one faint
+    // module, past the algebra on the bits as read, solves on the bits
+    // weighed, with every other way of doubting by reliability and the
+    // trials turned off.
+    let mut grid = clean.clone();
+    for y in 0..grid.height() {
+        for x in 0..grid.width() {
+            grid.set_sampled(x, y, grid.get(x, y), 200);
+        }
+    }
+    for &i in &rng.distinct(16, 33) {
+        let modules = layout.codeword_modules(block.codewords[i]);
+        let pos = modules[rng.below(modules.len())];
+        let (x, y) = (pos.x as usize, pos.y as usize);
+        grid.set_sampled(x, y, grid.get(x, y).inverted(), rng.below(10) as u8);
+    }
+    let alone = DecodeOptions { doubt_codewords: false, doubt_bits: false, flip_bits: false, erase_by_trial: false, ..DecodeOptions::default() };
+    let report = decode(&grid, &layout, mask, &Pins::new(), &alone);
+    assert!(matches!(report.blocks[0].outcome, BlockOutcome::Solved { method: SolveMethod::List { .. }, errors: 16, .. }), "{:?}", report.blocks[0].outcome);
+    assert!(report.blocks[0].is_verified() && report.text.plain() == text);
+    // With doubting by reliability off the curve is the hard decision
+    // one, and sixteen is past it.
+    let hard = DecodeOptions { reliability: false, erase_by_trial: false, ..DecodeOptions::default() };
+    assert!(!decode(&grid, &layout, mask, &Pins::new(), &hard).blocks[0].is_verified());
 }

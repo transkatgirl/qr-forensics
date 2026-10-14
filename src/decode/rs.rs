@@ -27,7 +27,10 @@
 //! reach codewords the block as read lies as near to as each other, they
 //! return every one ([`nearest`]), for the caller to tell apart by what
 //! the block's data makes of the message, where one alone would have to
-//! give the block up.
+//! give the block up. An eighth solver, [`super::list::rs_decode_listing`],
+//! is a list decoder proper: it interpolates a curve through the block's
+//! codewords weighed by their reliability and reads every codeword of
+//! the code off it, which reaches further than any trial of small sets.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -146,6 +149,12 @@ pub const TRIAL_SETS: usize = 1 << 16;
 /// the decode is one of.
 pub const TRIAL_SETS_MIN: usize = 12 * 1024;
 
+/// Most sets a solver may be given to erase by trial, where the budget
+/// is raised by hand ([`super::pipeline::DecodeOptions::trial_sets`]):
+/// a million decodes, which is seconds on a block, and the triples of a
+/// block of a hundred and eighty codewords.
+pub const TRIAL_SETS_MAX: usize = 1 << 20;
+
 /// What the bit-level solvers may try beyond doubting bits by their
 /// reliability, and how far.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,8 +191,8 @@ impl Trials {
 pub const FLIP_TRIPLE_BITS: usize = 512;
 
 /// How many sets of `size` among `n` there are, when no more than
-/// [`TRIAL_SETS`].
-pub fn sets_of(n: usize, size: usize) -> Option<usize> {
+/// `limit`.
+pub fn sets_of(n: usize, size: usize, limit: usize) -> Option<usize> {
     if size > n {
         return Some(0);
     }
@@ -191,7 +200,7 @@ pub fn sets_of(n: usize, size: usize) -> Option<usize> {
     for k in 0..size {
         count = count * (n - k) as u128 / (k + 1) as u128;
     }
-    usize::try_from(count).ok().filter(|&count| count <= TRIAL_SETS)
+    usize::try_from(count).ok().filter(|&count| count <= limit)
 }
 
 /// Every set of `size` indices below `n`, in order, to `f`, until `f`
@@ -251,7 +260,7 @@ pub fn soft_distance(block: &[CwRead], bit_reliability: &[[u8; 8]], corrected: &
 /// those naming the same codeword the one `better` prefers stands for
 /// them; those lying further off than the margin are dismissed. Empty
 /// when nothing was found, and one solution where it stands clear.
-fn nearest<T>(mut found: Vec<(u32, T)>, same: impl Fn(&T, &T) -> bool, better: impl Fn(&T, &T) -> bool) -> Vec<T> {
+pub(super) fn nearest<T>(mut found: Vec<(u32, T)>, same: impl Fn(&T, &T) -> bool, better: impl Fn(&T, &T) -> bool) -> Vec<T> {
     found.sort_by_key(|&(distance, _)| distance);
     let mut kept: Vec<(u32, T)> = Vec::new();
     for (distance, candidate) in found {
@@ -313,6 +322,27 @@ pub fn located_error_bits(read: usize, errors: usize) -> u32 {
     }
     let ways: f64 = (1..=errors).map(|i| ((read - errors + i) as f64 / i as f64).log2()).sum();
     let bits = errors as f64 * (16.0 - 255f64.log2()) - ways - (255f64 / 254.0).log2();
+    bits.max(0.0).floor() as u32
+}
+
+/// What confirms a codeword of the code found within `errors` of the
+/// `read` codewords of a block, whatever found it, in bits: how rarely
+/// a block of noise has any codeword so near. The `redundancy` left
+/// after the erasures tells `256^redundancy` readings apart, and about
+/// each codeword `C(read, errors) · 255^errors` readings lie within
+/// `errors` of it, so noise shows one once in the quotient. Within half
+/// the code's distance this is a byte for each codeword of slack and
+/// [`located_error_bits`] besides, to the bit; past it, where there is
+/// no slack and the decoders that stop at half the distance never go,
+/// it falls by eight bits a codeword less what the codewords' ways
+/// give back, and reaches nought where any block would have a codeword
+/// within reach ([`super::list`]).
+pub fn list_solution_bits(read: usize, redundancy: usize, errors: usize) -> u32 {
+    if errors > read {
+        return 0;
+    }
+    let ways: f64 = (1..=errors).map(|i| ((read - errors + i) as f64 / i as f64).log2()).sum();
+    let bits = 8.0 * redundancy as f64 - errors as f64 * 255f64.log2() - ways - (255f64 / 254.0).log2();
     bits.max(0.0).floor() as u32
 }
 
@@ -601,6 +631,38 @@ fn rs_decode_core(block: &[CwRead], doubted: &[usize], ec_len: usize, reserved: 
     }
 
     let slack = ec_len - f - 2 * l;
+    settle(block, doubted, &erased, corrected, l, slack, located_error_bits(n - f, l), reserved)
+}
+
+/// A solution's accounts, from the block it corrected: whether it may
+/// stand, and what confirms it. `erased` are the codewords taken as
+/// erasures, those read with unknown bits and the `doubted` among them,
+/// read in full and taken as erased all the same; `errors` how many
+/// codewords read in full the solution changed besides; `slack` the
+/// redundancy it left unused, in codewords; and `located_bits` what the
+/// errors it located confirm ([`located_error_bits`], or
+/// [`list_solution_bits`] less the slack's byte each for a solution
+/// reached past half the code's distance). A solution that overturns a
+/// pinned bit is refused, and so is one that overturns the known bits of
+/// the codewords it erased with too little slack to say that it is the
+/// bits that are wrong ([`OVERTURN_COST`]): a doubted codeword's bits are
+/// expected to be wrong, and its agreement is weighed against its
+/// disagreement instead ([`doubted_agreement`]).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn settle(
+    block: &[CwRead],
+    doubted: &[usize],
+    erased: &[usize],
+    corrected: Vec<u8>,
+    errors: usize,
+    slack: usize,
+    located_bits: u32,
+    reserved: usize,
+) -> Result<RsSolution, RsFailure> {
+    let n = block.len();
+    let is_doubted = |i: usize| doubted.contains(&i);
+    let is_erased = |i: usize| erased.contains(&i);
+    let received: Vec<u8> = block.iter().map(|c| c.value & c.known).collect();
     let mut check_bits = 0;
     let mut flipped_known_bits = 0;
     let (mut doubted_agreeing, mut doubted_flipped) = (0u32, 0u32);
@@ -619,7 +681,7 @@ fn rs_decode_core(block: &[CwRead], doubted: &[usize], ec_len: usize, reserved: 
             flipped_known_bits += flipped;
             doubted_flipped += flipped;
             doubted_agreeing += cw.known.count_ones() - flipped;
-        } else if cw.is_erasure() {
+        } else if is_erased(i) {
             if flipped > 0 && slack == 0 {
                 return Err(RsFailure::KnownBitConflict { index: i });
             }
@@ -649,17 +711,7 @@ fn rs_decode_core(block: &[CwRead], doubted: &[usize], ec_len: usize, reserved: 
         .map(|i| Erratum { index: i, magnitude: corrected[i] ^ received[i], was_erasure: is_erased(i) })
         .collect();
 
-    Ok(RsSolution {
-        corrected,
-        errata,
-        errors: l,
-        erasures: f,
-        slack,
-        check_bits,
-        flipped_known_bits,
-        located_bits: located_error_bits(n - f, l),
-        reserved,
-    })
+    Ok(RsSolution { corrected, errata, errors, erasures: erased.len(), slack, check_bits, flipped_known_bits, located_bits, reserved })
 }
 
 /// Decode by doubting: erase the least reliable fully read codewords, one
@@ -706,13 +758,26 @@ pub fn rs_decode_doubting(
 pub const CHASE_BITS: usize = 10;
 /// Fewest bits the chase flips, however many decodes it is one of.
 pub const CHASE_MIN_BITS: usize = 6;
+/// Most bits the chase may be set to flip by hand
+/// ([`super::pipeline::DecodeOptions::chase_bits`]): sixty-five thousand
+/// patterns, which is a second or so on a large block, and sixteen bits
+/// of misdecode risk for the located errors to pay for.
+pub const CHASE_MAX_BITS: usize = 16;
 
 /// How many bits the chase flips in a decode that is one of `tries`: the
 /// most, less a bit for each doubling of the tries, since the patterns
 /// of every try are chances of a misdecode together and a search of
 /// every format has thirty-two decodes to spend them over.
 pub fn chase_bits(tries: usize) -> usize {
-    CHASE_BITS.saturating_sub(tries_charge(tries) as usize).max(CHASE_MIN_BITS)
+    chase_bits_among(CHASE_BITS, tries)
+}
+
+/// [`chase_bits`] from a budget of `bits` set by hand: less a bit for
+/// each doubling of the tries, and never below [`CHASE_MIN_BITS`] or
+/// the budget itself, whichever is the less.
+pub fn chase_bits_among(bits: usize, tries: usize) -> usize {
+    let bits = bits.clamp(1, CHASE_MAX_BITS);
+    bits.saturating_sub(tries_charge(tries) as usize).max(CHASE_MIN_BITS.min(bits))
 }
 /// Fewest EC codewords a chased solution must leave unused: the patterns
 /// tried are a power of two, and each is a fresh chance of a misdecode,
@@ -799,7 +864,7 @@ pub fn rs_decode_chasing_bits(
         return Vec::new();
     }
     doubtful.sort();
-    doubtful.truncate(bits.clamp(1, CHASE_BITS));
+    doubtful.truncate(bits.clamp(1, CHASE_MAX_BITS));
 
     let n = block.len();
     let received: Vec<u8> = block.iter().map(|c| c.value & c.known).collect();
@@ -914,8 +979,8 @@ pub fn rs_decode_trying(
     let mut tried = 0;
     let mut size = if left % 2 == 1 { 1 } else { 2 };
     while size < left {
-        let budget = sets.min(TRIAL_SETS);
-        let Some(count) = sets_of(candidates.len(), size).filter(|&count| count > 0 && tried + count <= budget) else { break };
+        let budget = sets.min(TRIAL_SETS_MAX);
+        let Some(count) = sets_of(candidates.len(), size, budget).filter(|&count| count > 0 && tried + count <= budget) else { break };
         tried += count;
         let mut found: Vec<(u32, (Vec<usize>, RsSolution))> = Vec::new();
         each_set(candidates.len(), size, |set| {
@@ -1545,8 +1610,9 @@ impl BitSystem {
         }
         let candidates: Vec<usize> = (0..n).filter(|&i| !columns_of[i].is_empty()).collect();
         let c = candidates.len();
-        let tries: Option<usize> = (1..=size).map(|s| sets_of(c, s)).sum();
-        let Some(tries) = tries.filter(|&tries| tries <= budget.min(TRIAL_SETS)) else { return (0, Vec::new()) };
+        let budget = budget.min(TRIAL_SETS_MAX);
+        let tries: Option<usize> = (1..=size).map(|s| sets_of(c, s, budget)).sum();
+        let Some(tries) = tries.filter(|&tries| tries <= budget) else { return (0, Vec::new()) };
         if size == 0 || size > c || zero < 8 * size + DOUBT_SPARE_EQUATIONS {
             return (tries, Vec::new());
         }
@@ -1639,7 +1705,7 @@ impl BitSystem {
             // As many of the least reliable bits as have no more pairs
             // than four lookups a set of the budget: a lookup is a hash of
             // a few words where a set erased is a decode.
-            let s = c.min(FLIP_TRIPLE_BITS).min((8 * budget.min(TRIAL_SETS)).isqrt());
+            let s = c.min(FLIP_TRIPLE_BITS).min((8 * budget.min(TRIAL_SETS_MAX)).isqrt());
             let triples: usize = (0..s).map(|a| (a + 1..s).map(|b| c - b - 1).sum::<usize>()).sum();
             if c >= 3 && zero >= DOUBT_SPARE_EQUATIONS + tries_charge(tries + triples) as usize {
                 tries += triples;
@@ -2402,7 +2468,7 @@ mod tests {
                 // it is not.
                 read[wrong[limit + 1]].value ^= rng.nonzero();
                 let size = 2 - ec_len % 2;
-                let fits = sets_of(n, size).zip(sets_of(n, size + 2)).is_some_and(|(small, large)| small + large <= TRIAL_SETS);
+                let fits = sets_of(n, size, TRIAL_SETS).zip(sets_of(n, size + 2, TRIAL_SETS)).is_some_and(|(small, large)| small + large <= TRIAL_SETS);
                 let found = rs_decode_trying(&read, &certain, ec_len, 0, TRIAL_SETS);
                 if fits {
                     let (erased, solution) = only(found).unwrap_or_else(|| panic!("{what} and one more"));
@@ -2438,7 +2504,8 @@ mod tests {
         let certain = vec![[CERTAIN; 8]; 130];
         let (erased, solution) = only(rs_decode_trying(&read, &certain, 30, 0, TRIAL_SETS)).expect("pairs of a large block");
         assert_eq!((erased.len(), solution.errors, solution.corrected == block), (2, 16, true));
-        assert_eq!(sets_of(130, 3), None);
+        assert_eq!(sets_of(130, 3, TRIAL_SETS), None);
+        assert_eq!(sets_of(130, 3, TRIAL_SETS_MAX), Some(130 * 129 * 128 / 6));
         let block = codeword(&mut rng, 101, 29);
         let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
         for cw in &mut read[..15] {

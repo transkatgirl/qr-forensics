@@ -789,10 +789,14 @@ fn read_prepared(image: &Luma, prepared: &Prepared, variant: Variant, params: &S
 /// padding was placed. The report comes back with the pins it was then
 /// decoded under, or as it was with none. A decode the pins leave short
 /// of a read is left as it was: what they would add to it rests on the
-/// padding alone, with nothing to confirm it.
+/// padding alone, with nothing to confirm it. A decode that is a read
+/// already comes back with the pins it derived for itself, when it was
+/// asked to derive any ([`DecodeOptions::derive_pins`]), which are the
+/// same pins found the same way.
 fn with_padding(grid: &ModuleGrid, layout: &SymbolLayout, report: DecodeReport, opts: &DecodeOptions) -> (DecodeReport, Pins) {
     if report.is_trustworthy() {
-        return (report, Pins::new());
+        let pins = report.derived_pins.clone();
+        return (report, pins);
     }
     match recover_padding_after(grid, layout, report.mask, &Pins::new(), opts, &report) {
         Some(recovery) if recovery.confirmed && recovery.report.is_trustworthy() => (recovery.report, recovery.pins),

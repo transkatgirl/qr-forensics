@@ -16,7 +16,7 @@ use qr_forensics::imaging::detect::SearchParams;
 use qr_forensics::imaging::read::ReadResult;
 use qr_forensics::imaging::sample::{Classified, SampleParams, Sharpening};
 use qr_forensics::symbol::function_map::FunctionMap;
-use qr_forensics::symbol::grid::{Mirror, Module, ModuleGrid};
+use qr_forensics::symbol::grid::{CERTAIN, Mirror, Module, ModuleGrid};
 use qr_forensics::symbol::layout::{CwId, SymbolLayout};
 use qr_forensics::symbol::tables::Mode;
 use qr_forensics::symbol::{EcLevel, SymbolVersion};
@@ -581,7 +581,29 @@ pub enum Ink {
     /// near its threshold is the colour it falls on, at the reliability
     /// it read at, where a sampling of the grid would leave it unknown.
     Photo,
+    /// The colour left as it is, and how far it is to be believed set to
+    /// the painted reliability ([`ViewState::paint_reliability`]): for a
+    /// region a stain or a tear runs over, whose modules can be read but
+    /// not trusted as far as the rest, so that the decoder doubts them
+    /// first. Nothing on an unknown module.
+    Doubt,
+    /// The colour left as it is and made certain again: what the other
+    /// button paints while the ink is Doubtful.
+    Sure,
 }
+
+/// The reliability the Doubtful ink is given when it is picked with the
+/// painted reliability at certain: three bits of likelihood, one module
+/// in eight misread, as a module beside a located error is held to.
+pub const DOUBT_RELIABILITY: u8 = 16;
+
+/// The most a module painted by hand may be believed short of certain:
+/// eight bits of likelihood, one module in two hundred and fifty-six
+/// misread. The painted reliability slider runs from a guess to here,
+/// and one step beyond to certain; a module believed further than this
+/// and still open to doubt is a nicety the decoder never needs, since
+/// nothing it doubts by reliability reaches so far down the order.
+pub const PAINT_RELIABILITY_MAX: u8 = 56;
 
 /// Which modules a sampling of the photo writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -831,11 +853,15 @@ pub struct ViewState {
     pub grid_lines: bool,
     /// Keep fixed patterns at their specified colours.
     pub lock_fixed: bool,
-    /// Paint dark and light as guesses, at a reliability of 0, to be
-    /// doubted as a module sampled on its threshold is, where a module
-    /// painted otherwise is certain. What the From photo ink reads goes
-    /// in at 0 as well, in place of the reliability it read at.
-    pub paint_as_guess: bool,
+    /// How far a module painted dark or light is to be believed, on the
+    /// decoder's scale: [`CERTAIN`] for a module that is never doubted,
+    /// nought for a guess no surer than a module sampled on its
+    /// threshold, and anything between, up to [`PAINT_RELIABILITY_MAX`]
+    /// from the slider. What the From photo ink reads goes in at this
+    /// reliability too, below certain, in place of the one it read at;
+    /// and the Doubtful ink sets it on a module without changing its
+    /// colour.
+    pub paint_reliability: u8,
     pub align_view: PanZoom,
     pub edit_view: PanZoom,
     pub selected: Option<CwId>,
@@ -976,7 +1002,7 @@ impl Default for ViewState {
             grid_opacity: 0.6,
             grid_lines: true,
             lock_fixed: true,
-            paint_as_guess: false,
+            paint_reliability: CERTAIN,
             align_view: PanZoom::default(),
             edit_view: PanZoom::default(),
             selected: None,

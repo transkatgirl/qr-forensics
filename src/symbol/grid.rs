@@ -213,6 +213,24 @@ impl ModuleGrid {
         self.set_sampled(x, y, module, 0);
     }
 
+    /// Set a module painted at a reliability chosen by hand: certain at
+    /// [`CERTAIN`], and otherwise as sure as a sampled module of that
+    /// reliability, a guess at nought.
+    pub fn set_painted(&mut self, x: usize, y: usize, module: Module, reliability: u8) {
+        if reliability == CERTAIN { self.set(x, y, module) } else { self.set_sampled(x, y, module, reliability) }
+    }
+
+    /// Change how sure a module's colour is, leaving the colour as it is:
+    /// for a region a stain or a tear runs over, whose modules are read
+    /// but not to be believed as far as the rest. Nothing on an unknown
+    /// module, which has no colour to be sure of.
+    pub fn set_reliability(&mut self, x: usize, y: usize, reliability: u8) {
+        let module = self.get(x, y);
+        if module != Module::Unknown {
+            self.set_painted(x, y, module, reliability);
+        }
+    }
+
     /// How sure the module's colour is; [`CERTAIN`] unless it was sampled
     /// or guessed.
     #[inline]
@@ -467,5 +485,19 @@ mod tests {
         assert_eq!(grid.transposed().reliability(1, 2), 40);
         assert_eq!(grid.inverted().reliability(2, 1), 40);
         assert_ne!(grid.inverted(), grid);
+        // Painted at a reliability of one's own: certain at the top of
+        // the scale, a guess at the bottom, and in between as sampled.
+        grid.set_painted(2, 1, Module::Light, 120);
+        assert_eq!((grid.get(2, 1), grid.reliability(2, 1)), (Module::Light, 120));
+        grid.set_painted(2, 1, Module::Light, CERTAIN);
+        assert_eq!(grid.reliability(2, 1), CERTAIN);
+        // The reliability alone, the colour kept; nothing on an unknown.
+        grid.set_reliability(2, 1, 16);
+        assert_eq!((grid.get(2, 1), grid.reliability(2, 1)), (Module::Light, 16));
+        grid.set_reliability(2, 1, CERTAIN);
+        assert_eq!(grid.reliability(2, 1), CERTAIN);
+        grid.set(2, 1, Module::Unknown);
+        grid.set_reliability(2, 1, 16);
+        assert_eq!((grid.get(2, 1), grid.reliability(2, 1)), (Module::Unknown, CERTAIN));
     }
 }

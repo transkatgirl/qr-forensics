@@ -425,6 +425,9 @@ pub fn try_beginnings(
     opts: &DecodeOptions,
     before: &DecodeReport,
 ) -> Option<Beginning> {
+    // The decodes made here are trials of a beginning, and derive no
+    // pins of their own.
+    let opts = &DecodeOptions { derive_pins: false, ..*opts };
     let mut best: Option<Beginning> = None;
     for text in BEGINNINGS {
         let mut places = vec![Place::Start(Mode::Byte)];

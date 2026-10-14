@@ -469,7 +469,9 @@ pub fn recover_padding(
 }
 
 /// [`recover_padding`] for a caller that has already decoded the grid
-/// under these pins: `before` is that decode.
+/// under these pins: `before` is that decode. The decodes made here
+/// derive no pins of their own ([`DecodeOptions::derive_pins`]): this
+/// is the derivation.
 pub fn recover_padding_after(
     grid: &ModuleGrid,
     layout: &SymbolLayout,
@@ -478,6 +480,20 @@ pub fn recover_padding_after(
     opts: &DecodeOptions,
     before: &DecodeReport,
 ) -> Option<PaddingRecovery> {
+    let opts = DecodeOptions { derive_pins: false, ..*opts };
+    recover_padding_with(layout, pins, before, |pins| decode(grid, layout, mask, pins, &opts))
+}
+
+/// [`recover_padding_after`] with the grid decoded by `redecode`, given
+/// the pins to decode under: for a caller holding a decode it can make
+/// again under more pins without solving every block anew
+/// ([`super::pipeline::Decoding`]).
+pub fn recover_padding_with(
+    layout: &SymbolLayout,
+    pins: &Pins,
+    before: &DecodeReport,
+    mut redecode: impl FnMut(&Pins) -> DecodeReport,
+) -> Option<PaddingRecovery> {
     let mut candidate = detect_padding(layout, before)?;
     let mut first_pad = candidate.first_pad_codeword;
 
@@ -485,7 +501,7 @@ pub fn recover_padding_after(
     let mut added = pad_pins(layout, &candidate, &mut new_pins);
     let mut header_pins_added = 0;
     let mut header_codewords: Vec<usize> = Vec::new();
-    let mut report = decode(grid, layout, mask, &new_pins, opts);
+    let mut report = redecode(&new_pins);
     let mut confirmed = false;
 
     // Each pass can verify more headers, which can locate the terminator,
@@ -501,7 +517,7 @@ pub fn recover_padding_after(
                 added += changed;
                 header_pins_added += changed;
                 header_codewords.extend(inference.inferred.iter().filter_map(|&(bit, _)| layout.data_stream.get(bit / 8)));
-                report = decode(grid, layout, mask, &new_pins, opts);
+                report = redecode(&new_pins);
                 continue;
             }
         }
@@ -538,7 +554,7 @@ pub fn recover_padding_after(
             candidate.end_bit = Some(bit);
             candidate.header_certainty = Some(certainty);
             added += pad_pins(layout, &candidate, &mut new_pins);
-            report = decode(grid, layout, mask, &new_pins, opts);
+            report = redecode(&new_pins);
             continue;
         }
         // Inferred header bits are taken on trust by the pins; the blocks
@@ -550,7 +566,7 @@ pub fn recover_padding_after(
             break;
         }
         added += changed;
-        report = decode(grid, layout, mask, &new_pins, opts);
+        report = redecode(&new_pins);
     }
 
     Some(PaddingRecovery {

@@ -35,7 +35,7 @@ use qr_forensics::imaging::sample::{
     Classified, Kernel, Rule, SampleParams, VersionGuess, read_modules, suggest_versions,
 };
 use qr_forensics::symbol::function_map::{FunctionMap, looks_inverted};
-use qr_forensics::symbol::grid::{Mirror, Module, ModuleGrid, Symmetry};
+use qr_forensics::symbol::grid::{CERTAIN, Mirror, Module, ModuleGrid, Symmetry};
 use qr_forensics::symbol::layout::{CwId, SymbolLayout};
 use qr_forensics::symbol::{EcLevel, Family, SymbolVersion};
 use qr_forensics::work::{self, Cancel};
@@ -496,10 +496,12 @@ impl App {
         app
     }
 
-    /// The app as it starts: a blank grid and no photo.
+    /// The app as it starts: a blank grid and no photo. The decoder pins
+    /// the padding and headers it finds of its own accord here, which the
+    /// library leaves to its callers.
     fn blank() -> Self {
         let doc = Document::blank(SymbolVersion::Qr(2));
-        let opts = DecodeOptions::default();
+        let opts = DecodeOptions { derive_pins: true, ..DecodeOptions::default() };
         let (derived, _) = derive(&doc, None, &opts, true);
         Self {
             doc,
@@ -609,14 +611,18 @@ impl App {
     /// the reliability it reads it at and with no unsure band, whatever
     /// Sampling has for one: the colour the module falls on, however
     /// near its threshold. Nothing is read where there is no sample of
-    /// the photo to go by. A colour is certain, or a guess while Paint as
-    /// a guess holds, and a module of that colour already is painted all
-    /// the same: how sure it is goes with the paint, so that a guess is
-    /// made certain, or a module sampled or certain made a guess, by
-    /// painting over it. What is read off the photo is a guess too while
-    /// Paint as a guess holds, whatever reliability it read at. Unknown
-    /// is neither, and on a module unknown already it paints nothing:
-    /// there is no colour there to be sure of, and the press is no edit.
+    /// the photo to go by. A colour goes in at the painted reliability,
+    /// certain at the top of the scale and a guess at the bottom, and a
+    /// module of that colour already is painted all the same: how sure
+    /// it is goes with the paint, so that a guess is made certain, or a
+    /// module sampled or certain made a guess, by painting over it. What
+    /// is read off the photo goes in at the painted reliability too while
+    /// that is below certain, whatever reliability it read at. Unknown is
+    /// neither, and on a module unknown already it paints nothing: there
+    /// is no colour there to be sure of, and the press is no edit. The
+    /// Doubtful ink leaves the colour and sets the reliability alone, and
+    /// Sure, its other button, makes the module certain again; neither
+    /// touches an unknown module.
     fn paint(&mut self, x: i32, y: i32, ink: Ink) {
         let func = &self.derived.func;
         if x < 0 || y < 0 || x as usize >= func.width || y as usize >= func.height {
@@ -626,22 +632,22 @@ impl App {
         if self.view.lock_fixed && func.expected(x, y).is_some() {
             return;
         }
+        let reliability = self.view.paint_reliability;
         let grid = &mut self.doc.grid;
         let before = (grid.get(x, y), grid.reliability(x, y));
         match ink {
             Ink::Module(Module::Unknown) if before.0 == Module::Unknown => {}
-            Ink::Module(module) if self.view.paint_as_guess && module != Module::Unknown => grid.set_guessed(x, y, module),
-            Ink::Module(module) => grid.set(x, y, module),
+            Ink::Module(Module::Unknown) => grid.set(x, y, Module::Unknown),
+            Ink::Module(module) => grid.set_painted(x, y, module, reliability),
             Ink::Photo => {
                 let sampled = self.preview.as_ref().map(|preview| &preview.classified);
                 let Some(sampled) = sampled.filter(|sampled| sampled.modules.len() == func.width * func.height) else { return };
                 let i = y * func.width + x;
-                if self.view.paint_as_guess {
-                    grid.set_guessed(x, y, sampled.decided[i]);
-                } else {
-                    grid.set_sampled(x, y, sampled.decided[i], sampled.reliability[i]);
-                }
+                let read = if reliability < CERTAIN { reliability } else { sampled.reliability[i] };
+                grid.set_sampled(x, y, sampled.decided[i], read);
             }
+            Ink::Doubt => grid.set_reliability(x, y, reliability.min(CERTAIN - 1)),
+            Ink::Sure => grid.set_reliability(x, y, CERTAIN),
         }
         self.dirty |= before != (grid.get(x, y), grid.reliability(x, y));
     }
@@ -2894,11 +2900,15 @@ impl App {
                 (egui::Key::Num2, Ink::Module(Module::Light)),
                 (egui::Key::Num3, Ink::Module(Module::Unknown)),
                 (egui::Key::Num4, Ink::Photo),
+                (egui::Key::Num5, Ink::Doubt),
             ];
             for (key, ink) in inks {
                 // The photo's ink only while there is a sample of it.
                 if i.key_pressed(key) && (ink != Ink::Photo || self.preview.is_some()) {
                     self.view.ink = ink;
+                    if ink == Ink::Doubt && self.view.paint_reliability == CERTAIN {
+                        self.view.paint_reliability = DOUBT_RELIABILITY;
+                    }
                 }
             }
             for (key, tool) in [(egui::Key::B, Tool::Brush), (egui::Key::R, Tool::Rect), (egui::Key::I, Tool::Inspect)] {
@@ -6309,16 +6319,27 @@ mod tests {
         };
         assert!(read.iter().all(|&reliability| reliability > 0), "{read:?}: a clean photo reads well clear of its threshold");
         // As a guess, each module is the colour it falls on still, and no
-        // surer than one read right on its threshold.
-        bench.app.view.paint_as_guess = true;
+        // surer than one read right on its threshold; at a reliability
+        // set by hand, as sure as that.
+        bench.app.view.paint_reliability = 0;
         for (x, y) in [(10, 10), (11, 10), (12, 11)] {
             bench.app.paint(x, y, Ink::Photo);
             assert_eq!(bench.app.doc.grid.get(x as usize, y as usize), truth.get(x as usize, y as usize), "({x}, {y})");
             assert_eq!(bench.app.doc.grid.reliability(x as usize, y as usize), 0, "({x}, {y})");
         }
-        // Painted over with the box unticked, each has the reliability it
-        // read at again.
-        bench.app.view.paint_as_guess = false;
+        bench.app.view.paint_reliability = 40;
+        bench.app.paint(10, 10, Ink::Photo);
+        assert_eq!(bench.app.doc.grid.reliability(10, 10), 40);
+        // The Doubtful ink lowers a module without repainting it, and its
+        // other button makes it certain again.
+        bench.app.view.paint_reliability = 16;
+        bench.app.paint(11, 10, Ink::Doubt);
+        assert_eq!((bench.app.doc.grid.get(11, 10), bench.app.doc.grid.reliability(11, 10)), (truth.get(11, 10), 16));
+        bench.app.paint(11, 10, Ink::Sure);
+        assert_eq!(bench.app.doc.grid.reliability(11, 10), CERTAIN);
+        // Painted over at certain, each has the reliability it read at
+        // again.
+        bench.app.view.paint_reliability = CERTAIN;
         for (&(x, y), &reliability) in [(10, 10), (11, 10), (12, 11)].iter().zip(&read) {
             bench.app.paint(x, y, Ink::Photo);
             assert_eq!(bench.app.doc.grid.reliability(x as usize, y as usize), reliability.min(CERTAIN - 1), "({x}, {y})");
@@ -6628,11 +6649,21 @@ mod tests {
         for label in ["Doubt the least reliable modules", "Whole codewords", "Single bits", "Flip the faintest bits"] {
             assert!(texts.iter().any(|text| text == label), "{label}: {texts:?}");
         }
-        assert_eq!(bench.app.opts, DecodeOptions::default());
+        // The app has the decoder pin what it finds, which the library's
+        // defaults leave to the caller.
+        let base = DecodeOptions { derive_pins: true, ..DecodeOptions::default() };
+        assert_eq!(bench.app.opts, base);
         bench.click(bench.text_at("Flip the faintest bits"), egui::PointerButton::Primary);
-        assert_eq!(bench.app.opts, DecodeOptions { flip_bits: false, ..DecodeOptions::default() });
+        assert_eq!(bench.app.opts, DecodeOptions { flip_bits: false, ..base });
         bench.click(bench.text_at("Whole codewords"), egui::PointerButton::Primary);
-        assert_eq!(bench.app.opts, DecodeOptions { flip_bits: false, doubt_codewords: false, ..DecodeOptions::default() });
+        assert_eq!(bench.app.opts, DecodeOptions { flip_bits: false, doubt_codewords: false, ..base });
+        for label in ["Use list decoding", "Pin the padding and headers found", "Erase codewords by trial"] {
+            assert!(bench.texts().iter().any(|text| text == label), "{label}");
+        }
+        bench.click(bench.text_at("Pin the padding and headers found"), egui::PointerButton::Primary);
+        assert!(!bench.app.opts.derive_pins);
+        bench.click(bench.text_at("Use list decoding"), egui::PointerButton::Primary);
+        assert!(!bench.app.opts.list_decode);
         // With doubting off altogether the three have nothing to say,
         // and keep what they were set to.
         bench.click(bench.text_at("Doubt the least reliable modules"), egui::PointerButton::Primary);
@@ -6662,7 +6693,7 @@ mod tests {
         bench.app.view.stage = Stage::Edit;
         bench.step();
         let texts = bench.texts();
-        assert!(texts.iter().any(|text| text == "Takes effect once modules are sampled from a photo, or painted as a guess."), "{texts:?}");
+        assert!(texts.iter().any(|text| text == "Takes effect once modules are sampled from a photo, or painted below certain."), "{texts:?}");
         let wrong: Vec<(usize, usize)> = (2..=9)
             .map(|i| layout.codeword_modules(layout.data_stream[i])[3])
             .map(|module| (module.x as usize, module.y as usize))
@@ -6686,8 +6717,9 @@ mod tests {
         };
         // As guesses, they are the first modules doubted, and as unknown
         // the eight codewords are well within what the block takes.
-        bench.click(bench.text_at("Paint as a guess"), egui::PointerButton::Primary);
-        assert!(bench.app.view.paint_as_guess);
+        bench.app.view.paint_reliability = 0;
+        bench.step();
+        assert!(bench.texts().iter().any(|text| text.contains("a guess")), "the slider says what it paints");
         repaint(&mut bench);
         assert!(wrong.iter().all(|&(x, y)| bench.app.doc.grid.reliability(x, y) == 0));
         assert!(bench.app.derived.report.is_trustworthy());
@@ -6702,10 +6734,11 @@ mod tests {
         assert_eq!((bench.app.doc.grid.get(x, y), bench.app.doc.grid.reliability(x, y)), (Module::Unknown, CERTAIN));
         bench.act(Action::Undo);
         assert_eq!(bench.app.doc.grid.reliability(x, y), 0, "one undo takes the stroke back, and the guess is a guess again");
-        // Painted over once more with the box unticked they are certain,
-        // and the block is as far from solving as it was.
-        bench.click(bench.text_at("Paint as a guess"), egui::PointerButton::Primary);
-        assert!(!bench.app.view.paint_as_guess);
+        // Painted over once more at certain they are certain, and the
+        // block is as far from solving as it was.
+        bench.app.view.paint_reliability = CERTAIN;
+        bench.step();
+        assert!(bench.texts().iter().any(|text| text.contains("certain")), "the slider says what it paints");
         repaint(&mut bench);
         assert!(wrong.iter().all(|&(x, y)| bench.app.doc.grid.reliability(x, y) == CERTAIN));
         assert_eq!(bench.app.derived.report.blocks_solved(), 0);
@@ -6744,7 +6777,7 @@ mod tests {
         // Unknown on the unknown module, certain and as a guess: nothing
         // of it is changed, and the press costs neither.
         for guess in [false, true] {
-            bench.app.view.paint_as_guess = guess;
+            bench.app.view.paint_reliability = if guess { 0 } else { CERTAIN };
             bench.app.view.ink = Ink::Module(Module::Unknown);
             bench.click(cell(x, y), egui::PointerButton::Primary);
             assert!(bench.app.doc == before, "guess {guess}");

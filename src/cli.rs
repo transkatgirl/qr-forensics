@@ -561,7 +561,7 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
     };
     let asked = SampleParams { enhance: options.enhance, ..SampleParams::default() };
     let params = if options.surface { asked.under(Rule::Surface) } else { asked };
-    let opts = DecodeOptions { charset: options.charset, ..DecodeOptions::default() };
+    let opts = DecodeOptions { charset: options.charset, derive_pins: true, ..DecodeOptions::default() };
     let mut status = 0;
     for image in &options.images {
         let path = Path::new(image);

@@ -55,7 +55,7 @@ const RELIABILITY_FADE: u8 = 120;
 
 /// One misread in so many, said roundly: "1/200", "1/65.5 thousand",
 /// "1/4.3 billion".
-fn one_in(odds: f64) -> String {
+pub(super) fn one_in(odds: f64) -> String {
     let (scale, word) = if odds >= 1e12 {
         (1e12, " trillion")
     } else if odds >= 1e9 {
@@ -142,7 +142,7 @@ fn toolbar(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                 });
                 if app.view.overlay == Overlay::Reliability {
                     ui.weak(format!(
-                        "Red: painted as a guess, or sampled with little to believe the reading by, fading out at {:.0} bits of likelihood \
+                        "Red: painted below certain, or sampled with little to believe the reading by, fading out at {:.0} bits of likelihood \
                          ({} misread); other painted modules untinted",
                         reliability_bits(RELIABILITY_FADE),
                         one_in(misread_odds(RELIABILITY_FADE))
@@ -1303,10 +1303,11 @@ fn edit_stage(ui: &mut egui::Ui, app: &mut App, response: &egui::Response, paint
     } else if primary {
         app.view.ink
     } else {
-        Ink::Module(match app.view.ink {
-            Ink::Module(Module::Dark) => Module::Light,
-            _ => Module::Dark,
-        })
+        match app.view.ink {
+            Ink::Module(Module::Dark) => Ink::Module(Module::Light),
+            Ink::Doubt | Ink::Sure => Ink::Sure,
+            _ => Ink::Module(Module::Dark),
+        }
     };
 
     match app.view.tool {
@@ -1348,6 +1349,8 @@ fn edit_stage(ui: &mut egui::Ui, app: &mut App, response: &egui::Response, paint
                     Ink::Module(Module::Light) => Color32::from_white_alpha(110),
                     Ink::Module(Module::Unknown) => UNKNOWN_TINT.gamma_multiply(0.45),
                     Ink::Photo => ACCENT.gamma_multiply(0.25),
+                    Ink::Doubt => DOUBTED.gamma_multiply(0.35),
+                    Ink::Sure => GOOD.gamma_multiply(0.3),
                 };
                 painter.rect_filled(rect, 0.0, fill);
                 painter.rect_stroke(rect, 0.0, Line::new(1.5, SELECT), StrokeKind::Inside);

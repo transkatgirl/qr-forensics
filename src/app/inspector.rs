@@ -759,7 +759,8 @@ fn format_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
             ui.weak("Reads as");
             ui.weak("Bits differing").on_hover_text(
                 "Counted against the best word the copies make between them, each half taken from the copy that \
-                 agrees better. Hover a count to see each copy.",
+                 agrees better. Words are ranked likeliest first: by their differing bits over all copies, each \
+                 weighted by its reliability. Hover a count to see each copy and the weight.",
             );
             ui.weak("");
             ui.end_row();
@@ -782,12 +783,13 @@ fn format_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                     name.push_str(if version.family() == Family::Model1 { " (Model 2 mask)" } else { " (Model 1 mask)" });
                 }
                 ui.label(name);
-                let per_copy: Vec<String> = candidate
+                let mut per_copy: Vec<String> = candidate
                     .per_copy
                     .iter()
                     .enumerate()
                     .map(|(i, (wrong, compared))| format!("copy {}: {wrong} of {compared}", i + 1))
                     .collect();
+                per_copy.push(format!("weight over all copies: {:.1} bits", f64::from(candidate.weight) / 8.0));
                 ui.label(format!("{} of {}", candidate.best_mismatches, candidate.best_compared))
                     .on_hover_text(per_copy.join("\n"));
                 if candidate.fits_grid {
@@ -912,6 +914,9 @@ fn outcome_text(block: &BlockReport) -> (String, bool) {
                 SolveMethod::BitTrial { doubted_bits, erased } => format!(
                     "solved bit by bit after erasing {erased} codewords by trial and doubting the {doubted_bits} least reliable bits: \
                      {errors} codewords changed, {confidence_bits} checks"
+                ),
+                SolveMethod::List { multiplicity } => format!(
+                    "solved by list decoding (multiplicity {multiplicity}): {errors} wrong, {erasures} unknown, {confidence_bits} checks"
                 ),
                 SolveMethod::PinnedOnly => "solved from pins alone".to_owned(),
             };
@@ -1269,6 +1274,21 @@ fn padding_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) 
                 "These pins were made under a different EC level and are not applied. Remove them or switch back.",
             );
         }
+    }
+    let derived_pins = &derived.report.derived_pins;
+    if !derived_pins.is_empty() {
+        let of = |source: PinSource| derived_pins.values().filter(|p| p.source == source).count();
+        ui.label(format!(
+            "The decoder pinned {} codewords itself: {} padding, {} terminator, {} header.",
+            derived_pins.len(),
+            of(PinSource::Padding),
+            of(PinSource::Terminator),
+            of(PinSource::Header)
+        ))
+        .on_hover_text(
+            "Set by Pin the padding and headers found, under Decoding. These pins belong to the decode, not the \
+             document: Pin the padding adds them to the document, and unticking the option removes them.",
+        );
     }
 
     match &derived.padding {

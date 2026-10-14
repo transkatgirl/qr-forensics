@@ -33,13 +33,19 @@ const CORRECTABLE: u32 = 3;
 /// Known bits a read needs before agreeing with a codeword means anything:
 /// fewer than this agree with some word by chance too easily.
 pub const MIN_INFO_BITS: u32 = 8;
-/// How much less the bits a candidate overturns must weigh than those the
-/// runner-up overturns, at the same count, for the weights to decide
-/// between them: a quarter of the sampler's scale, so that one bit read
-/// well inside its colour against one read near the threshold settles
-/// it, and two bits of middling margin do not. ZXing and ZBar rank format
-/// words by Hamming distance alone; a module sampled from a photo comes
-/// with a margin, and a faint bit is the one most likely misread.
+/// How much less the bits a candidate overturns must weigh, summed over
+/// every known bit of every copy, than those the runner-up overturns,
+/// for the bits to decide between them: a quarter of the sampler's
+/// scale, eight bits of likelihood, so that one bit read well inside its
+/// colour against one read near the threshold settles it, one certain
+/// bit settles it, and two bits of middling margin do not. The weights
+/// are log-odds, so their sum over the copies is the likelihood of the
+/// read under each word, and the word of least summed weight is the
+/// likeliest: the maximum-likelihood rule over both copies at once, as
+/// a repetition code is decoded. ZXing and ZBar rank format words by
+/// Hamming distance alone, and ZBar assembles the cleanest word from the
+/// halves of the two copies; a module sampled from a photo comes with a
+/// margin, and a faint bit is the one most likely misread.
 pub const WEIGHT_MARGIN: u32 = 64;
 
 /// Remainder of `data · x^degree` divided by `generator`.
@@ -207,6 +213,13 @@ pub struct FormatCandidate {
     /// Summed weights of the bits that assembly overturns: what the
     /// mismatches cost, in the sampler's reliability.
     pub best_weight: u32,
+    /// Summed weights of every known bit of every copy that disagrees
+    /// with the word: the whole of what the bits say against it, and
+    /// what the candidates are ranked by ([`WEIGHT_MARGIN`]). A bit
+    /// painted by hand weighs [`CERTAIN`], so on a grid painted by hand
+    /// this is the mismatches over both copies, two hundred and
+    /// fifty-five times.
+    pub weight: u32,
     /// The word matches only as painted without the standard's XOR mask,
     /// which some encoders leave out.
     pub unmasked: bool,
@@ -248,7 +261,8 @@ pub struct FormatAnalysis {
     pub copies: Vec<InfoRead>,
     /// Best first. Candidates that fit the grid sort ahead of those that do
     /// not; then those within correction range, as painted the standard way
-    /// before the unmasked quirk; then fewer assembled mismatches.
+    /// before the unmasked quirk; then the least summed weight of the bits
+    /// disagreeing over every copy, and fewer assembled mismatches.
     pub candidates: Vec<FormatCandidate>,
 }
 
@@ -264,7 +278,7 @@ impl FormatAnalysis {
         self.candidates
             .iter()
             .filter(|c| c.is_standard())
-            .min_by_key(|c| (c.best_mismatches, Reverse(c.best_compared), c.best_weight))
+            .min_by_key(|c| (c.weight, c.best_mismatches, Reverse(c.best_compared), c.best_weight))
     }
 
     /// Known bits over every copy that says anything: a [blank
@@ -284,17 +298,17 @@ impl FormatAnalysis {
             .map_or(u32::MAX, |m| m.saturating_sub(first.best_mismatches))
     }
 
-    /// How much more the bits the runner-up overturns weigh than those
-    /// `first` overturns, among candidates that pass `admit` and overturn
-    /// as many bits as `first`: what tells them apart when the count
-    /// cannot. `u32::MAX` when no such candidate exists.
+    /// How much more the bits the runner-up overturns weigh, over every
+    /// copy, than those `first` overturns, among candidates that pass
+    /// `admit`: what tells the two apart, by the likelihood of the read
+    /// under each. `u32::MAX` when no such candidate exists.
     fn weight_margin_among(&self, first: &FormatCandidate, admit: impl Fn(&FormatCandidate) -> bool) -> u32 {
         self.candidates
             .iter()
-            .filter(|c| admit(c) && c.fields != first.fields && c.best_mismatches == first.best_mismatches)
-            .map(|c| c.best_weight)
+            .filter(|c| admit(c) && c.fields != first.fields)
+            .map(|c| c.weight)
             .min()
-            .map_or(u32::MAX, |w| w.saturating_sub(first.best_weight))
+            .map_or(u32::MAX, |w| w.saturating_sub(first.weight))
     }
 
     fn rivals(best: &FormatCandidate) -> impl Fn(&FormatCandidate) -> bool {
@@ -311,8 +325,8 @@ impl FormatAnalysis {
         }
     }
 
-    /// How much more the runner-up's overturned bits weigh than the best
-    /// candidate's, when they overturn as many.
+    /// How much more the runner-up's overturned bits weigh, over every
+    /// copy, than the best candidate's.
     pub fn weight_margin(&self) -> u32 {
         match self.best() {
             Some(best) => self.weight_margin_among(best, Self::rivals(best)),
@@ -320,11 +334,14 @@ impl FormatAnalysis {
         }
     }
 
-    /// True when nothing distinguishes the best candidate from the next:
-    /// neither the count of bits each overturns nor, at the same count,
-    /// a clear difference in how faint those bits were.
+    /// True when the bits do not distinguish the best candidate from the
+    /// next: the bits each overturns, over every copy, weigh within
+    /// [`WEIGHT_MARGIN`] of each other. On a grid painted by hand every
+    /// bit weighs the same, and a word that overturns one bit fewer
+    /// stands clear; on a grid sampled from a photo a word that overturns
+    /// one faint bit fewer does not.
     pub fn is_ambiguous(&self) -> bool {
-        self.margin() == 0 && self.weight_margin() < WEIGHT_MARGIN
+        self.weight_margin() < WEIGHT_MARGIN
     }
 
     /// Bits the best candidate would have to overturn, beyond which the
@@ -382,8 +399,7 @@ impl FormatAnalysis {
         if closest.doubtful() {
             return Some(false);
         }
-        let margin = self.margin_among(closest, FormatCandidate::is_standard);
-        let decided = margin > 0 || self.weight_margin_among(closest, FormatCandidate::is_standard) >= WEIGHT_MARGIN;
+        let decided = self.weight_margin_among(closest, FormatCandidate::is_standard) >= WEIGHT_MARGIN;
         (closest.best_compared >= MIN_INFO_BITS && decided).then_some(true)
     }
 }
@@ -455,6 +471,7 @@ pub fn analyze_format_reads(version: SymbolVersion, copies: Vec<InfoRead>) -> Fo
                 _ => word ^ copy.xor ^ other.unwrap_or(0),
             };
             let per_copy: Vec<(u32, u32)> = copies.iter().map(|c| c.distance(target(c))).collect();
+            let weight: u32 = copies.iter().map(|c| c.weight(target(c))).sum();
             let (mut best_mismatches, mut best_compared, mut best_weight) = (0, 0, 0);
             for &mask in &halves {
                 let pick = copies
@@ -480,6 +497,7 @@ pub fn analyze_format_reads(version: SymbolVersion, copies: Vec<InfoRead>) -> Fo
                 best_mismatches,
                 best_compared,
                 best_weight,
+                weight,
                 unmasked: quirk == 1,
                 other_model: quirk == 2,
                 fits_grid: fields.version == version,
@@ -487,7 +505,7 @@ pub fn analyze_format_reads(version: SymbolVersion, copies: Vec<InfoRead>) -> Fo
         }
     }
     candidates.sort_by_key(|c| {
-        (!c.fits_grid, c.doubtful(), c.quirk_rank(), c.best_mismatches, c.best_weight, c.mismatches)
+        (!c.fits_grid, c.doubtful(), c.quirk_rank(), c.weight, c.best_mismatches, c.best_weight, c.mismatches)
     });
     FormatAnalysis { copies: read, candidates }
 }
@@ -506,13 +524,15 @@ pub struct VersionAnalysis {
     pub mismatches: u32,
     /// Known bits that assembly compared.
     pub compared: u32,
-    /// Mismatches of the next best version minus those of the best.
+    /// Mismatches of the next best version's assembled read minus those
+    /// of the best's.
     pub margin: u32,
-    /// Summed weights of the bits the best version's assembly overturns.
+    /// Summed weights of every known bit of every copy that disagrees
+    /// with the best version's word: what the versions are ranked by, as
+    /// the format words are ([`FormatCandidate::weight`]).
     pub weight: u32,
-    /// How much more the next best version's overturned bits weigh than
-    /// the best version's, when the two overturn as many; `u32::MAX` when
-    /// the counts differ.
+    /// How much more the bits disagreeing with the next best version
+    /// weigh than those disagreeing with the best, over every copy.
     pub weight_margin: u32,
 }
 
@@ -528,12 +548,10 @@ impl VersionAnalysis {
     }
 
     /// The bits name a version: within correction range, on enough known
-    /// bits, with nothing else as close, by count or, at the same count,
-    /// by how faint the overturned bits were.
+    /// bits, and the bits disagreeing with any other version weighing
+    /// [`WEIGHT_MARGIN`] more.
     pub fn is_reliable(&self) -> bool {
-        self.compared >= MIN_INFO_BITS
-            && self.mismatches <= CORRECTABLE
-            && (self.margin > 0 || self.weight_margin >= WEIGHT_MARGIN)
+        self.compared >= MIN_INFO_BITS && self.mismatches <= CORRECTABLE && self.weight_margin >= WEIGHT_MARGIN
     }
 
     /// As [`FormatAnalysis::verdict`], for the version bits.
@@ -556,9 +574,9 @@ pub fn analyze_version(grid: &ModuleGrid, func: &FunctionMap) -> Option<VersionA
     Some(analyze_version_reads(copies))
 }
 
-/// (mismatches, compared, weight) of a version's assembled read, ordered
-/// worst last.
-type VersionScore = (u32, Reverse<u32>, u32);
+/// (summed weight over every copy, assembled mismatches, compared,
+/// assembled weight) of a version's read, ordered worst last.
+type VersionScore = (u32, u32, Reverse<u32>, u32);
 
 /// Bits of a version copy in each of its two physical halves. The bits
 /// run three to a row down the 6 by 3 block, so bits 0..9 are its first
@@ -566,11 +584,15 @@ type VersionScore = (u32, Reverse<u32>, u32);
 /// and damage that takes one end of the block leaves the other half.
 const VERSION_HALVES: [u32; 2] = [0x1FF, 0x3FFFF & !0x1FF];
 
-/// Rank every version against version-information copies already read.
+/// Rank every version against version-information copies already read:
+/// by the summed weight of every known bit of every copy that disagrees
+/// with it, the maximum-likelihood rule over both copies at once, and
+/// at equal weight by the cleanest read the copies assemble into.
 pub fn analyze_version_reads(copies: Vec<InfoRead>) -> VersionAnalysis {
     let mut scored: Vec<(VersionScore, u8)> = (7..=40u8)
         .map(|v| {
             let word = info18(v as u32);
+            let total: u32 = copies.iter().map(|c| c.weight(word)).sum();
             let (mut mismatches, mut compared, mut weight) = (0, 0, 0);
             for &mask in &VERSION_HALVES {
                 let pick = copies
@@ -587,7 +609,7 @@ pub fn analyze_version_reads(copies: Vec<InfoRead>) -> VersionAnalysis {
                     weight += cost;
                 }
             }
-            ((mismatches, Reverse(compared), weight), v)
+            ((total, mismatches, Reverse(compared), weight), v)
         })
         .collect();
     scored.sort();
@@ -595,11 +617,11 @@ pub fn analyze_version_reads(copies: Vec<InfoRead>) -> VersionAnalysis {
     VersionAnalysis {
         copies,
         best_version: scored[0].1,
-        mismatches: best.0,
-        compared: best.1.0,
-        margin: next.0 - best.0,
-        weight: best.2,
-        weight_margin: if next.0 == best.0 { next.2.saturating_sub(best.2) } else { u32::MAX },
+        mismatches: best.1,
+        compared: best.2.0,
+        margin: next.1.saturating_sub(best.1),
+        weight: best.0,
+        weight_margin: next.0.saturating_sub(best.0),
     }
 }
 
@@ -859,6 +881,58 @@ mod tests {
         // Too few bits to mean anything, even when they agree.
         let few = read(info18(23), 0x3F);
         assert_eq!(analyze_version_reads(vec![few]).verdict(), None);
+    }
+
+    #[test]
+    fn the_likeliest_word_over_both_copies_wins() {
+        use crate::symbol::Pos;
+        let version = SymbolVersion::Qr(3);
+        let words = format_words(version);
+        let (right, other) = (words[5].1, words.iter().map(|w| w.1).find(|&w| (w ^ words[5].1).count_ones() == 7).unwrap());
+        let copy = |xor| InfoCopy { bits: (0..15).map(|i| Pos::new(i, 0)).collect(), xor };
+        let read = |painted: u32, weight: u8, xor: u32| info_read_weighted(&copy(xor), |i| Some((painted >> i & 1 != 0, weight)));
+        // One copy reads as the right word, every bit solid; the other
+        // reads as another word to the bit, every bit faint. Half by
+        // half the two words tie, each with a clean copy to its name;
+        // over every bit of both the right word overturns seven faint
+        // bits where the other overturns seven solid, and stands clear.
+        let solid = read(right ^ 0x5412, 200, 0x5412);
+        let faint = read(other ^ 0x5412, 20, 0x5412);
+        let analysis = analyze_format_reads(version, vec![solid, faint]);
+        let best = analysis.best().unwrap();
+        assert_eq!((best.word, best.best_mismatches, best.weight), (right, 0, 7 * 20));
+        let rival = analysis.candidates.iter().find(|c| c.word == other && c.is_standard()).unwrap();
+        assert_eq!((rival.best_mismatches, rival.weight), (0, 7 * 200));
+        assert_eq!(analysis.weight_margin(), 7 * 180);
+        assert!(analysis.is_reliable() && !analysis.is_ambiguous());
+        assert_eq!(analysis.verdict(), Some(true));
+        // Read as solidly as each other, the copies cancel and the bits
+        // settle nothing.
+        let analysis = analyze_format_reads(version, vec![solid, read(other ^ 0x5412, 200, 0x5412)]);
+        assert_eq!(analysis.weight_margin(), 0);
+        assert!(analysis.is_ambiguous() && !analysis.is_reliable());
+        assert_eq!(analysis.verdict(), None);
+        // A faint wrong bit in each copy against one solid wrong bit in
+        // one: by count the two words tie at one bit each, and the
+        // weights decide for the word that overturns the faint ones.
+        let differ: Vec<u32> = (0..15).filter(|i| (right ^ other) >> i & 1 != 0).collect();
+        let p = differ[0];
+        let painted = (right ^ 0x5412) ^ (1 << p);
+        let mixed = |faint_bit: u32, xor: u32| {
+            info_read_weighted(&copy(xor), |i| Some((painted >> i & 1 != 0, if i as u32 == faint_bit { 10 } else { 200 })))
+        };
+        let mut a = mixed(p, 0x5412);
+        let mut b = mixed(p, 0x5412);
+        // Every bit where the words differ but p and q unknown, so that
+        // the two words are a bit apart from the read each.
+        for &i in &differ[2..] {
+            a.known &= !(1 << i);
+            b.known &= !(1 << i);
+        }
+        let analysis = analyze_format_reads(version, vec![a, b]);
+        let best = analysis.best().unwrap();
+        assert_eq!(best.word, right, "{:?}", analysis.candidates.iter().take(3).map(|c| (c.word, c.weight)).collect::<Vec<_>>());
+        assert_eq!(best.weight, 2 * 10);
     }
 
     #[test]

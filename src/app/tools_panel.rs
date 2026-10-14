@@ -1,14 +1,17 @@
 //! Left panel: which symbol this is, the photo, and how to get modules in.
 
 use eframe::egui;
+use qr_forensics::decode::list::{LIST_COST_MAX, LIST_COST_MIN};
+use qr_forensics::decode::rs::{CHASE_MAX_BITS, TRIAL_SETS_MAX};
 use qr_forensics::imaging::adjust::{Adjust, Channel, Enlarge, Filter, LENS_MIN_PAIRS, MAX_ENLARGED_SIDE};
 use qr_forensics::imaging::binarize::{BinarizeParams, WINDOW_RADII};
 use qr_forensics::imaging::detect::{AnchorKind, Detection, anchor_sites};
-use qr_forensics::imaging::sample::{BLUR_MIN_GAIN, Kernel, POOR_SEPARABILITY, SHARPEN_BELOW_PX};
+use qr_forensics::imaging::sample::{BLUR_MIN_GAIN, Kernel, POOR_SEPARABILITY, SHARPEN_BELOW_PX, misread_odds, reliability_bits};
 use qr_forensics::symbol::function_map::looks_inverted;
-use qr_forensics::symbol::grid::Module;
+use qr_forensics::symbol::grid::{CERTAIN, Module};
 use qr_forensics::symbol::{Family, SymbolVersion};
 
+use super::canvas::one_in;
 use super::state::*;
 use super::{Action, App, JobKind, Transform};
 
@@ -954,7 +957,7 @@ fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         ui.selectable_value(&mut app.view.tool, Tool::Inspect, "Inspect")
             .on_hover_text("I — click a module to select its codeword");
     });
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.selectable_value(&mut app.view.ink, Ink::Module(Module::Dark), "Dark").on_hover_text("1");
         ui.selectable_value(&mut app.view.ink, Ink::Module(Module::Light), "Light").on_hover_text("2");
         ui.selectable_value(&mut app.view.ink, Ink::Module(Module::Unknown), "Unknown").on_hover_text("3");
@@ -964,20 +967,63 @@ fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                     "4 — each module as sampling reads it off the photo, as Sample all reads the whole grid, but with no \
                      unsure band: a module near its threshold is painted the colour it falls on, at the reliability it \
                      read at, where Sample all would leave it unknown. Brush over a part of the grid, or drag a \
-                     rectangle about it, to sample that part alone. With Paint as a guess ticked, each goes in at the \
-                     lowest reliability instead",
+                     rectangle about it, to sample that part alone. With the painted reliability below certain, that \
+                     reliability is used instead",
                 )
                 .on_disabled_hover_text("Load a photo and place the corners to paint modules from it");
         });
+        let doubtful = ui.selectable_label(app.view.ink == Ink::Doubt, "Doubtful").on_hover_text(
+            "5 — keep each module's colour but set its reliability to the painted reliability below. For stains, \
+             tears and folds: modules you can read but don't fully trust, which the decoder should doubt first when \
+             a block fails. The right button makes modules certain again. Unknown modules are left alone.",
+        );
+        if doubtful.clicked() {
+            app.view.ink = Ink::Doubt;
+            if app.view.paint_reliability == CERTAIN {
+                app.view.paint_reliability = DOUBT_RELIABILITY;
+            }
+        }
     });
-    ui.weak("Left button paints the ink; right button paints the other of dark and light; Shift paints unknown.");
-    ui.checkbox(&mut app.view.paint_as_guess, "Paint as a guess").on_hover_text(
-        "Dark and light are painted as guesses: no surer than a module sampled right on its threshold, so that Doubt \
-         the least reliable modules, under Decoding, may take them as unknown or flip them when a block fails. \
-         Unticked, a module painted is certain and never doubted. Paint over a module again, in the colour it has, \
-         to change which it is. From photo paints a guess as well, the colour the module falls on at the lowest \
-         reliability in place of the one it read at. Unknown is painted as it always is.",
+    ui.weak(if app.view.ink == Ink::Doubt {
+        "Left button sets the reliability; right button makes modules certain; Shift paints unknown."
+    } else {
+        "Left button paints the ink; right button paints the other of dark and light; Shift paints unknown."
+    });
+    // The slider runs from a guess to eight bits of likelihood, and one
+    // step beyond that to certain.
+    const CERTAIN_STEP: u8 = PAINT_RELIABILITY_MAX + 1;
+    let mut step = if app.view.paint_reliability == CERTAIN { CERTAIN_STEP } else { app.view.paint_reliability.min(PAINT_RELIABILITY_MAX) };
+    let painted = egui::Slider::new(&mut step, 0..=CERTAIN_STEP)
+        .text("painted reliability")
+        .custom_formatter(|value, _| {
+            let step = value.round() as u8;
+            if step >= CERTAIN_STEP {
+                "certain".to_owned()
+            } else if step == 0 {
+                "a guess (1/2 misread)".to_owned()
+            } else {
+                format!("{:.1} bits ({} misread)", reliability_bits(step), one_in(misread_odds(step)))
+            }
+        })
+        .custom_parser(|text| match text.trim() {
+            "certain" => Some(f64::from(CERTAIN_STEP)),
+            other => other
+                .split(|c: char| !c.is_ascii_digit() && c != '.')
+                .next()
+                .and_then(|n| n.parse::<f64>().ok())
+                .map(|bits| ((bits - 1.0) * 8.0).round().clamp(0.0, f64::from(PAINT_RELIABILITY_MAX))),
+        });
+    let response = ui.add(painted).on_hover_text(
+        "Reliability of modules painted dark or light: from a guess (misread 1 in 2, like a module sampled right on \
+         its threshold) up to 8 bits (1 in 256), then certain. Certain modules are never doubted. Below certain, a \
+         painted module counts the same as one sampled at that reliability, so Doubt the least reliable modules, \
+         under Decoding, may erase or flip it when a block fails; guesses go first. Paint over a module to change \
+         its reliability. From photo also uses this reliability while it is below certain, and Doubtful applies it \
+         without changing colours. Unknown is unaffected.",
     );
+    if response.changed() {
+        app.view.paint_reliability = if step >= CERTAIN_STEP { CERTAIN } else { step };
+    }
     ui.checkbox(&mut app.view.lock_fixed, "Lock fixed patterns")
         .on_hover_text("Finders, timing and alignment patterns keep the colours the standard gives them");
     ui.horizontal(|ui| {
@@ -1064,10 +1110,51 @@ fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
          Many tries are many chances of a wrong answer, so a solution found this way needs more to confirm it, \
          and where two disagree the message is asked which it is, or neither is kept.",
     );
+    if opts.erase_by_trial {
+        ui.indent("trial_sets", |ui| {
+            ui.add(egui::Slider::new(&mut opts.trial_sets, 1024..=TRIAL_SETS_MAX).logarithmic(true).text("sets tried"))
+                .on_hover_text(
+                    "Most codeword sets to erase by trial, across all set sizes. The default, 65,536, covers every \
+                     triple in a 73-codeword block; every pair in the largest block is about 12,000, and every \
+                     triple in a 180-codeword block about a million. Each set is another chance of a wrong answer, \
+                     so a solution needs one more bit of confirmation for each doubling. When decoding under many \
+                     formats or samplings, the budget is split between them, but never below every pair.",
+                );
+        });
+    }
+    ui.checkbox(&mut opts.list_decode, "Use list decoding").on_hover_text(
+        "When a block fails, run soft-decision list decoding (Koetter–Vardy): weight each codeword by its modules' \
+         reliability and find every valid codeword close enough to the block as read. Corrects past half the code's \
+         distance, more so the lower the block's rate: up to 11 wrong codewords in a version 1-H block (8 normally, \
+         10 with trial erasures) and 19 in a 40-H block (15 normally, 16 with trial erasures). At level L it gains \
+         nothing. Faint modules are tried as both colours at once, so it covers every faint module rather than the \
+         few Flip the faintest bits tries. A solution is confirmed by how rarely random data lands that close to a \
+         codeword, and if two are found, the message decides between them.",
+    );
+    if opts.list_decode {
+        ui.indent("list_cost", |ui| {
+            ui.add(egui::Slider::new(&mut opts.list_cost, LIST_COST_MIN..=LIST_COST_MAX).logarithmic(true).text("constraints"))
+                .on_hover_text(
+                    "Interpolation budget: more constraints reach further but take longer. A point of multiplicity m \
+                     costs m(m+1)/2 constraints, so multiplicities grow with the square root of the budget, and run \
+                     time with its square. The default, 2,048, reaches 19 wrong codewords of 45 in a 40-H block and \
+                     takes about 0.1 s on the largest blocks; 32,768 takes seconds. When decoding under many formats \
+                     or samplings, the budget is split between them, down to 512.",
+                );
+        });
+    }
+    ui.checkbox(&mut opts.derive_pins, "Pin the padding and headers found").on_hover_text(
+        "When the decode doesn't verify, find where the padding starts (from the segment headers or the pad \
+         pattern), pin the pad codewords, the terminator, and any header bits with only one reading that parses, \
+         then re-solve the blocks those pins touch until nothing more changes. This is Pin the padding, done \
+         automatically on every decode; a pinned codeword costs no error correction. Pins are kept only if they \
+         solve or verify another block, or the segment headers confirm them. They show under Pins and in the Pins \
+         overlay; Pin the padding, under Padding recovery, adds them to the document.",
+    );
     ui.checkbox(&mut opts.reliability, "Doubt the least reliable modules").on_hover_text(
         "When a block fails, treat its codewords with the faintest sampled modules as unknown, a few at a \
-         time, until it solves with something to spare. Modules painted by hand are never doubted, but for \
-         those painted as a guess, which are among the first doubted. The three ways of doubting below are \
+         time, until it solves with something to spare. Modules painted by hand are never doubted unless they \
+         were painted below certain. The three ways of doubting below are \
          each tried, and the solution with the most to confirm it kept; Blocks says which solved a block, and \
          its Show outlines the modules that were doubted.",
     );
@@ -1084,18 +1171,26 @@ fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                 )
                 .on_disabled_hover_text("Needs Solve unknown bits individually");
             ui.checkbox(&mut opts.flip_bits, "Flip the faintest bits").on_hover_text(
-                "Flip the ten least reliable modules every way and decode each: reaches a block wrong in a little more \
-                 than its error correction takes. And where the block solves bit by bit but for a module or two or \
-                 three read solidly wrong, flip the ones the equations name. Many tries are many chances of a wrong \
-                 answer, so every pattern that solves must agree, or the message is asked which it is; turn this off \
-                 where a solution it reached looks wrong.",
+                "Try every pattern of flips on the least reliable modules (how many is set below) and decode each: \
+                 reaches a block wrong in a little more than its error correction takes. And where the block solves bit \
+                 by bit but for a module or two or three read solidly wrong, flip the ones the equations name. Many tries are \
+                 many chances of a wrong answer, so every pattern that solves must agree, or the message is asked which \
+                 it is; turn this off where a solution it reached looks wrong.",
             );
+            if opts.flip_bits {
+                ui.add(egui::Slider::new(&mut opts.chase_bits, 1..=CHASE_MAX_BITS).text("bits flipped")).on_hover_text(
+                    "How many of the least reliable bits to try every pattern of: n bits is 2^n decodes. The default, 10, \
+                     is about a thousand; 16 is 65,536, around a second on a large block. Each decode is another chance \
+                     of a wrong answer, so a solution needs one more bit of confirmation per bit flipped. When decoding \
+                     under many formats or samplings, fewer are flipped, but never fewer than 6.",
+                );
+            }
         });
     });
     if opts != app.opts {
         actions.push(Action::SetDecodeOptions(opts));
     }
     if opts.reliability && !app.doc.grid.has_reliability() {
-        ui.weak("Takes effect once modules are sampled from a photo, or painted as a guess.");
+        ui.weak("Takes effect once modules are sampled from a photo, or painted below certain.");
     }
 }
