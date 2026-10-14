@@ -1524,24 +1524,28 @@ pub fn solve_bit_erasures_doubting(
     }
 
     // The system of equations with the known bits carried, at each count
-    // of doubted bits it was built for: the flips and every size of free
-    // ask for the same one, and building it is most of a try. None where
-    // no trial can help: consistent, the known bits solve as they are,
-    // with too few equations to spare, since the count as it is found
-    // nothing; incomplete, a trial takes equations the unknown bits
-    // already lack.
-    let systems: RefCell<HashMap<usize, Option<Rc<(BitSystem, ZeroRows)>>>> = RefCell::new(HashMap::new());
-    let system_at = |k: usize, read: &[CwRead]| -> Option<Rc<(BitSystem, ZeroRows)>> {
+    // of doubted bits it was built for: the count as it is, the flips and
+    // every size of free ask for the same one, and building it is most of
+    // a try. The unknown bits reduce in it as they do in a system that
+    // carries no known bit, so the count as it is reads its solution off
+    // it ([`BitSystem::solve`]). The rows no unknown has a pivot in are
+    // there only where a trial can help: not where the system is
+    // consistent, the known bits solving as they are, with too few
+    // equations to spare, since the count as it is found nothing; nor
+    // where it is incomplete, a trial taking equations the unknown bits
+    // already lack. The known bits are carried only where a flip or a
+    // free may be tried: the count as it is solves as well without them,
+    // and a system that carries them is several times the size.
+    let carried = trials.flips || trials.free;
+    let systems: RefCell<HashMap<usize, Rc<(BitSystem, Option<ZeroRows>)>>> = RefCell::new(HashMap::new());
+    let system_at = |k: usize, read: &[CwRead]| -> Rc<(BitSystem, Option<ZeroRows>)> {
         systems
             .borrow_mut()
             .entry(k)
             .or_insert_with(|| {
-                let system = BitSystem::build(read, ec_len, true);
-                if system.rank < system.unknown || system.consistent() {
-                    return None;
-                }
-                let zero = system.zero_rows();
-                Some(Rc::new((system, zero)))
+                let system = BitSystem::build(read, ec_len, carried);
+                let zero = (carried && system.rank == system.unknown && !system.consistent()).then(|| system.zero_rows());
+                Rc::new((system, zero))
             })
             .clone()
     };
@@ -1558,19 +1562,21 @@ pub fn solve_bit_erasures_doubting(
         // the sets tried.
         let found: Vec<(BitSolution, Vec<usize>, Vec<u8>, usize)> = match trial {
             Trial::Plain => {
-                let solution = solve_bit_erasures(&read, ec_len).ok().filter(BitSolution::is_complete)?;
+                // As [`solve_bit_erasures`] solves the block.
+                unknowns_within_reach(&read, ec_len).ok()?;
+                let solution = system_at(k, &read).0.solve(&read).ok().filter(BitSolution::is_complete)?;
                 vec![(solution, Vec::new(), vec![0; n], 1)]
             }
             Trial::Flips => {
-                let shared = system_at(k, &read)?;
+                let shared = system_at(k, &read);
                 let (system, zero) = &*shared;
-                let (tries, found) = system.flipping(zero, &read, bit_reliability, trials.sets);
+                let (tries, found) = system.flipping(zero.as_ref()?, &read, bit_reliability, trials.sets);
                 found.into_iter().map(|(flipped, solution)| (solution, Vec::new(), flipped, tries)).collect()
             }
             Trial::Free(size) => {
-                let shared = system_at(k, &read)?;
+                let shared = system_at(k, &read);
                 let (system, zero) = &*shared;
-                let (tries, found) = system.trying(zero, &read, bit_reliability, size, trials.sets);
+                let (tries, found) = system.trying(zero.as_ref()?, &read, bit_reliability, size, trials.sets);
                 found.into_iter().map(|(erased, _, solution)| (solution, erased, vec![0; n], tries)).collect()
             }
         };
@@ -1721,6 +1727,13 @@ const PARTIAL_MARGIN: usize = 32;
 pub fn solve_bit_erasures(block: &[CwRead], ec_len: usize) -> Result<BitSolution, BitSolveFailure> {
     let n = block.len();
     assert!(n <= 255 && ec_len <= n);
+    unknowns_within_reach(block, ec_len)?;
+    BitSystem::build(block, ec_len, false).solve(block)
+}
+
+/// Whether a block has unknown bits for [`solve_bit_erasures`] to solve,
+/// and not so many that no partial solution is worth a try.
+fn unknowns_within_reach(block: &[CwRead], ec_len: usize) -> Result<(), BitSolveFailure> {
     let u: usize = block.iter().map(|cw| cw.known.count_zeros() as usize).sum();
     let equations = 8 * ec_len;
     if u == 0 {
@@ -1729,16 +1742,7 @@ pub fn solve_bit_erasures(block: &[CwRead], ec_len: usize) -> Result<BitSolution
     if u > equations + PARTIAL_MARGIN {
         return Err(BitSolveFailure::TooManyUnknowns { unknown_bits: u, equations });
     }
-    let system = BitSystem::build(block, ec_len, false);
-    if !system.consistent() {
-        return Err(BitSolveFailure::Inconsistent);
-    }
-    let solution = system.solution(block, &vec![0; n], equations - system.rank);
-    if solution.solved_bits == 0 {
-        return Err(BitSolveFailure::Underdetermined { rank: system.rank, unknown_bits: u });
-    }
-    debug_assert!(solution.solved_bits < u || rs_syndromes(&solution.corrected, ec_len).iter().all(|&s| s == 0));
-    Ok(solution)
+    Ok(())
 }
 
 /// Solve for unknown bits with a codeword or two or three of those read
@@ -1911,6 +1915,22 @@ impl BitSystem {
 
     fn row(&self, r: usize) -> &[u64] {
         &self.rows[r * self.words..(r + 1) * self.words]
+    }
+
+    /// The block solved with every known bit taken as read, as
+    /// [`solve_bit_erasures`] solves it: alike whether the system carries
+    /// the known bits or not, since the unknown columns and the
+    /// right-hand side reduce the same either way.
+    fn solve(&self, block: &[CwRead]) -> Result<BitSolution, BitSolveFailure> {
+        if !self.consistent() {
+            return Err(BitSolveFailure::Inconsistent);
+        }
+        let solution = self.solution(block, &vec![0; block.len()], self.equations - self.rank);
+        if solution.solved_bits == 0 {
+            return Err(BitSolveFailure::Underdetermined { rank: self.rank, unknown_bits: self.unknown });
+        }
+        debug_assert!(solution.solved_bits < self.unknown || rs_syndromes(&solution.corrected, self.equations / 8).iter().all(|&s| s == 0));
+        Ok(solution)
     }
 
     fn bit(row: &[u64], col: usize) -> bool {
@@ -2896,6 +2916,46 @@ mod tests {
             *cw = CwRead::unknown();
         }
         assert!(matches!(solve_bit_erasures(&read, ec_len), Err(BitSolveFailure::TooManyUnknowns { .. })));
+    }
+
+    /// The block as read is solved off a system that carries its known
+    /// bits, for the doubting to share with its trials, just as it is
+    /// off one that does not: complete, partial, inconsistent or
+    /// underdetermined alike.
+    #[test]
+    fn a_system_carrying_its_known_bits_solves_as_one_without_them() {
+        let mut rng = Rng(31);
+        let mut seen = [0usize; 4];
+        for _ in 0..400 {
+            let ec_len = 2 + rng.below(10);
+            let data_len = 2 + rng.below(30);
+            let block = codeword(&mut rng, data_len, ec_len);
+            let n = block.len();
+            let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+            for _ in 0..rng.below(12 * ec_len) {
+                let (i, b) = (rng.below(n), 1u8 << rng.below(8));
+                read[i].known &= !b;
+                read[i].value &= !b;
+            }
+            for _ in 0..rng.below(3) {
+                let i = rng.below(n);
+                read[i].value ^= rng.byte() & read[i].known;
+            }
+            for _ in 0..rng.below(3) {
+                let i = rng.below(n);
+                read[i].pinned = read[i].known & rng.byte();
+            }
+            let alone = solve_bit_erasures(&read, ec_len);
+            let carried = unknowns_within_reach(&read, ec_len).and_then(|()| BitSystem::build(&read, ec_len, true).solve(&read));
+            assert_eq!(carried, alone);
+            seen[match alone {
+                Ok(solution) if solution.is_complete() => 0,
+                Ok(_) => 1,
+                Err(BitSolveFailure::Inconsistent) => 2,
+                Err(_) => 3,
+            }] += 1;
+        }
+        assert!(seen.iter().all(|&n| n > 0), "{seen:?}");
     }
 
     #[test]

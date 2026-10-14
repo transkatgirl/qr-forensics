@@ -2622,16 +2622,16 @@ fn scan(
     dark: &dyn Fn(i64, i64) -> Option<bool>,
     min_module: f64,
     max_module: f64,
-    clusters: &mut Clusters,
+    hits: &mut Vec<Candidate>,
     transposed: bool,
 ) {
-    let push = |clusters: &mut Clusters, hit: Candidate| {
+    let push = |hits: &mut Vec<Candidate>, hit: Candidate| {
         let hit = if transposed {
             Candidate { x: hit.y, y: hit.x, module: [hit.module[1], hit.module[0]], ..hit }
         } else {
             hit
         };
-        clusters.merge(hit);
+        hits.push(hit);
     };
     // (start, length, kind): 0 light, 1 dark, 2 no pixel.
     let mut runs: Vec<(usize, usize, u8)> = Vec::new();
@@ -2670,7 +2670,7 @@ fn scan(
                 // as likely as not, so they are not asked; the template
                 // fit has the last word.
                 if let Some(cy) = half_cross_check(|i| dark(column, i), y as i64, centre_dark, row_module, RATIO_TOLERANCE) {
-                    push(clusters, Candidate { x: cx, y: cy, module: [row_module, row_module], inverted: !centre_dark, votes: 1, half: true, quad: None, scanned: true });
+                    push(hits, Candidate { x: cx, y: cy, module: [row_module, row_module], inverted: !centre_dark, votes: 1, half: true, quad: None, scanned: true });
                 }
                 continue;
             };
@@ -2702,7 +2702,7 @@ fn scan(
             if !module.iter().all(|m| (min_module..=max_module).contains(m)) {
                 continue;
             }
-            push(clusters, Candidate { x: cx, y: cy, module, inverted: !centre_dark, votes: 1, half: false, quad: None, scanned: true });
+            push(hits, Candidate { x: cx, y: cy, module, inverted: !centre_dark, votes: 1, half: false, quad: None, scanned: true });
         }
     }
 }
@@ -2749,7 +2749,14 @@ fn scan_for_finders(rect: &Rectified, threshold: Option<f32>, max_module: f64) -
         alone.sort_by(strongest_first);
         return alone;
     }
-    let mut clusters = scan_thresholds(rect, threshold, max_module);
+    // The two thresholds and the windows, every reading scanned side by
+    // side on the cores to spare, each reading's hits gathered in the
+    // order its scan made them.
+    let mut readings = vec![(threshold, Binarizer::Global), (threshold, Binarizer::Local { radius: rect.local_radius })];
+    readings.extend(window_binarizers(rect).map(|binarizer| (None, binarizer)));
+    let mut hits = scan_readings(rect, &readings, max_module);
+    let windows = hits.split_off(2);
+    let mut clusters = clustered(rect, hits);
     // The windows' hits are gathered apart, and stand only where the
     // two thresholds made no whole candidate: pooled into one gathering
     // they shifted the centre and the module of a candidate those two
@@ -2757,7 +2764,7 @@ fn scan_for_finders(rect: &Rectified, threshold: Option<f32>, max_module: f64) -
     // and a symbol on curled paper that had read outright was then
     // placed a few pixels off at its far corner and read only with its
     // padding pinned.
-    let mut windowed = scan_windows(rect, max_module);
+    let mut windowed = clustered(rect, windows);
     windowed.retain(|c| {
         let near = |o: &Candidate| o.inverted == c.inverted && distance([o.x, o.y], [c.x, c.y]) < c.module_mean().max(o.module_mean());
         !clusters.iter().any(|o| !o.half && near(o))
@@ -2781,12 +2788,32 @@ fn quorate(c: &Candidate) -> bool {
 
 /// The candidates of the scans against one threshold for the whole
 /// outline and against the threshold that follows the local lighting,
-/// rows and columns each, pooled, in no order.
+/// rows and columns each, pooled, in no order: what [`scan_for_finders`]
+/// makes of the two before it adds the windows.
+#[cfg(test)]
 fn scan_thresholds(rect: &Rectified, threshold: Option<f32>, max_module: f64) -> Vec<Candidate> {
+    let readings = [(threshold, Binarizer::Global), (threshold, Binarizer::Local { radius: rect.local_radius })];
+    clustered(rect, scan_readings(rect, &readings, max_module))
+}
+
+/// The hits of the scans of each reading, the reading `binarizer` sets
+/// at `threshold` ([`Reading::of`]), rows and columns, each reading's in
+/// the order its scan makes them: the readings side by side on the cores
+/// to spare, since none asks anything of another.
+fn scan_readings(rect: &Rectified, readings: &[(Option<f32>, Binarizer)], max_module: f64) -> Vec<Vec<Candidate>> {
+    work::map(readings, |&(threshold, binarizer)| {
+        let reading = Reading::of(rect, threshold, binarizer);
+        scan_both_ways(rect, &|x, y| reading.dark(rect, x, y), max_module)
+    })
+}
+
+/// The hits of scans gathered into candidates, each reading's in turn
+/// and in its order, as one scan after another gathers them: what a
+/// hit merges with depends on the hits before it.
+fn clustered(rect: &Rectified, hits: Vec<Vec<Candidate>>) -> Vec<Candidate> {
     let mut clusters = Clusters::new(rect.frame.width, rect.frame.height);
-    let local = Binarizer::Local { radius: rect.local_radius };
-    for reading in [Reading::of(rect, threshold, Binarizer::Global), Reading::of(rect, threshold, local)] {
-        scan_both_ways(rect, &|x, y| reading.dark(rect, x, y), max_module, &mut clusters);
+    for hit in hits.into_iter().flatten() {
+        clusters.merge(hit);
     }
     clusters.quorate()
 }
@@ -2796,32 +2823,28 @@ fn scan_thresholds(rect: &Rectified, threshold: Option<f32>, max_module: f64) ->
 /// Otsu's split, as the view shows it, whatever the sampling's
 /// threshold is fixed at.
 fn scan_alone(rect: &Rectified, max_module: f64) -> Vec<Candidate> {
-    let mut clusters = Clusters::new(rect.frame.width, rect.frame.height);
-    let reading = Reading::of(rect, None, rect.binarizer);
-    scan_both_ways(rect, &|x, y| reading.dark(rect, x, y), max_module, &mut clusters);
-    clusters.quorate()
+    clustered(rect, scan_readings(rect, &[(None, rect.binarizer)], max_module))
 }
 
 /// [`scan`] of the rows of the rectified image, binarised by `dark`,
-/// and then of its columns, into `clusters`.
-fn scan_both_ways(rect: &Rectified, dark: &dyn Fn(i64, i64) -> Option<bool>, max_module: f64, clusters: &mut Clusters) {
+/// and then of its columns: the hits, in the order the scan made them.
+fn scan_both_ways(rect: &Rectified, dark: &dyn Fn(i64, i64) -> Option<bool>, max_module: f64) -> Vec<Candidate> {
     let (w, h) = (rect.frame.width, rect.frame.height);
-    scan(w, h, dark, MIN_MODULE, max_module, clusters, false);
-    scan(h, w, &|x, y| dark(y, x), MIN_MODULE, max_module, clusters, true);
+    let mut hits = Vec::new();
+    scan(w, h, dark, MIN_MODULE, max_module, &mut hits, false);
+    scan(h, w, &|x, y| dark(y, x), MIN_MODULE, max_module, &mut hits, true);
+    hits
 }
 
-/// The candidates of the scans against the mean of a window a few
-/// pixels about each pixel, at each width narrower than the
-/// neighbourhood the local threshold has, pooled, in no order: a finder
-/// blurred until its rings are ripples reads as rings only against what
-/// lies right beside them. See [`super::binarize`].
-fn scan_windows(rect: &Rectified, max_module: f64) -> Vec<Candidate> {
-    let mut clusters = Clusters::new(rect.frame.width, rect.frame.height);
-    for radius in WINDOW_RADII.into_iter().filter(|&radius| radius as f64 <= rect.local_radius) {
-        let reading = Reading::of(rect, None, Binarizer::Window { radius: radius as f64 });
-        scan_both_ways(rect, &|x, y| reading.dark(rect, x, y), max_module, &mut clusters);
-    }
-    clusters.quorate()
+/// The readings against the mean of a window a few pixels about each
+/// pixel, at each width narrower than the neighbourhood the local
+/// threshold has, that [`scan_for_finders`] scans besides the two
+/// thresholds: a finder blurred until its rings are ripples reads as
+/// rings only against what lies right beside them. See
+/// [`super::binarize`].
+fn window_binarizers(rect: &Rectified) -> impl Iterator<Item = Binarizer> {
+    let reach = rect.local_radius;
+    WINDOW_RADII.into_iter().filter(move |&radius| radius as f64 <= reach).map(|radius| Binarizer::Window { radius: radius as f64 })
 }
 
 /// A finder pattern verified against the photo.
@@ -4131,6 +4154,14 @@ fn choose_model(anchors: &[Anchor], points: usize) -> Model {
     }
 }
 
+/// Rows of a site's window [`search_site`] scores at once, the caller's
+/// among them. A window is a few milliseconds of work, and every thread
+/// woken for one idles a while after it before it sleeps: with every
+/// window spread over every core, reads of the corpus took a tenth more
+/// of the processor's time than with each on one, and spread over four,
+/// a thirtieth more, for most of the time saved.
+const SEARCH_SITE_THREADS: usize = 4;
+
 /// Look for a site's pattern within `window` modules of where `predicted`
 /// puts its centre, with the shape of the patch taken from `map`. Returns
 /// the anchor and its correspondences: the four corners of a finder,
@@ -4141,7 +4172,7 @@ fn search_site(
     image: &Luma,
     func: &FunctionMap,
     site: &Site,
-    map: &impl Project,
+    map: &(impl Project + Sync),
     window: f64,
     inverted: bool,
     threshold: Option<f32>,
@@ -4161,16 +4192,23 @@ fn search_site(
     // its distance from the prediction: a timing pattern repeats every two
     // modules, and a match two modules off is more likely a false one, as
     // ZBar keeps its alignment searches close for the same reason.
-    let mut placements: Vec<([[f64; 2]; 4], f64)> = Vec::new();
-    for iy in -steps..=steps {
-        for ix in -steps..=steps {
-            let (dx, dy) = (ix as f64 * SEARCH_STEP, iy as f64 * SEARCH_STEP);
-            let corners = placed(dx, dy);
-            if let Some(score) = scorer.contrast_signed(corners, sign) {
-                placements.push((corners, score - penalty * (dx * dx + dy * dy)));
+    // A row of the window at a time, side by side on a few of the cores
+    // to spare and taken in their order: this is the search, and nothing
+    // else of it can be spread.
+    let rows: Vec<i32> = (-steps..=steps).collect();
+    let mut placements: Vec<([[f64; 2]; 4], f64)> = work::Crew::gather(SEARCH_SITE_THREADS - 1)
+        .map(&rows, |&iy| {
+            let mut row = Vec::new();
+            for ix in -steps..=steps {
+                let (dx, dy) = (ix as f64 * SEARCH_STEP, iy as f64 * SEARCH_STEP);
+                let corners = placed(dx, dy);
+                if let Some(score) = scorer.contrast_signed(corners, sign) {
+                    row.push((corners, score - penalty * (dx * dx + dy * dy)));
+                }
             }
-        }
-    }
+            row
+        })
+        .concat();
     placements.sort_by(|a, b| b.1.total_cmp(&a.1));
     let moves: &[[f64; 4]] = if site.kind == AnchorKind::Finder { &MOVES } else { &SHIFT };
     let mut evaluations = 0;
@@ -5945,10 +5983,13 @@ impl<'a> ScannedView<'a> {
         // same whatever was found before it. The first is made alone: on
         // a sound photo the best proposal is the symbol, and disposes of
         // the rest. Once one has come to nothing, the proposals next in
-        // line are fitted side by side on the cores to spare, and still
-        // taken one at a time: a fit made for a proposal that a symbol
-        // found meanwhile disposes of is thrown away, as on one core it
-        // would never have been made.
+        // line are fitted side by side on the threads standing idle, and
+        // still taken one at a time: a fit made for a proposal that a
+        // symbol found meanwhile disposes of is thrown away, as on one
+        // core it would never have been made. With no thread idle, as in
+        // a search beside others, they are fitted one at a time, as they
+        // would be on one core, rather than a batch at once by the search
+        // alone.
         let detect_each = |proposals: &[Proposal], most: usize, most_unspoken: usize, found: &mut Vec<Detection>, unfitted: &mut Vec<Unfitted>| {
             let mut fits: Vec<Option<Option<Detection>>> = vec![None; proposals.len()];
             let (mut failed, mut unspoken) = (0, 0);
@@ -5962,7 +6003,7 @@ impl<'a> ScannedView<'a> {
                     continue;
                 }
                 if fits[i].is_none() {
-                    let crew = work::Crew::gather(if failed == 0 { 0 } else { FITS_AT_ONCE.min(most - failed) - 1 });
+                    let crew = work::Crew::gather_idle(if failed == 0 { 0 } else { FITS_AT_ONCE.min(most - failed) - 1 });
                     // No more of those nothing speaks for are fitted
                     // ahead than may still fail.
                     let mut room = most_unspoken.saturating_sub(unspoken);
@@ -7781,19 +7822,27 @@ fn settle_corner(
     let steps = (half_width / SEARCH_STEP).ceil() as i32;
     // Offsets in module units around the start, through the map in use.
     let Some(start_module) = map.inverse().map(|inv| inv.apply(start[0], start[1])) else { return false };
-    for iy in -steps..=steps {
-        for ix in -steps..=steps {
-            let mut trial = *corners;
-            trial[i] = map.apply(start_module[0] + ix as f64 * SEARCH_STEP, start_module[1] + iy as f64 * SEARCH_STEP);
-            if let [a] = lines.as_slice() {
-                trial[i] = a.project(trial[i]);
-            }
-            if let Some(score) = scorer.score(trial, sign)
-                && score > best
-            {
-                best = score;
-                best_outline = trial;
-            }
+    // Every trial scored a row at a time, side by side on the cores to
+    // spare, and the best taken in the order the rows and columns run.
+    let rows: Vec<i32> = (-steps..=steps).collect();
+    let scored = work::map(&rows, |&iy| {
+        (-steps..=steps)
+            .map(|ix| {
+                let mut trial = *corners;
+                trial[i] = map.apply(start_module[0] + ix as f64 * SEARCH_STEP, start_module[1] + iy as f64 * SEARCH_STEP);
+                if let [a] = lines.as_slice() {
+                    trial[i] = a.project(trial[i]);
+                }
+                (trial, scorer.score(trial, sign))
+            })
+            .collect::<Vec<_>>()
+    });
+    for (trial, score) in scored.into_iter().flatten() {
+        if let Some(score) = score
+            && score > best
+        {
+            best = score;
+            best_outline = trial;
         }
     }
     // Then settle to a fraction of the step.
@@ -8972,31 +9021,30 @@ pub fn refine_anchors(
         let (plain, flipped) = (scorer.agreement_known(&map, false), scorer.agreement_known(&map, true));
         flipped.map(|a| a.0) > plain.map(|a| a.0)
     };
-    let mut refined: Vec<Anchor> = anchors
-        .iter()
-        .enumerate()
-        .map(|(k, anchor)| {
-            let Some(site) = site_of(func, anchor) else { return *anchor };
-            // Search a small window around where the anchor already is,
-            // through the map the other anchors make: the map through
-            // this one too passes through wherever it was put, and an
-            // anchor dropped by hand half a module off bends it there,
-            // which an anchor two modules away then holds against.
-            let others: Vec<ControlPoint> = controls.iter().enumerate().filter(|(i, _)| *i != k).map(|(_, c)| *c).collect();
-            let Some(map) = Projection::new(func.width, func.height, corners, &others) else { return *anchor };
-            let shifted = |x: f64, y: f64| {
-                let [px, py] = map.apply(x, y);
-                let [ax, ay] = map.apply(anchor.at[0], anchor.at[1]);
-                [px + anchor.center[0] - ax, py + anchor.center[1] - ay]
-            };
-            let local = ShiftedMap { f: &shifted };
-            let limit = if anchor.kind == AnchorKind::Timing { TIMING_REFINE_LIMIT } else { REFINE_LIMIT };
-            match search_site(image, func, &site, &local, SEARCH_STEP, inverted, threshold) {
-                Some((found, _)) if distance(found.center, anchor.center) <= limit * module_size_at(&map, anchor.at) => found,
-                _ => *anchor,
-            }
-        })
-        .collect();
+    // Each anchor through the map the others make as they were given, so
+    // that none waits on another: side by side on the cores to spare.
+    let numbered: Vec<(usize, &Anchor)> = anchors.iter().enumerate().collect();
+    let mut refined: Vec<Anchor> = work::map(&numbered, |&(k, anchor)| {
+        let Some(site) = site_of(func, anchor) else { return *anchor };
+        // Search a small window around where the anchor already is,
+        // through the map the other anchors make: the map through
+        // this one too passes through wherever it was put, and an
+        // anchor dropped by hand half a module off bends it there,
+        // which an anchor two modules away then holds against.
+        let others: Vec<ControlPoint> = controls.iter().enumerate().filter(|(i, _)| *i != k).map(|(_, c)| *c).collect();
+        let Some(map) = Projection::new(func.width, func.height, corners, &others) else { return *anchor };
+        let shifted = |x: f64, y: f64| {
+            let [px, py] = map.apply(x, y);
+            let [ax, ay] = map.apply(anchor.at[0], anchor.at[1]);
+            [px + anchor.center[0] - ax, py + anchor.center[1] - ay]
+        };
+        let local = ShiftedMap { f: &shifted };
+        let limit = if anchor.kind == AnchorKind::Timing { TIMING_REFINE_LIMIT } else { REFINE_LIMIT };
+        match search_site(image, func, &site, &local, SEARCH_STEP, inverted, threshold) {
+            Some((found, _)) if distance(found.center, anchor.center) <= limit * module_size_at(&map, anchor.at) => found,
+            _ => *anchor,
+        }
+    });
     // A timing anchor that still breaks the trend of its line is put
     // where the trend has it: that is what its neighbours say of the
     // paper there, and its own reading has gone astray.
@@ -9016,7 +9064,7 @@ pub fn refine_anchors(
 
 /// A map given as a closure.
 struct ShiftedMap<'a> {
-    f: &'a dyn Fn(f64, f64) -> [f64; 2],
+    f: &'a (dyn Fn(f64, f64) -> [f64; 2] + Sync),
 }
 
 impl Project for ShiftedMap<'_> {

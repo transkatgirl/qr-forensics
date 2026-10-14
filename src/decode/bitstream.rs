@@ -91,6 +91,19 @@ pub enum SegmentContent {
     Unreadable,
 }
 
+impl SegmentContent {
+    /// The content of a data segment whose payload was not read: of its
+    /// kind, and empty.
+    fn unread(mode: Mode) -> Self {
+        match mode {
+            Mode::Byte => Self::Bytes(Vec::new()),
+            Mode::Kanji => Self::Kanji(Vec::new()),
+            Mode::Hanzi => Self::Hanzi(Vec::new()),
+            _ => Self::Chars(Vec::new()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Segment {
     pub mode: Mode,
@@ -375,6 +388,20 @@ pub fn parse(stream: &StreamBits, spec: &StreamSpec) -> ParseReport {
 }
 
 fn parse_once(stream: &StreamBits, spec: &StreamSpec) -> Parsed {
+    parse_with(stream, spec, true)
+}
+
+/// [`parse_once`], with the payloads of the segments read only when
+/// `payloads` asks for them. Without them each data segment's content is
+/// left empty, of its kind, and it is marked damaged only for what its
+/// header shows; the payload's own damage is left to be asked of it
+/// ([`payload_damaged`]). The segments, their headers and bounds, where
+/// the stream ends and what blocked it, come out as they do with the
+/// payloads read, since what a payload holds steers the parse no
+/// further than its length, which the header gives. That is all the
+/// search of [`explore`] asks of the thousands of readings it parses,
+/// until one ends cleanly.
+fn parse_with(stream: &StreamBits, spec: &StreamSpec, payloads: bool) -> Parsed {
     let total = stream.len();
     let micro = spec.version.family() == Family::Micro;
     let mode_bits = spec.mode_bits as usize;
@@ -447,7 +474,11 @@ fn parse_once(stream: &StreamBits, spec: &StreamSpec) -> Parsed {
                 let need = payload_bits(mode, count);
                 let truncated = need > total - cursor;
                 let payload_end = if truncated { total } else { cursor + need };
-                let (content, payload_damaged) = parse_payload(stream, mode, count, cursor, payload_end);
+                let (content, payload_damaged) = if payloads {
+                    parse_payload(stream, mode, count, cursor, payload_end)
+                } else {
+                    (SegmentContent::unread(mode), false)
+                };
                 damaged |= payload_damaged;
                 segments.push(Segment {
                     mode,
@@ -646,13 +677,13 @@ fn explore(
             trial.certainty[i] = Certainty::Unverified;
             path.push((i, value));
         }
-        let parsed = parse_once(trial, spec);
+        let parsed = parse_with(trial, spec, false);
         match parsed.blocked.clone() {
             Some(next) => explore(trial, original, spec, next, path, depth, search),
             None => {
                 if let Some(end) = survives(&parsed, trial, original, spec) {
                     let guessed = path.iter().copied().filter(|&(bit, _)| bit < end).collect();
-                    search.survivors.push((guessed, parsed));
+                    search.survivors.push((guessed, parse_once(trial, spec)));
                 }
             }
         }
@@ -673,7 +704,9 @@ fn explore(
 /// reading that has to guess its own terminator, or that swallows the
 /// padding as payload and stops near capacity, explains nothing the
 /// stream shows: a control segment followed by such a guess would pass
-/// for any message, so neither counts.
+/// for any message, so neither counts. `parsed` is parsed without its
+/// payloads ([`parse_with`]), and theirs is the last test, as the
+/// dearest.
 fn survives(parsed: &Parsed, trial: &StreamBits, original: &StreamBits, spec: &StreamSpec) -> Option<usize> {
     let EndOfData::At { bit, .. } = parsed.end else { return None };
     if parsed.segments.iter().any(|s| s.damaged || s.truncated) {
@@ -686,7 +719,17 @@ fn survives(parsed: &Parsed, trial: &StreamBits, original: &StreamBits, spec: &S
     }
     let expected = standard_tail(terminator_bits, trial.len(), bit);
     let agreement = tail_agreement(trial, bit, &expected);
-    (agreement.is_plausible() && agreement.matches >= terminator_bits as u32 + MIN_TAIL_EVIDENCE).then_some(bit)
+    if !(agreement.is_plausible() && agreement.matches >= terminator_bits as u32 + MIN_TAIL_EVIDENCE) {
+        return None;
+    }
+    (!parsed.segments.iter().any(|s| payload_damaged(trial, s))).then_some(bit)
+}
+
+/// Whether the payload of a data segment parsed without it
+/// ([`parse_with`]) holds an impossible value, as [`parse_payload`]
+/// finds when it reads it.
+fn payload_damaged(stream: &StreamBits, segment: &Segment) -> bool {
+    segment.count.is_some_and(|count| parse_payload(stream, segment.mode, count, segment.payload.start, segment.payload.end).1)
 }
 
 /// The guessed bits every survivor shares.
@@ -1053,6 +1096,49 @@ mod tests {
         assert_eq!((agreement.matches, agreement.verified_mismatches), (11, 9));
         assert!(!agreement.is_plausible());
         assert!(tail_agreement(&bits("0000 0000 0000"), 0, &standard_tail(4, 12, 0)).zero_filled);
+    }
+
+    /// The search of the readings of an unreadable header parses each
+    /// without its payloads, and asks a payload whether it is damaged
+    /// only of a reading that parses through: every parse comes out as
+    /// it does with the payloads read, but for their contents.
+    #[test]
+    fn a_parse_without_payloads_agrees_with_one_with_them() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let (mut segments, mut damaged) = (0, 0);
+        for version in [SymbolVersion::Qr(1), SymbolVersion::Qr(12), SymbolVersion::Qr(40), SymbolVersion::Micro(2), SymbolVersion::Micro(4), SymbolVersion::Rmqr(20), SymbolVersion::Model1(3)] {
+            let spec = StreamSpec::new(version);
+            for _ in 0..3000 {
+                let mut stream = StreamBits::default();
+                for _ in 0..8 + next() % 400 {
+                    let roll = next();
+                    let certainty = match roll % 16 {
+                        0 => Certainty::Unknown,
+                        1..=5 => Certainty::Unverified,
+                        _ => Certainty::Verified,
+                    };
+                    stream.push(roll >> 8 & 1 != 0, certainty);
+                }
+                let full = parse_once(&stream, &spec);
+                let bare = parse_with(&stream, &spec, false);
+                assert_eq!((bare.end, &bare.blocked, bare.preamble_damaged), (full.end, &full.blocked, full.preamble_damaged));
+                assert_eq!(bare.segments.len(), full.segments.len());
+                for (bare, full) in bare.segments.iter().zip(&full.segments) {
+                    let shape = |s: &Segment| (s.mode, s.header.clone(), s.payload.clone(), s.count, s.header_certainty, s.truncated);
+                    assert_eq!(shape(bare), shape(full));
+                    assert_eq!(bare.damaged || payload_damaged(&stream, bare), full.damaged);
+                    segments += 1;
+                    damaged += usize::from(full.damaged && !bare.damaged);
+                }
+            }
+        }
+        assert!(damaged > 100 && segments > 10 * damaged, "{damaged} of {segments}");
     }
 
     #[test]

@@ -10,6 +10,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 rfd = "0.17"
 arboard = { version = "3", features = ["image-data"] }
 encoding_rs = "0.8"
+rayon = "1.12"
 
 [features]
 # Development aid: scripted UI run that saves screenshots. See src/app/selftest.rs.

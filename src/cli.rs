@@ -169,6 +169,7 @@ use qr_forensics::imaging::sample::{Rule, SampleParams};
 use qr_forensics::symbol::function_map::FunctionMap;
 use qr_forensics::symbol::layout::SymbolLayout;
 use qr_forensics::symbol::{Family, SymbolVersion};
+use qr_forensics::work;
 
 const USAGE: &str = "usage: qr-forensics decode [--family qr|micro|rmqr|model1] [--outline x,y,x,y,x,y,x,y] \
                      [--hex | --escaped] [--charset name] [--corners] [--details] [--grid] [--partial] \
@@ -628,7 +629,9 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
                         sought.found
                     }
                 };
-                found.into_iter().filter_map(|detection| read_detection(&luma, detection, &params, &opts)).collect()
+                // Each symbol found read side by side on the cores to
+                // spare, as Read all reads them, and kept in its order.
+                work::map(&found, |detection| read_detection(&luma, detection.clone(), &params, &opts)).into_iter().flatten().collect()
             }
         };
         if results.is_empty() {

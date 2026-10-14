@@ -57,7 +57,14 @@ impl Luma {
     /// inside the photo, and the fitting of templates is nearly all the
     /// time a search takes: such a sample is read here, in line, with
     /// the arithmetic of [`Self::sample_by_border`] and none of its
-    /// care for the border, where nothing needs clamping.
+    /// care for the border, where nothing needs clamping. The two rows
+    /// the sample lies between are one slice, the second at the image's
+    /// width into it, so that the four pixels are bounds checked once.
+    ///
+    /// The border's own sampling is in line as well: a call in the
+    /// middle of the loops that sample, rare as it is, has them keep
+    /// what they are working on in memory rather than in registers
+    /// around every sample.
     #[inline]
     pub fn sample(&self, x: f64, y: f64) -> Option<f32> {
         let (fx, fy) = (x - 0.5, y - 0.5);
@@ -65,7 +72,8 @@ impl Luma {
             let (x0, y0) = (fx as usize, fy as usize);
             let (tx, ty) = ((fx - x0 as f64) as f32, (fy - y0 as f64) as f32);
             let first = y0 * self.width + x0;
-            let (above, below) = (&self.data[first..first + 2], &self.data[first + self.width..first + self.width + 2]);
+            let pixels = &self.data[first..first + self.width + 2];
+            let (above, below) = (&pixels[..2], &pixels[self.width..]);
             let top = above[0] * (1.0 - tx) + above[1] * tx;
             let bottom = below[0] * (1.0 - tx) + below[1] * tx;
             return Some(top * (1.0 - ty) + bottom * ty);
@@ -75,6 +83,7 @@ impl Luma {
 
     /// [`Self::sample`] for a point within half a pixel of the image's
     /// border, or off the image.
+    #[inline]
     fn sample_by_border(&self, x: f64, y: f64) -> Option<f32> {
         // An image with no pixels has no border to be within: the clamps
         // below would be asked for a range that ends before it begins.

@@ -128,10 +128,21 @@ pub fn sample_module_inner(
 ) -> Option<f32> {
     let [dx, dy] = map.displacement(mx as f64 + 0.5, my as f64 + 0.5);
     let (mut sum, mut count) = (0.0f32, 0u32);
-    for sy in 0..points {
-        for sx in 0..points {
-            let offset = |s: usize| (1.0 - inner) / 2.0 + inner * (s as f64 + 0.5) / points as f64;
-            let [px, py] = map.base(mx as f64 + offset(sx), my as f64 + offset(sy));
+    // Where the samples lie across a module, the same down it: worked
+    // out once, where they would be again for every sample.
+    let offset = |s: usize| (1.0 - inner) / 2.0 + inner * (s as f64 + 0.5) / points as f64;
+    let mut offsets = [0.0f64; 8];
+    let offsets: &[f64] = if points <= offsets.len() {
+        for (s, at) in offsets.iter_mut().enumerate().take(points) {
+            *at = offset(s);
+        }
+        &offsets[..points]
+    } else {
+        &(0..points).map(offset).collect::<Vec<f64>>()
+    };
+    for &oy in offsets {
+        for &ox in offsets {
+            let [px, py] = map.base(mx as f64 + ox, my as f64 + oy);
             if let Some(value) = image.sample(px + dx, py + dy) {
                 sum += value;
                 count += 1;

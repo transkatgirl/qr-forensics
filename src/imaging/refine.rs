@@ -32,6 +32,7 @@
 //! applied to one finder or alignment pattern at a time through a
 //! [`Template`] of that patch alone.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::Luma;
@@ -40,6 +41,7 @@ use super::projection::{ControlPoint, Project, Projection, Spline};
 use super::sample::{INNER_FRACTION, POINTS, SampleParams, otsu, sample_positions};
 use crate::symbol::Pos;
 use crate::symbol::function_map::FunctionMap;
+use crate::work;
 
 /// How far the refinement may move a corner a finder pattern's own fit
 /// placed, in modules.
@@ -228,6 +230,54 @@ impl<P: Project> Project for Shifted<'_, P> {
     }
 }
 
+/// A spline's weights at the centre of every boundary of a template, laid
+/// out a site at a time: the weight of site `j` at boundary `e` is
+/// `by_site[j * edges + e]`. The displacement at each boundary is its
+/// weights times the residuals, summed site by site; laid out so, the
+/// sums of all the boundaries are taken side by side, each in the order
+/// it would be taken alone, where a boundary at a time waits on every
+/// addition before the next.
+struct EdgeWeights {
+    /// Sites each boundary has a weight for: none when there is no
+    /// boundary.
+    sites: usize,
+    edges: usize,
+    by_site: Vec<f64>,
+}
+
+impl EdgeWeights {
+    fn new(per_edge: &[Vec<f64>]) -> Self {
+        let (sites, edges) = (per_edge.first().map_or(0, Vec::len), per_edge.len());
+        let by_site = (0..sites).flat_map(|j| per_edge.iter().map(move |weights| weights[j])).collect();
+        Self { sites, edges, by_site }
+    }
+
+    /// Every `stride`th boundary's weights, as [`Scorer::with_max_edges`]
+    /// keeps the boundaries.
+    fn step_by(&self, stride: usize) -> Self {
+        let edges = self.edges.div_ceil(stride);
+        let by_site = self.by_site.chunks_exact(self.edges.max(1)).flat_map(|column| column.iter().step_by(stride).copied()).collect();
+        Self { sites: self.sites, edges, by_site }
+    }
+
+    /// The displacement at every boundary, by the residuals of a
+    /// projection with this spline, as
+    /// [`Projection::displacement_from_weights`] gives each.
+    fn displacements(&self, residuals: &[[f64; 2]]) -> Vec<[f64; 2]> {
+        let mut out = vec![[0.0, 0.0]; self.edges];
+        if self.edges == 0 {
+            return out;
+        }
+        for (column, r) in self.by_site.chunks_exact(self.edges).zip(residuals) {
+            for (d, &w) in out.iter_mut().zip(column) {
+                d[0] += w * r[0];
+                d[1] += w * r[1];
+            }
+        }
+        out
+    }
+}
+
 /// Scores placements of one template against the photo.
 pub(crate) struct Scorer<'a> {
     image: &'a Luma,
@@ -244,7 +294,7 @@ pub(crate) struct Scorer<'a> {
     /// Spline weights at each boundary's centre, for projections that
     /// share one spline: the displacement there is then a weighted sum of
     /// the projection's residuals.
-    edge_weights: Option<Vec<Vec<f64>>>,
+    edge_weights: Option<EdgeWeights>,
     /// How far, in modules, every boundary is expected to have moved into
     /// the dark: the bleed of an over-exposed photo. Negative for light
     /// bled into by dark.
@@ -328,7 +378,7 @@ impl<'a> Scorer<'a> {
             let stride = self.edges.len().div_ceil(max);
             self.edges = std::mem::take(&mut self.edges).into_iter().step_by(stride).collect();
             if let Some(weights) = &mut self.edge_weights {
-                *weights = std::mem::take(weights).into_iter().step_by(stride).collect();
+                *weights = weights.step_by(stride);
             }
         }
         self
@@ -338,7 +388,7 @@ impl<'a> Scorer<'a> {
     /// projections that share `spline`. Only right for a template in the
     /// symbol's own coordinates.
     pub(crate) fn with_spline(mut self, spline: Option<&Spline>) -> Self {
-        self.edge_weights = spline.map(|s| self.edges.iter().map(|e| s.weights(e.at)).collect());
+        self.edge_weights = spline.map(|s| EdgeWeights::new(&self.edges.iter().map(|e| s.weights(e.at)).collect::<Vec<_>>()));
         self
     }
 
@@ -366,8 +416,9 @@ impl<'a> Scorer<'a> {
     /// [`Scorer::with_spline`], which avoids re-evaluating the spline.
     pub(crate) fn contrast_projection(&self, map: &Projection, sign: f64) -> Option<f64> {
         match &self.edge_weights {
-            Some(weights) if map.spline().is_some_and(|s| s.len() == weights.first().map_or(0, Vec::len)) => {
-                self.contrast_edges(sign, |e, _| map.displacement_from_weights(&weights[e]), |x, y| map.base(x, y))
+            Some(weights) if map.spline().is_some_and(|s| s.len() == weights.sites) => {
+                let displacements = weights.displacements(map.residuals());
+                self.contrast_edges(sign, |e, _| displacements[e], |x, y| map.base(x, y))
             }
             _ => self.contrast_with(map, sign),
         }
@@ -380,11 +431,13 @@ impl<'a> Scorer<'a> {
         base: impl Fn(f64, f64) -> [f64; 2],
     ) -> Option<f64> {
         let mut per_edge: Vec<f64> = Vec::with_capacity(self.edges.len());
+        // Where each sample pair lies along a boundary, the same for
+        // every boundary.
+        let along: Vec<f64> = (0..self.along).map(|k| ALONG_FRACTION * ((k as f64 + 0.5) / self.along as f64 - 0.5)).collect();
         for (e, edge) in self.edges.iter().enumerate() {
             let [dx, dy] = displacement(e, edge);
             let (mut total, mut count) = (0.0f64, 0usize);
-            for k in 0..self.along {
-                let t = ALONG_FRACTION * ((k as f64 + 0.5) / self.along as f64 - 0.5);
+            for &t in &along {
                 let (mx, my) = (
                     edge.at[0] + edge.along[0] * t - edge.across[0] * self.bloom,
                     edge.at[1] + edge.along[1] * t - edge.across[1] * self.bloom,
@@ -401,7 +454,7 @@ impl<'a> Scorer<'a> {
                 let (px, py) = (p[0] + dx, p[1] + dy);
                 for &scale in &self.scales {
                     let light = self.image.sample(px + ux * scale, py + uy * scale);
-                    let dark = self.image.sample(px - ux * scale, py - uy * scale);
+                    let dark = light.and_then(|_| self.image.sample(px - ux * scale, py - uy * scale));
                     total += match (light, dark) {
                         (Some(light), Some(dark)) => sign * (light - dark) as f64,
                         // Off the image counts as wrong by the widest margin,
@@ -618,6 +671,17 @@ impl<'a> Scorer<'a> {
 /// as often as it avoided them, so the sweep is left as it is, and a read
 /// that fails is tried again with the photo turned instead, which
 /// [`super::read`] does.
+///
+/// The best only rises, so corners scored once in a descent are refused
+/// every time they come round again: they scored no more than the best
+/// then, or were the best then and have been bettered since, or are the
+/// corners as they stand. They are not scored again. That spares a pass
+/// after one that improved the moves the last improvement left refused,
+/// which it would otherwise score all over to find nothing; a move
+/// `moves` holds twice; and the move straight back to where an
+/// improvement came from, which lands on those very corners as often as
+/// the step undone rounds away to nothing. The descent ends where it
+/// ended when every trial was scored.
 pub(crate) fn descend_by(
     corners: [[f64; 2]; 4],
     moves: &[[f64; 4]],
@@ -629,6 +693,8 @@ pub(crate) fn descend_by(
     *evaluations += 1;
     let mut current = corners;
     let mut step = step.max(MIN_STEP);
+    let mut scored: HashSet<[u64; 8]> = HashSet::new();
+    scored.insert(bits_of(corners));
     while step >= MIN_STEP {
         for _ in 0..MAX_PASSES {
             let mut improved = false;
@@ -638,6 +704,9 @@ pub(crate) fn descend_by(
                         let mut trial = current;
                         for (corner, weight) in trial.iter_mut().zip(pattern) {
                             corner[axis] += direction * weight * step;
+                        }
+                        if !scored.insert(bits_of(trial)) {
+                            continue;
                         }
                         *evaluations += 1;
                         if let Some(value) = score(trial)
@@ -657,6 +726,13 @@ pub(crate) fn descend_by(
         step /= 2.0;
     }
     Some((current, best))
+}
+
+/// The corners as their bits: the same bits are the same corners, and
+/// score the same.
+fn bits_of(corners: [[f64; 2]; 4]) -> [u64; 8] {
+    let [[a, b], [c, d], [e, f], [g, h]] = corners.map(|p| p.map(f64::to_bits));
+    [a, b, c, d, e, f, g, h]
 }
 
 /// Mean of the values with the lowest [`TRIM_FRACTION`] of them left out.
@@ -785,8 +861,15 @@ pub fn refine_corners_holding(
     let pinned = super::detect::corners_held_by_controls(func, anchors);
     let still: Vec<usize> = loose.iter().chain(&pinned).copied().collect();
     let moves = holding(&still);
-    let normal = scorer.descend_by(corners, &moves, step, &mut evaluations, score(1.0))?;
-    let flipped = scorer.descend_by(corners, &moves, step, &mut evaluations, score(-1.0))?;
+    // The two polarities descend from the same corners and take nothing
+    // from one another: side by side, on a core to spare.
+    let descents = work::map(&[1.0, -1.0], |&sign| {
+        let mut evaluations = 0;
+        (scorer.descend_by(corners, &moves, step, &mut evaluations, score(sign)), evaluations)
+    });
+    evaluations += descents.iter().map(|(_, n)| n).sum::<usize>();
+    let [(normal, _), (flipped, _)] = <[_; 2]>::try_from(descents).ok()?;
+    let (normal, flipped) = (normal?, flipped?);
     let (inverted, (mut current, _)) = if flipped.1 > normal.1 { (true, flipped) } else { (false, normal) };
     // A corner a finder pattern's own fit placed is let move only the
     // last fraction of a pixel, which the whole outline's contrast does
@@ -849,6 +932,122 @@ mod tests {
         // Fewer than five values: nothing is dropped.
         let mut four = vec![1.0, 2.0, 3.0, -4.0];
         assert_eq!(trimmed_mean(&mut four), Some(0.5));
+    }
+
+    /// The descent as it was before it passed over corners it had
+    /// scored: every trial scored, which [`descend_by`] is held to.
+    fn descend_scoring_every_trial(
+        corners: [[f64; 2]; 4],
+        moves: &[[f64; 4]],
+        step: f64,
+        evaluations: &mut usize,
+        score: impl Fn([[f64; 2]; 4]) -> Option<f64>,
+    ) -> Option<([[f64; 2]; 4], f64)> {
+        let mut best = score(corners)?;
+        *evaluations += 1;
+        let mut current = corners;
+        let mut step = step.max(MIN_STEP);
+        while step >= MIN_STEP {
+            for _ in 0..MAX_PASSES {
+                let mut improved = false;
+                for &pattern in moves {
+                    for axis in 0..2 {
+                        for direction in [1.0, -1.0] {
+                            let mut trial = current;
+                            for (corner, weight) in trial.iter_mut().zip(pattern) {
+                                corner[axis] += direction * weight * step;
+                            }
+                            *evaluations += 1;
+                            if let Some(value) = score(trial)
+                                && value > best
+                            {
+                                best = value;
+                                current = trial;
+                                improved = true;
+                            }
+                        }
+                    }
+                }
+                if !improved {
+                    break;
+                }
+            }
+            step /= 2.0;
+        }
+        Some((current, best))
+    }
+
+    #[test]
+    fn a_descent_ends_where_scoring_every_trial_ends() {
+        let func = FunctionMap::new(SymbolVersion::Qr(2));
+        let (image, corners) = drawn(&func, |across| 1.0 - 0.3 * across as f32);
+        let scorer = Scorer::new(&image, &Template::whole(&func), corners, None);
+        let target = corners.map(|[x, y]| [x + 1.7, y - 0.9]);
+        let smooth = |c: [[f64; 2]; 4]| Some(-c.iter().flatten().zip(target.iter().flatten()).map(|(a, b)| (a - b).powi(2)).sum::<f64>());
+        // Plateaus, where a trial ties the best and is refused, and a
+        // region that cannot be scored.
+        let rugged = |c: [[f64; 2]; 4]| {
+            let v: f64 = c.iter().flatten().enumerate().map(|(i, &x)| ((x * (1.3 + i as f64 * 0.17)).sin() * 4.0).floor()).sum();
+            (v > -12.0).then_some(v)
+        };
+        let contrast = |c: [[f64; 2]; 4]| scorer.contrast_signed(c, 1.0);
+        let scores: [&dyn Fn([[f64; 2]; 4]) -> Option<f64>; 3] = [&smooth, &rugged, &contrast];
+        // `holding` leaves a move twice in the list when corners are held.
+        let held = holding(&[2, 3]);
+        let movesets: [&[[f64; 4]]; 4] = [&MOVES, &SHIFT, &held, &[[1.0, 0.0, 0.0, 0.0]]];
+        let (mut fewer, mut runs) = (0, 0);
+        for (s, score) in scores.iter().enumerate() {
+            for moves in movesets {
+                for (k, step) in [0.05, 0.4, 3.0].into_iter().enumerate() {
+                    let start = corners.map(|[x, y]| [x + 0.37 * k as f64 - 0.5, y + 0.81 - 0.29 * k as f64]);
+                    let (mut skipping, mut every) = (0, 0);
+                    let ours = descend_by(start, moves, step, &mut skipping, score);
+                    let reference = descend_scoring_every_trial(start, moves, step, &mut every, score);
+                    let bits = |(c, v): ([[f64; 2]; 4], f64)| (c.map(|p| p.map(f64::to_bits)), v.to_bits());
+                    assert_eq!(ours.map(bits), reference.map(bits), "score {s}, moves {moves:?}, step {step}");
+                    assert!(skipping <= every);
+                    fewer += usize::from(skipping < every);
+                    runs += 1;
+                }
+            }
+        }
+        assert!(fewer * 2 > runs, "{fewer} of {runs} descents scored fewer trials");
+    }
+
+    /// The spline's weights laid out a site at a time displace every
+    /// boundary as each boundary's own weights do, to the bit, and so
+    /// score a projection as the spline evaluated afresh at each does.
+    #[test]
+    fn boundaries_displaced_together_are_displaced_as_each_alone() {
+        let func = FunctionMap::new(SymbolVersion::Qr(7));
+        let (image, corners) = drawn(&func, |_| 1.0);
+        let (w, h) = (func.width as f64, func.height as f64);
+        let plane = Homography::rect_to_quad(w, h, corners).unwrap();
+        let anchors: Vec<ControlPoint> = [[3.5, 3.5], [41.5, 3.5], [3.5, 41.5], [22.5, 22.5], [38.5, 38.5], [6.5, 22.5]]
+            .iter()
+            .enumerate()
+            .map(|(k, &at)| {
+                let [x, y] = plane.apply(at[0], at[1]);
+                ControlPoint { at, px: [x + 0.3 * (k as f64).sin(), y - 0.4 * (k as f64).cos()] }
+            })
+            .collect();
+        let projection = Projection::new(func.width, func.height, corners, &anchors).unwrap();
+        let spline = projection.spline().expect("the anchors bend the map");
+        for max_edges in [usize::MAX, 333] {
+            let scorer = Scorer::new(&image, &Template::whole(&func), corners, None).with_spline(Some(spline)).with_max_edges(max_edges);
+            let together = scorer.edge_weights.as_ref().unwrap().displacements(projection.residuals());
+            assert_eq!(together.len(), scorer.edges.len());
+            for (edge, displaced) in scorer.edges.iter().zip(&together) {
+                let alone = projection.displacement_from_weights(&spline.weights(edge.at));
+                assert_eq!(displaced.map(f64::to_bits), alone.map(f64::to_bits));
+            }
+            for nudge in [0.0, 0.6, -1.3] {
+                let moved = corners.map(|[x, y]| [x + nudge, y - 0.5 * nudge]);
+                let map = Projection::new(func.width, func.height, moved, &anchors).unwrap();
+                let shared = scorer.contrast_projection(&map, 1.0).unwrap();
+                assert_eq!(shared.to_bits(), scorer.contrast_with(&map, 1.0).unwrap().to_bits());
+            }
+        }
     }
 
     #[test]

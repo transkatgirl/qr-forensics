@@ -1781,48 +1781,51 @@ pub fn brute_force(
         message_evidence: false,
         ..*opts
     };
-    let mut layouts: Vec<(EcLevel, Arc<SymbolLayout>)> = Vec::new();
-    let mut attempts = Vec::new();
+    let pins_at = |ec: EcLevel| match pins {
+        Some((level, pins)) if level == ec => pins,
+        _ => &no_pins,
+    };
+    // Every level and mask, decoded side by side on the cores to spare
+    // ([`work::map`]) and taken in their order: each decode stands alone,
+    // and on a symbol of a block or two there is nothing else to spread.
+    let mut tried: Vec<(EcLevel, u8, u32, Arc<SymbolLayout>)> = Vec::new();
     for &ec in func.version.ec_levels() {
         let Some(layout) = SymbolLayout::new(func.clone(), ec) else { continue };
         let layout = Arc::new(layout);
-        layouts.push((ec, layout.clone()));
-        let pins = match pins {
-            Some((level, pins)) if level == ec => pins,
-            _ => &no_pins,
-        };
         for mask in 0..func.version.mask_count() {
             let format_mismatches = format
                 .candidates
                 .iter()
                 .find(|c| c.fits_grid && c.is_standard() && c.fields.ec == ec && c.fields.mask == mask)
                 .map_or(0, |c| c.best_mismatches);
-            let report = decode(grid, &layout, mask, pins, &first_pass);
-            attempts.push(Attempt { ec, mask, format_mismatches, mirror: None, report });
+            tried.push((ec, mask, format_mismatches, layout.clone()));
         }
     }
-    let by_score = |a: &Attempt, b: &Attempt| {
+    let reports = work::map(&tried, |(ec, mask, _, layout)| decode(grid, layout, *mask, pins_at(*ec), &first_pass));
+    let mut attempts: Vec<(Attempt, Arc<SymbolLayout>)> = tried
+        .into_iter()
+        .zip(reports)
+        .map(|((ec, mask, format_mismatches, layout), report)| (Attempt { ec, mask, format_mismatches, mirror: None, report }, layout))
+        .collect();
+    let by_score = |(a, _): &(Attempt, Arc<SymbolLayout>), (b, _): &(Attempt, Arc<SymbolLayout>)| {
         b.report.score.cmp(&a.report.score).then(a.format_mismatches.cmp(&b.format_mismatches))
     };
     attempts.sort_by(by_score);
     if two_passes {
-        let blocks = attempts.iter().map(|a| a.report.blocks.len()).max().unwrap_or(1).max(1);
+        let blocks = attempts.iter().map(|(a, _)| a.report.blocks.len()).max().unwrap_or(1).max(1);
         // An rMQR grid has two attempts, fewer than the minimum: then all of them.
         let retry = (DOUBTING_BUDGET / blocks).max(DOUBTING_MIN_ATTEMPTS).min(attempts.len());
-        for attempt in attempts.iter_mut().take(retry) {
-            if attempt.report.is_trustworthy() {
-                continue;
-            }
-            let layout = &layouts.iter().find(|(ec, _)| *ec == attempt.ec).expect("layout was built").1;
-            let pins = match pins {
-                Some((level, pins)) if level == attempt.ec => pins,
-                _ => &no_pins,
-            };
-            attempt.report = decode(grid, layout, attempt.mask, pins, opts);
+        let again: Vec<usize> = (0..retry).filter(|&i| !attempts[i].0.report.is_trustworthy()).collect();
+        let reports = work::map(&again, |&i| {
+            let (attempt, layout) = &attempts[i];
+            decode(grid, layout, attempt.mask, pins_at(attempt.ec), opts)
+        });
+        for (&i, report) in again.iter().zip(reports) {
+            attempts[i].0.report = report;
         }
         attempts.sort_by(by_score);
     }
-    attempts
+    attempts.into_iter().map(|(attempt, _)| attempt).collect()
 }
 
 /// Decode the grid's mirror images under every EC level and mask, best
