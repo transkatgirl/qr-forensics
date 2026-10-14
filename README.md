@@ -135,12 +135,24 @@ Sampling reads a colour for each module off the photo.
   made again with those modules kept at the colour they fell on, as
   guesses the decoder doubts first, and a read that decodes only that
   way says so and sets the band to nought.
+- **Sharpen small or blurred modules** takes back out of each module what
+  blur put into it from its neighbours. How far the photo blurs, and
+  which way, is learnt from the fixed patterns, whose colours are known,
+  and undone where that gains enough to be worth it; where it cannot be
+  learnt, the modules are sharpened by a guess at the blur. The section
+  says which was done. Off, the modules are taken as they read, which
+  suits a clean print with specks in it.
 - How far each module's reading is to be believed is learnt from the
-  photo itself: the fixed patterns, whose colours are known, say how far
-  a module read right lies from its threshold, how much the readings
-  spread, and how many are wrong by more than that spread explains, as
-  specks and stains are. The section reports the fit, and the decoder
-  doubts the least reliable modules first by it.
+  photo itself: the fixed patterns say how far a dark module and a
+  light one read right lie from the threshold, how much the readings of
+  each colour spread, and how many are wrong by more than that spread
+  explains, as specks and stains are. Where one colour spreads wider,
+  as ink read unevenly does against clean paper, a reading near the
+  threshold is likelier that colour, and the threshold moves toward the
+  other. The colours are told apart so only once the blur is undone or
+  found slight, since a blur greys the fixed patterns' thin light rings
+  and leaves their solid dark blocks as they were. The section reports
+  the fit, and the decoder doubts the least reliable modules first by it.
 - **Kernel** chooses how a module's luminance is taken: the average over its
   middle, its centre point alone, or a vote of five points.
 

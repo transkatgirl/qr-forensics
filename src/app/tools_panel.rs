@@ -4,7 +4,7 @@ use eframe::egui;
 use qr_forensics::imaging::adjust::{Adjust, Channel, Enlarge, Filter, LENS_MIN_PAIRS, MAX_ENLARGED_SIDE};
 use qr_forensics::imaging::binarize::{BinarizeParams, WINDOW_RADII};
 use qr_forensics::imaging::detect::{AnchorKind, Detection, anchor_sites};
-use qr_forensics::imaging::sample::{Kernel, POOR_SEPARABILITY, SHARPEN_BELOW_PX};
+use qr_forensics::imaging::sample::{BLUR_MIN_GAIN, Kernel, POOR_SEPARABILITY, SHARPEN_BELOW_PX};
 use qr_forensics::symbol::function_map::looks_inverted;
 use qr_forensics::symbol::grid::Module;
 use qr_forensics::symbol::{Family, SymbolVersion};
@@ -823,10 +823,13 @@ fn sampling_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
          keeps what decodes.",
     );
     ui.checkbox(&mut params.sharpen_modules, "Sharpen small or blurred modules").on_hover_text(format!(
-        "Once the modules are read, set each against its four neighbours and put back some of what blur took from it: \
-         where a module is under {SHARPEN_BELOW_PX} pixels across, the more the smaller, and wherever the luminances \
-         read do not separate into dark and light. The line below says when it has been done. Off, the modules are \
-         taken as they were read, which suits a clean print with specks in it, each of which sharpening sets off.",
+        "Once the modules are read, take back out of each what blur put into it from its neighbours. How far the \
+         photo blurs, and which way, is learnt from the fixed patterns, whose colours are known, and undone where \
+         that gains enough to be worth it. Where it cannot be learnt, each module is set against its four neighbours \
+         by a guess instead: where a module is under {SHARPEN_BELOW_PX} pixels across, the more the smaller, and \
+         wherever the luminances read do not separate into dark and light. The lines below say what was done. Off, \
+         the modules are taken as they were read, which suits a clean print with specks in it, each of which \
+         sharpening sets off.",
     ));
     if let Some(preview) = &app.preview {
         let sharpening = preview.sharpening;
@@ -865,19 +868,56 @@ fn sampling_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
              dark with light into greys. Watch it while moving a corner or a setting: it rises as the grid comes onto \
              the modules.",
         ));
+        if let Some(blur) = preview.classified.blur {
+            let what = if preview.classified.equalised {
+                "and undone"
+            } else if blur.is_worth_undoing() {
+                "and left in, with sharpening off"
+            } else {
+                "and is too slight to be worth undoing"
+            };
+            ui.weak(format!(
+                "The blur was learnt from {} fixed modules {what}: their neighbours put {:.0}% as much into each \
+                 module's reading as its own colour does",
+                blur.fitted,
+                100.0 * blur.spill()
+            ))
+            .on_hover_text(format!(
+                "Each module's own colour moves its reading by {:.2} of half the contrast, and each neighbour by {:.2} \
+                 beside it in its row, {:.2} above and below it, and {:.2} and {:.2} at its corners down and up the \
+                 diagonals: the more one way than another, the more the camera or the paper moved that way. Put through \
+                 the filter that best takes that back out without raising the noise past what it gains, a module's own \
+                 colour stands {:.1} times as clear in its reading, and the reading is so filtered when that is {:.1} \
+                 times or more and the modules are to be sharpened.",
+                blur.own,
+                blur.across,
+                blur.down,
+                blur.falling,
+                blur.rising,
+                blur.gain,
+                1.0 + BLUR_MIN_GAIN
+            ));
+        }
         if let Some(calibration) = preview.classified.calibration {
             ui.weak(format!(
-                "Reliability calibrated on {} fixed modules: noise {:.2} of the contrast, {} of them read wrong",
-                calibration.labelled, calibration.sigma, calibration.misread
+                "Reliability calibrated on {} fixed modules: noise {:.2} of the contrast on the dark side and {:.2} on \
+                 the light, {} of them read wrong",
+                calibration.labelled, calibration.dark.sigma, calibration.light.sigma, calibration.misread
             ))
             .on_hover_text(format!(
                 "How far a module's reading is to be believed is learnt from the fixed patterns, whose colours are known: \
-                 a module read right lies about {:.2} of half the contrast from its threshold, the readings spread about \
-                 that by {:.2}, and {:.1}% of them are wrong by more than that spread explains, which no margin is proof \
-                 against. The decoder doubts the least reliable modules first, and weighs what a solution overturns by it.",
-                calibration.typical,
-                calibration.sigma,
-                100.0 * calibration.gross
+                 a module read right lies about {:.2} of half the contrast from its threshold on the dark side and {:.2} \
+                 on the light, the readings of each colour spread about that by {:.2} and {:.2}, and {:.1}% of them are \
+                 wrong by more than that spread explains, which no margin is proof against. Where one colour spreads \
+                 wider, a reading near the threshold is likelier that colour, and the threshold moves toward the other: \
+                 here by {:+.2}. The decoder doubts the least reliable modules first, and weighs what a solution \
+                 overturns by it.",
+                -calibration.dark.mean,
+                calibration.light.mean,
+                calibration.dark.sigma,
+                calibration.light.sigma,
+                100.0 * calibration.gross,
+                calibration.threshold
             ));
         }
     }

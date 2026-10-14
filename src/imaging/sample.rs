@@ -3,7 +3,7 @@
 use super::Luma;
 use super::binarize::Binarizer;
 use super::enhance::{Enhance, Enhanced};
-use super::homography::Homography;
+use super::homography::{HUBER_K, Homography, REWEIGHTINGS, least_squares};
 use super::projection::Project;
 use crate::symbol::function_map::{FunctionMap, looks_inverted};
 use crate::symbol::grid::{CERTAIN, Module, ModuleGrid};
@@ -261,26 +261,92 @@ pub fn sample_modules_noting(
         height,
         luma,
     };
+    let module_px = module_px_at_middle(map, width, height);
+    if !sharpen {
+        return (sampled, Sharpening { module_px: module_px as f32, ..Sharpening::default() });
+    }
+    sampled.sharpened_as_guessed(module_px)
+}
+
+/// The size of a module in the photo, in pixels, at the middle of a
+/// `width` × `height` symbol placed by `map`.
+fn module_px_at_middle(map: &impl Project, width: usize, height: usize) -> f64 {
     let (cx, cy) = (width as f64 / 2.0, height as f64 / 2.0);
     let step = |dx: f64, dy: f64| {
         let [ax, ay] = map.base(cx, cy);
         let [bx, by] = map.base(cx + dx, cy + dy);
         ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt()
     };
-    let module_px = (step(1.0, 0.0) + step(0.0, 1.0)) / 2.0;
-    let mut done = Sharpening { module_px: module_px as f32, ..Sharpening::default() };
-    if !sharpen {
-        return (sampled, done);
+    (step(1.0, 0.0) + step(0.0, 1.0)) / 2.0
+}
+
+/// A placement read for a decode: sampled through `map` as `params` ask,
+/// through the photo enlarged or sharpened when they ask for that as
+/// [`sample_modules_as`] reads one, classified under their rule, and
+/// taught by the modules whose colour is known, `expected`, the photo
+/// light on dark where `inverted` says, as [`Classified::learn`] teaches
+/// it; with what the guess at the blur did to the modules, if anything.
+///
+/// Where `params` ask for the modules to be sharpened, the blur is
+/// learnt from the reading as it was read and undone
+/// ([`Classified::equalise`]), and only where there is no blur worth
+/// undoing, or too few known modules to learn it from, are the modules
+/// sharpened by the guess [`sample_modules_noting`] makes. A blur learnt
+/// from a reading the guess has sharpened already is the guess's as much
+/// as the lens's, and reaches past the eight neighbours it is fitted to.
+/// Over the corpus photographs blurred by half a module, the reading so
+/// equalised decoded 325 of 332 symbols, where the guess decoded 308;
+/// and on top of the guess the filter decoded as many, its reliabilities
+/// believed further than its misreads bore out. Where they ask for the
+/// modules as read, the blur is learnt and left in, and says only
+/// whether the colours may be calibrated apart ([`Classified::calibrate`]).
+pub fn read_modules(
+    image: &Luma,
+    map: &impl Project,
+    width: usize,
+    height: usize,
+    params: &SampleParams,
+    expected: &[Option<bool>],
+    inverted: bool,
+) -> (Classified, Sharpening) {
+    if !params.enhance.is_none() {
+        let (w, h) = (width as f64, height as f64);
+        let outline = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]].map(|[x, y]| map.apply(x, y));
+        if let Some(view) = Enhanced::around(image, outline, params.enhance) {
+            return read_modules_as_they_lie(&view.luma, &view.through(map), width, height, params, expected, inverted);
+        }
     }
-    let sampled = if module_px < SHARPEN_BELOW_PX {
-        done.for_size = SHARPEN_GAIN * (1.0 - module_px / SHARPEN_BELOW_PX) as f32;
-        sampled.sharpened(done.for_size)
-    } else {
-        sampled
-    };
-    let (sampled, gain) = sampled.sharpened_for_separation_by();
-    done.for_separation = gain;
-    (sampled, done)
+    read_modules_as_they_lie(image, map, width, height, params, expected, inverted)
+}
+
+/// [`read_modules`] off the pixels given, as they are.
+fn read_modules_as_they_lie(
+    image: &Luma,
+    map: &impl Project,
+    width: usize,
+    height: usize,
+    params: &SampleParams,
+    expected: &[Option<bool>],
+    inverted: bool,
+) -> (Classified, Sharpening) {
+    let (read, mut sharpening) = sample_modules_noting(image, map, width, height, params.kernel, false);
+    let mut classified = classify(&read, params);
+    if !params.sharpen_modules {
+        // Left as read, but with the blur known, which says whether the
+        // colours may be fitted apart.
+        classified.learn_blur(expected, inverted);
+    } else if classified.equalise(expected, inverted).is_none() || !classified.equalised {
+        // A reading the guess sharpens is classified afresh and knows no
+        // blur: the guess rings about the fixed patterns' thin rings as a
+        // blur greys them, and the colours are fitted alike.
+        let (sharpened, guessed) = read.sharpened_as_guessed(module_px_at_middle(map, width, height));
+        if guessed.any() {
+            classified = classify(&sharpened, params);
+        }
+        sharpening = guessed;
+    }
+    classified.calibrate(expected, inverted);
+    (classified, sharpening)
 }
 
 /// [`sample_modules_with`] off the photo as `params` ask for it: with
@@ -319,6 +385,24 @@ impl Sampled {
     /// [`separability`] measures it.
     pub fn separability(&self) -> f32 {
         separability(self.luma.iter().flatten().copied())
+    }
+
+    /// The reading sharpened against its neighbours by the guess
+    /// [`sample_modules_noting`] makes at the blur, its modules
+    /// `module_px` pixels across: the more the smaller they are under
+    /// [`SHARPEN_BELOW_PX`], and again where it separates poorly
+    /// ([`Self::sharpened_for_separation`]); with what was done.
+    pub fn sharpened_as_guessed(self, module_px: f64) -> (Self, Sharpening) {
+        let mut done = Sharpening { module_px: module_px as f32, ..Sharpening::default() };
+        let sampled = if module_px < SHARPEN_BELOW_PX {
+            done.for_size = SHARPEN_GAIN * (1.0 - module_px / SHARPEN_BELOW_PX) as f32;
+            self.sharpened(done.for_size)
+        } else {
+            self
+        };
+        let (sampled, gain) = sampled.sharpened_for_separation_by();
+        done.for_separation = gain;
+        (sampled, done)
     }
 
     /// The reading sharpened against its neighbours when its luminances
@@ -528,8 +612,17 @@ pub struct Classified {
     /// How far each module is from its threshold, as a share of half the
     /// local contrast: nought on the threshold, one where a module of
     /// full contrast lies. Nought where the module could not be sampled
-    /// or its neighbourhood had no contrast.
+    /// or its neighbourhood had no contrast. Once the read is
+    /// [calibrated](Self::calibrate), the distance from the threshold the
+    /// calibration settles, which need not lie where the rule put it.
     pub margin: Vec<f32>,
+    /// Where each module lies about the threshold its rule gave it, as a
+    /// share of half the local contrast: below nought on the dark side,
+    /// above it on the light. What `decided` and `margin` are made from,
+    /// and what an [equalising](Self::equalise) works on. Nought where
+    /// the module could not be sampled or its neighbourhood had no
+    /// contrast.
+    pub offset: Vec<f32>,
     /// How sure each module's reading is, on the scale the decoder works
     /// in: eight times the bits of likelihood the reading carries, less
     /// eight, so that a module on its threshold is nought and one read
@@ -542,6 +635,18 @@ pub struct Classified {
     /// The misread model the reliabilities were calibrated with, once
     /// they were.
     pub calibration: Option<Calibration>,
+    /// How the photo blurs each module into its neighbours, once it has
+    /// been [learnt](Self::learn_blur).
+    pub blur: Option<Blur>,
+    /// The reading has been [equalised](Self::equalise): the blur undone.
+    pub equalised: bool,
+    /// Modules to a row of the symbol, which every list here runs through
+    /// row by row.
+    pub width: usize,
+    /// The unsure band the modules were classified with, as a share of
+    /// half the local contrast ([`SampleParams::band`]), kept so that a
+    /// module moved by equalising or calibration is judged by it again.
+    pub band: f32,
     /// The global threshold, automatic or as given.
     pub threshold: f32,
     /// How clearly the module luminances fall into two groups: how empty
@@ -604,51 +709,140 @@ impl Classified {
     /// photo shows the symbol light on dark, so that a module read dark
     /// is right where the symbol is light.
     ///
-    /// Each labelled module gives a signed margin, its margin toward
-    /// the colour it should have: a module read right lies about
-    /// [`Calibration::typical`] of half the contrast from its threshold,
-    /// one read wrong on the other side. The spread about the typical
-    /// margin, taken robustly so that a torn finder pattern does not set
-    /// it, is the photo's noise ([`Calibration::sigma`]), from which the
-    /// odds of a misread at any margin follow; and the modules read
-    /// wrong by more than that noise explains are the gross misreads
-    /// ([`Calibration::gross`]), specks and stains and tears, which no
-    /// margin protects against and which cap what any module's reading
-    /// may be believed. Every sampled module's reliability is then
-    /// recomputed from its margin under the model. Nothing is changed,
-    /// and `None` returned, with fewer than [`CALIBRATION_MIN_LABELLED`]
-    /// labelled modules, or when they read so poorly that the labels
-    /// are not to be trusted: the placement is off the symbol.
+    /// The labelled modules of each colour give where the readings of
+    /// that colour lie about the threshold, and how they spread, taken
+    /// robustly so that a torn finder pattern does not set either: the
+    /// photo's noise on the dark side and on the light ([`Calibration`]).
+    /// From the two follow the odds of a misread at any reading, and the
+    /// threshold itself, where a reading is as likely of one colour as of
+    /// the other: the rule that gave each module its threshold put it
+    /// midway between dark and light, which is where it belongs only
+    /// when the two spread alike. And the modules read wrong by more than
+    /// that noise explains are the gross misreads, specks and stains and
+    /// tears, which no margin protects against and which cap what any
+    /// module's reading may be believed. Every sampled module is then
+    /// judged again under the model: its colour by the side of the
+    /// threshold it lies on, and its reliability by the odds. Nothing is
+    /// changed, and `None` returned, with fewer than
+    /// [`CALIBRATION_MIN_LABELLED`] labelled modules, or when they read so
+    /// poorly that the labels are not to be trusted: the placement is off
+    /// the symbol.
+    ///
+    /// The two colours are fitted apart only once the blur has been
+    /// [learnt](Self::learn_blur), and undone or found too slight to be
+    /// worth undoing. The fixed patterns hold their dark modules in solid
+    /// blocks and their light ones in thin rings and strips between dark,
+    /// which a blur greys and leaves the blocks as they were: fitted apart
+    /// on a blurred reading, the light side spreads wider than the dark
+    /// for the blur's sake and not the photo's, and the threshold moves
+    /// to call grey modules light, which over blurred photographs read
+    /// fewer symbols than one spread for both. Without that, the colours
+    /// take one spread between them, about a threshold midway.
     pub fn calibrate(&mut self, expected: &[Option<bool>], inverted: bool) -> Option<Calibration> {
-        let mut signed: Vec<f32> = expected
+        let labelled: Vec<(f32, bool)> = expected
             .iter()
             .zip(&self.decided)
-            .zip(&self.margin)
-            .filter_map(|((want, got), &margin)| {
-                let (want, got) = ((*want)?, got.as_dark()?);
-                let right = (got != inverted) == want;
-                Some(if right { margin } else { -margin })
+            .zip(&self.offset)
+            .filter_map(|((want, got), &offset)| {
+                got.as_dark()?;
+                Some((offset, (*want)? != inverted))
             })
             .collect();
-        if signed.len() < CALIBRATION_MIN_LABELLED {
-            return None;
-        }
-        let typical = median(&mut signed);
-        if typical < CALIBRATION_MIN_TYPICAL {
-            return None;
-        }
-        let mut deviations: Vec<f32> = signed.iter().map(|s| (s - typical).abs()).collect();
-        let sigma = (MAD_TO_SIGMA * median(&mut deviations)).clamp(CALIBRATION_MIN_SIGMA, CALIBRATION_MAX_SIGMA);
-        let misread = signed.iter().filter(|&&s| s < 0.0).count();
-        let gross = signed.iter().filter(|&&s| s < -2.0 * sigma).count() as f32 / signed.len() as f32;
-        let calibration = Calibration { typical, sigma, gross, labelled: signed.len(), misread };
-        for ((reliability, &margin), decided) in self.reliability.iter_mut().zip(&self.margin).zip(&self.decided) {
-            if *decided != Module::Unknown {
-                *reliability = calibration.reliability(margin);
+        let apart = self.blur.is_some_and(|blur| self.equalised || !blur.is_worth_undoing());
+        let calibration = Calibration::fit(&labelled, apart)?;
+        for i in 0..self.offset.len() {
+            if self.decided[i] != Module::Unknown {
+                self.judge(i, calibration.threshold, &calibration);
             }
         }
         self.calibration = Some(calibration);
         Some(calibration)
+    }
+
+    /// Undo the blur the photo shows, as the modules whose colour is
+    /// known show it, before the reading is calibrated: `expected` and
+    /// `inverted` are as [`Self::calibrate`] takes them.
+    ///
+    /// A lens out of focus, or a hand that moved, spreads each module
+    /// into its neighbours, and a dark module among light ones reads
+    /// grey. How far it spreads, and in which direction, is learnt from
+    /// the labelled modules whose eight neighbours are labelled too, as
+    /// the middles of the finder patterns are ([`Blur::fit`]); the
+    /// reading is then put through the filter that best undoes that
+    /// spread without raising the noise past what it gains
+    /// ([`Blur::undo`]), and every module is judged again by where it
+    /// now lies. A photo too sharp for the filter to gain much
+    /// ([`Blur::is_worth_undoing`]) is left as it was read. The blur
+    /// learnt, undone or not; `None` when none could be learnt
+    /// ([`Self::learn_blur`]).
+    ///
+    /// The fixed patterns are mostly solid, where a blur moves nothing,
+    /// and the data mostly is not: a calibration on the blurred reading
+    /// would learn from the finder patterns a noise the data does not
+    /// have, and believe the data too far. Equalised, a module reads its
+    /// own colour wherever it lies, and the patterns speak for the data:
+    /// over photographs blurred by a third and by half a module, the
+    /// noise the fixed patterns showed was two thirds and three quarters
+    /// of the data's as read, and the same as the data's equalised.
+    pub fn equalise(&mut self, expected: &[Option<bool>], inverted: bool) -> Option<Blur> {
+        let blur = self.learn_blur(expected, inverted)?;
+        if blur.is_worth_undoing() && !self.equalised {
+            let read = self.readings();
+            for (i, offset) in blur.undo(&read, self.width).into_iter().enumerate() {
+                if let Some(offset) = offset {
+                    self.offset[i] = offset;
+                    self.judge(i, 0.0, &Calibration::DEFAULT);
+                }
+            }
+            // A calibration made before is of a reading that is no more.
+            self.calibration = None;
+            self.equalised = true;
+        }
+        Some(blur)
+    }
+
+    /// Learn how the photo blurs from the modules whose colour is known,
+    /// as [`Self::equalise`] does, and keep it, leaving the reading as
+    /// it is: what tells [`Self::calibrate`] whether the reading is sharp
+    /// enough for each colour's spread to be its own, where the modules
+    /// are not to be sharpened. `None`, and nothing kept, when too few
+    /// known modules have known neighbours all round, or the fit says
+    /// the placement is off the symbol ([`Blur::fit`]). Once the reading
+    /// is equalised the blur it was equalised by stands.
+    pub fn learn_blur(&mut self, expected: &[Option<bool>], inverted: bool) -> Option<Blur> {
+        if self.equalised {
+            return self.blur;
+        }
+        let blur = Blur::fit(&self.readings(), self.width, expected, inverted)?;
+        self.blur = Some(blur);
+        Some(blur)
+    }
+
+    /// Each module's offset where it was read at all.
+    fn readings(&self) -> Vec<Option<f32>> {
+        self.offset.iter().zip(&self.decided).map(|(&offset, decided)| (*decided != Module::Unknown).then_some(offset)).collect()
+    }
+
+    /// Learn from the modules whose colour is known how the photo blurs
+    /// and how far its readings are to be believed: the reading
+    /// [equalised](Self::equalise), then [calibrated](Self::calibrate).
+    /// The calibration, when one could be made.
+    pub fn learn(&mut self, expected: &[Option<bool>], inverted: bool) -> Option<Calibration> {
+        self.equalise(expected, inverted);
+        self.calibrate(expected, inverted)
+    }
+
+    /// Judge module `i` again by where it lies: dark below `threshold`
+    /// and light above it, its margin how far it lies from it, unknown
+    /// within the band, and its reliability what `calibration` makes of
+    /// its offset.
+    fn judge(&mut self, i: usize, threshold: f32, calibration: &Calibration) {
+        let offset = self.offset[i];
+        let side = Module::from_dark(offset < threshold);
+        self.margin[i] = (offset - threshold).abs();
+        self.decided[i] = side;
+        self.modules[i] = if self.margin[i] < self.band { Module::Unknown } else { side };
+        self.reliability[i] = calibration.reliability(offset);
     }
 }
 
@@ -681,20 +875,55 @@ pub const CALIBRATION_MAX_SIGMA: f32 = 1.5;
 /// The standard deviation of a normal distribution from the median of
 /// absolute deviations about its median.
 const MAD_TO_SIGMA: f32 = 1.4826;
+/// Fewest labelled modules of a colour for that colour's readings to be
+/// fitted on their own; with fewer, the colour takes the noise of both
+/// together, about the typical margin.
+pub const CALIBRATION_MIN_EACH: usize = 12;
+/// How many labelled modules' worth of weight the noise of both colours
+/// together carries in each colour's own: a colour with few labelled
+/// modules keeps near the noise of both, one with hundreds speaks for
+/// itself.
+const CALIBRATION_PRIOR: f32 = 16.0;
+/// The most one colour's readings may spread against the other's: glare
+/// that flattens the paper, or ink that reads unevenly, spreads one side
+/// twice the other, and a fit further apart than this is two colours
+/// read off too few modules.
+const CALIBRATION_MAX_RATIO: f32 = 3.0;
 
-/// How a module's reading is to be believed, as a function of how far
-/// from its threshold it was read: the misread model
-/// [`Classified::calibrate`] fits to a photo, or the default for one not
-/// yet fitted.
+/// Where the readings of one colour lie about their rule's threshold,
+/// and how they spread, as shares of half the local contrast.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Spread {
+    /// The middle of the readings: below nought for the dark, above it
+    /// for the light, and further from it the sharper the photo.
+    pub mean: f32,
+    /// How they spread about it: the photo's noise on that side.
+    pub sigma: f32,
+}
+
+/// How a module's reading is to be believed, as a function of where it
+/// lies about its threshold: the misread model [`Classified::calibrate`]
+/// fits to a photo, or the default for one not yet fitted.
+///
+/// The readings of each colour are taken to lie about their own mean
+/// with their own spread. A photo seldom spreads the two alike: glare
+/// flattens the paper towards white and leaves the ink as it was, and
+/// ink soaked unevenly into the paper, or printed in dots, spreads the
+/// dark side where the paper stays even. Where the two spread alike the
+/// model is the one the reliabilities were first computed under, odds
+/// that grow with a reading's distance from a threshold midway between
+/// the means; where they do not, a reading near the threshold is likelier
+/// of the colour that spreads the wider, and the threshold itself moves
+/// toward the other.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Calibration {
-    /// Where a module read right lies about its threshold, as a share of
-    /// half the local contrast: one on a sharp photo of a clean print,
-    /// less as blur draws dark and light together.
-    pub typical: f32,
-    /// How the readings spread about that, as a share of half the
-    /// contrast: the photo's noise.
-    pub sigma: f32,
+    /// The readings of the modules dark in the photo, and of those light.
+    pub dark: Spread,
+    pub light: Spread,
+    /// Where a reading is as likely dark as light, about the threshold
+    /// the rule gave it: nought where the two colours spread alike about
+    /// it, toward the colour that spreads the less where they do not.
+    pub threshold: f32,
     /// The share of modules read wrong by more than the noise explains:
     /// specks, stains and tears, against which no margin is proof. What
     /// caps the belief in any reading.
@@ -707,33 +936,459 @@ pub struct Calibration {
 
 impl Calibration {
     /// The model for a photo not yet fitted: the noise a photo of
-    /// middling quality shows, under which the reliability runs near
-    /// enough with the margin as the linear scale it replaced did, two
-    /// hundred and fifty-four at a module of full contrast and sixty-one
-    /// at a quarter of it.
-    pub const DEFAULT: Self = Self { typical: 1.0, sigma: 0.29, gross: 0.0, labelled: 0, misread: 0 };
+    /// middling quality shows, alike on both sides, under which the
+    /// reliability runs near enough with the margin as the linear scale
+    /// it replaced did, two hundred and fifty-four at a module of full
+    /// contrast and sixty-one at a quarter of it.
+    pub const DEFAULT: Self = Self {
+        dark: Spread { mean: -1.0, sigma: 0.29 },
+        light: Spread { mean: 1.0, sigma: 0.29 },
+        threshold: 0.0,
+        gross: 0.0,
+        labelled: 0,
+        misread: 0,
+    };
 
-    /// The bits of likelihood that a module read `margin` from its
-    /// threshold was read right: minus the log of the odds it was
-    /// misread. Under the model a module's luminance lies about its
-    /// colour's mean, `typical` half-contrasts from the threshold, with
-    /// a spread of `sigma`, so the log odds of the two colours at a
-    /// reading `margin` to one side are `2 · margin · typical / sigma²`;
-    /// and besides that a share `gross` of modules are wrong whatever
-    /// their margin.
-    pub fn bits(&self, margin: f32) -> f32 {
-        let ratio = 2.0 * margin.max(0.0) * self.typical / (self.sigma * self.sigma * std::f32::consts::LN_2);
-        let wrong = self.gross + (1.0 - self.gross) / (1.0 + 2f32.powf(ratio.min(126.0)));
+    /// The model fitted to `labelled`: each module's offset from its
+    /// rule's threshold ([`Classified::offset`]), and whether it is dark
+    /// in the photo; each colour apart where `apart` says, and otherwise
+    /// both alike, about a threshold midway. `None` with fewer than
+    /// [`CALIBRATION_MIN_LABELLED`] of them, or when the typical module
+    /// lies within [`CALIBRATION_MIN_TYPICAL`] of its threshold on the
+    /// side its colour should be, as one does when the labels are not
+    /// where the placement puts them.
+    pub fn fit(labelled: &[(f32, bool)], apart: bool) -> Option<Self> {
+        if labelled.len() < CALIBRATION_MIN_LABELLED {
+            return None;
+        }
+        // Both colours together, each module's offset toward the colour
+        // it should have: what a colour with too few modules of its own
+        // falls back on, and what a colour with few leans towards.
+        let mut toward: Vec<f32> = labelled.iter().map(|&(offset, dark)| if dark { -offset } else { offset }).collect();
+        let typical = median(&mut toward);
+        if typical < CALIBRATION_MIN_TYPICAL {
+            return None;
+        }
+        let both = spread_about(&toward, typical);
+        let side = |dark: bool, fallback: f32| {
+            let mut values: Vec<f32> = labelled.iter().filter(|l| l.1 == dark).map(|l| l.0).collect();
+            if !apart || values.len() < CALIBRATION_MIN_EACH {
+                return Spread { mean: fallback, sigma: both };
+            }
+            let mean = median(&mut values);
+            let own = spread_about(&values, mean);
+            let n = values.len() as f32;
+            Spread { mean, sigma: ((n * own * own + CALIBRATION_PRIOR * both * both) / (n + CALIBRATION_PRIOR)).sqrt() }
+        };
+        let (mut dark, mut light) = (side(true, -typical), side(false, typical));
+        if light.mean - dark.mean < 2.0 * CALIBRATION_MIN_TYPICAL {
+            return None;
+        }
+        // The spreads drawn together about their geometric middle as far
+        // as the ratio allows.
+        let middle = (dark.sigma * light.sigma).sqrt();
+        let reach = CALIBRATION_MAX_RATIO.sqrt();
+        dark.sigma = dark.sigma.clamp(middle / reach, middle * reach);
+        light.sigma = light.sigma.clamp(middle / reach, middle * reach);
+        let mut fitted = Self { dark, light, threshold: 0.0, gross: 0.0, labelled: labelled.len(), misread: 0 };
+        // Two colours, one spread far wider than the other and both near
+        // the threshold, can leave the wider so likely everywhere that a
+        // reading at the narrower one's own middle is called the wider
+        // colour. Such a fit says little but that the photo is noisy, and
+        // the two take one spread between them.
+        if fitted.log_odds(dark.mean) >= 0.0 || fitted.log_odds(light.mean) <= 0.0 {
+            let one = ((dark.sigma * dark.sigma + light.sigma * light.sigma) / 2.0).sqrt();
+            fitted.dark.sigma = one;
+            fitted.light.sigma = one;
+        }
+        // The odds rise steadily from the dark middle to the light, and
+        // the threshold is where they cross even: midway between the two,
+        // exactly, where they spread alike.
+        fitted.threshold = if fitted.dark.sigma == fitted.light.sigma {
+            (fitted.dark.mean + fitted.light.mean) / 2.0
+        } else {
+            let (mut low, mut high) = (fitted.dark.mean, fitted.light.mean);
+            for _ in 0..40 {
+                let mid = (low + high) / 2.0;
+                if fitted.log_odds(mid) < 0.0 {
+                    low = mid;
+                } else {
+                    high = mid;
+                }
+            }
+            (low + high) / 2.0
+        };
+        let (threshold, dark, light) = (fitted.threshold, fitted.dark, fitted.light);
+        fitted.misread = labelled.iter().filter(|&&(offset, is_dark)| (offset < threshold) != is_dark).count();
+        let gross = labelled
+            .iter()
+            .filter(|&&(offset, is_dark)| {
+                if is_dark { offset > threshold + 2.0 * dark.sigma } else { offset < threshold - 2.0 * light.sigma }
+            })
+            .count();
+        fitted.gross = gross as f32 / labelled.len() as f32;
+        Some(fitted)
+    }
+
+    /// How far a module read right lies from the threshold, on average
+    /// over the two colours, as a share of half the contrast: one on a
+    /// sharp photo of a clean print, less as blur draws dark and light
+    /// together.
+    pub fn typical(&self) -> f32 {
+        (self.light.mean - self.dark.mean) / 2.0
+    }
+
+    /// The natural log of the odds that a reading `offset` from its
+    /// rule's threshold is light rather than dark, from how the readings
+    /// of each colour lie and spread: zero at [`Self::threshold`],
+    /// positive above it. Between the two means it is the log of the
+    /// ratio of the two colours' normal densities; beyond either it is
+    /// carried on at the slope it had there, since two normal densities
+    /// of unequal spread would otherwise turn about beyond the narrower
+    /// one's mean, and call a reading darker than any dark module light.
+    /// With the spreads alike it is a straight line, `2 · (offset -
+    /// middle) · half the gap between the means / sigma²`, the odds the
+    /// reliabilities were first computed under.
+    pub fn log_odds(&self, offset: f32) -> f32 {
+        let (dark, light) = (self.dark, self.light);
+        let between = |u: f32| {
+            (dark.sigma / light.sigma).ln() - (u - light.mean).powi(2) / (2.0 * light.sigma * light.sigma)
+                + (u - dark.mean).powi(2) / (2.0 * dark.sigma * dark.sigma)
+        };
+        let gap = light.mean - dark.mean;
+        if offset > light.mean {
+            between(light.mean) + (offset - light.mean) * gap / (dark.sigma * dark.sigma)
+        } else if offset < dark.mean {
+            between(dark.mean) + (offset - dark.mean) * gap / (light.sigma * light.sigma)
+        } else {
+            between(offset)
+        }
+    }
+
+    /// The bits of likelihood that a module read `offset` from its
+    /// rule's threshold is the colour the side of [`Self::threshold`] it
+    /// lies on says: minus the log of the odds it was misread, from the
+    /// odds of the two colours there ([`Self::log_odds`]); and besides
+    /// that a share `gross` of modules are wrong whatever their reading.
+    pub fn bits(&self, offset: f32) -> f32 {
+        let odds = self.log_odds(offset).abs().min(87.0);
+        let wrong = self.gross + (1.0 - self.gross) / (1.0 + odds.exp());
         -wrong.max(f32::MIN_POSITIVE).log2()
     }
 
-    /// Reliability for a module read `margin` from its threshold: eight
-    /// times the bits of likelihood less eight, so that a module on its
-    /// threshold, read right as often as not, is nought, and a module
-    /// whose reading is beyond doubt reaches the cap of 254, one short
-    /// of [`CERTAIN`], which is for modules painted by hand.
-    pub fn reliability(&self, margin: f32) -> u8 {
-        ((self.bits(margin) - 1.0) * 8.0).round().clamp(0.0, (CERTAIN - 1) as f32) as u8
+    /// Reliability for a module read `offset` from its rule's threshold:
+    /// eight times the bits of likelihood less eight, so that a module on
+    /// the threshold, read right as often as not, is nought, and a module
+    /// whose reading is beyond doubt reaches the cap of 254, one short of
+    /// [`CERTAIN`], which is for modules painted by hand.
+    pub fn reliability(&self, offset: f32) -> u8 {
+        ((self.bits(offset) - 1.0) * 8.0).round().clamp(0.0, (CERTAIN - 1) as f32) as u8
+    }
+}
+
+/// The spread of `values` about `centre`, from their median absolute
+/// deviation, within the bounds a photo's noise is held to.
+fn spread_about(values: &[f32], centre: f32) -> f32 {
+    let mut deviations: Vec<f32> = values.iter().map(|v| (v - centre).abs()).collect();
+    (MAD_TO_SIGMA * median(&mut deviations)).clamp(CALIBRATION_MIN_SIGMA, CALIBRATION_MAX_SIGMA)
+}
+
+/// Fewest modules a blur is fitted on: the modules of one finder pattern
+/// whose eight neighbours lie in the pattern or its separator, all the
+/// fixed modules of a Micro QR symbol have to give, are thirty-six.
+pub const BLUR_MIN_FITTED: usize = 32;
+/// The most a neighbour may move a module's reading, as a share of what
+/// the module's own colour moves it, for the fit to be believed. A lens
+/// that blurs by seven tenths of a module, past what any kernel reads,
+/// moves it by about two fifths; a grid half a module off its symbol
+/// reads every module as much its neighbour as itself.
+const BLUR_MAX_SHARE: f32 = 0.6;
+/// Weight, in labelled modules, of what holds each neighbour's share at
+/// nought: nothing beside a finder pattern's thirty-six modules, but a
+/// fit made on fewer, or on modules too alike to tell the neighbours
+/// apart, leans to a sharp photo rather than to a guess.
+const BLUR_RIDGE: f64 = 2.0;
+/// How much clearer a module's own colour must stand in its reading
+/// once equalised, against what its neighbours and the noise put there,
+/// for the reading to be equalised: a tenth. A photo near enough sharp
+/// gains less, and is better read as it lies than through a filter
+/// fitted to it.
+pub const BLUR_MIN_GAIN: f32 = 0.1;
+/// Modules each way from a module that the equaliser reads: the blur
+/// is fitted to the module's eight neighbours, and undoing it reaches
+/// one further, where the neighbours' own neighbours spread back.
+const EQUALISER_REACH: i64 = 2;
+/// Taps of the equaliser, a square [`EQUALISER_REACH`] each way.
+const EQUALISER_TAPS: usize = 25;
+
+/// How the photo blurs each module into its neighbours, as the modules
+/// whose colour is known show it ([`Blur::fit`]), and the filter that
+/// undoes it ([`Blur::undo`]). Everything is a share of half the local
+/// contrast, as [`Classified::offset`] is.
+///
+/// The module's own colour moves its reading by `own`, and each of its
+/// eight neighbours moves it by the share of its pair: the two beside it
+/// in its row, the two above and below it, and the two corners on each
+/// diagonal. A blurred lens spreads alike every way, and a hand that
+/// moved spreads along the way it moved. Each pair is taken as alike on
+/// both sides, as a blur is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Blur {
+    /// The module's own colour, which is all a sharp photo's reading is.
+    pub own: f32,
+    /// Left and right.
+    pub across: f32,
+    /// Above and below.
+    pub down: f32,
+    /// Top left and bottom right.
+    pub falling: f32,
+    /// Bottom left and top right.
+    pub rising: f32,
+    /// How the readings spread about what the blur makes of their
+    /// neighbourhoods: the photo's noise.
+    pub noise: f32,
+    /// Modules the blur was fitted on.
+    pub fitted: usize,
+    /// How much clearer a module's own colour stands against what its
+    /// neighbours and the noise put into its reading once equalised than
+    /// before: the ratio of the two, of the squares of what is its own to
+    /// what is not.
+    pub gain: f32,
+    /// The equaliser, row-major, [`EQUALISER_REACH`] each way: the share
+    /// of each module about it that a module's equalised reading is made
+    /// of. They sum to one, so that a patch of one colour reads as it did.
+    taps: [f32; EQUALISER_TAPS],
+}
+
+impl Blur {
+    /// The blur fitted to `read`, each module's offset from its rule's
+    /// threshold where it was read ([`Classified::offset`]), over a symbol
+    /// `width` modules wide, against `expected`, the colour of each
+    /// module where it is known, dark in the photo where `inverted` says
+    /// it is not, as [`Classified::calibrate`] takes them. Fitted on the
+    /// labelled modules whose eight neighbours are labelled too, by least
+    /// squares reweighted as [`super::homography::Homography::fit`] is,
+    /// so that a speck on a finder pattern does not set it.
+    ///
+    /// The fit is of the blur, how each module's colour reaches its
+    /// neighbours, and not of the filter that undoes it: the modules it
+    /// is fitted on stand mostly among their own colour, as the data does
+    /// not, and a filter fitted on them would learn to smooth, which
+    /// serves a solid patch and ruins a lone module. The blur is the
+    /// lens's and the same everywhere, and the filter is worked out from
+    /// it for modules whose neighbours are any colour at all, as the
+    /// data's are: the one that leaves a module's reading as near its own
+    /// colour as it can come, the neighbours' reach against the noise the
+    /// filter raises weighed by the noise the fit found, as a Wiener
+    /// filter weighs them.
+    ///
+    /// `None` when too few modules can be fitted on, or when the fit says
+    /// the labels are not where the placement has them: a module's own
+    /// colour moves it too little, or a neighbour moves it as much as its
+    /// own does.
+    pub fn fit(read: &[Option<f32>], width: usize, expected: &[Option<bool>], inverted: bool) -> Option<Self> {
+        let height = read.len() / width.max(1);
+        let colour = |x: i64, y: i64| expected[y as usize * width + x as usize].map(|dark| if dark != inverted { -1.0 } else { 1.0 });
+        let mut rows: Vec<([f64; 6], f64)> = Vec::new();
+        for y in 1..height.saturating_sub(1) as i64 {
+            for x in 1..width.saturating_sub(1) as i64 {
+                let Some(offset) = read[y as usize * width + x as usize] else { continue };
+                let around = |dx: i64, dy: i64| colour(x + dx, y + dy);
+                let (Some(c), Some(l), Some(r), Some(u), Some(d), Some(ul), Some(dr), Some(ur), Some(dl)) = (
+                    around(0, 0),
+                    around(-1, 0),
+                    around(1, 0),
+                    around(0, -1),
+                    around(0, 1),
+                    around(-1, -1),
+                    around(1, 1),
+                    around(1, -1),
+                    around(-1, 1),
+                ) else {
+                    continue;
+                };
+                rows.push(([1.0, c, l + r, u + d, ul + dr, ur + dl], f64::from(offset)));
+            }
+        }
+        if rows.len() < BLUR_MIN_FITTED {
+            return None;
+        }
+        let ridge: Vec<([f64; 6], f64)> = (2..6)
+            .map(|k| {
+                let mut row = [0.0; 6];
+                row[k] = BLUR_RIDGE.sqrt();
+                (row, 0.0)
+            })
+            .collect();
+        let solve = |weights: &[f64]| {
+            least_squares(
+                rows.iter().zip(weights).map(|((row, value), &w)| (row.map(|v| v * w.sqrt()), value * w.sqrt())).chain(ridge.iter().copied()),
+            )
+        };
+        let residuals = |beta: &[f64; 6]| -> Vec<f32> {
+            rows.iter().map(|(row, value)| (value - row.iter().zip(beta).map(|(a, b)| a * b).sum::<f64>()) as f32).collect()
+        };
+        let scale = |residuals: &[f32]| {
+            let mut absolute: Vec<f32> = residuals.iter().map(|r| r.abs()).collect();
+            (MAD_TO_SIGMA * median(&mut absolute)).max(CALIBRATION_MIN_SIGMA)
+        };
+        let mut weights = vec![1.0; rows.len()];
+        let mut beta = solve(&weights)?;
+        for _ in 0..REWEIGHTINGS {
+            let residuals = residuals(&beta);
+            let threshold = HUBER_K as f32 * scale(&residuals);
+            let reweighted: Vec<f64> =
+                residuals.iter().map(|r| if r.abs() <= threshold { 1.0 } else { f64::from(threshold / r.abs()) }).collect();
+            if reweighted == weights {
+                break;
+            }
+            weights = reweighted;
+            beta = solve(&weights)?;
+        }
+        let noise = scale(&residuals(&beta)).min(CALIBRATION_MAX_SIGMA);
+        let [_, own, across, down, falling, rising] = beta.map(|v| v as f32);
+        if own < CALIBRATION_MIN_TYPICAL || [across, down, falling, rising].iter().any(|share| share.abs() > BLUR_MAX_SHARE * own) {
+            return None;
+        }
+        let mut blur = Self { own, across, down, falling, rising, noise, fitted: rows.len(), gain: 1.0, taps: [0.0; EQUALISER_TAPS] };
+        let taps = blur.equaliser()?;
+        blur.gain = (blur.clarity(&taps) / blur.clarity(&Self::identity())) as f32;
+        blur.taps = taps.map(|t| t as f32);
+        Some(blur)
+    }
+
+    /// Whether undoing the blur gains enough, [`BLUR_MIN_GAIN`], to be
+    /// worth it: a photo near enough sharp is better read as it lies than
+    /// through a filter fitted to it.
+    pub fn is_worth_undoing(&self) -> bool {
+        self.gain >= 1.0 + BLUR_MIN_GAIN
+    }
+
+    /// What a module `dx` across and `dy` down from another adds to that
+    /// one's reading, per unit of its colour.
+    fn share(&self, dx: i64, dy: i64) -> f64 {
+        f64::from(match (dx, dy) {
+            (0, 0) => self.own,
+            (-1 | 1, 0) => self.across,
+            (0, -1 | 1) => self.down,
+            (-1, -1) | (1, 1) => self.falling,
+            (1, -1) | (-1, 1) => self.rising,
+            _ => 0.0,
+        })
+    }
+
+    /// The offset across and down of the module tap `q` of the
+    /// equaliser reads.
+    fn tap_offset(q: usize) -> (i64, i64) {
+        let side = 2 * EQUALISER_REACH + 1;
+        (q as i64 % side - EQUALISER_REACH, q as i64 / side - EQUALISER_REACH)
+    }
+
+    /// The equaliser that reads nothing but the module itself.
+    fn identity() -> [f64; EQUALISER_TAPS] {
+        let mut taps = [0.0; EQUALISER_TAPS];
+        taps[EQUALISER_TAPS / 2] = 1.0;
+        taps
+    }
+
+    /// What a module's colour, and each colour about it, come to in its
+    /// reading through `taps` after the blur: the share each module `dx`
+    /// across and `dy` down from it has, for every module the two reach.
+    fn through(&self, taps: &[f64; EQUALISER_TAPS], dx: i64, dy: i64) -> f64 {
+        (0..EQUALISER_TAPS)
+            .map(|q| {
+                let (qx, qy) = Self::tap_offset(q);
+                taps[q] * self.share(dx - qx, dy - qy)
+            })
+            .sum()
+    }
+
+    /// How clearly a module's own colour stands in its reading through
+    /// `taps`: the square of its own share against the squares of every
+    /// other module's and the noise the taps carry through, the colours
+    /// of the data being as likely dark as light and each its own.
+    fn clarity(&self, taps: &[f64; EQUALISER_TAPS]) -> f64 {
+        let reach = EQUALISER_REACH + 1;
+        let mut own = 0.0;
+        let mut others = f64::from(self.noise).powi(2) * taps.iter().map(|t| t * t).sum::<f64>();
+        for dy in -reach..=reach {
+            for dx in -reach..=reach {
+                let share = self.through(taps, dx, dy);
+                if (dx, dy) == (0, 0) {
+                    own = share;
+                } else {
+                    others += share * share;
+                }
+            }
+        }
+        own * own / others.max(f64::MIN_POSITIVE)
+    }
+
+    /// The taps that bring a module's reading through the blur nearest
+    /// to its own colour alone, by least squares over every module the
+    /// taps and the blur reach between them, with the noise each tap
+    /// carries through counted against it; scaled to sum to one. `None`
+    /// when they cannot be solved for, or sum to nothing.
+    fn equaliser(&self) -> Option<[f64; EQUALISER_TAPS]> {
+        let reach = EQUALISER_REACH + 1;
+        let noise = f64::from(self.noise);
+        let reached = (-reach..=reach).flat_map(|dy| (-reach..=reach).map(move |dx| (dx, dy))).map(|(dx, dy)| {
+            let row: [f64; EQUALISER_TAPS] = std::array::from_fn(|q| {
+                let (qx, qy) = Self::tap_offset(q);
+                self.share(dx - qx, dy - qy)
+            });
+            (row, if (dx, dy) == (0, 0) { 1.0 } else { 0.0 })
+        });
+        let carried = (0..EQUALISER_TAPS).map(|q| {
+            let mut row = [0.0; EQUALISER_TAPS];
+            row[q] = noise;
+            (row, 0.0)
+        });
+        let taps = least_squares(reached.chain(carried))?;
+        let sum: f64 = taps.iter().sum();
+        (sum > 1e-6).then(|| taps.map(|t| t / sum))
+    }
+
+    /// The equaliser's taps, row-major, [`EQUALISER_REACH`] modules each
+    /// way about the module equalised.
+    pub fn taps(&self) -> &[f32; EQUALISER_TAPS] {
+        &self.taps
+    }
+
+    /// How much of a module's reading its eight neighbours put there,
+    /// against what its own colour does.
+    pub fn spill(&self) -> f32 {
+        2.0 * (self.across + self.down + self.falling + self.rising) / self.own
+    }
+
+    /// `read`, each module's offset where it was read, over a symbol
+    /// `width` modules wide, equalised: each module's offset moved by
+    /// each tap's share of how far the module that tap reads lies from
+    /// it. The taps sum to one, so this is the filter laid over the
+    /// reading; a module beyond the symbol's edge, or one not read, is
+    /// taken to lie where the module equalised does, and changes nothing,
+    /// as the quiet zone, which may be anything in a photo, is not
+    /// guessed at. A module not read stays so.
+    pub fn undo(&self, read: &[Option<f32>], width: usize) -> Vec<Option<f32>> {
+        let height = (read.len() / width.max(1)) as i64;
+        (0..read.len())
+            .map(|i| {
+                let value = read[i]?;
+                let (x, y) = ((i % width) as i64, (i / width) as i64);
+                let mut out = value;
+                for (q, &tap) in self.taps.iter().enumerate() {
+                    let (dx, dy) = Self::tap_offset(q);
+                    let (nx, ny) = (x + dx, y + dy);
+                    if (dx, dy) == (0, 0) || tap == 0.0 || nx < 0 || ny < 0 || nx >= width as i64 || ny >= height {
+                        continue;
+                    }
+                    if let Some(there) = read[ny as usize * width + nx as usize] {
+                        out += tap * (there - value);
+                    }
+                }
+                Some(out)
+            })
+            .collect()
     }
 }
 
@@ -1016,6 +1671,7 @@ pub fn classify(sampled: &Sampled, params: &SampleParams) -> Classified {
     let mut modules = Vec::with_capacity(w * h);
     let mut decided = Vec::with_capacity(w * h);
     let mut margins = Vec::with_capacity(w * h);
+    let mut offsets = Vec::with_capacity(w * h);
     let mut reliability = Vec::with_capacity(w * h);
     let mut flat = 0;
     let mut neighbourhood: Vec<f32> = Vec::new();
@@ -1024,6 +1680,7 @@ pub fn classify(sampled: &Sampled, params: &SampleParams) -> Classified {
             modules.push(Module::Unknown);
             decided.push(Module::Unknown);
             margins.push(0.0);
+            offsets.push(0.0);
             reliability.push(0);
             continue;
         };
@@ -1047,6 +1704,7 @@ pub fn classify(sampled: &Sampled, params: &SampleParams) -> Classified {
                     modules.push(Module::Unknown);
                     decided.push(Module::Unknown);
                     margins.push(0.0);
+                    offsets.push(0.0);
                     reliability.push(0);
                     flat += 1;
                     continue;
@@ -1065,14 +1723,20 @@ pub fn classify(sampled: &Sampled, params: &SampleParams) -> Classified {
         modules.push(if margin < params.band { Module::Unknown } else { side });
         decided.push(side);
         margins.push(margin);
+        offsets.push((value - threshold) / half);
         reliability.push(quantize(margin));
     }
     Classified {
         modules,
         decided,
         margin: margins,
+        offset: offsets,
         reliability,
         calibration: None,
+        blur: None,
+        equalised: false,
+        width: w,
+        band: params.band,
         threshold: global,
         separability,
         flat,
@@ -1669,29 +2333,46 @@ mod tests {
         // The margins are shares of half the contrast the readings
         // themselves show, so a module read right lies about one of them
         // from its threshold whatever the contrast; the noise, 0.15 of
-        // the full margin as laid down, is near 0.19 of that.
-        assert!((0.9..1.1).contains(&calibration.typical), "{calibration:?}");
-        assert!((0.12..0.26).contains(&calibration.sigma), "{calibration:?}");
+        // the full margin as laid down, is near 0.19 of that, on either
+        // side, which the noise was laid down alike on, and the threshold
+        // stays near the middle: the two spreads are fitted on a hundred
+        // modules each, and differ by what so few differ by.
+        assert!((0.9..1.1).contains(&calibration.typical()), "{calibration:?}");
+        for side in [calibration.dark, calibration.light] {
+            assert!((0.12..0.26).contains(&side.sigma), "{calibration:?}");
+        }
+        assert!(calibration.threshold.abs() < 0.1, "{calibration:?}");
         assert!((calibration.gross - misread as f32 / labelled as f32).abs() < 1e-6, "{calibration:?}");
-        // Under the fit, a module's reliability grows with its margin,
-        // never beyond what the gross misreads allow, and the specks
-        // among the fixed patterns cap every module's reliability at
-        // the bits the gross rate is worth.
+        // Under the fit, a module's reliability grows with its distance
+        // from the threshold on either side, never beyond what the gross
+        // misreads allow, and the specks among the fixed patterns cap
+        // every module's reliability at the bits the gross rate is worth.
         let cap = calibration.reliability(10.0);
         let bits = -(calibration.gross).log2();
         assert_eq!(cap, ((bits - 1.0) * 8.0).round() as u8, "{calibration:?}");
+        assert_eq!(calibration.reliability(-10.0), cap);
         assert!(classified.reliability.iter().all(|&r| r <= cap));
-        let mut by_margin: Vec<(f32, u8)> = classified.margin.iter().copied().zip(classified.reliability.iter().copied()).collect();
-        by_margin.sort_by(|a, b| a.0.total_cmp(&b.0));
-        assert!(by_margin.windows(2).all(|pair| pair[0].1 <= pair[1].1), "monotone in the margin");
+        for dark in [true, false] {
+            let mut by_margin: Vec<(f32, u8)> = (0..w * h)
+                .filter(|&i| classified.decided[i] == Module::from_dark(dark))
+                .map(|i| (classified.margin[i], classified.reliability[i]))
+                .collect();
+            by_margin.sort_by(|a, b| a.0.total_cmp(&b.0));
+            assert!(by_margin.windows(2).all(|pair| pair[0].1 <= pair[1].1), "monotone in the margin");
+        }
         assert_ne!(classified.reliability, before);
         // A photo with less noise believes the same margin more; the
         // default model lies between.
-        let clean = Calibration { sigma: 0.05, gross: 0.0, ..calibration };
+        let clean = Calibration {
+            dark: Spread { sigma: 0.05, ..calibration.dark },
+            light: Spread { sigma: 0.05, ..calibration.light },
+            gross: 0.0,
+            ..calibration
+        };
         assert!(clean.reliability(0.3) > Calibration::DEFAULT.reliability(0.3));
         assert!(Calibration::DEFAULT.reliability(0.3) > calibration.reliability(0.3));
         assert_eq!((Calibration::DEFAULT.reliability(0.0), Calibration::DEFAULT.reliability(1.0)), (0, 254));
-        assert_eq!(Calibration::DEFAULT.reliability(0.25), 61);
+        assert_eq!((Calibration::DEFAULT.reliability(0.25), Calibration::DEFAULT.reliability(-0.25)), (61, 61));
         // The scale read back: a coin's toss on the threshold, and a bit
         // more for every eight, which is how often such a reading is
         // misread.
@@ -1706,7 +2387,11 @@ mod tests {
         let mut inverted = classify(&Sampled { width: w, height: h, luma: sampled.luma.iter().map(|v| v.map(|v| 1.0 - v)).collect() }, &params);
         let fit = inverted.calibrate(&expected, true).expect("fits, read light on dark");
         assert_eq!((fit.labelled, fit.misread), (calibration.labelled, calibration.misread));
-        assert!((fit.typical - calibration.typical).abs() < 1e-3 && (fit.sigma - calibration.sigma).abs() < 1e-3, "{fit:?} vs {calibration:?}");
+        // The modules dark in the photo are now those light in the symbol,
+        // their readings turned about the threshold.
+        assert!((fit.typical() - calibration.typical()).abs() < 1e-3, "{fit:?} vs {calibration:?}");
+        assert!((fit.dark.mean + calibration.light.mean).abs() < 1e-3 && (fit.dark.sigma - calibration.light.sigma).abs() < 1e-3, "{fit:?} vs {calibration:?}");
+        assert!((fit.light.mean + calibration.dark.mean).abs() < 1e-3 && (fit.light.sigma - calibration.dark.sigma).abs() < 1e-3, "{fit:?} vs {calibration:?}");
         assert!((fit.gross - calibration.gross).abs() < 1e-6, "{fit:?} vs {calibration:?}");
         assert!(inverted.calibrate(&expected, false).is_none(), "read the wrong way round, the fixed patterns are not where they should be");
         // Too few labelled modules, and nothing is fitted.
@@ -1714,5 +2399,287 @@ mod tests {
         let mut sparse = classify(&sampled, &params);
         assert_eq!(sparse.calibrate(&few, false), None);
         assert_eq!(sparse.reliability, before);
+    }
+
+    /// Normal deviates for the tests below.
+    struct Normal(u64);
+
+    impl Normal {
+        fn uniform(&mut self) -> f32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            ((self.0 >> 40) as f32 + 0.5) / (1u64 << 24) as f32
+        }
+
+        fn next(&mut self) -> f32 {
+            let (a, b) = (self.uniform(), self.uniform());
+            (-2.0 * a.ln()).sqrt() * (std::f32::consts::TAU * b).cos()
+        }
+    }
+
+    #[test]
+    fn each_colour_is_calibrated_by_its_own_spread() {
+        // Ink read unevenly, its readings spread wide about their middle,
+        // and clean paper read evenly: a reading a little to the light
+        // side of the rule's midway threshold is likelier ink than paper.
+        let mut normal = Normal(0x5EED);
+        let labelled: Vec<(f32, bool)> =
+            (0..400).map(|i| if i % 2 == 0 { (-0.7 + 0.36 * normal.next(), true) } else { (0.9 + 0.14 * normal.next(), false) }).collect();
+        let fit = Calibration::fit(&labelled, true).expect("fits");
+        assert!((fit.dark.mean + 0.7).abs() < 0.08 && (fit.light.mean - 0.9).abs() < 0.04, "{fit:?}");
+        assert!((0.28..0.44).contains(&fit.dark.sigma) && (0.1..0.18).contains(&fit.light.sigma), "{fit:?}");
+        // The threshold moves toward the paper, and the odds rise steadily
+        // through it and beyond both middles: a reading darker than any
+        // ink is not called paper for lying far from the ink's middle.
+        assert!(fit.threshold > 0.2 && fit.threshold < fit.light.mean, "{fit:?}");
+        assert!(fit.log_odds(fit.threshold).abs() < 1e-3);
+        assert!(fit.log_odds(0.1) < 0.0 && fit.reliability(0.1) > 0);
+        let odds: Vec<f32> = (-300..=300).map(|i| fit.log_odds(i as f32 / 100.0)).collect();
+        assert!(odds.windows(2).all(|pair| pair[0] < pair[1]), "rising");
+        // A colour with too few modules of its own takes both colours'
+        // noise about the typical margin.
+        let lopsided: Vec<(f32, bool)> = labelled.iter().copied().filter(|l| !l.1).chain(labelled.iter().copied().filter(|l| l.1).take(5)).collect();
+        let fit = Calibration::fit(&lopsided, true).expect("fits");
+        let mut toward: Vec<f32> = lopsided.iter().map(|&(o, d)| if d { -o } else { o }).collect();
+        let typical = median(&mut toward);
+        assert_eq!(fit.dark.mean, -typical, "{fit:?}");
+        assert!(fit.dark.sigma <= spread_about(&toward, typical) * 1.0001, "{fit:?}");
+        // Spreads further apart than the ratio allows are drawn together.
+        let far: Vec<(f32, bool)> =
+            (0..400).map(|i| if i % 2 == 0 { (-0.8 + 0.6 * normal.next(), true) } else { (0.9 + 0.06 * normal.next(), false) }).collect();
+        let fit = Calibration::fit(&far, true).expect("fits");
+        assert!(fit.dark.sigma / fit.light.sigma <= CALIBRATION_MAX_RATIO * 1.0001, "{fit:?}");
+        // Fitted alike, the two colours take one spread about a threshold
+        // midway, the typical margin to each side.
+        let alike = Calibration::fit(&labelled, false).expect("fits");
+        let mut toward: Vec<f32> = labelled.iter().map(|&(o, d)| if d { -o } else { o }).collect();
+        let typical = median(&mut toward);
+        assert_eq!((alike.dark.mean, alike.light.mean, alike.threshold), (-typical, typical, 0.0));
+        assert_eq!((alike.dark.sigma, alike.light.sigma), (spread_about(&toward, typical), spread_about(&toward, typical)));
+        assert_eq!(alike.log_odds(0.3), -alike.log_odds(-0.3));
+    }
+
+    #[test]
+    fn calibration_moves_the_threshold_to_where_the_colours_cross() {
+        // A version 2 symbol read with its ink spread wide and its paper
+        // even, against one threshold midway between them: dark modules
+        // that strayed past the middle are read light, until the
+        // calibration puts the threshold where the two colours cross.
+        let (w, h) = (25usize, 25usize);
+        let func = FunctionMap::new(SymbolVersion::Qr(2));
+        let expected = func.expected_modules().to_vec();
+        let mut normal = Normal(0xD0_7712);
+        let truth: Vec<bool> = (0..w * h).map(|i| expected[i].unwrap_or_else(|| normal.uniform() < 0.5)).collect();
+        let luma: Vec<Option<f32>> =
+            truth.iter().map(|&dark| Some(0.5 + 0.35 * if dark { -0.6 + 0.4 * normal.next() } else { 0.9 + 0.15 * normal.next() })).collect();
+        let sampled = Sampled { width: w, height: h, luma };
+        let params = SampleParams { local: false, band: 0.0, threshold: Some(0.5), ..SampleParams::default() };
+        let mut classified = classify(&sampled, &params);
+        let wrong = |c: &Classified| (0..w * h).filter(|&i| expected[i].is_none() && c.decided[i] != Module::from_dark(truth[i])).count();
+        let before = wrong(&classified);
+        // With nothing known of the blur, the colours are fitted alike and
+        // the threshold stays where the rule put it.
+        let mut unknown_blur = classified.clone();
+        assert_eq!(unknown_blur.calibrate(&expected, false).expect("fits").threshold, 0.0);
+        assert_eq!(wrong(&unknown_blur), before);
+        // The photo is sharp: there is no blur to undo, and the reading,
+        // left as it was, is calibrated a colour at a time.
+        let calibration = classified.learn(&expected, false).expect("fits");
+        assert!(classified.blur.is_some_and(|blur| !blur.is_worth_undoing()) && !classified.equalised, "{:?}", classified.blur);
+        assert!(calibration.threshold > 0.2, "{calibration:?}");
+        assert!(before >= 8 && wrong(&classified) * 4 <= before, "{before} wrong before, {} after", wrong(&classified));
+        // Every module is judged by the calibrated threshold.
+        for i in 0..w * h {
+            let offset = classified.offset[i];
+            assert_eq!(classified.decided[i], Module::from_dark(offset < calibration.threshold));
+            assert!((classified.margin[i] - (offset - calibration.threshold).abs()).abs() < 1e-6);
+            assert_eq!(classified.reliability[i], calibration.reliability(offset));
+        }
+    }
+
+    /// Offsets of a version 2 symbol read through `blur` with `noise`,
+    /// its data random, the quiet zone light; with the symbol's colours,
+    /// dark true, and its fixed modules' colours.
+    fn blurred_symbol(own: f32, across: f32, down: f32, falling: f32, rising: f32, noise: f32, seed: u64) -> (Vec<f32>, Vec<bool>, Vec<Option<bool>>) {
+        let (w, h) = (25i64, 25i64);
+        let func = FunctionMap::new(SymbolVersion::Qr(2));
+        let expected = func.expected_modules().to_vec();
+        let mut normal = Normal(seed);
+        let truth: Vec<bool> = (0..(w * h) as usize).map(|i| expected[i].unwrap_or_else(|| normal.uniform() < 0.5)).collect();
+        let colour = |x: i64, y: i64| if x < 0 || y < 0 || x >= w || y >= h || !truth[(y * w + x) as usize] { 1.0 } else { -1.0 };
+        let offsets = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                own * colour(x, y)
+                    + across * (colour(x - 1, y) + colour(x + 1, y))
+                    + down * (colour(x, y - 1) + colour(x, y + 1))
+                    + falling * (colour(x - 1, y - 1) + colour(x + 1, y + 1))
+                    + rising * (colour(x + 1, y - 1) + colour(x - 1, y + 1))
+                    + noise * normal.next()
+            })
+            .collect();
+        (offsets, truth, expected)
+    }
+
+    #[test]
+    fn a_blur_is_learnt_from_the_fixed_patterns_and_undone() {
+        // Spread a quarter of the module's own reach to each side across,
+        // less up and down, and a little along one diagonal, as a hand
+        // that moved spreads it: a lone module among the other colour
+        // reads on the wrong side of the threshold.
+        let (offsets, truth, expected) = blurred_symbol(0.5, 0.13, 0.08, 0.05, 0.01, 0.04, 0xB1_0B);
+        let read: Vec<Option<f32>> = offsets.iter().copied().map(Some).collect();
+        let blur = Blur::fit(&read, 25, &expected, false).expect("blurred enough to fit");
+        assert!((blur.own - 0.5).abs() < 0.05, "{blur:?}");
+        for (got, want) in [(blur.across, 0.13), (blur.down, 0.08), (blur.falling, 0.05), (blur.rising, 0.01)] {
+            assert!((got - want).abs() < 0.03, "{blur:?}");
+        }
+        assert!(blur.noise < 0.08 && blur.gain > 1.0 + BLUR_MIN_GAIN, "{blur:?}");
+        assert!((blur.taps().iter().sum::<f32>() - 1.0).abs() < 1e-4);
+        assert!((blur.spill() - 2.0 * 0.27 / 0.5).abs() < 0.15, "{blur:?}");
+        let wrong = |values: &[Option<f32>]| (0..625).filter(|&i| expected[i].is_none() && (values[i].unwrap() < 0.0) != truth[i]).count();
+        let undone = blur.undo(&read, 25);
+        assert!(wrong(&read) >= 5 && wrong(&undone) * 5 <= wrong(&read), "{} wrong as read, {} undone", wrong(&read), wrong(&undone));
+        // A module not read stays so, and a patch of one colour reads as
+        // it did.
+        let mut holed = read.clone();
+        holed[300] = None;
+        assert_eq!(blur.undo(&holed, 25)[300], None);
+        let solid = vec![Some(0.9f32); 625];
+        assert!(blur.undo(&solid, 25).iter().all(|v| (v.unwrap() - 0.9).abs() < 1e-5));
+    }
+
+    #[test]
+    fn a_sharp_photo_or_a_misplaced_grid_is_left_as_read() {
+        // Nothing spread: the blur is learnt, and the filter would gain
+        // nothing by undoing it.
+        let (offsets, _, expected) = blurred_symbol(0.9, 0.0, 0.0, 0.0, 0.0, 0.06, 0x5AA9);
+        let read: Vec<Option<f32>> = offsets.iter().copied().map(Some).collect();
+        let blur = Blur::fit(&read, 25, &expected, false).expect("fits");
+        assert!(!blur.is_worth_undoing() && blur.spill().abs() < 0.1, "{blur:?}");
+        // The labels of another symbol's fixed patterns: a module's own
+        // colour says nothing of its reading.
+        let (offsets, _, _) = blurred_symbol(0.5, 0.13, 0.08, 0.05, 0.01, 0.04, 0xB1_0B);
+        let shifted: Vec<Option<bool>> = (0..625).map(|i| expected[(i + 3) % 625]).collect();
+        let read: Vec<Option<f32>> = offsets.iter().copied().map(Some).collect();
+        assert_eq!(Blur::fit(&read, 25, &shifted, false), None);
+        // Too few modules with all their neighbours labelled: the top four
+        // rows hold the upper halves of two finder patterns, twenty-four.
+        let few: Vec<Option<bool>> = expected.iter().enumerate().map(|(i, &e)| e.filter(|_| i < 100)).collect();
+        assert_eq!(Blur::fit(&read, 25, &few, false), None);
+    }
+
+    /// A version 2 symbol drawn `px` pixels a module, its data random,
+    /// out of focus by `blur` modules; the map onto it, its colours, dark
+    /// true, and its fixed modules' colours.
+    fn rendered_symbol(px: usize, blur: f64, seed: u64) -> (Luma, Homography, Vec<bool>, Vec<Option<bool>>) {
+        let n = 25;
+        let func = FunctionMap::new(SymbolVersion::Qr(2));
+        let expected = func.expected_modules().to_vec();
+        let mut normal = Normal(seed);
+        let truth: Vec<bool> = (0..n * n).map(|i| expected[i].unwrap_or_else(|| normal.uniform() < 0.5)).collect();
+        let side = n * px;
+        let mut data: Vec<f32> = (0..side * side).map(|i| if truth[(i / side / px) * n + i % side / px] { 0.15 } else { 0.85 }).collect();
+        if blur > 0.0 {
+            let sigma = blur * px as f64;
+            let reach = (3.0 * sigma).ceil() as i64;
+            let taps: Vec<f32> = (-reach..=reach).map(|i| (-(i * i) as f64 / (2.0 * sigma * sigma)).exp() as f32).collect();
+            let total: f32 = taps.iter().sum();
+            for (step, len) in [(1usize, side), (side, side)] {
+                let source = data.clone();
+                for i in 0..side * side {
+                    let along = if step == 1 { i % side } else { i / side } as i64;
+                    data[i] = (-reach..=reach)
+                        .map(|d| {
+                            let at = (along + d).clamp(0, len as i64 - 1);
+                            let j = if step == 1 { i - i % side + at as usize } else { at as usize * side + i % side };
+                            taps[(d + reach) as usize] * source[j]
+                        })
+                        .sum::<f32>()
+                        / total;
+                }
+            }
+        }
+        let corner = side as f64;
+        let map = Homography::rect_to_quad(25.0, 25.0, [[0.0, 0.0], [corner, 0.0], [corner, corner], [0.0, corner]]).unwrap();
+        (Luma::new(side, side, data), map, truth, expected)
+    }
+
+    #[test]
+    fn a_blur_learnt_takes_the_place_of_the_guess_at_it() {
+        let wrong = |c: &Classified, truth: &[bool], expected: &[Option<bool>]| {
+            (0..625).filter(|&i| expected[i].is_none() && c.decided[i] != Module::from_dark(truth[i])).count()
+        };
+        // Out of focus by half a module: the blur is learnt and undone,
+        // and the guess at it is not made besides.
+        let (image, map, truth, expected) = rendered_symbol(6, 0.5, 0xF0C5);
+        let params = SampleParams::default();
+        let (read, sharpening) = read_modules(&image, &map, 25, 25, &params, &expected, false);
+        assert!(read.equalised && read.blur.is_some_and(|blur| blur.is_worth_undoing()), "{:?}", read.blur);
+        assert!(!sharpening.any() && read.calibration.is_some(), "{sharpening:?}");
+        let guessed = classify(&sample_modules_noting(&image, &map, 25, 25, params.kernel, true).0, &params);
+        let as_read = classify(&sample_modules_noting(&image, &map, 25, 25, params.kernel, false).0, &params);
+        assert!(
+            wrong(&read, &truth, &expected) < wrong(&as_read, &truth, &expected),
+            "{} wrong equalised, {} as read, {} sharpened by the guess",
+            wrong(&read, &truth, &expected),
+            wrong(&as_read, &truth, &expected),
+            wrong(&guessed, &truth, &expected)
+        );
+        // With sharpening off the reading is taken as it was read: the
+        // blur is learnt, and keeps the colours from being fitted apart.
+        let off = SampleParams { sharpen_modules: false, ..params };
+        let (left, sharpening) = read_modules(&image, &map, 25, 25, &off, &expected, false);
+        assert!(!left.equalised && left.blur.is_some() && !sharpening.any());
+        assert_eq!(left.calibration.map(|c| c.threshold), Some(0.0));
+        assert_eq!(left.decided, as_read.decided);
+        // Sharp, with modules too small for the lens to have left them
+        // whole, there is no blur to undo, and the guess sharpens them as
+        // it did, its colours fitted alike.
+        let (image, map, _, expected) = rendered_symbol(3, 0.0, 0x5_3A9);
+        let (read, sharpening) = read_modules(&image, &map, 25, 25, &params, &expected, false);
+        assert!(!read.equalised && read.blur.is_none() && sharpening.for_size > 0.0, "{sharpening:?}");
+        assert_eq!(read.decided, classify(&sample_modules_noting(&image, &map, 25, 25, params.kernel, true).0, &params).decided);
+        assert_eq!(read.calibration.map(|c| c.threshold), Some(0.0));
+        // Sharp, with modules large enough, nothing is sharpened, and the
+        // colours are fitted apart.
+        let (image, map, _, expected) = rendered_symbol(8, 0.0, 0x5_3A9);
+        let (read, sharpening) = read_modules(&image, &map, 25, 25, &params, &expected, false);
+        assert!(!read.equalised && read.blur.is_some() && !sharpening.any(), "{:?} {sharpening:?}", read.blur);
+    }
+
+    #[test]
+    fn a_classified_reading_is_equalised_before_it_is_calibrated() {
+        let (offsets, truth, expected) = blurred_symbol(0.5, 0.13, 0.08, 0.05, 0.01, 0.04, 0xE0_A1);
+        let sampled = Sampled { width: 25, height: 25, luma: offsets.iter().map(|o| Some(0.5 + 0.3 * o)).collect() };
+        let params = SampleParams { local: false, threshold: Some(0.5), band: 0.1, ..SampleParams::default() };
+        let wrong = |c: &Classified| (0..625).filter(|&i| expected[i].is_none() && c.decided[i] != Module::from_dark(truth[i])).count();
+        let plain = classify(&sampled, &params);
+        let mut classified = plain.clone();
+        let blur = classified.equalise(&expected, false).expect("equalised");
+        assert_eq!(classified.blur, Some(blur));
+        assert!(wrong(&classified) * 5 <= wrong(&plain), "{} wrong as read, {} equalised", wrong(&plain), wrong(&classified));
+        for i in 0..625 {
+            let offset = classified.offset[i];
+            assert_eq!(classified.decided[i], Module::from_dark(offset < 0.0));
+            assert_eq!(classified.margin[i], offset.abs());
+            assert_eq!(classified.modules[i], if offset.abs() < 0.1 { Module::Unknown } else { classified.decided[i] });
+        }
+        // Learning is the two in turn.
+        let mut learnt = plain.clone();
+        let calibration = learnt.learn(&expected, false).expect("calibrated");
+        classified.calibrate(&expected, false);
+        assert_eq!(learnt, classified);
+        assert_eq!(learnt.calibration, Some(calibration));
+        // The fixed patterns, equalised, spread as the data does.
+        let spread = |c: &Classified, fixed: bool| {
+            let labels: Vec<(f32, bool)> =
+                (0..625).filter(|&i| expected[i].is_some() == fixed).map(|i| (c.offset[i], truth[i])).collect();
+            let fit = Calibration::fit(&labels, true).unwrap();
+            (fit.dark.sigma + fit.light.sigma) / 2.0
+        };
+        let (before, after) = ((spread(&plain, true), spread(&plain, false)), (spread(&learnt, true), spread(&learnt, false)));
+        assert!(after.1 / after.0 < before.1 / before.0, "data against fixed: {before:?} as read, {after:?} equalised");
     }
 }

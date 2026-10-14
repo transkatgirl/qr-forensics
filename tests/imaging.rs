@@ -17,7 +17,9 @@ use qr_forensics::symbol::function_map::{FunctionMap, Role};
 use qr_forensics::imaging::homography::Homography;
 use qr_forensics::imaging::projection::{ControlPoint, Projection};
 use qr_forensics::imaging::refine::{refine_corners, refine_corners_holding};
-use qr_forensics::imaging::sample::{Kernel, Rule, SampleParams, classify, sample_modules, sample_modules_as, sample_modules_with, suggest_versions};
+use qr_forensics::imaging::sample::{
+    Kernel, Rule, SampleParams, classify, read_modules, sample_modules, sample_modules_with, suggest_versions,
+};
 use qr_forensics::symbol::grid::{CERTAIN, Module, ModuleGrid};
 use qr_forensics::symbol::{EcLevel, Family, SymbolVersion};
 use qrcode_generator::Segment;
@@ -1563,14 +1565,17 @@ fn a_symbol_out_of_focus_reads_through_the_photo_sharpened() {
     let error = corner_error(read.detection.corners, quad);
     assert!(error < 1.5, "corners {error:.2} px off");
     // Sampled through the same copy, with the kernel and threshold rule
-    // of the read, the placement gives the read's grid again: what the
+    // of the read, and the blur learnt from the fixed patterns as the
+    // read learnt it, the placement gives the read's grid again: what the
     // window's Sampling does once it has taken the read's settings over.
     // Sampled off the photo as it lies, the same placement reads more
     // than twice as many modules wrong or not at all.
     let sample = |enhance: Enhance| {
         let how = SampleParams { kernel: read.kernel, enhance, ..params.under(read.rule) };
         let map = read.detection.projection().expect("the placement maps");
-        classify(&sample_modules_as(&image, &map, grid.width(), grid.height(), &how), &how).to_grid(grid.width(), grid.height())
+        let func = FunctionMap::new(read.detection.version);
+        let (classified, _) = read_modules(&image, &map, grid.width(), grid.height(), &how, func.expected_modules(), read.detection.inverted);
+        classified.to_grid(grid.width(), grid.height())
     };
     let (again, plain) = (sample(read.enhance), sample(Enhance::NONE));
     let differing = (0..grid.width() * grid.height()).filter(|i| again.get(i % grid.width(), i / grid.width()) != read.grid.get(i % grid.width(), i / grid.width())).count();
@@ -1599,11 +1604,15 @@ fn a_blurred_symbol_in_failing_light_reads_once_a_stained_codeword_a_block_is_fr
     // blocks of the four a codeword whose modules the blur has carried
     // over their thresholds with margin, which no doubting by
     // reliability reaches. Erased by trial, that codeword frees its
-    // block, and the neighbourhood reads the symbol; a read comes to
-    // that of itself, before the other rules. A threshold that lies as
-    // a surface across the symbol follows the light and asks nothing of
-    // a module's neighbours, as BoofCV reads every symbol, and reads it
-    // with nothing freed, as it did when it was all that could.
+    // block, and the neighbourhood reads the symbol. A threshold that
+    // lies as a surface across the symbol follows the light and asks
+    // nothing of a module's neighbours, as BoofCV reads every symbol,
+    // and reads it with nothing freed, as it did when it was all that
+    // could. A read learns the blur from the finder patterns and takes
+    // it back out of every module before any threshold is drawn, and
+    // then no codeword is carried over: every block solves by error
+    // correction alone, with redundancy to spare, under the
+    // neighbourhood, which a read tries first.
     let (version, ec) = (SymbolVersion::Qr(6), EcLevel::M);
     let grid = symbol(version, ec);
     let layout = layout(version, ec);
@@ -1618,22 +1627,20 @@ fn a_blurred_symbol_in_failing_light_reads_once_a_stained_codeword_a_block_is_fr
     assert!(read.is_trustworthy(), "{:?} of {} blocks", read.report.blocks_verified(), read.report.blocks.len());
     assert_eq!(read.text(), text);
     assert_eq!((read.version(), read.rule, read.unsure_kept), (version, Rule::Neighbourhood, false));
+    assert!(
+        read.report.blocks.iter().all(|b| matches!(b.outcome, BlockOutcome::Solved { method: SolveMethod::ReedSolomon, slack: 8.., .. })),
+        "{:?}",
+        read.report.blocks.iter().map(|b| b.outcome).collect::<Vec<_>>()
+    );
+    // Through the very placement that read, sampled as the guess at the
+    // blur sharpens it, with nothing freed by trial and no solid bit
+    // flipped, no kernel reads under either of the rules that split the
+    // symbol, through the band or with the unsure modules kept at their
+    // colour: the codewords the blur carried over are wrong either way.
     // Freed whole, or, where the blur carried only a bit or two or three
     // of it over, those bits flipped by what the equations were left
-    // wanting, which spends nothing where a codeword freed spends eight.
-    let freed = read
-        .report
-        .blocks
-        .iter()
-        .filter(|b| matches!(b.outcome, BlockOutcome::Solved { method: SolveMethod::BitTrial { .. } | SolveMethod::BitFlip { .. }, .. }))
-        .count();
-    assert_eq!(freed, 3, "{:?}", read.report.blocks.iter().map(|b| b.outcome).collect::<Vec<_>>());
-    // Through the very placement that read, with nothing freed by trial
-    // and no solid bit flipped, no kernel reads under either of the
-    // rules that split the symbol, through the band or with the unsure
-    // modules kept at their colour: the codewords the blur carried over
-    // are wrong either way. The surface reads it with nothing freed or
-    // flipped.
+    // wanting, the neighbourhood reads it. The surface reads it with
+    // nothing freed or flipped.
     let map = read.detection.projection().expect("the placement maps");
     let reads = |rule: Rule, kernel: Kernel, band: f32, aided: bool| {
         let how = SampleParams { kernel, band, ..params.under(rule) };
@@ -1651,15 +1658,27 @@ fn a_blurred_symbol_in_failing_light_reads_once_a_stained_codeword_a_block_is_fr
     }
     assert!(reads(Rule::Neighbourhood, read.kernel, params.band, true));
     assert!(reads(Rule::Surface, params.kernel, params.band, false));
+    // With the blur learnt and undone, every kernel reads it under the
+    // neighbourhood with nothing freed or flipped.
+    let func = FunctionMap::new(version);
+    for kernel in Kernel::ALL {
+        let how = SampleParams { kernel, ..params };
+        let (equalised, _) = read_modules(&image, &map, grid.width(), grid.height(), &how, func.expected_modules(), false);
+        assert!(equalised.equalised, "{kernel:?}");
+        let opts = DecodeOptions { erase_by_trial: false, flip_bits: false, ..opts };
+        let report = decode(&equalised.to_grid(grid.width(), grid.height()), &layout, 0, &Pins::new(), &opts);
+        assert!(report.is_trustworthy(), "{kernel:?}: {} of {} blocks", report.blocks_verified(), report.blocks.len());
+    }
 }
 
 #[test]
 fn small_modules_a_lens_has_run_together_read_enlarged() {
     // A version 3 symbol a pixel and a quarter a module, blurred by
     // seven tenths of a pixel, as a lens and a sensor leave a symbol far
-    // from the camera: read through the photo enlarged four times and
-    // sharpened, with its corners placed in the photo's own pixels to
-    // about a module.
+    // from the camera: found through the photo enlarged, read off the
+    // photo as it lies once the blur learnt from its finder patterns is
+    // undone, with its corners placed in the photo's own pixels to about
+    // a module.
     let (version, ec) = (SymbolVersion::Qr(3), EcLevel::M);
     let grid = symbol(version, ec);
     let truth = decode_plain(&grid, &layout(version, ec), 0).text.plain();
@@ -1668,6 +1687,16 @@ fn small_modules_a_lens_has_run_together_read_enlarged() {
     let image = defocus(&render(&grid, quad, (360, 300), |_, _, v| v), 0.7);
     let (params, opts) = (SampleParams::default(), DecodeOptions::default());
     let read = read_outline(&image, SymbolVersion::Qr(2), bounding_box(quad, 0.25), &params, &opts).expect("found");
+    assert!(read.is_trustworthy(), "{:?} of {} blocks", read.report.blocks_verified(), read.report.blocks.len());
+    assert_eq!((read.text(), read.version()), (truth.clone(), version));
+    assert_eq!(read.enhance, Enhance::NONE, "read through {:?}", read.enhance);
+    let error = corner_error(read.detection.corners, quad);
+    assert!(error < 1.5, "corners {error:.2} px off");
+    // With the modules taken as they read, nothing undoes the blur, and
+    // the symbol is read through the photo enlarged four times and
+    // sharpened.
+    let as_read = SampleParams { sharpen_modules: false, ..params };
+    let read = read_outline(&image, SymbolVersion::Qr(2), bounding_box(quad, 0.25), &as_read, &opts).expect("found");
     assert!(read.is_trustworthy(), "{:?} of {} blocks", read.report.blocks_verified(), read.report.blocks.len());
     assert_eq!((read.text(), read.version()), (truth, version));
     assert_eq!(read.enhance.enlarge, 4, "read through {:?}", read.enhance);

@@ -32,7 +32,7 @@ use qr_forensics::imaging::refine::{Refinement, refine_corners, refine_corners_h
 use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::enhance::Enhance;
 use qr_forensics::imaging::sample::{
-    Classified, Kernel, Rule, SampleParams, VersionGuess, classify, sample_modules_noting, suggest_versions,
+    Classified, Kernel, Rule, SampleParams, VersionGuess, read_modules, suggest_versions,
 };
 use qr_forensics::symbol::function_map::{FunctionMap, looks_inverted};
 use qr_forensics::symbol::grid::{Mirror, Module, ModuleGrid, Symmetry};
@@ -1158,11 +1158,12 @@ impl App {
             return;
         }
         self.preview = self.model.as_ref().map(|model| {
-            let params = &self.view.sample;
-            let (sampled, sharpening) =
-                sample_modules_noting(&photo.luma, model.projection.as_ref(), func.width, func.height, params.kernel, params.sharpen_modules);
-            let mut classified = classify(&sampled, params);
-            classified.calibrate(func.expected_modules(), false);
+            // The photo as it lies, adjusted as the user has it: what a read
+            // made through a copy enlarged or sharpened shows here once the
+            // photo is adjusted to match.
+            let params = SampleParams { enhance: Enhance::NONE, ..self.view.sample };
+            let (classified, sharpening) =
+                read_modules(&photo.luma, model.projection.as_ref(), func.width, func.height, &params, func.expected_modules(), false);
             let grid = classified.to_grid(func.width, func.height);
             let fixed = func.fixed_agreement(&grid);
             let turned = orientation_of(&grid, func);
@@ -4657,7 +4658,9 @@ mod tests {
         // focus by eight tenths of a module: grey where a dark module
         // has light neighbours, and its finders' rings run into their
         // stones. (Out of focus by seven tenths it read through the
-        // module centres once reliability was calibrated.)
+        // module centres once reliability was calibrated. By eight it
+        // read through the copy only with its padding pinned, until the
+        // blur learnt from its fixed patterns was undone.)
         let message = "https://example.com/out-of-focus";
         let (w, h, pixels) = render_rgba(&symbol_of(message), 3, 4);
         let render = image::RgbaImage::from_raw(w as u32, h as u32, pixels).expect("a render is an image");
@@ -4672,18 +4675,15 @@ mod tests {
         bench.act(Action::FindCorners);
         bench.settle();
         let notice = bench.notice().text.clone();
-        assert!(notice.contains("the message decodes once its padding is pinned") && notice.contains("It decoded only with the photo"), "{notice}");
+        assert!(notice.contains("the message decodes.") && notice.contains("It decoded only with the photo"), "{notice}");
         let adjust = bench.app.doc.adjust;
         assert!(adjust.sharpen >= 0.5 && adjust.enlarge > Enlarge::NONE, "{adjust:?}");
         let photo = bench.app.photo.as_ref().expect("the photo is loaded");
         assert_eq!((photo.width, photo.height), adjust.enlarge.size(400, 360));
         assert_eq!(bench.app.doc.version, SymbolVersion::Qr(3));
         // Sample then reads off the photo so adjusted what the read read
-        // through its copy: the message, once the padding is pinned as
-        // the read pinned it.
+        // through its copy: the message.
         bench.act(Action::Sample { only_unknown: false, scope: SampleScope::All });
-        bench.step();
-        bench.act(Action::ApplyPadding);
         bench.step();
         assert!(bench.app.derived.report.is_trustworthy(), "{}: {:?}", bench.notice().text, bench.app.derived.report.text.plain());
         assert_eq!(bench.app.derived.report.text.plain(), message);

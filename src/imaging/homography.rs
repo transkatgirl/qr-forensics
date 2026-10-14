@@ -2,10 +2,10 @@
 
 /// Reweightings of a fit after the plain least squares: enough for a
 /// gross outlier's weight to fall to nothing.
-const REWEIGHTINGS: usize = 3;
+pub(crate) const REWEIGHTINGS: usize = 3;
 /// Huber's threshold, in residual scales: residuals beyond it count only
 /// linearly. 1.345 keeps 95% efficiency on clean Gaussian data.
-const HUBER_K: f64 = 1.345;
+pub(crate) const HUBER_K: f64 = 1.345;
 /// The residual scale from the median absolute residual, for Gaussian
 /// residuals.
 const MAD_TO_SIGMA: f64 = 1.4826;
@@ -247,7 +247,7 @@ fn normalizer(points: impl Iterator<Item = [f64; 2]> + Clone) -> Option<Homograp
 
 /// Least-squares solution of the rows `(coefficients, value)`, through the
 /// normal equations. `None` when the system is rank deficient.
-fn least_squares<const N: usize>(rows: impl Iterator<Item = ([f64; N], f64)>) -> Option<[f64; N]> {
+pub(crate) fn least_squares<const N: usize>(rows: impl Iterator<Item = ([f64; N], f64)>) -> Option<[f64; N]> {
     let mut ata = [[0.0f64; N]; N];
     let mut atb = [0.0f64; N];
     for (a, b) in rows {

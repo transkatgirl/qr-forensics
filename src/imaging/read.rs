@@ -127,7 +127,7 @@ use super::detect::{
 use super::enhance::{Enhance, Enhanced};
 use super::projection::{ControlPoint, Project, Projection};
 use super::refine::{MOVES, Scorer, Shifted, Template, Warp, descend_by, fixed_threshold, refine_corners_holding};
-use super::sample::{Kernel, Rule, SampleParams, classify, sample_modules_noting};
+use super::sample::{Kernel, Rule, SampleParams, classify, read_modules, sample_modules_noting};
 use super::{Luma, rotate_outline_cw, unrotate_point_cw};
 use crate::decode::bch::{FormatAnalysis, FormatCandidate};
 use crate::decode::codewords::Pins;
@@ -730,11 +730,10 @@ fn read_prepared(image: &Luma, prepared: &Prepared, variant: Variant, params: &S
     let Variant { kernel, rule, unsure_kept } = variant;
     let banded = SampleParams { kernel, ..params.under(rule) };
     let sampling = SampleParams { band: if unsure_kept { 0.0 } else { params.band }, ..banded };
-    let sampled = sample_modules_noting(image, &projection, func.width, func.height, kernel, params.sharpen_modules).0;
-    let mut classified = classify(&sampled, &banded);
-    // How far a reading is to be believed is learnt from the fixed
-    // patterns, whose colours are known before anything is decoded.
-    classified.calibrate(func.expected_modules(), found.inverted);
+    // How the photo blurs, and how far a reading is to be believed, are
+    // learnt from the fixed patterns, whose colours are known before
+    // anything is decoded.
+    let (classified, _) = read_modules(image, &projection, func.width, func.height, &banded, func.expected_modules(), found.inverted);
     if unsure_kept && classified.unsure() == 0 {
         return None;
     }
@@ -922,12 +921,11 @@ fn feedback_round(image: &Luma, current: &ReadResult, params: &SampleParams, opt
     // settled.
     let controls: Vec<ControlPoint> = anchors.iter().map(|a| a.control_point()).collect();
     let projection = Projection::new(func.width, func.height, corners, &controls)?;
-    let sampled = sample_modules_noting(image, &projection, func.width, func.height, current.kernel, params.sharpen_modules).0;
-    let mut classified = classify(&sampled, params);
     // The template has every module of the blocks that verified besides
     // the fixed patterns: hundreds of labelled modules to learn the
-    // photo's misreads from, where the fixed patterns gave tens.
-    classified.calibrate(&template.expected, found.inverted);
+    // photo's blur and misreads from, where the fixed patterns gave tens.
+    let how = SampleParams { kernel: current.kernel, ..*params };
+    let (classified, _) = read_modules(image, &projection, func.width, func.height, &how, &template.expected, found.inverted);
     let mut grid = classified.to_grid(func.width, func.height);
     if found.inverted {
         grid = grid.inverted();
