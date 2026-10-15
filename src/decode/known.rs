@@ -198,9 +198,13 @@ fn pack(mode: Mode, payload: usize, total: Option<usize>, first: usize, values: 
 }
 
 /// The pins that fix `text` at `place` in the message `report` read,
-/// with byte data in the character set it is read in there, or, at the
-/// start of the message, in `charset`. Nothing is decoded: the pins are
-/// to be laid over those in force and the grid decoded under them.
+/// with byte data in the character set it is read in there
+/// ([`text::encode_as_read`]): the set an ECI designator before it
+/// declares, else the one chosen, else the one guessed from the
+/// message's bytes. At the start of the message no designator comes
+/// before the text, so that is the set chosen or guessed, and UTF-8
+/// where no byte was read to guess from. Nothing is decoded: the pins
+/// are to be laid over those in force and the grid decoded under them.
 pub fn text_pins(layout: &SymbolLayout, report: &DecodeReport, place: Place, text: &str, charset: Charset) -> Result<TextPins, TextPinError> {
     if text.is_empty() {
         return Err(TextPinError::Empty);
@@ -216,7 +220,10 @@ pub fn text_pins(layout: &SymbolLayout, report: &DecodeReport, place: Place, tex
                 SegmentContent::Kanji(cells) | SegmentContent::Hanzi(cells) => cells.len(),
                 _ => return Err(TextPinError::NotData),
             };
-            let fnc1 = segments.iter().any(|s| matches!(s.content, SegmentContent::Fnc1First | SegmentContent::Fnc1Second(_)));
+            // By the mode, which says FNC1 in second position where the
+            // application indicator could not be read and the content
+            // says nothing: the percent sign is spelt doubled all the same.
+            let fnc1 = segments.iter().any(|s| matches!(s.mode, Mode::Fnc1First | Mode::Fnc1Second));
             let values = values_of(segment.mode, text, fnc1, |text| text::encode_as_read(segments, source.segment, charset, text))?;
             let room = cells.saturating_sub(source.cell);
             if values.len() > room {
@@ -239,7 +246,16 @@ pub fn text_pins(layout: &SymbolLayout, report: &DecodeReport, place: Place, tex
                 bits.extend([false, false, false, true].into_iter().enumerate().map(|(i, bit)| (at + i, bit)));
                 at += 4;
             }
-            let values = values_of(mode, text, false, |text| text::encode_in(charset, text))?;
+            // Byte data at the start of the message is byte data no
+            // designator precedes, and is read as such: in the set
+            // chosen, or, with none chosen, the one guessed from the
+            // message's bytes, which is UTF-8 where none were read. Text
+            // pinned at a character follows the same rule, and text
+            // pinned at the start once took UTF-8 whatever the message
+            // read as: "café" pinned at the start of a symbol read as
+            // ISO-8859-1 asserted two bytes for its last letter where the
+            // symbol held one.
+            let values = values_of(mode, text, false, |text| text::encode_as_read(segments, 0, charset, text))?;
             let (packed, fixed) = pack(mode, at + count_bits, None, 0, &values);
             bits.extend(packed);
             (bits, values.len(), fixed)
@@ -362,6 +378,17 @@ pub struct Beginning {
 /// message decoded under it begins with it; one that contradicts bits
 /// already confirmed is not tried. `pins` are those in force and
 /// `before` the decode under them. `None` when no beginning helps.
+///
+/// Placed at a character as read, a beginning is tried only when every
+/// character of it is pinned: text cut on both ends by groups not given
+/// in full asserts less than it says. At the start of the message the
+/// odd character that ends an alphanumeric beginning is left out of the
+/// pins as a matter of course, since whether it is a group of its own or
+/// the first half of a pair turns on what follows it, which is unknown;
+/// the pairs before it are pinned whole, and the message decoded under
+/// them must still begin with the whole beginning, odd character and
+/// all. Most beginnings are of odd length, `WIFI:` and `BEGIN:VCARD`
+/// among them, and were never tried in alphanumeric mode before.
 pub fn try_beginnings(
     grid: &ModuleGrid,
     layout: &SymbolLayout,
@@ -384,7 +411,7 @@ pub fn try_beginnings(
         }
         for place in places {
             let Ok(found) = text_pins(layout, before, place, text, opts.charset) else { continue };
-            if found.contradicted > 0 || found.left_out > 0 {
+            if found.contradicted > 0 || (matches!(place, Place::Char(_)) && found.left_out > 0) {
                 continue;
             }
             // Against the modules as read, before any decode is spent.

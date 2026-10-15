@@ -286,7 +286,11 @@ pub struct TextReport {
     pub notes: Vec<String>,
     /// The message as bytes, before any character set: numeric and
     /// alphanumeric characters as ASCII, byte-mode data as read, kanji and
-    /// hanzi as their two bytes. `None` for a byte that is unreadable.
+    /// hanzi as their two bytes. Under FNC1 the alphanumeric data is as
+    /// the message carries it, as [`plain`](Self::plain) and `parity`
+    /// have it: the group separator for the percent sign that spells it,
+    /// and one percent sign for the pair that spells one. `None` for a
+    /// byte that is unreadable.
     pub bytes: Vec<Option<u8>>,
     /// ECI designators and the offset into `bytes` from which each
     /// applies.
@@ -544,11 +548,16 @@ struct Markers {
 
 impl Markers {
     fn of(segments: &[Segment]) -> Self {
-        let has = |f: &dyn Fn(&SegmentContent) -> bool| segments.iter().any(|s| f(&s.content));
+        let has = |f: &dyn Fn(&Segment) -> bool| segments.iter().any(f);
         Self {
-            fnc1_first: has(&|c| matches!(c, SegmentContent::Fnc1First)),
-            fnc1_second: has(&|c| matches!(c, SegmentContent::Fnc1Second(_))),
-            eci: has(&|c| matches!(c, SegmentContent::Eci(_))),
+            fnc1_first: has(&|s| matches!(s.content, SegmentContent::Fnc1First)),
+            // By the mode: FNC1 in second position whatever its application
+            // indicator reads as, which is nothing where the indicator
+            // could not be read and the content says so. Told by the
+            // content, a segment so read was no FNC1 at all, and its
+            // percent signs stood for themselves.
+            fnc1_second: has(&|s| s.mode == Mode::Fnc1Second),
+            eci: has(&|s| matches!(s.content, SegmentContent::Eci(_))),
         }
     }
 
@@ -571,10 +580,43 @@ impl Markers {
 
 /// XOR of every data byte, as the parity of a structured append message is
 /// computed over its whole input; `None` when any byte is unreadable.
+///
+/// ISO/IEC 18004 8.2 has the parity taken over the original input data,
+/// before it is divided among the symbols, and the input is what the
+/// message says, not how a segment spells it: under FNC1 an alphanumeric
+/// segment writes the group separator as a percent sign and a percent
+/// sign as two (7.4.8.3), an artifact of the mode that the input never
+/// held. So a lone percent sign counts as the separator, 0x1D, and a pair
+/// as the one 0x25 it stands for, which is what an encoder handed the
+/// input XORs before it writes either.
 fn parity(segments: &[Segment]) -> Option<u8> {
+    let fnc1 = Markers::of(segments).fnc1();
     let mut parity = 0u8;
     for segment in segments {
         match &segment.content {
+            SegmentContent::Chars(cells) if fnc1 && segment.mode == Mode::Alphanumeric => {
+                let mut percent = false;
+                for cell in cells {
+                    let ch = cell.value?;
+                    match (ch, percent) {
+                        ('%', true) => {
+                            parity ^= b'%';
+                            percent = false;
+                        }
+                        ('%', false) => percent = true,
+                        (ch, waiting) => {
+                            if waiting {
+                                parity ^= GROUP_SEPARATOR as u8;
+                            }
+                            percent = false;
+                            parity ^= ch as u8;
+                        }
+                    }
+                }
+                if percent {
+                    parity ^= GROUP_SEPARATOR as u8;
+                }
+            }
             SegmentContent::Chars(cells) => {
                 for cell in cells {
                     parity ^= cell.value? as u8;
@@ -591,7 +633,9 @@ fn parity(segments: &[Segment]) -> Option<u8> {
                     parity ^= high ^ low;
                 }
             }
-            SegmentContent::Unreadable => return None,
+            // Control segments, and the field of one that could not be
+            // read, a structured append header or an application
+            // indicator: none is data, and none goes into the parity.
             _ => {}
         }
     }
@@ -619,35 +663,56 @@ pub fn decode_text_of(family: Family, segments: &[Segment], charset: Charset) ->
     }
 
     for (index, segment) in segments.iter().enumerate() {
-        report.bytes.extend(segment_bytes(&segment.content));
+        let fnc1_alphanumeric = markers.fnc1() && segment.mode == Mode::Alphanumeric && matches!(segment.content, SegmentContent::Chars(_));
+        if !fnc1_alphanumeric {
+            report.bytes.extend(segment_bytes(&segment.content));
+        }
         let from = |cell: usize, bits: &Range<usize>| CharSource { segment: index, cell, bits: bits.clone() };
         match &segment.content {
-            SegmentContent::Chars(cells) if markers.fnc1() && segment.mode == Mode::Alphanumeric => {
+            SegmentContent::Chars(cells) if fnc1_alphanumeric => {
                 // Under FNC1, a percent sign in alphanumeric data stands
                 // for the group separator, and two in a row for one
                 // percent sign (ISO/IEC 18004 7.4.8.3). A percent sign
-                // waits, with its place, for what follows it.
+                // waits, with its place, for what follows it. The bytes
+                // are the message's, as the text and the parity are: the
+                // separator, and one percent sign for the pair, not the
+                // spelling.
                 let mut pending: Option<(Certainty, CharSource)> = None;
                 for (i, cell) in cells.iter().enumerate() {
                     let here = from(i, &cell.bits);
                     match (cell.value, pending.take()) {
                         (Some('%'), Some((certainty, first))) => {
                             let both = CharSource { bits: first.bits.start..cell.bits.end, ..first };
+                            report.bytes.push(Some(b'%'));
                             report.push("%", certainty.min(cell.certainty), &both);
                         }
                         (Some('%'), None) => pending = Some((cell.certainty, here)),
                         (value, Some((certainty, first))) => {
-                            report.push(GROUP_SEPARATOR.encode_utf8(&mut [0; 4]), certainty, &first);
+                            // Whether the percent sign is the separator
+                            // or the first half of a pair is settled by
+                            // the character after it, so the separator is
+                            // no surer than that character: before one
+                            // that could not be read, it is a guess.
+                            report.bytes.push(Some(GROUP_SEPARATOR as u8));
+                            report.push(GROUP_SEPARATOR.encode_utf8(&mut [0; 4]), certainty.min(cell.certainty), &first);
+                            report.bytes.push(value.map(|ch| ch as u8));
                             match value {
                                 Some(ch) => report.push(ch.encode_utf8(&mut [0; 4]), cell.certainty, &here),
                                 None => report.push_unknown(&here),
                             }
                         }
-                        (Some(ch), None) => report.push(ch.encode_utf8(&mut [0; 4]), cell.certainty, &here),
-                        (None, None) => report.push_unknown(&here),
+                        (Some(ch), None) => {
+                            report.bytes.push(Some(ch as u8));
+                            report.push(ch.encode_utf8(&mut [0; 4]), cell.certainty, &here);
+                        }
+                        (None, None) => {
+                            report.bytes.push(None);
+                            report.push_unknown(&here);
+                        }
                     }
                 }
                 if let Some((certainty, first)) = pending {
+                    report.bytes.push(Some(GROUP_SEPARATOR as u8));
                     report.push(GROUP_SEPARATOR.encode_utf8(&mut [0; 4]), certainty, &first);
                 }
             }
@@ -728,7 +793,17 @@ pub fn decode_text_of(family: Family, segments: &[Segment], charset: Charset) ->
                 }
             }
             SegmentContent::Eci(None) => {
-                report.notes.push("An ECI designator is unreadable; character set guessed.".into());
+                // The designator declares a set, and which one cannot be
+                // read: whatever a designator before it declared no
+                // longer holds, and the bytes after it are read as those
+                // of a symbol that declares none, in the set chosen or
+                // guessed. [`encode_as_read`] follows the same rule.
+                declared = None;
+                report.notes.push(
+                    "An ECI designator is unreadable: the character set it declares is unknown, and the bytes after it \
+                     are read in the set chosen or guessed, as bytes no designator covers are."
+                        .into(),
+                );
             }
             SegmentContent::StructuredAppend { index, total, parity } => {
                 let check = match report.parity {
@@ -763,7 +838,22 @@ pub fn decode_text_of(family: Family, segments: &[Segment], charset: Charset) ->
                     "FNC1 in second position with application indicator value {indicator}, which is not defined."
                 )),
             },
-            SegmentContent::Unreadable => {}
+            // The field of a control segment that could not be read: a
+            // structured append header, or the application indicator of
+            // FNC1 in second position, which is FNC1 still.
+            SegmentContent::Unreadable => match segment.mode {
+                Mode::Fnc1Second => report.notes.push(
+                    "FNC1 in second position with its application indicator unreadable: in alphanumeric data % is shown \
+                     as the group separator and %% as %, and the indicator, transmitted ahead of the data, is unknown."
+                        .into(),
+                ),
+                Mode::StructuredAppend => report.notes.push(
+                    "Structured append with its header unreadable: which symbol of how many this is, and the parity of \
+                     the whole message, are unknown."
+                        .into(),
+                ),
+                _ => {}
+            },
         }
         if segment.damaged {
             report.notes.push(format!(
@@ -815,22 +905,22 @@ fn byte_codec(declared: Option<Option<Codec>>, charset: Charset, guess: impl FnO
 }
 
 /// `text` as the bytes of the character set that the byte data of segment
-/// `index` is read in, by the rule [`decode_text_of`] follows: the set an
-/// ECI designator before the segment declares, or the one chosen, or the
-/// one guessed from the bytes. `Err` with the first character that set
-/// lacks.
+/// `index` is read in, by the rule [`decode_text_of`] follows: the set the
+/// last ECI designator before the segment declares, or the one chosen, or
+/// the one guessed from the bytes; a designator that could not be read
+/// declares nothing, and undoes what one before it declared. `Err` with
+/// the first character that set lacks.
 pub fn encode_as_read(segments: &[Segment], index: usize, charset: Charset, text: &str) -> Result<Vec<u8>, char> {
-    let declared = segments[..index.min(segments.len())].iter().rev().find_map(|segment| match segment.content {
-        SegmentContent::Eci(Some(value)) => Some(eci_codec(value)),
-        _ => None,
-    });
+    let declared = segments[..index.min(segments.len())]
+        .iter()
+        .rev()
+        .find_map(|segment| match segment.content {
+            SegmentContent::Eci(Some(value)) => Some(Some(eci_codec(value))),
+            SegmentContent::Eci(None) => Some(None),
+            _ => None,
+        })
+        .flatten();
     byte_codec(declared, charset, || guess_codec(segments)).0.encode(text)
-}
-
-/// `text` as bytes of `charset`, UTF-8 when none is chosen. `Err` with
-/// the first character the set lacks.
-pub fn encode_in(charset: Charset, text: &str) -> Result<Vec<u8>, char> {
-    charset.codec().unwrap_or(Codec::Rs(encoding_rs::UTF_8)).encode(text)
 }
 
 /// Decode byte cells, leaving a placeholder for each unreadable byte and
@@ -872,25 +962,170 @@ fn decode_bytes(codec: Codec, cells: &[Cell<u8>], at: (usize, usize), report: &m
                 // One byte at a time, so each character can inherit the
                 // certainty of exactly the bytes that produced it.
                 let mut decoder = encoding.new_decoder_without_bom_handling();
-                let mut pending = Certainty::Verified;
-                // The cell the character under way began at.
-                let mut begun = None;
+                let mut begun = Begun::default();
                 let mut out = String::with_capacity(32);
+                let bytes = |first: usize, end: usize| run[first - i..end - i].iter().map(|c| c.value.unwrap()).collect::<Vec<u8>>();
+                let weakest = |first: usize, last: usize| run[first - i..=last - i].iter().map(|c| c.certainty).min().unwrap_or(Certainty::Unknown);
                 for (n, cell) in run.iter().enumerate() {
                     out.clear();
-                    pending = pending.min(cell.certainty);
-                    let first = *begun.get_or_insert(i + n);
-                    let _ = decoder.decode_to_string(&[cell.value.unwrap()], &mut out, n + 1 == run.len());
-                    if !out.is_empty() {
-                        report.push(&out, pending, &from(first, i + n));
-                        pending = Certainty::Verified;
-                        begun = None;
-                    }
+                    let last = n + 1 == run.len();
+                    let _ = decoder.decode_to_string(&[cell.value.unwrap()], &mut out, last);
+                    begun.take_in(encoding, &out, i + n, i + n, last, &bytes, &weakest, &from, report);
                 }
             }
         }
         i = run_end;
     }
+}
+
+/// The character under way in a run of units fed to a decoder one at a
+/// time: the cell it began at.
+#[derive(Default)]
+struct Begun(Option<usize>);
+
+impl Begun {
+    /// Take in what the decoder gave for the unit over cells `start` to
+    /// `end`, and put each character it made under the cells it was made
+    /// from. `bytes(first, end)` is the units from cell `first` up to
+    /// cell `end`, `weakest(first, last)` the weakest certainty among
+    /// cells `first` to `last`, and `source(first, last)` the source of
+    /// a character made of them.
+    ///
+    /// A unit usually finishes the character under way, or begins one
+    /// and gives nothing yet. A unit that cannot follow the lead before
+    /// it makes the decoder give more than one: it gives up the lead, or
+    /// as few of the units before it as it can, as a replacement
+    /// character, and reads the rest over again from the unit after
+    /// them, which may come to characters of their own and end in a
+    /// lead left waiting; and a lead still waiting at the end of the
+    /// data is given up there. Put under the cell the lead began at, as
+    /// everything the decoder gave once was, a character read over
+    /// again pointed a pin made from it at the lead's byte. So what the
+    /// decoder gave is taken apart ([`attributed`]), and each character
+    /// goes under the units it was made of.
+    #[allow(clippy::too_many_arguments)]
+    fn take_in(
+        &mut self,
+        encoding: &'static Encoding,
+        out: &str,
+        start: usize,
+        end: usize,
+        last: bool,
+        bytes: &dyn Fn(usize, usize) -> Vec<u8>,
+        weakest: &dyn Fn(usize, usize) -> Certainty,
+        source: &dyn Fn(usize, usize) -> CharSource,
+        report: &mut TextReport,
+    ) {
+        let first = self.0.unwrap_or(start);
+        if out.is_empty() {
+            self.0 = Some(first);
+            return;
+        }
+        if first == start {
+            // Nothing was under way: whatever came is this unit's own.
+            report.push(out, weakest(start, end), &source(start, end));
+            self.0 = None;
+            return;
+        }
+        // Still waiting at the end of the data is a lead the decoder
+        // gave up, which is in `out` already.
+        let waiting = !last && leaves_pending(encoding, &bytes(first, end + 1));
+        let width = end + 1 - start;
+        let all = bytes(first, end + 1);
+        let units: Vec<&[u8]> = all.chunks(width).collect();
+        let (characters, left) = attributed(encoding, &units, out, last, waiting);
+        for (text, a, b) in characters {
+            let (from, to) = (first + a * width, first + b * width + width - 1);
+            report.push(&text, weakest(from, to), &source(from, to));
+        }
+        self.0 = left.map(|unit| first + unit * width);
+    }
+}
+
+/// What a decoder fed `units` one at a time made of them, each character
+/// put with the first and last unit it was made of; and the unit the
+/// decoder was left waiting from, when it was. `out` is what it gave,
+/// all of it on taking in the last unit, having given nothing for those
+/// before; `last` whether the data ends there, and `waiting` whether it
+/// was left waiting on more.
+///
+/// The decoder gives more than one character at a unit when it gives up
+/// the units before it: the fewest it can, as a replacement character,
+/// and reads the rest afresh from the unit after them. So the units
+/// given up are looked for, from the fewest: those that on their own
+/// come to what `out` opens with, while the rest, fed afresh
+/// ([`pieces_of`]), come to the remainder, in pieces each finished by
+/// the unit the decoder gave it on, and leave the decoder waiting as it
+/// was left. A piece of more than one character is taken apart the same
+/// way. Where no such split accounts for `out`, it is one character of
+/// every unit: a code that stands for two characters, as Big5 has.
+fn attributed(encoding: &'static Encoding, units: &[&[u8]], out: &str, last: bool, waiting: bool) -> (Vec<(String, usize, usize)>, Option<usize>) {
+    if units.is_empty() {
+        return (Vec::new(), None);
+    }
+    let whole = || (vec![(out.to_owned(), 0, units.len() - 1)], None);
+    if units.len() == 1 || (!waiting && out.chars().nth(1).is_none()) {
+        return whole();
+    }
+    for given_up in 1..units.len() {
+        let head = decoded_alone(encoding, &units[..given_up].concat());
+        if head.is_empty() || !out.starts_with(head.as_str()) {
+            continue;
+        }
+        let (pieces, left) = pieces_of(encoding, &units[given_up..], last);
+        let rest: String = pieces.iter().map(|(text, _, _)| text.as_str()).collect();
+        if rest != out[head.len()..] || left.is_some() != waiting {
+            continue;
+        }
+        let mut characters = vec![(head, 0, given_up - 1)];
+        for (text, a, b) in pieces {
+            let (parts, _) = attributed(encoding, &units[given_up + a..=given_up + b], &text, false, false);
+            characters.extend(parts.into_iter().map(|(text, x, y)| (text, given_up + a + x, given_up + a + y)));
+        }
+        return (characters, left.map(|unit| given_up + unit));
+    }
+    whole()
+}
+
+/// `units` fed afresh to a decoder one at a time: each piece it gave,
+/// with the first unit since the piece before and the unit it gave the
+/// piece on; and the unit it was left waiting from, when it was. With
+/// `last` the data ends there, and the decoder is made to finish.
+fn pieces_of(encoding: &'static Encoding, units: &[&[u8]], last: bool) -> (Vec<(String, usize, usize)>, Option<usize>) {
+    let mut decoder = encoding.new_decoder_without_bom_handling();
+    let mut pieces = Vec::new();
+    let mut cut = 0;
+    for (k, unit) in units.iter().enumerate() {
+        let mut out = String::with_capacity(decoder.max_utf8_buffer_length(unit.len()).unwrap_or(4 * unit.len() + 16));
+        let _ = decoder.decode_to_string(unit, &mut out, last && k + 1 == units.len());
+        if !out.is_empty() {
+            pieces.push((out, cut, k));
+            cut = k + 1;
+        }
+    }
+    (pieces, (cut < units.len()).then_some(cut))
+}
+
+/// What `bytes` come to decoded on their own, as a whole: a character
+/// they leave unfinished is given up as a replacement character.
+fn decoded_alone(encoding: &'static Encoding, bytes: &[u8]) -> String {
+    let mut decoder = encoding.new_decoder_without_bom_handling();
+    let mut out = String::with_capacity(decoder.max_utf8_buffer_length(bytes.len()).unwrap_or(4 * bytes.len() + 16));
+    let _ = decoder.decode_to_string(bytes, &mut out, true);
+    out
+}
+
+/// Whether `bytes` end in a character left unfinished: one a decoder fed
+/// them would still be waiting on, and would give up were the data to
+/// end there.
+fn leaves_pending(encoding: &'static Encoding, bytes: &[u8]) -> bool {
+    let mut decoder = encoding.new_decoder_without_bom_handling();
+    let mut out = String::with_capacity(decoder.max_utf8_buffer_length(bytes.len()).unwrap_or(4 * bytes.len() + 16));
+    let _ = decoder.decode_to_string(bytes, &mut out, false);
+    let given = out.len();
+    out.reserve(decoder.max_utf8_buffer_length(0).unwrap_or(16));
+    let _ = decoder.decode_to_string(&[], &mut out, true);
+    out.len() > given
 }
 
 /// Decode an encoding whose code units are `unit` bytes wide, keeping the
@@ -899,57 +1134,53 @@ fn decode_bytes(codec: Codec, cells: &[Cell<u8>], at: (usize, usize), report: &m
 /// rather than at the next readable byte, which would garble everything
 /// after the gap.
 fn decode_fixed_width(codec: Codec, unit: usize, cells: &[Cell<u8>], at: (usize, usize), report: &mut TextReport) {
-    let mut decoder = match codec {
-        Codec::Rs(encoding) => Some(encoding.new_decoder_without_bom_handling()),
+    let encoding = match codec {
+        Codec::Rs(encoding) => Some(encoding),
         _ => None,
     };
+    let mut decoder = encoding.map(Encoding::new_decoder_without_bom_handling);
     let mut out = String::with_capacity(8);
     // A character may span two units (a surrogate pair), and inherits the
     // weakest of them.
-    let mut pending = Certainty::Verified;
-    // The cell the character under way began at.
-    let mut begun = None;
+    let mut begun = Begun::default();
+    // The source of a character made of cells `first` to `last`.
+    let source = |first: usize, last: usize| CharSource { segment: at.0, cell: at.1 + first, bits: cells[first].bits.start..cells[last].bits.end };
+    // The weakest certainty among cells `first` to `last`.
+    let weakest = |first: usize, last: usize| cells[first..=last].iter().map(|c| c.certainty).min().unwrap_or(Certainty::Unknown);
     let groups = cells.chunks(unit).count();
     for (n, group) in cells.chunks(unit).enumerate() {
         let (start, last) = (n * unit, n * unit + group.len() - 1);
-        let from = |first: usize| CharSource { segment: at.0, cell: at.1 + first, bits: cells[first].bits.start..cells[last].bits.end };
         let bytes: Option<Vec<u8>> = group.iter().map(|c| c.value).collect();
         let certainty = group.iter().map(|c| c.certainty).min().unwrap_or(Certainty::Unknown);
         match bytes {
-            Some(bytes) if bytes.len() == unit => {
-                pending = pending.min(certainty);
-                match codec {
-                    Codec::Utf32 { big_endian } => {
-                        let raw = bytes.iter().fold(0u32, |acc, &b| acc << 8 | u32::from(b));
-                        let raw = if big_endian { raw } else { raw.swap_bytes() };
-                        match char::from_u32(raw) {
-                            Some(ch) => report.push(ch.encode_utf8(&mut [0; 4]), pending, &from(start)),
-                            None => report.push_unknown(&from(start)),
-                        }
-                        pending = Certainty::Verified;
-                    }
-                    _ => {
-                        let decoder = decoder.as_mut().expect("an encoding_rs codec");
-                        out.clear();
-                        let first = *begun.get_or_insert(start);
-                        let _ = decoder.decode_to_string(&bytes, &mut out, n + 1 == groups);
-                        if !out.is_empty() {
-                            report.push(&out, pending, &from(first));
-                            pending = Certainty::Verified;
-                            begun = None;
-                        }
+            Some(bytes) if bytes.len() == unit => match codec {
+                Codec::Utf32 { big_endian } => {
+                    let raw = bytes.iter().fold(0u32, |acc, &b| acc << 8 | u32::from(b));
+                    let raw = if big_endian { raw } else { raw.swap_bytes() };
+                    match char::from_u32(raw) {
+                        Some(ch) => report.push(ch.encode_utf8(&mut [0; 4]), certainty, &source(start, last)),
+                        None => report.push_unknown(&source(start, last)),
                     }
                 }
-            }
+                _ => {
+                    let decoder = decoder.as_mut().expect("an encoding_rs codec");
+                    out.clear();
+                    let _ = decoder.decode_to_string(&bytes, &mut out, n + 1 == groups);
+                    // The units from cell `first` up to cell `end`, all
+                    // of them read: an unreadable one ends the character
+                    // under way below.
+                    let units = |first: usize, end: usize| cells[first..end].iter().map(|c| c.value.unwrap()).collect::<Vec<u8>>();
+                    let encoding = encoding.expect("an encoding_rs codec");
+                    begun.take_in(encoding, &out, start, last, n + 1 == groups, &units, &weakest, &source, report);
+                }
+            },
             _ => {
                 // A unit with an unreadable byte, or cut short by the end
                 // of the data. A character begun in the unit before is lost
                 // with it.
-                report.push_unknown(&from(begun.take().unwrap_or(start)));
-                pending = Certainty::Verified;
-                if let Codec::Rs(encoding) = codec {
-                    decoder = Some(encoding.new_decoder_without_bom_handling());
-                }
+                let first = begun.0.take().unwrap_or(start);
+                report.push_unknown(&source(first, last));
+                decoder = encoding.map(Encoding::new_decoder_without_bom_handling);
             }
         }
     }
@@ -1290,9 +1521,16 @@ mod tests {
         bytes.iter().map(|&b| Some(b)).collect()
     }
 
+    /// A control segment of `content`, in the mode the parser gives one.
     fn control(content: SegmentContent) -> Segment {
+        let mode = match content {
+            SegmentContent::Fnc1First => Mode::Fnc1First,
+            SegmentContent::Fnc1Second(_) => Mode::Fnc1Second,
+            SegmentContent::StructuredAppend { .. } => Mode::StructuredAppend,
+            _ => Mode::Eci,
+        };
         Segment {
-            mode: Mode::Eci,
+            mode,
             header: 0..0,
             payload: 0..0,
             count: None,
@@ -1511,26 +1749,37 @@ mod tests {
         assert_eq!(report.symbology.as_deref(), Some("]Q1"));
     }
 
-    #[test]
-    fn fnc1_puts_group_separators_in_alphanumeric_data() {
-        let alnum = |text: &str| {
-            let cells = text
-                .chars()
+    /// An alphanumeric segment of `cells`, six bits to a character.
+    fn alnum_cells(cells: Vec<Cell<char>>) -> Segment {
+        Segment {
+            mode: Mode::Alphanumeric,
+            header: 0..0,
+            payload: 0..0,
+            count: Some(cells.len()),
+            header_certainty: Certainty::Verified,
+            content: SegmentContent::Chars(cells),
+            damaged: false,
+            truncated: false,
+            header_inferred: false,
+        }
+    }
+
+    /// An alphanumeric segment holding `text`, every character verified.
+    fn alnum(text: &str) -> Segment {
+        alnum_cells(
+            text.chars()
                 .enumerate()
                 .map(|(i, ch)| Cell { value: Some(ch), certainty: Certainty::Verified, bits: 6 * i..6 * i + 6 })
-                .collect();
-            Segment {
-                mode: Mode::Alphanumeric,
-                header: 0..0,
-                payload: 0..0,
-                count: Some(text.len()),
-                header_certainty: Certainty::Verified,
-                content: SegmentContent::Chars(cells),
-                damaged: false,
-                truncated: false,
-                header_inferred: false,
-            }
-        };
+                .collect(),
+        )
+    }
+
+    fn xor(bytes: &[u8]) -> u8 {
+        bytes.iter().fold(0, |a, &b| a ^ b)
+    }
+
+    #[test]
+    fn fnc1_puts_group_separators_in_alphanumeric_data() {
         let report = decode_text(&[control(SegmentContent::Fnc1First), alnum("0112345%10ABC%%5%")], Charset::Auto);
         assert_eq!(report.plain(), "0112345\u{1D}10ABC%5\u{1D}");
         assert_eq!(report.symbology.as_deref(), Some("]Q3"));
@@ -1539,11 +1788,13 @@ mod tests {
         let gs1 = report.gs1.as_ref().unwrap();
         assert!(gs1.problems.iter().any(|p| p.contains("(01)")), "{:?}", gs1.problems);
         assert!(report.notes.iter().any(|n| n.starts_with("GS1:")));
-        assert_eq!(report.parity, Some(b"0112345%10ABC%%5%".iter().fold(0, |a, &b| a ^ b)));
+        // The parity is of the input the segment spells, not its spelling.
+        assert_eq!(report.parity, Some(xor(b"0112345\x1D10ABC%5\x1D")));
         // Without FNC1 the percent signs are themselves.
         let report = decode_text(&[alnum("50%%")], Charset::Auto);
         assert_eq!(report.plain(), "50%%");
         assert_eq!(report.symbology.as_deref(), Some("]Q1"));
+        assert_eq!(report.parity, Some(xor(b"50%%")));
         // FNC1 in second position: the indicator is transmitted ahead of
         // the data and named, and ECI lifts the modifier.
         let report = decode_text(
@@ -1551,8 +1802,8 @@ mod tests {
             Charset::Auto,
         );
         assert_eq!(report.plain(), "AA\u{1D}B");
-        assert_eq!(report.hex(), "41 41 25 42");
-        assert_eq!(report.parity, Some(b'A' ^ b'%' ^ b'B'), "the indicator is not message data");
+        assert_eq!(report.hex(), "41 41 1D 42");
+        assert_eq!(report.parity, Some(b'A' ^ 0x1D ^ b'B'), "the indicator is not message data");
         assert_eq!(report.symbology.as_deref(), Some("]Q6"));
         assert!(report.notes.iter().any(|n| n.contains("application indicator A")), "{:?}", report.notes);
         let report = decode_text(&[control(SegmentContent::Fnc1Second(150))], Charset::Auto);
@@ -1743,5 +1994,216 @@ mod tests {
         assert_eq!((report.plain().as_str(), report.encoding.as_deref()), ("РС", Some("ISO-8859-5 (chosen)")));
         assert_eq!(Charset::Eci(14).label(), "unsupported");
         assert!(Charset::Eci(14).codec().is_none());
+    }
+
+    /// Each character of the message with the cell it was made from and
+    /// the stream bits it spans.
+    fn sources_of(report: &TextReport) -> Vec<(char, usize, Range<usize>)> {
+        report.plain().chars().zip(&report.sources).map(|(ch, s)| (ch, s.cell, s.bits.clone())).collect()
+    }
+
+    #[test]
+    fn a_character_after_a_bad_lead_is_of_its_own_bytes() {
+        let cells = |bytes: &[u8]| byte_segment(&known(bytes), Certainty::Verified);
+        let bits = |first: usize, last: usize| 8 * first..8 * last + 8;
+        let bad = '\u{FFFD}';
+        // UTF-8: a lead that 'A' cannot follow is given up as a
+        // replacement character, and 'A' is 'A', of its own byte. Both
+        // were once put under the lead's byte, and a pin made by
+        // clicking the 'A' landed there.
+        let report = decode_text(&[cells(b"\xC3A")], Charset::Utf8);
+        assert_eq!(sources_of(&report), [(bad, 0, bits(0, 0)), ('A', 1, bits(1, 1))]);
+        // A lead given up for another lead: the second begins the next
+        // character, and is not the end of the first.
+        let report = decode_text(&[cells(b"\xC3\xC3A")], Charset::Utf8);
+        assert_eq!(sources_of(&report), [(bad, 0, bits(0, 0)), (bad, 1, bits(1, 1)), ('A', 2, bits(2, 2))]);
+        // Two bytes of a three-byte character given up as one.
+        let report = decode_text(&[cells(b"\xE3\x81A")], Charset::Utf8);
+        assert_eq!(sources_of(&report), [(bad, 0, bits(0, 1)), ('A', 2, bits(2, 2))]);
+        // A lead at the very end of the data is given up there.
+        let report = decode_text(&[cells(b"A\xC3")], Charset::Utf8);
+        assert_eq!(sources_of(&report), [('A', 0, bits(0, 0)), (bad, 1, bits(1, 1))]);
+        // A whole character spans its bytes still.
+        let report = decode_text(&[cells("aé".as_bytes())], Charset::Utf8);
+        assert_eq!(sources_of(&report), [('a', 0, bits(0, 0)), ('é', 1, bits(1, 2))]);
+        // Shift_JIS: a lead and a byte that is no trail, which is read on
+        // its own; then a lead and a trail that make no character, given
+        // up together.
+        let report = decode_text(&[cells(b"\x81 ")], Charset::ShiftJis);
+        assert_eq!(sources_of(&report), [(bad, 0, bits(0, 0)), (' ', 1, bits(1, 1))]);
+        let report = decode_text(&[cells(b"\x81\xAD@")], Charset::ShiftJis);
+        assert_eq!(sources_of(&report), [(bad, 0, bits(0, 1)), ('@', 2, bits(2, 2))]);
+        // GB18030: a lead, a digit that makes it the first of four
+        // bytes, and a byte that can be neither the third of those nor
+        // the second of anything. The lead is given up alone, and the
+        // digit and the byte are read over again, each its own; the
+        // digit was once put under the byte's cell with it. The same
+        // where the two read over again make a character of two bytes,
+        // and where a lead among them is left waiting, which begins the
+        // next character and is given up at the end of the data, the
+        // two digits after it read over again there.
+        let report = decode_text(&[cells(b"\x81\x30A")], Charset::Gb18030);
+        assert_eq!(sources_of(&report), [(bad, 0, bits(0, 0)), ('0', 1, bits(1, 1)), ('A', 2, bits(2, 2))]);
+        let report = decode_text(&[cells(b"\x81\x30\x81A")], Charset::Gb18030);
+        assert_eq!(sources_of(&report), [(bad, 0, bits(0, 0)), ('0', 1, bits(1, 1)), ('丄', 2, bits(2, 3))]);
+        let report = decode_text(&[cells(b"\x81\x30\x30\x81\x30\x30")], Charset::Gb18030);
+        assert_eq!(
+            sources_of(&report),
+            [(bad, 0, bits(0, 0)), ('0', 1, bits(1, 1)), ('0', 2, bits(2, 2)), (bad, 3, bits(3, 3)), ('0', 4, bits(4, 4)), ('0', 5, bits(5, 5))]
+        );
+        let report = decode_text(&[cells(b"\x81\x30\x30\x81\x30\x30\x81\x30A")], Charset::Gb18030);
+        assert_eq!(report.plain(), format!("{bad}00{bad}00{bad}0A"));
+        assert_eq!(sources_of(&report).iter().map(|(_, cell, _)| *cell).collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        // Each character read over again has the certainty of its own
+        // bytes, not the lead's.
+        let mut seg = byte_segment(&[], Certainty::Verified);
+        seg.content = SegmentContent::Bytes(vec![
+            Cell { value: Some(0x81), certainty: Certainty::Unverified, bits: 0..8 },
+            Cell { value: Some(0x30), certainty: Certainty::Verified, bits: 8..16 },
+            Cell { value: Some(b'A'), certainty: Certainty::Verified, bits: 16..24 },
+        ]);
+        let report = decode_text(&[seg], Charset::Gb18030);
+        assert_eq!(
+            report.spans,
+            [
+                TextSpan { text: bad.to_string(), certainty: Certainty::Unverified },
+                TextSpan { text: "0A".to_owned(), certainty: Certainty::Verified },
+            ]
+        );
+        // The certainty of what the lead's bytes come to is theirs, and
+        // of the character after it its own.
+        let mut seg = byte_segment(&[], Certainty::Verified);
+        seg.content = SegmentContent::Bytes(vec![
+            Cell { value: Some(0xC3), certainty: Certainty::Unverified, bits: 0..8 },
+            Cell { value: Some(0xC3), certainty: Certainty::Verified, bits: 8..16 },
+            Cell { value: Some(b'A'), certainty: Certainty::Verified, bits: 16..24 },
+        ]);
+        let report = decode_text(&[seg], Charset::Utf8);
+        assert_eq!(
+            report.spans,
+            [
+                TextSpan { text: bad.to_string(), certainty: Certainty::Unverified },
+                TextSpan { text: format!("{bad}A"), certainty: Certainty::Verified },
+            ]
+        );
+        // UTF-16: an unpaired high surrogate, then 'A' in the unit after
+        // it; a pair that is one character spans both units.
+        let utf16 = control(SegmentContent::Eci(Some(25)));
+        let report = decode_text(&[utf16.clone(), cells(b"\xD8\x00\x00A")], Charset::Auto);
+        assert_eq!(sources_of(&report), [(bad, 0, bits(0, 1)), ('A', 2, bits(2, 3))]);
+        let report = decode_text(&[utf16, cells(b"\xD8\x3D\xDE\x00")], Charset::Auto);
+        assert_eq!(sources_of(&report), [('\u{1F600}', 0, bits(0, 3))]);
+        // A code that stands for two characters is of its two bytes, both
+        // of them: nothing was given up.
+        let report = decode_text(&[cells(b"\x88\x62")], Charset::Big5);
+        assert_eq!(sources_of(&report), [('Ê', 0, bits(0, 1)), ('\u{304}', 0, bits(0, 1))]);
+    }
+
+    #[test]
+    fn fnc1_in_second_position_holds_with_its_indicator_unreadable() {
+        // The eight bits of the application indicator unknown: the
+        // segment's mode says FNC1 in second position and its content
+        // says nothing. The convention on alphanumeric data holds, the
+        // symbology identifier says FNC1, the parity is over the data,
+        // and a note says the indicator is unknown. Told by the content
+        // alone, the segment was once no FNC1, and the percent sign
+        // stood for itself.
+        let unreadable = Segment { mode: Mode::Fnc1Second, ..control(SegmentContent::Unreadable) };
+        let report = decode_text(&[unreadable, alnum("A%B")], Charset::Auto);
+        assert_eq!(report.plain(), "A\u{1D}B");
+        assert_eq!(report.symbology.as_deref(), Some("]Q5"));
+        assert_eq!(report.parity, Some(b'A' ^ 0x1D ^ b'B'));
+        assert!(
+            report.notes.iter().any(|n| n.starts_with("FNC1 in second position with its application indicator unreadable")),
+            "{:?}",
+            report.notes
+        );
+        // An unreadable structured append header is no data either, and
+        // the parity of this symbol's own data is known.
+        let header = Segment { mode: Mode::StructuredAppend, ..control(SegmentContent::Unreadable) };
+        let report = decode_text(&[header, alnum("AB")], Charset::Auto);
+        assert_eq!(report.parity, Some(b'A' ^ b'B'));
+        assert!(report.notes.iter().any(|n| n.starts_with("Structured append with its header unreadable")), "{:?}", report.notes);
+    }
+
+    #[test]
+    fn a_separator_before_an_unreadable_character_is_a_guess() {
+        // Under FNC1 a percent sign is the group separator unless another
+        // follows it, and what follows this one could not be read.
+        let segment = alnum_cells(vec![
+            Cell { value: Some('%'), certainty: Certainty::Verified, bits: 0..6 },
+            Cell { value: None, certainty: Certainty::Unknown, bits: 6..12 },
+            Cell { value: Some('A'), certainty: Certainty::Verified, bits: 12..18 },
+        ]);
+        let report = decode_text(&[control(SegmentContent::Fnc1First), segment], Charset::Auto);
+        assert_eq!(report.plain(), "\u{1D}\u{FFFD}A");
+        assert_eq!(report.counts(), (1, 0, 2));
+        assert_eq!(report.spans[0].certainty, Certainty::Unknown);
+        // Before a character that was read, the separator is as sure as
+        // the two of them; at the end of the segment, as the sign itself.
+        let report = decode_text(&[control(SegmentContent::Fnc1First), alnum("%A%")], Charset::Auto);
+        assert_eq!(report.plain(), "\u{1D}A\u{1D}");
+        assert_eq!(report.counts(), (3, 0, 0));
+    }
+
+    #[test]
+    fn an_unreadable_designator_undoes_the_one_before_it() {
+        // ISO-8859-5 declared, then a designator whose value could not be
+        // read: the bytes after it are of a set no one knows, and are
+        // read as bytes no designator covers, in the set chosen.
+        let segments = [
+            control(SegmentContent::Eci(Some(7))),
+            byte_segment(&known(&[0xC0, 0xC1]), Certainty::Verified),
+            control(SegmentContent::Eci(None)),
+            byte_segment(&known(&[0xC0, 0xC1]), Certainty::Verified),
+        ];
+        let report = decode_text(&segments, Charset::Latin1);
+        assert_eq!(report.plain(), "РСÀÁ");
+        assert_eq!(report.encoding.as_deref(), Some("ISO-8859-5 (ECI), ISO-8859-1 (chosen)"));
+        assert!(report.notes.iter().any(|n| n.starts_with("An ECI designator is unreadable")), "{:?}", report.notes);
+        // Text pinned in either run is encoded as that run is read.
+        assert_eq!(encode_as_read(&segments, 1, Charset::Latin1, "С"), Ok(vec![0xC1]));
+        assert_eq!(encode_as_read(&segments, 3, Charset::Latin1, "Á"), Ok(vec![0xC1]));
+        assert_eq!(encode_as_read(&segments, 3, Charset::Latin1, "С"), Err('С'));
+        // With no set chosen the set is guessed, from the bytes before
+        // any designator, of which there are none here.
+        let report = decode_text(&segments, Charset::Auto);
+        assert_eq!(report.plain(), "РС\u{FFFD}\u{FFFD}");
+        assert_eq!(report.encoding.as_deref(), Some("ISO-8859-5 (ECI), UTF-8 (guessed)"));
+        assert_eq!(encode_as_read(&segments, 3, Charset::Auto, "é"), Ok(vec![0xC3, 0xA9]));
+    }
+
+    #[test]
+    fn structured_append_parity_is_over_the_input_and_not_its_spelling() {
+        // Under FNC1 an alphanumeric segment spells the input
+        // "01095<GS>10ABC%5" as "01095%10ABC%%5": the parity is of the
+        // input, as the encoder took it before it wrote either.
+        let report = decode_text(&[control(SegmentContent::Fnc1First), alnum("01095%10ABC%%5")], Charset::Auto);
+        assert_eq!(report.plain(), "01095\u{1D}10ABC%5");
+        assert_eq!(report.parity, Some(xor(b"01095\x1D10ABC%5")));
+        // The bytes shown are the input too, so that they XOR to the
+        // parity: they were once the spelling.
+        assert_eq!(report.hex(), "30 31 30 39 35 1D 31 30 41 42 43 25 35");
+        let shown: Option<Vec<u8>> = report.bytes.iter().copied().collect();
+        assert_eq!(shown.as_deref().map(xor), report.parity);
+        // A sign that ends the segment is a separator too.
+        let report = decode_text(&[control(SegmentContent::Fnc1First), alnum("AB%")], Charset::Auto);
+        assert_eq!(report.parity, Some(xor(b"AB\x1D")));
+        // In second position the same, and the indicator stays out of it.
+        let report = decode_text(&[control(SegmentContent::Fnc1Second(42)), alnum("%%")], Charset::Auto);
+        assert_eq!((report.plain().as_str(), report.parity), ("42%", Some(b'%')));
+        // Without FNC1, and in the other modes, the characters are their
+        // own bytes.
+        assert_eq!(decode_text(&[alnum("A%%")], Charset::Auto).parity, Some(xor(b"A%%")));
+        let mut numeric = alnum("123");
+        numeric.mode = Mode::Numeric;
+        assert_eq!(decode_text(&[control(SegmentContent::Fnc1First), numeric], Charset::Auto).parity, Some(xor(b"123")));
+        // An unreadable character leaves it unknown.
+        let segment = alnum_cells(vec![
+            Cell { value: Some('%'), certainty: Certainty::Verified, bits: 0..6 },
+            Cell { value: None, certainty: Certainty::Unknown, bits: 6..12 },
+        ]);
+        let report = decode_text(&[control(SegmentContent::Fnc1First), segment], Charset::Auto);
+        assert_eq!((report.parity, report.hex().as_str()), (None, "1D ??"));
     }
 }

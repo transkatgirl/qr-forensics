@@ -116,8 +116,11 @@
 //! names the image, the family and version, whether the symbol was light
 //! on dark or mirrored, how the read stands, with `--details` what it
 //! settled, with `--corners` where it lies, and the message: as text,
-//! with `--escaped` the control characters spelt out, or with `--hex` the
-//! message's bytes. A read stands as `read` when every block is confirmed
+//! but for its control characters other than tab, spelt out as `<CR>`
+//! and `<LF>` are, so that a line break inside a message keeps the
+//! symbol to its line; with `--escaped` every control character and the
+//! unreadable mark spelt out; or with `--hex` the message's bytes. A
+//! read stands as `read` when every block is confirmed
 //! and the message parses; `read, padding pinned` when it is that only
 //! with the filler after a short message taken as known, which the
 //! standard fixes, and an encoder that fills otherwise fixes as well
@@ -158,7 +161,7 @@ use std::sync::Arc;
 use qr_forensics::decode::padding::{Filler, pinned_filler};
 use qr_forensics::decode::pipeline::{DecodeOptions, VERIFIED_RISK_BITS};
 use qr_forensics::decode::sequence::{ParityCheck, Part, Sequence};
-use qr_forensics::decode::text::Charset;
+use qr_forensics::decode::text::{Charset, escape_controls};
 use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::adjust::Enlarge;
 use qr_forensics::imaging::detect::{Lead, SearchParams, search_for_families};
@@ -173,7 +176,10 @@ use qr_forensics::work;
 
 const USAGE: &str = "usage: qr-forensics decode [--family qr|micro|rmqr|model1] [--outline x,y,x,y,x,y,x,y] \
                      [--hex | --escaped] [--charset name] [--corners] [--details] [--grid] [--partial] \
-                     [--surface] [--enlarge n] [--sharpen light|strong] [--full-search] [--] <image>...";
+                     [--surface] [--enlarge n] [--sharpen light|strong] [--full-search] [--] <image>...\n\
+                     A message is printed on its symbol's line, its control characters other than tab spelt out as \
+                     <CR>, <LF> and so on; --escaped spells out every one and the unreadable mark, --hex prints the \
+                     bytes.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Show {
@@ -475,6 +481,19 @@ fn risk_warning(path: &Path, result: &ReadResult) -> Option<String> {
     ))
 }
 
+/// The message as the default output prints it: as it is, but for its
+/// control characters other than tab, spelt out as `--escaped` spells
+/// them, so that a line break inside a message, as a vCard or an
+/// iCalendar entry has, keeps the symbol to its one line, and a row of
+/// `--grid` below it is never taken for part of the message. Tab stays,
+/// a field separator a line keeps, and so does the unreadable mark,
+/// which `--escaped` alone spells out.
+fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|ch| if ch.is_control() && ch != '\t' { escape_controls(ch.encode_utf8(&mut [0; 4])) } else { ch.to_string() })
+        .collect()
+}
+
 /// One symbol's line: the image, what was found, how the read stands,
 /// what it settled when `details` is asked, where it lies when `corners`
 /// is, in the pixels of a photo read at `times` its size, and the
@@ -489,7 +508,7 @@ fn describe(path: &Path, result: &ReadResult, options: &Options, times: f64) -> 
         what.push_str(", mirrored");
     }
     let message = match options.show {
-        Show::Text => result.text(),
+        Show::Text => one_line(&result.text()),
         Show::Hex => result.report.text.hex(),
         Show::Escaped => result.report.text.escaped(),
     };
@@ -545,7 +564,7 @@ fn describe_sequence(path: &Path, sequence: &Sequence, show: Show) -> String {
         ParityCheck::Empty | ParityCheck::Incomplete { .. } => String::new(),
     };
     let message = match show {
-        Show::Text => sequence.assembled().plain(),
+        Show::Text => one_line(&sequence.assembled().plain()),
         Show::Hex => sequence.hex(),
         Show::Escaped => sequence.assembled().escaped(),
     };
@@ -568,6 +587,13 @@ pub fn run(args: &[OsString]) -> i32 {
     run_to(args, &mut std::io::stdout().lock())
 }
 
+/// A line for standard error, when it takes one: with it closed there is
+/// no one to tell, and the status says what happened, where `eprintln!`
+/// would end the run in a panic instead.
+fn warn(message: &str) {
+    let _ = writeln!(std::io::stderr(), "{message}");
+}
+
 /// [`run`], printing what is read to `out`. When `out` takes no more, as
 /// a pipe whose reader has gone does not, the run stops quietly with the
 /// status so far: `println!` would panic there, and there is no one left
@@ -581,8 +607,8 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
             return 0;
         }
         Err(Unparsed::Bad(message)) => {
-            eprintln!("{message}");
-            eprintln!("{USAGE}");
+            warn(&message);
+            warn(USAGE);
             return 2;
         }
     };
@@ -595,7 +621,7 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
         let (luma, times) = match load(path) {
             Ok(loaded) => loaded,
             Err(message) => {
-                eprintln!("{}: {message}", path.display());
+                warn(&format!("{}: {message}", path.display()));
                 status = status.max(2);
                 continue;
             }
@@ -655,7 +681,7 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
                 return status;
             }
             if let Some(warning) = risk_warning(path, result) {
-                eprintln!("{warning}");
+                warn(&warning);
             }
             if options.grid {
                 for line in grid_lines(result) {
@@ -762,6 +788,15 @@ mod tests {
         let model1: Vec<OsString> = ["--family", "model1", "a.png"].iter().map(OsString::from).collect();
         let options = parse(&model1).unwrap();
         assert_eq!((options.family, options.outline), (Some(Family::Model1), None));
+    }
+
+    #[test]
+    fn the_default_output_keeps_a_message_to_its_line() {
+        // A line break, a group separator and an escape are spelt out;
+        // a tab, the unreadable mark and everything printable stay.
+        assert_eq!(one_line("BEGIN:VCARD\r\nN:A\tB\u{1D}\u{1B}\u{FFFD}é"), "BEGIN:VCARD<CR><LF>N:A\tB<GS><ESC>\u{FFFD}é");
+        assert_eq!(one_line("plain"), "plain");
+        assert_eq!(one_line(""), "");
     }
 
     #[test]

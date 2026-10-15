@@ -396,21 +396,35 @@ fn terminator_pins(layout: &SymbolLayout, end_bit: usize, first_pad: usize, pins
         let upto = (8 * (j + 1)).min(stop);
         let mask = (bit..upto).fold(0u8, |m, b| m | 0x80 >> (b % 8)) & codeword_bit_mask(layout, cw);
         bit = upto;
-        match pins.get(&cw) {
+        let pin = match pins.get(&cw) {
+            // Header bits inferred in the same codeword, where a segment
+            // of four bits, FNC1 in first position say, ends the data:
+            // the terminator's bits join them, under the header's name,
+            // which is left as it is. A codeword pinned by hand, or by
+            // the padding, is left alone. The codeword was once left
+            // alone whatever had pinned it, and the terminator's bits
+            // beside a header's went unpinned.
+            Some(existing) if existing.source == PinSource::Header => {
+                if existing.value & mask != 0 {
+                    continue;
+                }
+                Pin { mask: existing.mask | mask, ..*existing }
+            }
             Some(existing) if existing.source != PinSource::Terminator => continue,
-            Some(existing) if existing.mask == mask && existing.value & mask == 0 => continue,
-            _ => {}
+            _ => Pin { mask, value: 0, source: PinSource::Terminator },
+        };
+        if pins.get(&cw) != Some(&pin) {
+            pins.insert(cw, pin);
+            changed += 1;
         }
-        pins.insert(cw, Pin { mask, value: 0, source: PinSource::Terminator });
-        changed += 1;
     }
     changed
 }
 
 /// Pin the header bits that every clean reading of an unreadable header
 /// agrees on, as (stream bit, value) pairs. A codeword already pinned
-/// from another source is left alone. Returns how many codewords gained
-/// pinned bits.
+/// from another source than the terminator's is left alone. Returns how
+/// many codewords gained pinned bits.
 fn header_pins(layout: &SymbolLayout, inferred: &[(usize, bool)], pins: &mut Pins) -> usize {
     let mut changed = std::collections::BTreeSet::new();
     for &(bit, value) in inferred {
@@ -421,8 +435,16 @@ fn header_pins(layout: &SymbolLayout, inferred: &[(usize, bool)], pins: &mut Pin
             continue;
         }
         let mut pin = match pins.get(&cw) {
-            Some(existing) if existing.source != PinSource::Header => continue,
-            Some(existing) => *existing,
+            Some(existing) if existing.source == PinSource::Header => *existing,
+            // The terminator's bits in the same codeword, pinned before
+            // the header was inferred: the header's join them, and the
+            // codeword goes under the header's name, which the terminator
+            // then leaves as it is ([`terminator_pins`]). Under the
+            // terminator's name it would be pinned afresh as the
+            // terminator alone each pass, and the header laid over it
+            // again, with no end.
+            Some(existing) if existing.source == PinSource::Terminator => Pin { source: PinSource::Header, ..*existing },
+            Some(_) => continue,
             None => Pin { mask: 0, value: 0, source: PinSource::Header },
         };
         let before = pin;
@@ -637,4 +659,52 @@ pub fn pinned_filler(layout: &SymbolLayout, report: &DecodeReport, pins: &Pins) 
 /// Drop every pin that padding recovery placed.
 pub fn clear_padding_pins(pins: &mut Pins) {
     pins.retain(|_, pin| pin.source.is_by_hand());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::symbol::function_map::FunctionMap;
+    use crate::symbol::{EcLevel, SymbolVersion};
+
+    #[test]
+    fn header_and_terminator_bits_share_a_codeword() {
+        // FNC1 in first position is a segment of four bits and no more,
+        // and the terminator follows it in the same codeword: the header
+        // inferred and the terminator each want bits of stream codeword
+        // 1, bits 8 to 11 and 12 to 15. Laid in either order, the two
+        // sets of bits end up in one pin, under the header's name; laid
+        // again, nothing changes. Each once left the codeword alone
+        // where the other had pinned it, and the bits went unpinned.
+        let layout = SymbolLayout::new(Arc::new(FunctionMap::new(SymbolVersion::Qr(1))), EcLevel::L).unwrap();
+        let cw = layout.data_stream[1];
+        let inferred = [(8, false), (9, true), (10, false), (11, true)];
+        let both = Pin { mask: 0xFF, value: 0x50, source: PinSource::Header };
+
+        let mut pins = Pins::new();
+        assert_eq!(terminator_pins(&layout, 12, 2, &mut pins), 1);
+        assert_eq!(pins[&cw], Pin { mask: 0x0F, value: 0, source: PinSource::Terminator });
+        assert_eq!(header_pins(&layout, &inferred, &mut pins), 1);
+        assert_eq!(pins[&cw], both);
+        assert_eq!(terminator_pins(&layout, 12, 2, &mut pins), 0);
+        assert_eq!(header_pins(&layout, &inferred, &mut pins), 0);
+        assert_eq!(pins[&cw], both);
+
+        let mut pins = Pins::new();
+        assert_eq!(header_pins(&layout, &inferred, &mut pins), 1);
+        assert_eq!(terminator_pins(&layout, 12, 2, &mut pins), 1);
+        assert_eq!((pins[&cw], pins.len()), (both, 1));
+
+        // A pin by hand, or the padding's, is left alone by both.
+        for source in [PinSource::Manual, PinSource::Text, PinSource::Padding] {
+            let mut pins = Pins::new();
+            let held = Pin { mask: 0xFF, value: 0xEC, source };
+            pins.insert(cw, held);
+            assert_eq!(terminator_pins(&layout, 12, 2, &mut pins), 0);
+            assert_eq!(header_pins(&layout, &inferred, &mut pins), 0);
+            assert_eq!(pins[&cw], held);
+        }
+    }
 }

@@ -1184,6 +1184,11 @@ fn codewords_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
             ui.label(mono(format!("{value:02X} {value:08b}")));
         }
     });
+    // A pin in the document is the user's to take away, whether it was
+    // typed in, laid from known text, or taken over from padding recovery
+    // by Pin the padding, which keeps the source each came with. One the
+    // decoder placed by itself is in the report alone.
+    let in_document = app.doc.pins_ec == Some(app.derived.ec) && app.doc.pins.contains_key(&cw);
     ui.horizontal(|ui| {
         ui.label("Pin to");
         ui.add(egui::TextEdit::singleline(&mut view.pin_text).desired_width(44.0).hint_text("hex").font(egui::TextStyle::Monospace));
@@ -1196,8 +1201,22 @@ fn codewords_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
         {
             actions.push(Action::Pin(cw, value));
         }
-        if item.pin.is_some() && ui.button("Unpin").clicked() {
-            actions.push(Action::Unpin(cw));
+        match item.pin {
+            Some(_) if in_document => {
+                if ui.button("Unpin").clicked() {
+                    actions.push(Action::Unpin(cw));
+                }
+            }
+            // A pin the decoder placed is placed again by the next
+            // decode: there is nothing to unpin by hand.
+            Some(_) => {
+                ui.label("pinned by padding recovery").on_hover_text(
+                    "Placed by the decoder, under Pin the padding and headers found in Decoding, and placed again by \
+                     every decode. Untick that to drop the pins it places, or press Pin the padding under Padding \
+                     recovery to take them into the document, where each can be unpinned.",
+                );
+            }
+            None => {}
         }
     });
     // Bit by bit: a pin holds any of a codeword's bits, and what is known

@@ -157,10 +157,13 @@ impl Document {
     }
 
     /// A fresh grid at `version` that keeps the photo outline and
-    /// adjustments. Anchors name modules of the old version and do not
-    /// carry over.
+    /// adjustments, and the anchors too while `version` is this
+    /// document's own: they pin the fixed patterns to the photo, and a
+    /// grid of the same version has those in the same places. Anchors
+    /// name modules of their version, and do not carry over to another.
     pub fn blank_like(&self, version: SymbolVersion) -> Self {
-        Self { corners: self.corners, adjust: self.adjust, ..Self::blank(version) }
+        let anchors = if version == self.version { self.anchors.clone() } else { Vec::new() };
+        Self { corners: self.corners, anchors, adjust: self.adjust, ..Self::blank(version) }
     }
 
     /// The anchors as control points of the projection.

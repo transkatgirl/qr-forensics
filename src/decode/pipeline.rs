@@ -524,32 +524,51 @@ struct Candidate {
     outcome: BlockOutcome,
     corrected: Vec<u8>,
     doubted: Vec<u8>,
-    /// Decodes the solver made to reach it, at the most: what the soft
-    /// count is charged for.
-    tries: usize,
+    /// What the decodes made to reach it cost, in bits ([`tries_charge`]):
+    /// those its solver made, at the most, and those of which this
+    /// decode is one ([`DecodeOptions::tries`]), as the hard count is
+    /// charged for them ([`RsSolution::charge`]). The soft count is
+    /// charged the same, and a bit for the choice between the two
+    /// counts ([`Candidate::weigh`]), so that the two stand on one
+    /// footing and neither is the lenient one. The soft count was once
+    /// charged for the solver's decodes alone, and under a search of
+    /// every format a solution the fallbacks found stood on it as
+    /// verified where the hard count, charged for the search, fell
+    /// short of it.
+    charge: u32,
     /// Bits of risk on its own ([`Candidate::weigh`]), before any other
     /// codeword found is held against it.
     alone: u32,
+    /// Bits of risk it may stand on once the message has told it from
+    /// its rivals ([`arbitrate`]): `alone`, or less where another
+    /// codeword found, not among the rivals, holds it down still: one as
+    /// near the block as read as they are but left out for their number,
+    /// or one further from the nearest than the tie allows and yet near
+    /// this one. Set where it is offered as a rival ([`rivals_among`]).
+    held: u32,
     /// Found by searching the block with the message's evidence laid
     /// over it ([`Candidate::restated`]).
     guided: bool,
 }
 
 impl Candidate {
-    fn new(outcome: BlockOutcome, corrected: Vec<u8>, doubted: Vec<u8>, tries: usize) -> Self {
-        Self { outcome, corrected, doubted, tries, alone: 0, guided: false }
+    fn new(outcome: BlockOutcome, corrected: Vec<u8>, doubted: Vec<u8>, charge: u32) -> Self {
+        Self { outcome, corrected, doubted, charge, alone: 0, held: 0, guided: false }
     }
 
     /// The candidate, found by searching the block with the message's
     /// evidence laid over it, confirmed against `block` instead, the
     /// block as read with its unread bits at their lean ([`Laid::judged`],
     /// [`judged`]): its errors, erasures and slack, and what confirms
-    /// it, are what that block makes of its codeword, charged for its
-    /// tries twice over, since the block was searched twice. None when
-    /// that block refuses it, or confirms too little of it to offer.
+    /// it, are what that block makes of its codeword, charged a bit more
+    /// for its tries, since the block was searched twice; and it carries
+    /// that charge, so that the soft count is charged the same when it
+    /// is weighed ([`Candidate::weigh`]). None when that block refuses
+    /// it, or confirms too little of it to offer.
     fn restated(self, block: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: usize, reserved: usize) -> Option<Self> {
         let BlockOutcome::Solved { method, .. } = self.outcome else { return Some(self) };
-        let solution = judged(block, bit_reliability, ec_len, reserved, self.corrected, self.tries.saturating_mul(2))?;
+        let charge = self.charge + 1;
+        let solution = judged(block, bit_reliability, ec_len, reserved, self.corrected, charge)?;
         let outcome = BlockOutcome::Solved {
             method,
             errors: solution.errors,
@@ -559,21 +578,22 @@ impl Candidate {
             risk_bits: 0,
             beyond_standard: !solution.within_standard(),
         };
-        Some(Self { outcome, corrected: solution.corrected, guided: true, ..Self::new(outcome, Vec::new(), self.doubted, self.tries) })
+        Some(Self { outcome, corrected: solution.corrected, guided: true, ..Self::new(outcome, Vec::new(), self.doubted, charge) })
     }
 
     /// The candidate weighed on its own: its risk is what its solver
     /// counted for it ([`BlockOutcome::confidence_bits`]), or the soft
     /// count ([`soft_count_bits`]) for the bits it overturns weighed by
-    /// their reliability, charged for the tries and one for the choice
-    /// between the two counts, whichever is the more; less
+    /// their reliability, charged for the decodes as the solver's count
+    /// is ([`Candidate::charge`]) and one for the choice between the two
+    /// counts, whichever is the more; less
     /// [`SELECTION_CHARGE_BITS`] for anything but the plain decode of a
     /// block read whole, searched as read.
     fn weigh(mut self, block: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: usize) -> Self {
         let BlockOutcome::Solved { method, erasures, confidence_bits, .. } = self.outcome else { return self };
         let unknown: usize = block.iter().map(|c| c.known.count_zeros() as usize).sum();
         let distance = soft_distance(block, bit_reliability, &self.corrected);
-        let soft = soft_count_bits(block, bit_reliability, (8 * ec_len).saturating_sub(unknown), distance).saturating_sub(tries_charge(self.tries) + 1);
+        let soft = soft_count_bits(block, bit_reliability, (8 * ec_len).saturating_sub(unknown), distance).saturating_sub(self.charge + 1);
         let plain = matches!(method, SolveMethod::ReedSolomon) && erasures == 0 && !self.guided;
         let charge = if plain { 0 } else { SELECTION_CHARGE_BITS };
         self.alone = confidence_bits.max(soft).saturating_sub(charge);
@@ -678,9 +698,11 @@ const MAX_RIVALS: usize = 8;
 /// with too little to confirm it, which is nothing where it only filled
 /// unknown codewords and had none to spare, or one that spent the
 /// reserved codewords, is kept while the fallbacks look for better:
-/// flipping the faint bit of the one wrong codeword turns a solution
-/// that fills fifteen unknown codewords and locates that one with a
-/// codeword to spare into a confirmed one, with three.
+/// doubting the faint bit of the one wrong codeword, or flipping it,
+/// turns a solution that fills fifteen unknown codewords and locates
+/// that one with a codeword to spare into one with three, less what the
+/// patterns of flips tried are charged, which is nearer verified if not
+/// there.
 ///
 /// The solutions found are then held against each other by the block
 /// as read: of two codewords the solvers reach, the nearer in bits
@@ -750,25 +772,27 @@ fn solve_block(
             errors: doubt.errors(),
             erasures: erased,
             slack: 0,
-            confidence_bits: doubt.confidence_bits(),
+            // Charged for the decodes of which this one is, as every
+            // solution is: each is a fresh chance for a block of noise
+            // to pass, whatever solved the block.
+            confidence_bits: doubt.confidence_bits().saturating_sub(tries_charge(opts.tries)),
             risk_bits: 0,
             beyond_standard: doubt.solution.spare_equations < 8 * reserved,
         }
     };
     let bit_candidate = |doubt: BitDoubt| {
         let outcome = bit_outcome(&doubt);
-        weigh(Candidate::new(outcome, doubt.solution.corrected, doubt.doubted, doubt.tries))
+        weigh(Candidate::new(outcome, doubt.solution.corrected, doubt.doubted, tries_charge(doubt.tries) + tries_charge(opts.tries)))
     };
     let flips = opts.reliability && opts.flip_bits;
     let chase_bits = chase_bits_among(opts.chase_bits, opts.tries);
-    let patterns = (1usize << chase_bits) - 1;
 
     let mut exact_solved = false;
     let failure = match rs_decode_reserving(search, ec_len, reserved).map(|s| s.among(opts.tries)) {
         Ok(solution) => {
             exact_solved = true;
             let outcome = rs_outcome(SolveMethod::ReedSolomon, &solution);
-            match weigh(Candidate::new(outcome, solution.corrected, Vec::new(), opts.tries)) {
+            match weigh(Candidate::new(outcome, solution.corrected, Vec::new(), solution.charge)) {
                 Some(candidate) if candidate.verified_alone() => return BlockSolve::solved(candidate),
                 Some(candidate) => pool.push(candidate),
                 None => {}
@@ -796,12 +820,12 @@ fn solve_block(
                     errors: 0,
                     erasures: erased,
                     slack: 0,
-                    confidence_bits: solution.spare_equations as u32,
+                    confidence_bits: (solution.spare_equations as u32).saturating_sub(tries_charge(opts.tries)),
                     risk_bits: 0,
                     // Spare equations stand in for unused codewords.
                     beyond_standard: solution.spare_equations < 8 * reserved,
                 };
-                pool.extend(weigh(Candidate::new(outcome, solution.corrected, Vec::new(), 1)));
+                pool.extend(weigh(Candidate::new(outcome, solution.corrected, Vec::new(), tries_charge(opts.tries))));
             }
             Ok(solution) => partial = Some(solution),
             Err(_) => {}
@@ -828,7 +852,7 @@ fn solve_block(
         for erratum in solution.errata.iter().filter(|e| e.was_erasure && !search[e.index].is_erasure()) {
             which[erratum.index] = 0xFF;
         }
-        pool.extend(weigh(Candidate::new(outcome, solution.corrected, which, ec_len)));
+        pool.extend(weigh(Candidate::new(outcome, solution.corrected, which, solution.charge)));
     }
 
     // Doubting bits rather than codewords reaches damage spread over more
@@ -855,7 +879,7 @@ fn solve_block(
             let solution = solution.among(opts.tries);
             let flipped_bits = flipped.iter().map(|bits| bits.count_ones() as usize).sum();
             let outcome = rs_outcome(SolveMethod::Chase { flipped_bits }, &solution);
-            weigh(Candidate::new(outcome, solution.corrected, flipped, patterns))
+            weigh(Candidate::new(outcome, solution.corrected, flipped, solution.charge))
         });
         pool.extend(found);
     }
@@ -879,7 +903,7 @@ fn solve_block(
                 let solution = solution.among(opts.tries);
                 let flipped_bits = flipped.iter().map(|bits| bits.count_ones() as usize).sum();
                 let outcome = rs_outcome(SolveMethod::BeliefPropagation { rounds, flipped_bits }, &solution);
-                weigh(Candidate::new(outcome, solution.corrected, flipped, rounds + patterns))
+                weigh(Candidate::new(outcome, solution.corrected, flipped, solution.charge))
             },
         );
         pool.extend(found);
@@ -906,7 +930,7 @@ fn solve_block(
             for erratum in solution.errata.iter().filter(|e| !e.was_erasure) {
                 which[erratum.index] = erratum.magnitude & search[erratum.index].known;
             }
-            weigh(Candidate::new(outcome, solution.corrected, which, 1))
+            weigh(Candidate::new(outcome, solution.corrected, which, solution.charge))
         });
         pool.extend(found);
     }
@@ -924,7 +948,7 @@ fn solve_block(
             for &i in &erased {
                 which[i] = search[i].known & !search[i].pinned;
             }
-            weigh(Candidate::new(outcome, solution.corrected, which, opts.trial_sets))
+            weigh(Candidate::new(outcome, solution.corrected, which, solution.charge))
         });
         pool.extend(found);
     }
@@ -947,32 +971,30 @@ fn solve_block(
                 risk_bits: 0,
                 beyond_standard: !solution.within_standard(),
             };
-            pool.extend(weigh(Candidate::new(outcome, solution.corrected, Vec::new(), 1)));
+            pool.extend(weigh(Candidate::new(outcome, solution.corrected, Vec::new(), solution.charge)));
         }
     }
 
     // Every codeword found once, the best ranked solution of it standing
-    // for the rest; then each held against the nearest other by the
-    // block as read: its risk is no more than its margin over that one.
-    let mut distinct: Vec<Candidate> = Vec::new();
+    // for the rest, with how far the block as read lies from it; then
+    // each held against the nearest other by that distance, and the
+    // best ranked first.
+    let mut distinct: Vec<(Candidate, u32)> = Vec::new();
     for candidate in pool {
-        match distinct.iter_mut().find(|d| d.corrected == candidate.corrected) {
-            Some(held) => {
+        match distinct.iter_mut().find(|(held, _)| held.corrected == candidate.corrected) {
+            Some((held, _)) => {
                 if candidate.rank() > held.rank() {
                     *held = candidate;
                 }
             }
-            None => distinct.push(candidate),
+            None => {
+                let distance = soft_distance(block, bit_reliability, &candidate.corrected);
+                distinct.push((candidate, distance));
+            }
         }
     }
-    let distances: Vec<u32> = distinct.iter().map(|c| soft_distance(block, bit_reliability, &c.corrected)).collect();
-    let nearest = distances.iter().copied().min().unwrap_or(0);
-    for (i, candidate) in distinct.iter_mut().enumerate() {
-        let margin = (0..distances.len()).filter(|&j| j != i).map(|j| distances[j].saturating_sub(distances[i]) / 8).min();
-        candidate.set_risk(margin.map_or(candidate.alone, |margin| candidate.alone.min(margin)));
-    }
-    distinct.sort_by_key(|c| std::cmp::Reverse(c.rank()));
-    let Some(best) = distinct.first() else {
+    hold_against_each_other(&mut distinct);
+    let Some((best, _)) = distinct.first() else {
         let inferred = match partial {
             Some(solution) => solution.corrected.iter().zip(&solution.solved).map(|(&v, &m)| (v & m, m)).collect(),
             None => vec![(0, 0); block.len()],
@@ -989,23 +1011,59 @@ fn solve_block(
             half_padded_with_ones: false,
         };
     };
-    // Rivals are for a block nothing verified: the codewords the block
-    // as read lies as near to as the nearest, which it cannot tell
-    // apart, the best ranked few of them.
-    let rivals = if best.outcome.is_verified() {
-        Vec::new()
-    } else {
-        let tied: Vec<Candidate> = distinct
-            .iter()
-            .zip(&distances)
-            .filter(|(_, d)| **d < nearest + DISTANCE_MARGIN)
-            .map(|(c, _)| c.clone())
-            .take(MAX_RIVALS)
-            .collect();
-        if tied.len() >= 2 { tied } else { Vec::new() }
-    };
-    let best = distinct.swap_remove(0);
+    // Rivals are for a block nothing verified.
+    let rivals = if best.outcome.is_verified() { Vec::new() } else { rivals_among(&distinct) };
+    let (best, _) = distinct.swap_remove(0);
     BlockSolve { rivals, ..BlockSolve::solved(best) }
+}
+
+/// Each candidate held against the nearest other by the block as read,
+/// given with each how far the block lies from it ([`soft_distance`]):
+/// its risk is no more than its margin over that one, a bit for every
+/// eight of distance. Then the best ranked first.
+fn hold_against_each_other(distinct: &mut [(Candidate, u32)]) {
+    for i in 0..distinct.len() {
+        let own = distinct[i].1;
+        let margin = distinct.iter().enumerate().filter(|&(j, _)| j != i).map(|(_, &(_, d))| d.saturating_sub(own) / 8).min();
+        let candidate = &mut distinct[i].0;
+        candidate.set_risk(margin.map_or(candidate.alone, |margin| candidate.alone.min(margin)));
+    }
+    distinct.sort_by_key(|(candidate, _)| std::cmp::Reverse(candidate.rank()));
+}
+
+/// The rivals of a block nothing verified, from its distinct candidates
+/// as [`hold_against_each_other`] leaves them: the codewords the block as
+/// read lies as near to as the nearest, which it cannot tell apart, the
+/// best ranked [`MAX_RIVALS`] of them, and none where fewer than two are
+/// so near. Each carries the risk it may stand on once the message has
+/// told it from the others ([`Candidate::held`]): its own, held down by
+/// its margin over every codeword found that is not among them, since
+/// the message is never asked about those. That is one as near as the
+/// rivals but left out for their number; and one the block as read tells
+/// from the nearest, lying past the tie's window, which is drawn about
+/// the nearest, and yet within a bit of a rival further off. The rivals
+/// once stood clear of the second kind, and a block went from unverified
+/// to verified on the message's word for a rival, over a codeword one
+/// bit from it that the message was never shown.
+fn rivals_among(distinct: &[(Candidate, u32)]) -> Vec<Candidate> {
+    let nearest = distinct.iter().map(|&(_, distance)| distance).min().unwrap_or(0);
+    let tied: Vec<usize> = (0..distinct.len()).filter(|&i| distinct[i].1 < nearest + DISTANCE_MARGIN).collect();
+    if tied.len() < 2 {
+        return Vec::new();
+    }
+    let kept = &tied[..tied.len().min(MAX_RIVALS)];
+    kept.iter()
+        .map(|&i| {
+            let (candidate, distance) = &distinct[i];
+            let margin = (0..distinct.len())
+                .filter(|j| !kept.contains(j))
+                .map(|j| distinct[j].1.saturating_sub(*distance) / 8)
+                .min();
+            let mut candidate = candidate.clone();
+            candidate.held = margin.map_or(candidate.alone, |margin| candidate.alone.min(margin));
+            candidate
+        })
+        .collect()
 }
 
 /// The reliability of each bit of each codeword, `bits[cw][b]` for bit
@@ -1227,9 +1285,10 @@ impl StreamScore {
 /// is no tie for the message, and the nearest the block as read is
 /// taken; between rivals that disagree, the block stays as it was. The
 /// blocks are taken in order, each with those before it as settled. A
-/// rival taken stands on its own risk ([`Candidate::alone`]): the
-/// margin that held it down was over the rivals the message has now
-/// told it from.
+/// rival taken stands on its own risk ([`Candidate::held`]): the margin
+/// that held it down was over the rivals the message has now told it
+/// from, less what any codeword found that is not among them still
+/// holds it to.
 ///
 /// The solvers that try many ways are list decoders, and a list of two
 /// is what they return where the block as read lies as near to two
@@ -1238,6 +1297,13 @@ impl StreamScore {
 /// codeword's data parses as a segment of noise, with a header it does
 /// not have or a value no character takes, where the right one's reads
 /// on as the message does.
+///
+/// `asked` holds, for each block, every codeword the message has been
+/// asked about as a rival of that block so far, and the rivals told
+/// apart here are added to it: what tells a round of evidence that
+/// brings a block new rivals from one that brings back the old
+/// ([`weigh_again`]).
+#[allow(clippy::too_many_arguments)]
 fn arbitrate(
     layout: &SymbolLayout,
     raw: &[CwRead],
@@ -1245,6 +1311,7 @@ fn arbitrate(
     solves: &mut [BlockSolve],
     codewords: &mut [CodewordReport],
     blocks: &mut [BlockReport],
+    asked: &mut [Vec<Vec<u8>>],
     charset: Charset,
 ) {
     for b in 0..solves.len() {
@@ -1253,6 +1320,11 @@ fn arbitrate(
         }
         let spec = &layout.blocks[b];
         let rivals = std::mem::take(&mut solves[b].rivals);
+        for rival in &rivals {
+            if !asked[b].contains(&rival.corrected) {
+                asked[b].push(rival.corrected.clone());
+            }
+        }
         let mut scored: Vec<(StreamScore, usize)> = rivals
             .iter()
             .enumerate()
@@ -1271,7 +1343,7 @@ fn arbitrate(
             _ if agree_on_data => Some(0),
             _ => None,
         };
-        let taken = winner.map(|r| rivals[r].clone().at_risk(rivals[r].alone)).filter(|candidate| candidate.rank() > solves[b].rank());
+        let taken = winner.map(|r| rivals[r].clone().at_risk(rivals[r].held)).filter(|candidate| candidate.rank() > solves[b].rank());
         if let Some(candidate) = taken {
             let (near_errors, message_evidence, half) = (solves[b].near_errors, solves[b].message_evidence, solves[b].half_padded_with_ones);
             solves[b] = BlockSolve {
@@ -1293,6 +1365,26 @@ fn arbitrate(
 /// and settles characters of its own for the next.
 const EVIDENCE_ROUNDS: usize = 2;
 
+/// What a block solved again in a round of evidence is to the solve in
+/// hand: whether it takes that solve's place, and whether the round has
+/// improved the decode by it. It takes the place of the solve in hand
+/// when it ranks higher, or ranks the same and brings rivals, since the
+/// arbitration empties the rivals of the solve it leaves and the
+/// message, moved by the other blocks of the round, may now tell them
+/// apart. It improves the decode when its rank rose, or when one of its
+/// rivals is a codeword the message has not been asked about for the
+/// block (`asked`, as [`arbitrate`] keeps it). A solve recalled from the
+/// rounds before, bringing back the rivals the message was asked about
+/// already, is taken and is no improvement: the rounds once took it for
+/// one, and a block with rivals the message could not tell apart kept
+/// them from ending early whatever else they found.
+fn weigh_again(current: &BlockSolve, again: &BlockSolve, asked: &[Vec<u8>]) -> (bool, bool) {
+    let rose = again.rank() > current.rank();
+    let taken = rose || (again.rank() == current.rank() && !again.rivals.is_empty());
+    let unasked = again.rivals.iter().any(|rival| !asked.contains(&rival.corrected));
+    (taken, taken && (rose || unasked))
+}
+
 /// The exact decode of a block, when it verifies within the standard:
 /// the first thing [`solve_block`] tries, and all a sound block needs,
 /// made alone before the hard blocks are shared over the cores, since
@@ -1308,7 +1400,7 @@ fn exact_solve(block: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: usize, res
         risk_bits: 0,
         beyond_standard: !solution.within_standard(),
     };
-    let candidate = Candidate::new(outcome, solution.corrected, Vec::new(), opts.tries).weigh(block, bit_reliability, ec_len);
+    let candidate = Candidate::new(outcome, solution.corrected, Vec::new(), solution.charge).weigh(block, bit_reliability, ec_len);
     candidate.verified_alone().then(|| BlockSolve::solved(candidate))
 }
 
@@ -1492,7 +1584,10 @@ impl<'a> Decoding<'a> {
             .collect();
         let mut blocks: Vec<BlockReport> =
             layout.blocks.iter().zip(&solves).map(|(spec, solve)| report_block(layout, spec, solve, raw, &pinned, &mut codewords)).collect();
-        arbitrate(layout, raw, &pinned, &mut solves, &mut codewords, &mut blocks, opts.charset);
+        // The codewords the message has been asked about as rivals of
+        // each block, over every arbitration of this decode.
+        let mut asked: Vec<Vec<Vec<u8>>> = vec![Vec::new(); layout.blocks.len()];
+        arbitrate(layout, raw, &pinned, &mut solves, &mut codewords, &mut blocks, &mut asked, opts.charset);
 
         // The blocks that verified say two things of those that did not.
         // Where the photo misread: an error located is a module read as
@@ -1546,16 +1641,17 @@ impl<'a> Decoding<'a> {
                         .filter(|p| lowered[p.y as usize * width + p.x as usize] < self.module_reliability[p.y as usize * width + p.x as usize])
                         .count();
                 }
-                if again.rank() > solves[b].rank() || (again.rank() == solves[b].rank() && again.rivals.len() > solves[b].rivals.len()) {
+                let (taken, improves) = weigh_again(&solves[b], &again, &asked[b]);
+                if taken {
                     solves[b] = again;
-                    improved = true;
                 }
+                improved |= improves;
             }
             if !improved {
                 break;
             }
             blocks = layout.blocks.iter().zip(&solves).map(|(spec, solve)| report_block(layout, spec, solve, raw, &pinned, &mut codewords)).collect();
-            arbitrate(layout, raw, &pinned, &mut solves, &mut codewords, &mut blocks, opts.charset);
+            arbitrate(layout, raw, &pinned, &mut solves, &mut codewords, &mut blocks, &mut asked, opts.charset);
         }
 
         let Assembled { stream, parse, tail, text, stream_valid, tail_plausible } = assemble(layout, &codewords, &blocks, &pinned, opts.charset);
@@ -1847,4 +1943,119 @@ pub fn brute_force_mirrored(grid: &ModuleGrid, func: &Arc<FunctionMap>, opts: &D
         b.report.score.cmp(&a.report.score).then(a.format_mismatches.cmp(&b.format_mismatches))
     });
     attempts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A candidate for `corrected`, solved with `confidence` bits on its
+    /// own and nothing yet held against it.
+    fn candidate(corrected: Vec<u8>, confidence: u32) -> Candidate {
+        let outcome = BlockOutcome::Solved {
+            method: SolveMethod::ReedSolomon,
+            errors: 0,
+            erasures: 0,
+            slack: 0,
+            confidence_bits: confidence,
+            risk_bits: confidence,
+            beyond_standard: false,
+        };
+        Candidate { alone: confidence, held: confidence, ..Candidate::new(outcome, corrected, Vec::new(), 0) }
+    }
+
+    #[test]
+    fn rivals_are_the_codewords_as_near_as_the_nearest_whatever_their_rank() {
+        // Three codewords: one the block as read lies far from, which
+        // ranks best, and two it lies near, of which the one that ranks
+        // best of all stands last in the pool. The rivals are the two
+        // near ones, in their rank's order; the far one, though it ranks
+        // between them, is none. The rivals once took their distances by
+        // their place in the pool after the pool was sorted by rank, and
+        // here the far one was taken for a rival and the nearer of the
+        // two near ones was not.
+        let far = (candidate(vec![0xF0], 40), 200u32);
+        let near_worst = (candidate(vec![0x33], 4), 30);
+        let near_best = (candidate(vec![0x0F], 20), 10);
+        let mut distinct = vec![far, near_worst, near_best];
+        hold_against_each_other(&mut distinct);
+        // Each is held to its margin over the nearest other: the near
+        // ones are twenty apart, two bits, and the far one is held to
+        // nothing by both.
+        let risks: Vec<(u8, u32)> = distinct.iter().map(|(c, _)| (c.corrected[0], c.outcome.risk_bits())).collect();
+        assert_eq!(risks, [(0x0F, 2), (0xF0, 0), (0x33, 0)]);
+        let rivals = rivals_among(&distinct);
+        assert_eq!(rivals.iter().map(|c| c.corrected[0]).collect::<Vec<_>>(), [0x0F, 0x33]);
+        // Nothing as near was left out, so each stands on its own risk
+        // once the message has told them apart.
+        assert_eq!(rivals.iter().map(|c| c.held).collect::<Vec<_>>(), [20, 4]);
+        // One codeword alone, or two the block as read tells apart, are
+        // no rivals.
+        assert!(rivals_among(&distinct[..1]).is_empty());
+        let apart = vec![(candidate(vec![1], 20), 10u32), (candidate(vec![2], 20), 10 + DISTANCE_MARGIN)];
+        assert!(rivals_among(&apart).is_empty());
+    }
+
+    #[test]
+    fn a_codeword_as_near_but_left_out_of_the_rivals_holds_them_down_still() {
+        // One codeword more than the rivals may number, every one as near
+        // the block as read as the rest, a bit apart: the worst ranked
+        // is left out, and each rival stands on no more than its margin
+        // over it once the message has told the rivals apart.
+        let mut distinct: Vec<(Candidate, u32)> = (0..=MAX_RIVALS as u32).map(|i| (candidate(vec![i as u8], 40 - i), 10 + i)).collect();
+        hold_against_each_other(&mut distinct);
+        let rivals = rivals_among(&distinct);
+        assert_eq!(rivals.len(), MAX_RIVALS);
+        assert_eq!(rivals.iter().map(|c| c.corrected[0] as usize).collect::<Vec<_>>(), (0..MAX_RIVALS).collect::<Vec<_>>());
+        for (i, rival) in rivals.iter().enumerate() {
+            let left_out = 10 + MAX_RIVALS as u32;
+            assert_eq!(rival.held, (left_out - (10 + i as u32)) / 8, "rival {i}");
+            assert_eq!(rival.alone, 40 - i as u32, "rival {i}");
+        }
+        // With the one left out gone, every rival stands on its own.
+        distinct.pop();
+        assert!(rivals_among(&distinct).iter().all(|c| c.held == c.alone));
+    }
+
+    #[test]
+    fn a_block_solved_again_improves_the_round_by_its_rank_or_by_a_rival_not_yet_asked_about() {
+        let solve = |corrected: Vec<u8>, confidence: u32, rivals: Vec<Candidate>| BlockSolve { rivals, ..BlockSolve::solved(candidate(corrected, confidence)) };
+        // The solve in hand, unverified, its rivals emptied by the
+        // arbitration that asked the message about them.
+        let current = solve(vec![1], 4, Vec::new());
+        let asked = vec![vec![1u8], vec![2]];
+        // Recalled from the rounds before: the same rank, and the rivals
+        // the message was asked about. Taken, so that it may be
+        // arbitrated again under a message other blocks have moved, and
+        // no improvement by itself.
+        let recalled = solve(vec![1], 4, vec![candidate(vec![1], 4), candidate(vec![2], 3)]);
+        assert_eq!(weigh_again(&current, &recalled, &asked), (true, false));
+        // A rival the message was never asked about is an improvement,
+        // as every rival is before the first arbitration.
+        let fresh = solve(vec![1], 4, vec![candidate(vec![1], 4), candidate(vec![3], 3)]);
+        assert_eq!(weigh_again(&current, &fresh, &asked), (true, true));
+        assert_eq!(weigh_again(&current, &recalled, &[]), (true, true));
+        // A rank risen is an improvement with rivals or without; a rank
+        // fallen is not taken whatever rivals it brings; and the same
+        // rank without rivals is nothing.
+        assert_eq!(weigh_again(&current, &solve(vec![1], 6, Vec::new()), &asked), (true, true));
+        assert_eq!(weigh_again(&current, &solve(vec![1], 2, vec![candidate(vec![3], 2)]), &asked), (false, false));
+        assert_eq!(weigh_again(&current, &solve(vec![1], 4, Vec::new()), &asked), (false, false));
+    }
+
+    #[test]
+    fn a_codeword_past_the_tie_but_near_a_far_rival_holds_that_rival_down() {
+        // The block as read lies 10 from X, 66 from Y and 74 from Z: X
+        // and Y tie, and Z does not, lying past the margin from X. Yet
+        // Z lies a bit from Y, and the message, asked to tell X from Y,
+        // is never shown Z. Taken, Y stands on no more than that bit,
+        // and X on its margin over Z.
+        let mut distinct = vec![(candidate(vec![1], 12), 10u32), (candidate(vec![2], 20), 66), (candidate(vec![3], 20), 74)];
+        hold_against_each_other(&mut distinct);
+        let rivals = rivals_among(&distinct);
+        assert_eq!(rivals.iter().map(|c| (c.corrected[0], c.held)).collect::<Vec<_>>(), [(1, 8), (2, 1)]);
+        // With Z gone, each stands on its own.
+        distinct.retain(|(c, _)| c.corrected[0] != 3);
+        assert_eq!(rivals_among(&distinct).iter().map(|c| c.held).collect::<Vec<_>>(), [12, 20]);
+    }
 }

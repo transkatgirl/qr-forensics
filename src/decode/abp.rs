@@ -48,8 +48,8 @@ use std::f32::consts::LN_2;
 
 use super::gf256::{exp, mul};
 use super::rs::{
-    CHASE_MAX_BITS, CwRead, RsSolution, Trials, accounted, nearest, preferring_the_standard, rs_decode_chasing_bits, rs_decode_core,
-    rs_syndromes, soft_distance, solve_bit_erasures_doubting,
+    CHASE_MAX_BITS, CwRead, RsSolution, Trials, judged, nearest, preferring_the_standard, rs_decode_chasing_bits, rs_decode_core,
+    rs_syndromes, soft_distance, solve_bit_erasures_doubting, tries_charge,
 };
 use crate::symbol::grid::CERTAIN;
 use crate::work;
@@ -218,9 +218,11 @@ fn hard_decision(block: &[CwRead], llr: &[f32]) -> Vec<CwRead> {
 }
 
 /// What one codeword found confirms, against the block as read
-/// ([`accounted`]): the hard count for the codewords it changes of
-/// those read in full, or the soft count for the bits it overturns
-/// weighed by their reliability, whichever is the more. The propagation
+/// ([`judged`]): the hard count for the codewords it changes of those
+/// read in full, with the known bits of the erased codewords as checks,
+/// or the soft count for the bits it overturns weighed by their
+/// reliability, among which those bits already stand, whichever is the
+/// more, and never the two added. The propagation
 /// reaches a block wrong in more codewords than the hard count can
 /// confirm, each in a bit or two that read faintly; the soft count is
 /// what confirms those. The bits the propagation overturned that the
@@ -238,7 +240,7 @@ fn account(
     rounds: usize,
 ) -> Option<(u32, Propagated)> {
     let n = block.len();
-    let solution = accounted(block, bit_reliability, ec_len, reserved, corrected, tries)?;
+    let solution = judged(block, bit_reliability, ec_len, reserved, corrected, tries_charge(tries))?;
     let flipped: Vec<u8> =
         (0..n).map(|i| (solution.corrected[i] ^ block[i].value) & (refined[i].value ^ block[i].value) & block[i].known).collect();
     Some((soft_distance(block, bit_reliability, &solution.corrected), (rounds, flipped, solution)))

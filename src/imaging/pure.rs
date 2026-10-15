@@ -154,11 +154,15 @@ fn find_ink(family: Family, bounds: [usize; 4], ink: &dyn Fn(usize, usize) -> bo
         // The finder at one corner and the sub-pattern at the opposite one:
         // dark, light, dark, light down its own diagonal, a module each,
         // and then its dark centre, which runs on into whatever data
-        // module lies beyond, so is not asked.
+        // module lies beyond, so is not asked. No ink at that corner, and
+        // there are no runs to read and no placement: read as four runs
+        // of nothing, which at a pixel a module lay within the tolerance
+        // of a module, it once passed with no sub-pattern looked at.
         Family::Rmqr => finders
             .into_iter()
             .filter(|&(corner, module)| {
-                sub_module(runs::<4>(|i| along((corner + 2) % 4, i), reach, scale).unwrap_or([0.0; 4]))
+                runs::<4>(|i| along((corner + 2) % 4, i), reach, scale)
+                    .and_then(sub_module)
                     .is_some_and(|sub| (sub - module).abs() <= (RUN_TOLERANCE * module).max(1.0))
             })
             .collect(),
@@ -350,6 +354,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_finder_with_no_sub_pattern_opposite_is_no_rmqr_symbol() {
+        // R7x43 at a pixel a module, its bottom-right corner module, the
+        // first of the sub-pattern's diagonal, painted light: the runs
+        // down that diagonal cannot be read, and a placement that wants
+        // them is none. The runs unread once stood as nought each, which
+        // at a pixel a module lay within the tolerance of a module, and
+        // the placement passed with no sub-pattern looked at.
+        let version = SymbolVersion::Rmqr(0);
+        let (px, quiet) = (1, 2);
+        let mut image = render(version, px, quiet, 0, false);
+        let whole = [[0.0, 0.0], [image.width as f64, 0.0], [image.width as f64, image.height as f64], [0.0, image.height as f64]];
+        assert!(find(&image, Family::Rmqr, whole).is_some());
+        let func = FunctionMap::new(version);
+        let (x, y) = (func.width - 1, func.height - 1);
+        assert_eq!(func.expected(x, y), Some(true), "the corner of the sub-pattern is dark");
+        image.data[(y + quiet) * px * image.width + (x + quiet) * px] = 1.0;
+        assert!(find(&image, Family::Rmqr, whole).is_none());
     }
 
     #[test]

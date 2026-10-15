@@ -35,6 +35,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::LazyLock;
 
 use super::gf256::{div, exp, exp_of_sum, log, mul, poly_degree, poly_eval, poly_mul};
 use crate::symbol::grid::CERTAIN;
@@ -119,17 +120,15 @@ pub const OVERTURN_COST: u32 = 2;
 /// several of their tries may each reach a codeword that verifies, and
 /// where they reach different ones the nearer to what was read is the
 /// likelier, since the bits it overturns are the fainter. A bit
-/// overturned costs its reliability and one: two hundred and fifty-six
-/// for a certain bit, a few for a faint one. Reliability is eight times
-/// the bits of likelihood a module's reading carries, once the sampler
-/// has calibrated it against the modules whose colour it knew
-/// ([`crate::imaging::sample::Classified::calibrate`]), so the margin
-/// is a likelihood ratio of two hundred and fifty-six to one between
-/// the two codewords, a quarter of a certain bit, as the format words
-/// are told apart ([`super::bch::WEIGHT_MARGIN`]): one certain bit, or
-/// one bit read well inside its colour against one read near the
-/// threshold, settles it; two faint bits of middling margin do not, and
-/// both codewords are returned for the message to tell apart.
+/// overturned costs the likelihood its reading carries, in eighths of a
+/// bit ([`bit_cost`]): two hundred and sixty-three for a certain bit,
+/// nothing for one read on its threshold. So the margin is a likelihood
+/// ratio of two hundred and fifty-six to one between the two codewords,
+/// as the format words are told apart ([`super::bch::WEIGHT_MARGIN`]):
+/// one certain bit, or one bit read well inside its colour against one
+/// read near the threshold, settles it; two faint bits of middling
+/// margin do not, and both codewords are returned for the message to
+/// tell apart.
 pub const DISTANCE_MARGIN: u32 = 64;
 
 /// Sets of codewords a solver erases by trial, at the most, over every
@@ -234,10 +233,35 @@ pub fn tries_charge(tries: usize) -> u32 {
     tries.max(1).next_power_of_two().trailing_zeros()
 }
 
+/// What overturning a bit read at `reliability` costs, in eighths of a
+/// bit of likelihood: the log of the odds that it was read right, on
+/// the sampler's scale ([`crate::imaging::sample::reliability_bits`]),
+/// a bit of likelihood at nought and a bit more for every eight. That
+/// is nothing for a bit read on its threshold, a coin's toss that says
+/// nothing either way; thirteen for one read a bit of likelihood inside
+/// its colour; eight more than the reliability for one read well; and
+/// two hundred and sixty-three for a certain bit. Summed over the bits
+/// two codewords overturn, the difference is the likelihood ratio
+/// between them, in the same eighths. A bit's reliability and one, as
+/// the cost once was, gave a coin's toss an eighth of a bit of weight,
+/// and sixty-four of them, as a retry that keeps the unsure modules at
+/// the colour they fell on has, told two codewords apart by a byte that
+/// nothing had read.
+pub fn bit_cost(reliability: u8) -> u32 {
+    static COSTS: LazyLock<[u32; 256]> = LazyLock::new(|| {
+        std::array::from_fn(|reliability| {
+            let bits = reliability as f64 / 8.0 + 1.0;
+            (8.0 * (bits.exp2() - 1.0).log2()).round() as u32
+        })
+    });
+    COSTS[usize::from(reliability)]
+}
+
 /// How far a solution lies from the block as read: the bits read as
-/// known that it overturns, each weighed by its reliability and one, so
-/// that a certain bit costs two hundred and fifty-six and a bit read on
-/// its threshold one. The Hamming distance, bit for bit, where nothing
+/// known that it overturns, each at what overturning it costs
+/// ([`bit_cost`]), so that a certain bit costs two hundred and
+/// sixty-three and a bit read on its threshold nothing. Two hundred and
+/// sixty-three times the Hamming distance, bit for bit, where nothing
 /// was sampled.
 pub fn soft_distance(block: &[CwRead], bit_reliability: &[[u8; 8]], corrected: &[u8]) -> u32 {
     block
@@ -246,7 +270,7 @@ pub fn soft_distance(block: &[CwRead], bit_reliability: &[[u8; 8]], corrected: &
         .zip(corrected)
         .map(|((cw, reliability), &c)| {
             let overturned = (cw.value ^ c) & cw.known;
-            (0..8).filter(|&b| overturned >> b & 1 != 0).map(|b| u32::from(reliability[b]) + 1).sum::<u32>()
+            (0..8).filter(|&b| overturned >> b & 1 != 0).map(|b| bit_cost(reliability[b])).sum::<u32>()
         })
         .sum()
 }
@@ -275,15 +299,38 @@ pub(super) fn nearest<T>(mut found: Vec<(u32, T)>, same: impl Fn(&T, &T) -> bool
     kept.into_iter().map(|(_, candidate)| candidate).collect()
 }
 
-/// What the agreement of doubted bits with a solution is worth: the
-/// bits that agree less those that do not, less three standard
-/// deviations of that difference under the hypothesis that the solution
-/// is wrong and each doubted bit agrees with it by chance. A faint bit
-/// that turns out right confirms the solution, but a run of doubted bits
-/// agrees with any solution half the time.
+/// What the agreement of doubted bits with a solution is worth, in
+/// bits: how rarely so many of them agree with a wrong solution, under
+/// which each doubted bit agrees by chance, a coin's toss. The tail of
+/// the binomial, to the bit: for `agreeing` or more of the `agreeing +
+/// flipped` to fall right by chance. A faint bit that turns out right
+/// confirms the solution, but a run of doubted bits agrees with any
+/// solution half the time, and half of them agreeing is worth nothing.
+/// Three standard deviations short of the agreement stood for this
+/// once, which falls short of the tail by a byte over a few dozen bits
+/// and overshoots it by as much over a few hundred.
 pub fn doubted_agreement(agreeing: u32, flipped: u32) -> u32 {
-    let chance = (3.0 * f64::from(agreeing + flipped).sqrt()).ceil() as u32;
-    agreeing.saturating_sub(flipped).saturating_sub(chance)
+    let n = agreeing + flipped;
+    if 2 * agreeing <= n {
+        return 0;
+    }
+    // The sum of C(n, j) for j from `agreeing` to n, in logarithms: each
+    // term from the one above it, the last and largest the scale.
+    let mut log_term = 0.0f64;
+    let mut terms = Vec::with_capacity((n - agreeing + 1) as usize);
+    terms.push(log_term);
+    for j in (agreeing..n).rev() {
+        log_term += (f64::from(j + 1) / f64::from(n - j)).log2();
+        terms.push(log_term);
+    }
+    let total = log_term + terms.iter().map(|t| (t - log_term).exp2()).sum::<f64>().log2();
+    // Where the sum is a power of two the tail is a whole number of
+    // bits: every bit right, a bare majority of an odd count, or six of
+    // seven. The sum in logarithms then lands a hair either side of the
+    // whole number, and a hair short of it the floor lost a bit; so a
+    // hair is allowed, far wider than the rounding and far narrower than
+    // any gap that is no rounding.
+    (f64::from(n) - total + 1e-9).max(0.0).floor() as u32
 }
 
 /// What the errors a solution located confirm of it, in bits, for a
@@ -348,9 +395,10 @@ pub fn list_solution_bits(read: usize, redundancy: usize, errors: usize) -> u32 
 
 /// Furthest the soft count ([`soft_count_bits`]) looks, in
 /// reliability-weighted bits: a solution lying further from the block
-/// as read than this is confirmed by the hard count alone. Sixteen
-/// certain bits, or four hundred faint ones, which is more than any
-/// block has.
+/// as read than this is confirmed by the hard count alone. Fifteen
+/// certain bits, or three hundred read a bit of likelihood inside their
+/// colour, which is more than any block has; bits read on their
+/// threshold cost nothing and never reach it.
 pub const SOFT_COUNT_REACH: u32 = 4096;
 
 /// What confirms a codeword found within `distance` of the block as
@@ -359,9 +407,12 @@ pub const SOFT_COUNT_REACH: u32 = 4096;
 /// code is linear over GF(2) with `redundancy_bits` equations once the
 /// unknown bits are spent, so one binary word in `2^redundancy_bits` is
 /// a codeword, and about each word there are as many words within
-/// `distance` as there are sets of its known bits whose reliabilities
-/// and one sum to `distance` or less: counted by dynamic programming
-/// over the reliabilities, which are small integers. So noise shows a
+/// `distance` as there are sets of its known bits whose costs
+/// ([`bit_cost`]) sum to `distance` or less: counted by dynamic
+/// programming over the costs, which are small integers. A bit that
+/// costs nothing, read on its threshold, is in a set or out of it
+/// alike, and doubles the count: it takes a bit from what confirms the
+/// solution whichever way it was read. So noise shows a
 /// codeword within `distance` once in the quotient, and a solution
 /// that overturns only faint bits is rare in noise however many
 /// codewords it changes, where the hard count ([`list_solution_bits`])
@@ -390,25 +441,35 @@ pub fn soft_count_bits(block: &[CwRead], bit_reliability: &[[u8; 8]], redundancy
             if cw.known >> b & 1 == 0 || cw.pinned >> b & 1 != 0 {
                 continue;
             }
-            let cost = usize::from(reliability) + 1;
+            let cost = bit_cost(reliability) as usize;
             if cost > reach {
                 continue;
             }
-            // `ways[d] += ways[d - cost]` from the top down, which reads
-            // only counts not yet added to: so done a stretch of `cost` at
-            // a time, each stretch from the one below it, which it does
-            // not overlap. The counts below `cost` are as they were, and
-            // were no larger than the bound the last time round.
             let mut peak = 0f64;
-            let mut end = reach + 1;
-            while end > cost {
-                let start = (end - cost).max(cost);
-                let (below, from) = ways.split_at_mut(start);
-                for (w, &add) in from[..end - start].iter_mut().zip(&below[start - cost..end - cost]) {
-                    *w += add;
+            if cost == 0 {
+                // In every set or out of it for nothing: every count
+                // doubles.
+                for w in &mut ways {
+                    *w *= 2.0;
                     peak = peak.max(*w);
                 }
-                end = start;
+            } else {
+                // `ways[d] += ways[d - cost]` from the top down, which
+                // reads only counts not yet added to: so done a stretch
+                // of `cost` at a time, each stretch from the one below
+                // it, which it does not overlap. The counts below `cost`
+                // are as they were, and were no larger than the bound the
+                // last time round.
+                let mut end = reach + 1;
+                while end > cost {
+                    let start = (end - cost).max(cost);
+                    let (below, from) = ways.split_at_mut(start);
+                    for (w, &add) in from[..end - start].iter_mut().zip(&below[start - cost..end - cost]) {
+                        *w += add;
+                        peak = peak.max(*w);
+                    }
+                    end = start;
+                }
             }
             if peak > 2f64.powi(500) {
                 for w in &mut ways {
@@ -471,15 +532,19 @@ pub struct RsSolution {
     /// those it reproduced, less [`OVERTURN_COST`] for each it overturned,
     /// and nothing when that comes to less than nothing.
     pub check_bits: u32,
-    /// Known bits inside erased codewords that the solution overturned. Only
-    /// ever non-zero when `slack > 0`.
+    /// Known bits inside erased codewords that the solution overturned,
+    /// those of the doubted codewords among them.
     pub flipped_known_bits: u32,
     /// What the errors the decoder located confirm of the solution
-    /// ([`located_error_bits`]), less what the tries of a solver that
-    /// made many to find it cost: a bit for each doubling of them, since
-    /// each try is a fresh chance for a block of noise to show errors
-    /// located.
+    /// ([`located_error_bits`]); or, for a solution judged against the
+    /// block ([`judged`]), what the count that confirms it has beyond
+    /// the slack's bytes, less a bit for the choice between the two
+    /// counts ([`less_the_choice`]).
     pub located_bits: u32,
+    /// What the tries of a solver that made many to find it cost
+    /// ([`Self::among`]): a bit for each doubling of them, taken from
+    /// everything that confirms the solution ([`Self::confidence_bits`]).
+    pub charge: u32,
     /// EC codewords the standard reserves against misdecodes for this
     /// block: a solution that leaves fewer than this many unused has spent
     /// capacity the standard says is for detection only.
@@ -490,21 +555,35 @@ impl RsSolution {
     /// Rough count of independent bits confirming the solution: a byte
     /// for each codeword of redundancy left unused, the known bits of
     /// erased codewords it reproduced, and what the errors it located
-    /// confirm. A solution that only filled erasures, with nothing to
-    /// spare, has none, and any input would have "solved" so; one that
-    /// located errors with nothing to spare has what they confirm, which
-    /// at the limit of a block's error correction is a great deal.
+    /// confirm, less the charge for the tries of a solver that made many
+    /// to find it ([`Self::among`]). A solution that only filled
+    /// erasures, with nothing to spare, has none, and any input would
+    /// have "solved" so; one that located errors with nothing to spare
+    /// has what they confirm, which at the limit of a block's error
+    /// correction is a great deal.
     pub fn confidence_bits(&self) -> u32 {
+        self.uncharged_bits().saturating_sub(self.charge)
+    }
+
+    /// What confirms the solution before the charge for its tries: what
+    /// the solvers that try many ways hold a solution to before they
+    /// offer it ([`DOUBT_CONFIRMING_BITS`]), a threshold set with the
+    /// tries in mind, so that they are not held against it twice there.
+    pub fn uncharged_bits(&self) -> u32 {
         8 * self.slack as u32 + self.check_bits + self.located_bits
     }
 
-    /// The solution as the pick of `tries` a solver made: what its
-    /// located errors confirm is less by the bits it takes to count the
-    /// tries. The slack and the known bits reproduced are left as they
-    /// are, and the solvers that try many times ask more of those
-    /// instead ([`DOUBT_CONFIRMING_BITS`], [`CHASE_MIN_SLACK`]).
+    /// The solution as the pick of `tries` a solver made: charged a bit
+    /// for each doubling of them ([`tries_charge`]), since each try is a
+    /// fresh chance for a block of noise to pass whatever the solution
+    /// shows, its slack and the known bits it reproduced as much as the
+    /// errors it located. The charge was once taken from the located
+    /// errors' bits alone, and a solution that located none, as one
+    /// whose trial erasures were just the wrong codewords does, went
+    /// uncharged: the pick of sixty thousand sets showed the sixteen
+    /// bits of two codewords spare as the first try would have.
     pub fn among(mut self, tries: usize) -> Self {
-        self.located_bits = self.located_bits.saturating_sub(tries_charge(tries));
+        self.charge += tries_charge(tries);
         self
     }
 
@@ -788,51 +867,26 @@ pub(super) fn settle(
         .map(|i| Erratum { index: i, magnitude: corrected[i] ^ received[i], was_erasure: is_erased(i) })
         .collect();
 
-    Ok(RsSolution { corrected, errata, errors, erasures: erased.len(), slack, check_bits, flipped_known_bits, located_bits, reserved })
-}
-
-/// A codeword of the code, however it was found, confirmed against the
-/// block as read: the hard count of [`list_solution_bits`] for the
-/// codewords read in full that it changes, or the soft count of
-/// [`soft_count_bits`] for the bits it overturns weighed by
-/// `bit_reliability`, whichever is the more, less one for the choice
-/// between them and the charge for `tries` ([`tries_charge`]), with the
-/// known bits of the codewords that could not be read weighed as
-/// [`settle`] weighs them. For a solver that searched from something
-/// other than the block as read: the beliefs propagation leaves
-/// ([`super::abp`]), or the block with what the message makes likely
-/// laid over it ([`super::evidence`]). What it searched from says
-/// nothing here, since the search carries its word toward some codeword
-/// whatever the block holds; only how rarely a block of noise lies so
-/// near a codeword does. `None` for a codeword refused, or one with less
-/// than [`DOUBT_CONFIRMING_BITS`] behind it.
-pub(super) fn accounted(
-    block: &[CwRead],
-    bit_reliability: &[[u8; 8]],
-    ec_len: usize,
-    reserved: usize,
-    corrected: Vec<u8>,
-    tries: usize,
-) -> Option<RsSolution> {
-    let n = block.len();
-    let erased: Vec<usize> = (0..n).filter(|&i| block[i].is_erasure()).collect();
-    let (read, redundancy) = (n - erased.len(), ec_len.saturating_sub(erased.len()));
-    let errors = (0..n).filter(|&i| !block[i].is_erasure() && corrected[i] != block[i].value).count();
-    let unknown: usize = block.iter().map(|c| c.known.count_zeros() as usize).sum();
-    let hard = list_solution_bits(read, redundancy, errors);
-    let soft = soft_count_bits(block, bit_reliability, (8 * ec_len).saturating_sub(unknown), soft_distance(block, bit_reliability, &corrected));
-    let bits = hard.max(soft).saturating_sub(1).saturating_sub(tries_charge(tries));
-    let slack = redundancy.saturating_sub(2 * errors).min(bits as usize / 8);
-    let located = bits - 8 * slack as u32;
-    let solution = settle(block, &[], &erased, corrected, errors, slack, located, reserved).ok()?;
-    (solution.confidence_bits() >= DOUBT_CONFIRMING_BITS).then_some(solution)
+    Ok(RsSolution { corrected, errata, errors, erasures: erased.len(), slack, check_bits, flipped_known_bits, located_bits, charge: 0, reserved })
 }
 
 /// A codeword of the code found by searching something other than
-/// `block`, judged against `block` alone ([`super::evidence::Laid`]):
-/// how rarely a block of noise has a codeword as near, counted codeword
-/// by codeword or bit by bit, whichever counts the more, less one for
-/// the choice between them and the charge for `tries`.
+/// `block`, the word the beliefs made ([`super::abp`]) or the block with
+/// what the message makes likely laid over it
+/// ([`super::evidence::Laid`]), judged against `block` alone: how rarely
+/// a block of noise has a codeword as near, counted codeword by codeword
+/// or bit by bit, whichever counts the more, less one for the choice
+/// between them and `tries_cost`, what the decodes made to find it cost
+/// ([`tries_charge`]). The tries' cost is the charge the solution
+/// carries ([`RsSolution::charge`]), and the choice's bit comes off what
+/// confirms it ([`less_the_choice`]): a caller that weighs the solution
+/// against its soft count once more, charged for the tries it carries
+/// and a bit for that choice ([`super::pipeline`]), then charges the
+/// choice once. Carried in the charge, the bit was charged there again,
+/// and the propagation's solutions stood a bit below the chase's under
+/// a guided search. What it searched from says nothing here, since the
+/// search carries its word toward some codeword whatever the block
+/// holds.
 ///
 /// Codeword by codeword is as a decode of errors and erasures has it
 /// ([`list_solution_bits`], [`settle`]): the redundancy left after the
@@ -845,20 +899,23 @@ pub(super) fn accounted(
 /// Bit by bit is the soft count ([`soft_count_bits`]): every known bit
 /// at its reliability, against the equations the unknown bits leave,
 /// among which the known bits of the erased codewords already stand. So
-/// the two are never added, as [`accounted`] adds them: a search that
-/// solved bit by bit used every known bit to find its codeword, and its
-/// agreeing with them is what the soft count measures, once. A bit by
-/// bit count's slack is the codewords' worth of it, which is what the
-/// codewords the standard reserves are held to. `None` for a codeword
-/// that overturns a pin, or with less than [`DOUBT_CONFIRMING_BITS`]
-/// behind it.
+/// the two are never added: a search that solved bit by bit used every
+/// known bit to find its codeword, and its agreeing with them is what
+/// the soft count measures, once. The propagation's solutions were once
+/// counted so, the larger of the two counts and then the erased
+/// codewords' known bits on top of it, and a block with many codewords
+/// partly read was shown verified at a risk far below what the search
+/// had established. A bit by bit count's slack is the codewords' worth
+/// of it, which is what the codewords the standard reserves are held
+/// to. `None` for a codeword that overturns a pin, or with less than
+/// [`DOUBT_CONFIRMING_BITS`] behind it.
 pub(super) fn judged(
     block: &[CwRead],
     bit_reliability: &[[u8; 8]],
     ec_len: usize,
     reserved: usize,
     corrected: Vec<u8>,
-    tries: usize,
+    tries_cost: u32,
 ) -> Option<RsSolution> {
     if block.iter().zip(&corrected).any(|(cw, &c)| (cw.value ^ c) & cw.pinned != 0) {
         return None;
@@ -868,18 +925,25 @@ pub(super) fn judged(
     let (read, redundancy) = (n - erased.len(), ec_len.saturating_sub(erased.len()));
     let errors = (0..n).filter(|&i| !block[i].is_erasure() && corrected[i] != block[i].value).count();
     let unknown: usize = block.iter().map(|c| c.known.count_zeros() as usize).sum();
-    let charge = 1 + tries_charge(tries);
-    let hard = list_solution_bits(read, redundancy, errors).saturating_sub(charge);
-    let slack = redundancy.saturating_sub(2 * errors).min(hard as usize / 8);
+    // What each count is held to: a bit for the choice between them and
+    // the tries' cost. The slack never claims more than the bits confirm
+    // once charged.
+    let charge = 1 + tries_cost;
+    let hard = list_solution_bits(read, redundancy, errors);
+    let slack = redundancy.saturating_sub(2 * errors).min(hard.saturating_sub(charge) as usize / 8);
     let by_codeword = (erased.len() <= ec_len)
-        .then(|| settle(block, &[], &erased, corrected.clone(), errors, slack, hard - 8 * slack as u32, reserved).ok())
+        .then(|| {
+            settle(block, &[], &erased, corrected.clone(), errors, slack, hard - 8 * slack as u32, reserved)
+                .ok()
+                .map(|solution| less_the_choice(RsSolution { charge: tries_cost, ..solution }))
+        })
         .flatten();
     let distance = soft_distance(block, bit_reliability, &corrected);
-    let soft = soft_count_bits(block, bit_reliability, (8 * ec_len).saturating_sub(unknown), distance).saturating_sub(charge);
+    let soft = soft_count_bits(block, bit_reliability, (8 * ec_len).saturating_sub(unknown), distance);
     let solution = match by_codeword {
-        Some(solution) if solution.confidence_bits() >= soft => solution,
+        Some(solution) if solution.confidence_bits() >= soft.saturating_sub(charge) => solution,
         _ => {
-            let slack = soft as usize / 8;
+            let slack = soft.saturating_sub(charge) as usize / 8;
             let flipped_known_bits =
                 erased.iter().map(|&i| ((corrected[i] ^ block[i].value) & block[i].known).count_ones()).sum();
             let solution = RsSolution {
@@ -891,12 +955,28 @@ pub(super) fn judged(
                 check_bits: 0,
                 flipped_known_bits,
                 located_bits: soft - 8 * slack as u32,
+                charge: tries_cost,
                 reserved,
             };
-            restated(block, solution)
+            restated(block, less_the_choice(solution))
         }
     };
     (solution.confidence_bits() >= DOUBT_CONFIRMING_BITS).then_some(solution)
+}
+
+/// `solution` with a bit taken from what confirms it, for the choice
+/// between the two counts [`judged`] judges by: from what the count has
+/// beyond the slack's bytes, or from the checks where it has nothing
+/// there, which only a count of nothing leaves, the slack being held to
+/// the count less the charge and that bit. The confidence is as if the
+/// bit were charged, and the charge stays the tries' cost alone.
+fn less_the_choice(mut solution: RsSolution) -> RsSolution {
+    if solution.located_bits > 0 {
+        solution.located_bits -= 1;
+    } else {
+        solution.check_bits = solution.check_bits.saturating_sub(1);
+    }
+    solution
 }
 
 /// Decode by doubting: erase the least reliable fully read codewords, one
@@ -925,7 +1005,7 @@ pub fn rs_decode_doubting(
     let mut beyond: Option<(usize, RsSolution)> = None;
     for k in 1..=doubtful.len() {
         if let Ok(solution) = rs_decode_doubted(block, &doubtful[..k], ec_len, reserved).map(|s| s.among(doubtful.len()))
-            && solution.confidence_bits() >= DOUBT_CONFIRMING_BITS
+            && solution.uncharged_bits() >= DOUBT_CONFIRMING_BITS
         {
             let held = if solution.within_standard() { &mut best } else { &mut beyond };
             if held.as_ref().is_none_or(|(_, b)| solution.confidence_bits() > b.confidence_bits()) {
@@ -1364,7 +1444,7 @@ pub fn rs_decode_trying(
             }
             let erased: Vec<usize> = set.iter().map(|&k| candidates[k]).collect();
             let Ok(solution) = rs_decode_core(block, &erased, ec_len, reserved, &syndromes).map(|s| s.among(tried)) else { return };
-            if solution.confidence_bits() < DOUBT_CONFIRMING_BITS {
+            if solution.uncharged_bits() < DOUBT_CONFIRMING_BITS {
                 return;
             }
             let solution = restated(block, solution);
@@ -3029,12 +3109,14 @@ mod tests {
         }
         assert_eq!(rs_decode_doubting(&read, &reliability, ec_len, 0), None);
         // Nor is one with a single codeword spare whose doubted codewords
-        // agree with it no better than chance: one syndrome byte is all
-        // that stands behind it, which noise passes once in 256 tries,
-        // and doubting tries a count of codewords at a time.
+        // agree with it little better than chance: one syndrome byte and
+        // a bit or two of agreement are all that stand behind it, which
+        // noise passes once in a few hundred tries, and doubting tries a
+        // count of codewords at a time.
         read[3] = CwRead::known(block[3]);
         let plain = rs_decode_doubted(&read, &[0, 1, 2], ec_len, 0).unwrap();
-        assert_eq!((plain.slack, plain.confidence_bits(), plain.corrected == block), (1, 8, true));
+        assert_eq!((plain.slack, plain.corrected == block), (1, true));
+        assert!((8..=10).contains(&plain.confidence_bits()), "{}", plain.confidence_bits());
         assert_eq!(rs_decode_doubting(&read, &reliability, ec_len, 0), None);
 
         // Codewords misread in one faint bit each bear the solution out
@@ -3048,7 +3130,9 @@ mod tests {
         }
         let (doubted, sol) = rs_decode_doubting(&read, &reliability, ec_len, 0).unwrap();
         assert_eq!((doubted, sol.slack), (7, 1));
-        assert_eq!(sol.confidence_bits(), 8 + doubted_agreement(49, 7));
+        // Charged for the eight counts of codewords doubting tried.
+        assert_eq!(sol.confidence_bits(), 8 + doubted_agreement(49, 7) - tries_charge(8));
+        assert_eq!(sol.uncharged_bits(), 8 + doubted_agreement(49, 7));
         assert_eq!(sol.corrected, block);
         // With two codewords reserved for detection that solution is
         // beyond the standard's limit, and doubting offers it so marked,
@@ -3087,13 +3171,30 @@ mod tests {
     #[test]
     fn doubted_codewords_keep_their_agreeing_bits_as_checks() {
         // Beyond chance: a doubted codeword agrees with any solution in
-        // half its bits, so one bit of disagreement in eight is worth
-        // nothing alone, while seven codewords right in seven bits of
-        // eight are worth far more than their one slack codeword.
-        assert_eq!(doubted_agreement(7, 1), 0);
+        // half its bits, so four right of eight is worth nothing and
+        // seven of eight a few bits, while seven codewords right in
+        // seven bits of eight are worth far more than their one slack
+        // codeword. The tail of the binomial, to the bit: nine of the
+        // two hundred and fifty-six ways eight coins fall show seven or
+        // more heads.
+        assert_eq!(doubted_agreement(7, 1), 4);
         assert_eq!(doubted_agreement(4, 4), 0);
-        assert_eq!(doubted_agreement(49, 7), 42 - 23);
-        assert_eq!(doubted_agreement(56, 8), 48 - 24);
+        assert_eq!(doubted_agreement(0, 0), 0);
+        // Tails that are a whole number of bits: a bare majority of an
+        // odd count is a coin's toss, and six of seven, eight of the
+        // hundred and twenty-eight ways, four bits. The sum in
+        // logarithms once landed a hair above the whole number, and the
+        // floor a bit short.
+        assert_eq!((doubted_agreement(1, 0), doubted_agreement(2, 1), doubted_agreement(11, 10), doubted_agreement(31, 30)), (1, 1, 1, 1));
+        assert_eq!((doubted_agreement(6, 1), doubted_agreement(3, 1), doubted_agreement(255, 0)), (4, 1, 255));
+        assert_eq!(doubted_agreement(49, 7), 27);
+        assert_eq!(doubted_agreement(56, 8), 31);
+        // Over a few hundred bits three standard deviations overshot
+        // the tail: 164 right of 256 is seventeen bits, where they said
+        // twenty-four, and 205 of 256 seventy-five, where they said a
+        // hundred and six.
+        assert_eq!(doubted_agreement(164, 92), 17);
+        assert_eq!(doubted_agreement(205, 51), 75);
 
         let mut rng = Rng(51);
         let ec_len = 10;
@@ -3113,7 +3214,7 @@ mod tests {
         // solution agreed with, beyond the one it overturned, as checks.
         assert_eq!(sol.flipped_known_bits, 7);
         assert_eq!(sol.check_bits, doubted_agreement(49, 7));
-        assert_eq!(sol.confidence_bits(), 24 + doubted_agreement(49, 7));
+        assert_eq!(sol.confidence_bits(), 24 + doubted_agreement(49, 7) - tries_charge(7));
         assert!(sol.errata.iter().all(|e| e.was_erasure && e.magnitude.count_ones() == 1));
         assert_eq!(sol.errata.len(), 7);
         // Erasing them outright would have confirmed nothing beyond the slack.
@@ -3136,7 +3237,7 @@ mod tests {
         }
         let (doubted, sol) = rs_decode_doubting(&read, &reliability, ec_len, 0).unwrap();
         assert_eq!((doubted, sol.slack, sol.corrected == block), (10, 0, true));
-        assert_eq!(sol.confidence_bits(), doubted_agreement(70, 10));
+        assert_eq!(sol.confidence_bits(), doubted_agreement(70, 10) - tries_charge(10));
         let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
         for &i in &picked {
             read[i].value = rng.byte();
@@ -3228,7 +3329,7 @@ mod tests {
         // Two codewords spare, and the four solid errors the code located
         // among the forty read, less ten bits for the thousand and
         // twenty-three patterns of the ten faintest bits that were tried.
-        assert_eq!(sol.located_bits, located_error_bits(40, 4) - 10);
+        assert_eq!((sol.located_bits, sol.charge), (located_error_bits(40, 4), 10));
         assert_eq!(sol.confidence_bits(), 16 + 5);
         assert_eq!(sol.errata.len(), 7);
         for e in &sol.errata {
@@ -3247,17 +3348,85 @@ mod tests {
     }
 
     #[test]
+    fn a_judged_solution_carries_the_tries_cost_and_takes_the_choice_from_what_confirms_it() {
+        // A 5-Q block wrong in three codewords, every bit of each, judged
+        // as the block as read makes of its own codeword, as one of
+        // thirty-two decodes: too far for the soft count to look, so the
+        // hard count confirms it, twelve codewords spare and three errors
+        // located among thirty-three read, less one for the choice
+        // between the counts and the five bits the decodes cost. The
+        // charge is the tries' cost alone, and the choice's bit comes off
+        // what the count has beyond the slack's bytes: a caller weighing
+        // the solution against its soft count again, charged for the
+        // tries it carries and a bit for the choice, charges the choice
+        // once. Carried in the charge, the bit was charged there again.
+        let mut rng = Rng(0x7D6E);
+        let ec_len = 18;
+        let block = codeword(&mut rng, 15, ec_len);
+        let certain = vec![[CERTAIN; 8]; block.len()];
+        let tries_cost = tries_charge(32);
+        let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+        for &i in &rng.distinct(3, block.len()) {
+            read[i].value ^= 0xFF;
+        }
+        assert!(soft_distance(&read, &certain, &block) > SOFT_COUNT_REACH);
+        let hard = list_solution_bits(33, 18, 3);
+        let sol = judged(&read, &certain, ec_len, 0, block.clone(), tries_cost).unwrap();
+        assert_eq!((sol.errors, sol.slack, sol.check_bits, sol.charge), (3, 12, 0, tries_cost));
+        assert_eq!(sol.located_bits, hard - 8 * 12 - 1);
+        assert_eq!((sol.confidence_bits(), sol.uncharged_bits()), (hard - 1 - tries_cost, hard - 1));
+
+        // Wrong in one bit each, read on its threshold: the soft count,
+        // the hundred and forty-four bits of redundancy less one and the
+        // three coin tosses, confirms it where the hard count falls
+        // short, and is split the same way.
+        let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+        let mut faint = certain.clone();
+        for &i in &rng.distinct(3, block.len()) {
+            read[i].value ^= 1 << (i % 8);
+            faint[i][i % 8] = 0;
+        }
+        assert_eq!(soft_count_bits(&read, &faint, 8 * ec_len, 0), 140);
+        let sol = judged(&read, &faint, ec_len, 0, block.clone(), tries_cost).unwrap();
+        assert_eq!((sol.errors, sol.slack, sol.check_bits, sol.charge), (3, 16, 0, tries_cost));
+        assert_eq!(sol.located_bits, 140 - 8 * 16 - 1);
+        assert_eq!((sol.confidence_bits(), sol.uncharged_bits()), (140 - 1 - tries_cost, 140 - 1));
+
+        // Eighteen codewords half read, their low nibbles unknown, and
+        // the rest read right: the codewords read in full fix the half
+        // read ones with no redundancy left, so the hard count is
+        // nothing, and the seventy-two known bits of the half read ones,
+        // reproduced, are the checks. The choice's bit then comes off
+        // the checks, the count having nothing beyond the slack's bytes.
+        let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+        for &i in &rng.distinct(18, block.len()) {
+            read[i] = CwRead { value: block[i] & 0xF0, known: 0xF0, pinned: 0 };
+        }
+        assert_eq!(list_solution_bits(15, 0, 0), 0);
+        let sol = judged(&read, &certain, ec_len, 0, block.clone(), tries_cost).unwrap();
+        assert_eq!((sol.erasures, sol.slack, sol.located_bits, sol.check_bits, sol.charge), (18, 0, 0, 71, tries_cost));
+        assert_eq!((sol.confidence_bits(), sol.uncharged_bits()), (71 - tries_cost, 71));
+    }
+
+    #[test]
     fn the_nearest_of_solutions_that_disagree_wins_by_a_clear_margin_or_not_at_all() {
-        // A certain bit overturned costs 256, a faint one its reliability
-        // and one, and a bit that was not read nothing.
+        // A bit overturned costs the likelihood its reading carries, in
+        // eighths of a bit: nothing for a coin's toss, about thirteen for
+        // one read a bit of likelihood inside its colour, eight over
+        // the reliability for one read well, and 263 for a certain one.
+        assert_eq!((bit_cost(0), bit_cost(1), bit_cost(8), bit_cost(9), bit_cost(16), bit_cost(24)), (0, 2, 13, 14, 22, 31));
+        assert_eq!((bit_cost(200), bit_cost(CERTAIN - 1), bit_cost(CERTAIN)), (208, 262, 263));
+        assert!((1..=255u8).all(|r| bit_cost(r) > bit_cost(r - 1)));
+        // A certain bit overturned costs 263, a faint one less, one read
+        // on its threshold nothing, and a bit that was not read nothing.
         let block = [CwRead::known(0b1010_1010), CwRead { value: 0x0F, known: 0x0F, pinned: 0 }];
         let certain = [[CERTAIN; 8]; 2];
         assert_eq!(soft_distance(&block, &certain, &[0b1010_1010, 0x0F]), 0);
-        assert_eq!(soft_distance(&block, &certain, &[0b1010_1011, 0xFF]), 256);
+        assert_eq!(soft_distance(&block, &certain, &[0b1010_1011, 0xFF]), 263);
         let mut faint = certain;
         faint[0][0] = 9;
         faint[1][1] = 0;
-        assert_eq!(soft_distance(&block, &faint, &[0b1010_1011, 0x0D]), 11);
+        assert_eq!(soft_distance(&block, &faint, &[0b1010_1011, 0x0D]), 14);
 
         let same = |a: &u8, b: &u8| a == b;
         let never = |_: &u8, _: &u8| false;
@@ -3788,8 +3957,9 @@ mod tests {
         assert_eq!(soft_count_bits(&block, &certain, 8 * 18, 0), 8 * 18 - 1);
         assert_eq!(soft_count_bits(&block, &certain, 8 * 18, 0), list_solution_bits(33, 18, 0));
         let sets_of_eight: f64 = (0..=8).map(|j| (0..j).map(|i| (264 - i) as f64 / (i + 1) as f64).product::<f64>()).sum();
-        assert_eq!(soft_count_bits(&block, &certain, 8 * 18, 8 * 256), (144.0 - sets_of_eight.log2() - (255f64 / 254.0).log2()).floor() as u32);
-        assert!(soft_count_bits(&block, &certain, 8 * 18, 8 * 256) < list_solution_bits(33, 18, 1));
+        let byte = 8 * bit_cost(CERTAIN);
+        assert_eq!(soft_count_bits(&block, &certain, 8 * 18, byte), (144.0 - sets_of_eight.log2() - (255f64 / 254.0).log2()).floor() as u32);
+        assert!(soft_count_bits(&block, &certain, 8 * 18, byte) < list_solution_bits(33, 18, 1));
         assert_eq!(soft_count_bits(&block, &certain, 8 * 18, SOFT_COUNT_REACH + 1), 0);
         // Twenty faint bits among solid ones: the sets within the cost
         // of overturning ten of them are sets of the faint bits mostly,
@@ -3799,15 +3969,32 @@ mod tests {
         for i in 0..20 {
             faint[i][i % 8] = 4;
         }
-        let soft = soft_count_bits(&block, &faint, 8 * 18, 10 * 5);
+        let ten = 10 * bit_cost(4);
+        let soft = soft_count_bits(&block, &faint, 8 * 18, ten);
         assert!(soft > 100 && soft > list_solution_bits(33, 18, 10), "{soft}");
         // Pinned bits are not counted; unknown bits spend equations.
         let mut pinned = block.clone();
         for cw in &mut pinned[..20] {
             cw.pinned = 0xFF;
         }
-        assert!(soft_count_bits(&pinned, &faint, 8 * 18, 10 * 5) > soft);
-        assert_eq!(soft_count_bits(&block, &faint, 8 * 18 - 40, 10 * 5), soft - 40);
+        assert!(soft_count_bits(&pinned, &faint, 8 * 18, ten) > soft);
+        assert_eq!(soft_count_bits(&block, &faint, 8 * 18 - 40, ten), soft - 40);
+        // A bit read on its threshold costs nothing to overturn and is
+        // in a set or out of it alike: each takes a bit from the count,
+        // whatever the distance, where a byte each of reliability and
+        // one once made sixty-four of them a byte of margin. Within a
+        // byte of distance a little comes back, there being fewer
+        // certain bits to make sets of.
+        for tossed in [1usize, 5, 64] {
+            let mut tosses = certain.clone();
+            for i in 0..tossed {
+                tosses[i / 8][i % 8] = 0;
+            }
+            assert_eq!(soft_count_bits(&block, &tosses, 8 * 18, 0), 8 * 18 - 1 - tossed as u32, "{tossed}");
+            let want = soft_count_bits(&block, &certain, 8 * 18, byte) - tossed as u32;
+            let got = soft_count_bits(&block, &tosses, 8 * 18, byte);
+            assert!((want..=want + 4).contains(&got), "{tossed}: {got} for {want}");
+        }
     }
 
     #[test]

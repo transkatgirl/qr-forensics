@@ -3,12 +3,30 @@ mod cli;
 
 use eframe::egui;
 
+/// What the window takes, for `--help`; the headless reader prints a
+/// usage of its own.
+const USAGE: &str = "usage: qr-forensics [<image>]
+       qr-forensics decode [options] <image>...
+
+Opens the window, with the image given loaded. `decode` runs the headless reader instead, with no window, and
+exits with its status: `qr-forensics decode --help` says what it takes.";
+
 fn main() -> eframe::Result {
     // `decode` first on the command line runs the headless reader, with
     // no window, and exits with its status.
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     if args.first().is_some_and(|first| first == "decode") {
         std::process::exit(cli::run(&args[1..]));
+    }
+    // The usage or the version asked for is printed, not opened as an
+    // image named `--help`.
+    if args.first().is_some_and(|first| first == "--help" || first == "-h") {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    if args.first().is_some_and(|first| first == "--version") {
+        println!("qr-forensics {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

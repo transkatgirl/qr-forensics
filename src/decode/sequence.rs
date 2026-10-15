@@ -111,6 +111,39 @@ impl Sequence {
         replaced
     }
 
+    /// Add the parts of one message among `parts`: those whose count and
+    /// parity are this sequence's header ([`Self::header`]) while it
+    /// holds a message, and otherwise those of the message most of them
+    /// are of, the first met where two are as many. The rest come back
+    /// in their order, for the caller to say so. A part of another
+    /// message is no part of this one, whatever its index: the parts of
+    /// two messages read from one photo once went into one sequence
+    /// together, a part of one taking the place of the other's by its
+    /// index.
+    pub fn add_all(&mut self, parts: Vec<Part>) -> Vec<Part> {
+        let header = self.header().or_else(|| {
+            let mut counts: Vec<((u8, u8), usize)> = Vec::new();
+            for part in &parts {
+                let key = (part.total, part.parity);
+                match counts.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, n)) => *n += 1,
+                    None => counts.push((key, 1)),
+                }
+            }
+            // The last of the most from the back, which is the first.
+            counts.iter().rev().max_by_key(|(_, n)| *n).map(|(key, _)| *key)
+        });
+        let mut left_out = Vec::new();
+        for part in parts {
+            if header == Some((part.total, part.parity)) {
+                self.add(part);
+            } else {
+                left_out.push(part);
+            }
+        }
+        left_out
+    }
+
     pub fn remove(&mut self, index: u8) {
         self.parts.retain(|p| p.index != index);
     }
@@ -185,10 +218,12 @@ impl Sequence {
             out.encoding = Some(encodings.join(", "));
         }
         out.symbology = self.parts.first().and_then(|p| p.text.symbology.clone());
-        out.parity = if self.missing().is_empty() {
-            self.parts.iter().map(Part::own_parity).try_fold(0u8, |acc, p| p.map(|p| acc ^ p))
-        } else {
-            None
+        // The parity of the whole message is known only once every part
+        // of one message is in and read: parts that disagree about the
+        // sequence have no missing indices to name, and no parity either.
+        out.parity = match self.check() {
+            ParityCheck::Complete { computed, .. } => Some(computed),
+            _ => None,
         };
         out
     }
@@ -264,6 +299,34 @@ mod tests {
         sequence.add(part(2, 3, 0x11, "cd", Certainty::Verified));
         assert_eq!(sequence.check(), ParityCheck::Inconsistent);
         assert_eq!(sequence.header(), None);
+        // Parts that disagree about the sequence name no missing index,
+        // and that is no reason to report the parity of a whole message:
+        // there is no one message whose parity it would be.
+        assert!(sequence.missing().is_empty());
+        assert_eq!(sequence.assembled().parity, None);
+        assert_eq!(sequence.assembled().plain(), "abcd");
+        sequence.clear();
+        // The parts of two messages read from one photo, in the order
+        // the symbols were found: the message with more parts goes in,
+        // whole, and the other's parts come back. They once went in
+        // together, part 2 of the second taking the place of part 2 of
+        // the first.
+        let a = |index, text: &str| part(index, 2, 0x11, text, Certainty::Verified);
+        let b = |index, text: &str| part(index, 2, 0x22, text, Certainty::Verified);
+        let left_out = sequence.add_all(vec![a(1, "ab"), b(2, "zz"), a(2, "cd")]);
+        assert_eq!(sequence.assembled().plain(), "abcd");
+        assert_eq!(left_out.iter().map(|p| (p.index, p.parity)).collect::<Vec<_>>(), [(2, 0x22)]);
+        // Holding a message, the sequence takes that message's parts and
+        // no other's, however many.
+        sequence.clear();
+        sequence.add(b(1, "yy"));
+        let left_out = sequence.add_all(vec![a(1, "ab"), a(2, "cd"), b(2, "zz")]);
+        assert_eq!((sequence.assembled().plain().as_str(), left_out.len()), ("yyzz", 2));
+        // As many of each: the first met. Nothing: nothing.
+        sequence.clear();
+        let left_out = sequence.add_all(vec![b(1, "yy"), a(1, "ab")]);
+        assert_eq!((sequence.header(), left_out.len()), (Some((2, 0x22)), 1));
+        assert!(Sequence::default().add_all(Vec::new()).is_empty());
         sequence.clear();
         let mut torn = part(2, 2, 0x11, "c?", Certainty::Unknown);
         torn.text.parity = None;

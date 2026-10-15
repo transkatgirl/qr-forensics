@@ -332,13 +332,18 @@ impl BinarizeParams {
     /// The settings the scan uses for a symbol outlined by `corners`,
     /// top-left first and clockwise, in a `width` × `height` photo: the
     /// radius a sixth of the outline's shorter side, and the region the
-    /// outline with the margin the search reaches beyond it.
+    /// outline with the margin the search reaches beyond it. The radius
+    /// is whole pixels, taken upward: the blocks it reaches, whole
+    /// blocks rounded up ([`BlockMean::within`]), are then the blocks
+    /// the scan's radius reaches, which is not rounded. Taken to the
+    /// nearest pixel it fell a block short of the scan's for a side a
+    /// hair over a multiple of forty-eight.
     pub fn for_outline(corners: [[f64; 2]; 4], width: usize, height: usize) -> Self {
         let distance = |a: [f64; 2], b: [f64; 2]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt();
         let across = (distance(corners[0], corners[1]) + distance(corners[3], corners[2])) / 2.0;
         let down = (distance(corners[0], corners[3]) + distance(corners[1], corners[2])) / 2.0;
         let side = across.min(down);
-        let radius = if side.is_finite() && side > 0.0 { BlockMean::radius_for(side).round() as usize } else { Self::MIN_RADIUS };
+        let radius = if side.is_finite() && side > 0.0 { BlockMean::radius_for(side).ceil() as usize } else { Self::MIN_RADIUS };
         let (x0, x1) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, p| (a.0.min(p[0]), a.1.max(p[0])));
         let (y0, y1) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, p| (a.0.min(p[1]), a.1.max(p[1])));
         let region = if [x0, x1, y0, y1].iter().all(|v| v.is_finite()) {
@@ -421,6 +426,14 @@ mod tests {
         assert_eq!(BinarizeParams::for_outline(square(10.0, 10.0, 20.0), 1000, 800).radius, BinarizeParams::MIN_RADIUS);
         assert_eq!(BinarizeParams::for_outline([[0.0; 2]; 4], 1000, 800).region, None);
         assert_eq!(BinarizeParams::default().region, None);
+        // The view reaches the blocks the scan does, whatever the size of
+        // the outline: a radius taken to the nearest pixel fell a block
+        // short of the scan's for a side of 49, of 97 and so on.
+        for side in 48..=1536 {
+            let view = BinarizeParams::for_outline(square(0.0, 0.0, side as f64), 2000, 2000).radius as f64;
+            let scan = BlockMean::radius_for(side as f64);
+            assert_eq!((view / BLOCK as f64).ceil(), (scan / BLOCK as f64).ceil(), "a side of {side}");
+        }
     }
 
     #[test]

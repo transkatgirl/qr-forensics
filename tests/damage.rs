@@ -7,7 +7,9 @@ use common::*;
 use qr_forensics::decode::bitstream::Certainty;
 use qr_forensics::decode::codewords::Pins;
 use qr_forensics::decode::pipeline::{BlockOutcome, CwStatus, DecodeOptions, SolveMethod, decode};
-use qr_forensics::decode::rs::{AIDED_VERIFIED_BITS, CHASE_BITS, RsFailure, TRIAL_SETS, VERIFIED_BITS, located_error_bits, sets_of};
+use qr_forensics::decode::rs::{
+    AIDED_VERIFIED_BITS, CHASE_BITS, RsFailure, TRIAL_SETS, VERIFIED_BITS, located_error_bits, sets_of, tries_charge,
+};
 use qr_forensics::decode::text::UNKNOWN_CHAR;
 use qr_forensics::symbol::grid::{CERTAIN, Module, ModuleGrid};
 use qr_forensics::symbol::layout::SymbolLayout;
@@ -261,13 +263,14 @@ fn zero_slack_solutions_are_flagged_unverified() {
 }
 
 #[test]
-fn a_solution_with_little_to_spare_is_improved_by_flipping_the_faint_bit() {
+fn a_solution_with_little_to_spare_is_improved_by_doubting_the_faint_bit() {
     // Fifteen codewords of a 4-M block erased and one more read wrong and
     // faint: exact decoding takes the wrong one as an error and lands on
     // the right values with one codeword to spare, which is too little
-    // behind a solution that filled fifteen. Flipping the faint bit
-    // instead leaves three, and the solution is verified. An exact
-    // solution used to end the search before the fallbacks were tried.
+    // behind a solution that filled fifteen. Doubting the faint bit
+    // instead, or flipping it, leaves nearly three, and the solution
+    // comes within a bit of verified. An exact solution used to end the
+    // search before the fallbacks were tried.
     let mut rng = Rng(0x51AD);
     let (layout, clean, text) = sample(SymbolVersion::Qr(4), EcLevel::M, 5, &mut rng);
     let block = &layout.blocks[0];
@@ -303,24 +306,54 @@ fn a_solution_with_little_to_spare_is_improved_by_flipping_the_faint_bit() {
     assert!(!exact.blocks[0].is_verified());
     assert_eq!(exact.text.plain(), text);
 
+    // Doubting the faint bit as a single bit solves the block to the
+    // right values with twenty-three equations to spare; flipping it by
+    // the chase leaves three codewords, twenty-four bits, less six for
+    // the sixty-three patterns of flips tried, and ranks below. After
+    // the selection charge neither reaches the byte a verified block
+    // needs: the block stands solved and unconfirmed, a bit short. The
+    // chase once stood on its three codewords uncharged for the
+    // patterns, and the block passed for verified on them.
     let report = decode(&grid, &layout, 5, &Pins::new(), &unguided());
     match report.blocks[0].outcome {
-        BlockOutcome::Solved { method: SolveMethod::Chase { flipped_bits: 1 }, errors: 1, erasures: 15, slack: 3, .. } => {}
+        BlockOutcome::Solved { method: SolveMethod::BitReliability { doubted_bits: 1 }, errors: 1, erasures: 15, risk_bits: 7, .. } => {}
         other => panic!("{other:?}"),
     }
-    assert!(report.blocks[0].is_verified());
-    assert!(report.is_trustworthy());
+    assert!(report.is_complete() && !report.blocks[0].is_verified());
+    assert!(!report.is_trustworthy());
     assert_eq!(report.text.plain(), text);
     assert_eq!(report.codewords.iter().filter(|c| c.status == CwStatus::Corrected).count(), 1);
+    // As one of thirty-two decodes, which a search of every format
+    // makes, the solution is charged the five bits that costs, as the
+    // plain decode is, from both counts of it alike: the doubting
+    // solution stands five bits lower. The soft count once went
+    // uncharged for the search, and a fallback's solution that stood on
+    // it kept its risk whatever the search, where the plain decode's
+    // fell.
+    let among = decode(&grid, &layout, 5, &Pins::new(), &unguided().among(32));
+    assert_eq!(among.blocks[0].outcome.risk_bits(), 7 - tries_charge(32), "{:?}", among.blocks[0].outcome);
+
+    // One codeword fewer erased, and the exact solution has two to
+    // spare and the one error located, which with the soft count for
+    // the one faint bit it overturns is verified as it stands.
+    let grid = torn(block.ec_len - 4);
+    let report = decode(&grid, &layout, 5, &Pins::new(), &unguided());
+    match report.blocks[0].outcome {
+        BlockOutcome::Solved { method: SolveMethod::ReedSolomon, errors: 1, erasures: 14, slack: 2, .. } => {}
+        other => panic!("{other:?}"),
+    }
+    assert!(report.blocks[0].is_verified() && report.is_trustworthy());
+    assert_eq!(report.text.plain(), text);
 
     // One codeword more erased, and flipping the faint bit leaves two to
-    // spare: sixteen bits, which the sixty-three patterns of flips tried
-    // let a block of noise pass once in a thousand. The block is still
+    // spare: sixteen bits, less the six for the patterns tried, which
+    // the sixty-three patterns let a block of noise pass once in a
+    // thousand; doubting it leaves fifteen equations. The block is still
     // solved so, to the right values, and stands unconfirmed.
     let grid = torn(block.ec_len - 2);
     let report = decode(&grid, &layout, 5, &Pins::new(), &unguided());
     match report.blocks[0].outcome {
-        BlockOutcome::Solved { method: SolveMethod::Chase { flipped_bits: 1 }, errors: 1, erasures: 16, slack: 2, confidence_bits: 16, .. } => {}
+        BlockOutcome::Solved { errors: 1, erasures: 16, risk_bits: 0, .. } => {}
         other => panic!("{other:?}"),
     }
     assert!(report.is_complete() && !report.blocks[0].is_verified());

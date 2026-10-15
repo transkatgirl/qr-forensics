@@ -3,7 +3,7 @@
 use eframe::egui;
 use qr_forensics::decode::list::{LIST_COST_MAX, LIST_COST_MIN};
 use qr_forensics::decode::rs::{CHASE_MAX_BITS, TRIAL_SETS_MAX};
-use qr_forensics::imaging::adjust::{Adjust, Channel, Enlarge, Filter, LENS_MIN_PAIRS, MAX_ENLARGED_SIDE};
+use qr_forensics::imaging::adjust::{Adjust, Channel, Enlarge, Filter, K1_RANGE, LENS_MIN_PAIRS, MAX_ENLARGED_SIDE};
 use qr_forensics::imaging::binarize::{BinarizeParams, WINDOW_RADII};
 use qr_forensics::imaging::detect::{AnchorKind, Detection, anchor_sites};
 use qr_forensics::imaging::sample::{BLUR_MIN_GAIN, Kernel, POOR_SEPARABILITY, SHARPEN_BELOW_PX, misread_odds, reliability_bits};
@@ -239,7 +239,7 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
             // the thousandth, and the corners and anchors have been moved
             // for exactly that term, so it must not be rounded to the
             // slider's step behind them on the next frame.
-            let slider = egui::Slider::new(&mut adjust.k1, -0.3..=0.3)
+            let slider = egui::Slider::new(&mut adjust.k1, K1_RANGE)
                 .step_by(0.005)
                 .fixed_decimals(3)
                 .clamping(egui::SliderClamping::Edits);

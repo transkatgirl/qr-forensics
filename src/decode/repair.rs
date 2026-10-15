@@ -4,10 +4,11 @@
 //! scan.
 
 use super::bch;
+use super::codewords::codeword_bit_mask;
 use super::pipeline::{BlockReport, DecodeReport};
 use crate::symbol::function_map::InfoCopy;
 use crate::symbol::grid::{Module, ModuleGrid};
-use crate::symbol::layout::SymbolLayout;
+use crate::symbol::layout::{BlockSpec, SymbolLayout};
 use crate::symbol::mask::mask_bit;
 use crate::symbol::{Family, SymbolVersion};
 
@@ -20,14 +21,29 @@ fn paint_info(grid: &mut ModuleGrid, copies: &[InfoCopy], word: u32) {
     }
 }
 
-/// Whether the decode vouches for the layout's EC level and mask: a block
-/// solved under them, or the grid's own format bits name them beyond
-/// doubt. A level and mask that were only guessed, with nothing solved to
-/// bear them out, are no more than the layout in effect, and writing
-/// their format word back would turn the guess into bits that read as
-/// evidence for it.
+/// Whether the layout's EC level and mask are vouched for: a block
+/// verified under them, a message written in by hand under them, or the
+/// grid's own format bits naming them beyond doubt. A level and mask that
+/// were only guessed, with nothing to bear them out, are no more than the
+/// layout in effect, and writing their format word back would turn the
+/// guess into bits that read as evidence for it. A block merely solved
+/// bears nothing out: one with as many codewords unknown as it has of
+/// error correction solves under every mask, to whatever fills them, with
+/// nothing to confirm it. A block whose every data codeword is pinned by
+/// hand is another matter: the message is the user's own, written under
+/// the layout they chose, and its format word is part of what they are
+/// making, as a symbol built from its data for a test or a print is.
 fn format_established(grid: &ModuleGrid, layout: &SymbolLayout, mask: u8, report: &DecodeReport) -> bool {
-    if report.blocks.iter().any(BlockReport::is_solved) {
+    if report.blocks.iter().any(BlockReport::is_verified) {
+        return true;
+    }
+    let written_by_hand = |block: &BlockSpec| {
+        block.codewords[..block.data_len].iter().all(|&cw| {
+            let exists = codeword_bit_mask(layout, cw);
+            report.codewords[cw].pin.is_some_and(|pin| pin.source.is_by_hand() && pin.mask & exists == exists)
+        })
+    };
+    if layout.blocks.iter().any(written_by_hand) {
         return true;
     }
     let format = bch::analyze_format(grid, &layout.func);
@@ -36,11 +52,18 @@ fn format_established(grid: &ModuleGrid, layout: &SymbolLayout, mask: u8, report
 
 /// The grid as error correction says it should be: fixed patterns and
 /// version information regenerated, the format information regenerated
-/// for the layout in effect once the decode vouches for it (a block
-/// solved under it, or the grid's own format bits naming it), the modules
-/// of every solved codeword set to their corrected values, and remainder
-/// bits cleared. Modules of unsolved codewords are left as they are, so
-/// the result is complete exactly when the decode was.
+/// for the layout in effect once it is vouched for (a block verified
+/// under it, a message written in by hand under it, or the grid's own
+/// format bits naming it), the modules of every solved codeword set to
+/// their corrected values, and
+/// remainder bits cleared. Modules of unsolved codewords are left as they
+/// are, so the result is complete exactly when the decode was.
+///
+/// The codeword slots a Model 1 symbol's blocks leave unused at some
+/// levels ([`SymbolLayout::unused_modules`]) hold no codeword, and are
+/// cleared as the remainder bits are, to light before the mask: the
+/// Model 1 standard is not to hand to say what an encoder put there, and
+/// zxing-cpp, the one reader of the model, never looks.
 pub fn repaired_grid(grid: &ModuleGrid, layout: &SymbolLayout, mask: u8, report: &DecodeReport) -> ModuleGrid {
     let func = &layout.func;
     let version = func.version;
@@ -65,7 +88,7 @@ pub fn repaired_grid(grid: &ModuleGrid, layout: &SymbolLayout, mask: u8, report:
             out.set(x, y, Module::from_dark(dark));
         }
     }
-    for pos in &func.data_path[func.codeword_bits()..] {
+    for pos in layout.unused_modules().iter().chain(&func.data_path[func.codeword_bits()..]) {
         let (x, y) = (pos.x as usize, pos.y as usize);
         out.set(x, y, Module::from_dark(mask_bit(version, mask, x, y)));
     }
@@ -75,11 +98,12 @@ pub fn repaired_grid(grid: &ModuleGrid, layout: &SymbolLayout, mask: u8, report:
 /// What the decode established of every module, row-major over the
 /// symbol: the colour of each fixed module, of the format and version
 /// information under the layout in effect, of every module of a codeword
-/// in a block that verified, corrected, and of the remainder bits; `None`
-/// for the modules of codewords in blocks that did not verify. What
-/// [`repaired_grid`] writes back, as far as it is trusted, and nothing of
-/// the grid as read: a template of the symbol that a placement can be
-/// refitted to.
+/// in a block that verified, corrected, and of the remainder bits and the
+/// codeword slots a Model 1 symbol leaves unused, as [`repaired_grid`]
+/// clears them; `None` for the modules of codewords in blocks that did
+/// not verify. What [`repaired_grid`] writes back, as far as it is
+/// trusted, and nothing of the grid as read: a template of the symbol
+/// that a placement can be refitted to.
 pub fn known_modules(layout: &SymbolLayout, mask: u8, report: &DecodeReport) -> Vec<Option<bool>> {
     let func = &layout.func;
     let version = func.version;
@@ -113,7 +137,7 @@ pub fn known_modules(layout: &SymbolLayout, mask: u8, report: &DecodeReport) -> 
             out[y * width + x] = Some((value & (0x80 >> (span.bit_offset as usize + bit)) != 0) != mask_bit(version, mask, x, y));
         }
     }
-    for pos in &func.data_path[func.codeword_bits()..] {
+    for pos in layout.unused_modules().iter().chain(&func.data_path[func.codeword_bits()..]) {
         let (x, y) = (pos.x as usize, pos.y as usize);
         out[y * width + x] = Some(mask_bit(version, mask, x, y));
     }

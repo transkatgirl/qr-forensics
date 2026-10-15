@@ -8,6 +8,7 @@ use super::projection::Project;
 use crate::symbol::function_map::{FunctionMap, looks_inverted};
 use crate::symbol::grid::{CERTAIN, Module, ModuleGrid};
 use crate::symbol::{Family, Pos, SymbolVersion};
+use crate::work;
 
 /// Points sampled per module along each axis, spread over the middle of the
 /// module so neighbours and edge blur stay out of the average.
@@ -1788,6 +1789,8 @@ pub fn suggest_versions(
     let mut guesses: Vec<VersionGuess> = family
         .versions()
         .into_iter()
+        // Called off, the ranking comes back with the versions tried.
+        .take_while(|_| !work::cancelled())
         .filter_map(|version| {
             let func = FunctionMap::new(version);
             let h = Homography::rect_to_quad(func.width as f64, func.height as f64, corners)?;
@@ -1815,6 +1818,18 @@ pub fn suggest_versions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ranking_versions_called_off_comes_back_with_the_versions_tried() {
+        use crate::work::Cancel;
+        let image = Luma::new(80, 80, vec![0.5; 80 * 80]);
+        let corners = [[10.0, 10.0], [70.0, 10.0], [70.0, 70.0], [10.0, 70.0]];
+        let params = SampleParams::default();
+        assert_eq!(suggest_versions(&image, corners, Family::Micro, &params).len(), 4);
+        let request = Cancel::new();
+        request.cancel();
+        assert!(request.scope(|| suggest_versions(&image, corners, Family::Micro, &params)).is_empty());
+    }
 
     #[test]
     fn otsu_splits_between_groups() {

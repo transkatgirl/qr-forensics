@@ -1099,6 +1099,19 @@ impl Detection {
         swapped
     }
 
+    /// Quarter turns clockwise the symbol sits in `outline`, to the
+    /// nearest quarter ([`turns_between`]), reckoned as for a placement
+    /// seen from the front: the corners of a mirrored symbol run in the
+    /// symbol's own order, which is mirror order in the photo, and are
+    /// taken in the photo's order. Reckoned on the corners as they ran,
+    /// a mirrored symbol that sat upright in its outline was told to be
+    /// a quarter turn out.
+    pub(crate) fn turns_in(&self, outline: [[f64; 2]; 4]) -> u8 {
+        let c = self.corners;
+        let front = if self.mirrored { [c[0], c[3], c[2], c[1]] } else { c };
+        turns_between(outline, front)
+    }
+
     /// This placement relabelled for its symbol turned or reflected by
     /// `symmetry`, as [`ModuleGrid::symmetric`] turns a grid: the same
     /// outline with the symbol's corners at other corners of it, so that
@@ -1398,7 +1411,7 @@ fn detect_candidates_in(
         let capstones: Vec<Capstone> = all.iter().map(|c| c.reframed(&geometry)).collect();
         let mut settled = false;
         for (mut fit, ranked) in detect_in_frame(image, version, &geometry, &capstones, threshold, params) {
-            fit.turns = turns_between(region, fit.corners);
+            fit.turns = fit.turns_in(region);
             // The symbol's own bits name this version, or, for a symbol
             // with three finders, its fixed patterns and quiet zone read
             // nearly all right: no other frame will do better. A symbol
@@ -8996,6 +9009,10 @@ pub(crate) fn settle_loose_corners_with(
     let mut corners = corners;
     for _ in 0..2 {
         for &i in &loose {
+            // Called off, the corners come back as they stand.
+            if work::cancelled() {
+                return corners;
+            }
             settle_corner(image, func, &mut corners, i, sign, threshold, &[], false);
         }
     }
@@ -9025,6 +9042,10 @@ pub fn refine_anchors(
     // that none waits on another: side by side on the cores to spare.
     let numbered: Vec<(usize, &Anchor)> = anchors.iter().enumerate().collect();
     let mut refined: Vec<Anchor> = work::map(&numbered, |&(k, anchor)| {
+        // Called off, an anchor not yet looked for stays where it is.
+        if work::cancelled() {
+            return *anchor;
+        }
         let Some(site) = site_of(func, anchor) else { return *anchor };
         // Search a small window around where the anchor already is,
         // through the map the other anchors make: the map through

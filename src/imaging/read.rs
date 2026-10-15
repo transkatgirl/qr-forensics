@@ -122,7 +122,7 @@ use std::sync::Arc;
 
 use super::detect::{
     Anchor, AnchorKind, Climb, Detection, Retry, detect_candidates_by, outline_around, refine_anchors, seen_from_behind,
-    turned_on_symbol, turns_between,
+    turned_on_symbol,
 };
 use super::enhance::{Enhance, Enhanced};
 use super::projection::{ControlPoint, Project, Projection};
@@ -1134,7 +1134,7 @@ fn unturn(found: &mut Detection, quarters: u8, width: usize, height: usize, regi
     for anchor in &mut found.anchors {
         anchor.center = unrotate_point_cw(anchor.center, quarters, width, height);
     }
-    found.turns = turns_between(region, found.corners);
+    found.turns = found.turns_in(region);
     // The turn is noted beside whatever else the photo was made into:
     // the step of the ladder the detector climbed to, or the copy a
     // read in one brings the detection back from, stays as it is.
@@ -1178,6 +1178,47 @@ mod tests {
             turned: 0,
             decodes: None,
         }
+    }
+
+    #[test]
+    fn a_symbol_brought_back_from_a_turned_photo_is_turned_as_seen_from_the_front() {
+        use crate::imaging::rotate_point_cw;
+        let (width, height) = (500, 600);
+        let square = placed().corners;
+        let turned_in_place = [square[1], square[2], square[3], square[0]];
+        // Found in the photo as it lies, on the outline's own corners:
+        // no turn, from the front or from behind. The corners of a
+        // mirrored symbol run in mirror order, and reckoned on them as
+        // they ran, the turn came to a quarter.
+        let mut upright = placed();
+        unturn(&mut upright, 0, width, height, square);
+        assert_eq!(upright.turns, 0);
+        let mut mirrored = Detection { corners: [square[0], square[3], square[2], square[1]], mirrored: true, ..placed() };
+        unturn(&mut mirrored, 0, width, height, square);
+        assert_eq!(mirrored.turns, 0);
+        // A quarter turn clockwise in the outline, with the symbol's
+        // top-left corner at the outline's top right, is a quarter from
+        // the front and from behind alike.
+        let mut turned = Detection { corners: turned_in_place, ..placed() };
+        unturn(&mut turned, 0, width, height, square);
+        assert_eq!(turned.turns, 1);
+        let mut turned_behind = Detection { corners: [turned_in_place[0], turned_in_place[3], turned_in_place[2], turned_in_place[1]], mirrored: true, ..placed() };
+        unturn(&mut turned_behind, 0, width, height, square);
+        assert_eq!(turned_behind.turns, 1);
+        // Found in the photo turned a quarter, where an upright symbol
+        // lies turned: brought back, it is upright, mirrored or not, and
+        // the copy it was found in is noted.
+        let in_turned_photo = square.map(|p| rotate_point_cw(p, 1, width, height));
+        let mut brought_back = Detection { corners: in_turned_photo, ..placed() };
+        unturn(&mut brought_back, 1, width, height, square);
+        assert_eq!((brought_back.turns, brought_back.turned), (0, 1));
+        for (i, corner) in brought_back.corners.iter().enumerate() {
+            assert!((corner[0] - square[i][0]).abs() < 1e-9 && (corner[1] - square[i][1]).abs() < 1e-9, "{i}: {corner:?}");
+        }
+        let behind = [in_turned_photo[0], in_turned_photo[3], in_turned_photo[2], in_turned_photo[1]];
+        let mut brought_back = Detection { corners: behind, mirrored: true, ..placed() };
+        unturn(&mut brought_back, 1, width, height, square);
+        assert_eq!(brought_back.turns, 0);
     }
 
     #[test]

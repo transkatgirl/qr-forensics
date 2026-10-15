@@ -6,7 +6,7 @@ mod common;
 
 use common::*;
 use qr_forensics::decode::bitstream::Certainty;
-use qr_forensics::decode::codewords::{PinSource, Pins};
+use qr_forensics::decode::codewords::{Pin, PinSource, Pins};
 use qr_forensics::decode::known::{BEGINNINGS, Place, TextPinError, lay_over, text_pins, try_beginnings};
 use qr_forensics::decode::pipeline::{BlockOutcome, DecodeOptions, DecodeReport, decode};
 use qr_forensics::decode::text::Charset;
@@ -212,6 +212,42 @@ fn text_is_pinned_where_it_stands_in_the_message() {
     assert_eq!(text_pins(&layout, &before, Place::Char(0), "", Charset::Auto), Err(TextPinError::Empty));
 }
 
+#[test]
+fn a_character_after_a_bad_lead_byte_is_pinned_at_its_own_byte() {
+    // Under Shift_JIS, 0xC2 is a half-width katakana on its own, 0x81 a
+    // lead byte, and '!' no trail byte: the lead is given up as a
+    // replacement character and '!' read on its own. Clicking the '!'
+    // and pinning it once pinned the lead's byte with its value, the
+    // two characters having been put under the cell the lead began at.
+    let (version, ec, mask) = (SymbolVersion::Qr(2), EcLevel::M, 1);
+    let layout = layout(version, ec);
+    let bytes = b"\xC2\x81!x";
+    let clean = encode(version, ec, Some(mask), &[Segment::bytes(bytes)]).unwrap();
+    let report = decode(&clean, &layout, mask, &Pins::new(), &DecodeOptions { charset: Charset::ShiftJis, ..DecodeOptions::default() });
+    assert!(report.is_trustworthy());
+    assert_eq!(report.text.plain(), "ﾂ\u{FFFD}!x");
+    assert_eq!(report.text.sources.iter().map(|s| s.cell).collect::<Vec<_>>(), [0, 1, 2, 3]);
+    let found = text_pins(&layout, &report, Place::Char(2), "!x", Charset::ShiftJis).unwrap();
+    assert_eq!((found.pinned, found.contradicted), (2, 0));
+    // The byte segment's header is twelve bits, so byte k lies at stream
+    // bits 12 + 8k: bytes 2 and 3 straddle message codewords 3 to 5.
+    let pinned: Vec<usize> = found.pins.keys().map(|&cw| layout.stream_index(cw).unwrap()).collect();
+    assert_eq!(pinned, [3, 4, 5]);
+    // The low nibble of '!' and the high nibble of 'x'.
+    assert_eq!(found.pins[&layout.data_stream[4]], Pin::full(0x17, PinSource::Text));
+    // The same under UTF-8, where 0xC3 is a lead that 'A' cannot follow.
+    let bytes = b"\xC3AB";
+    let clean = encode(version, ec, Some(mask), &[Segment::bytes(bytes)]).unwrap();
+    let report = decode(&clean, &layout, mask, &Pins::new(), &DecodeOptions { charset: Charset::Utf8, ..DecodeOptions::default() });
+    assert_eq!(report.text.plain(), "\u{FFFD}AB");
+    assert_eq!(report.text.sources.iter().map(|s| s.cell).collect::<Vec<_>>(), [0, 1, 2]);
+    let found = text_pins(&layout, &report, Place::Char(1), "AB", Charset::Utf8).unwrap();
+    assert_eq!((found.pinned, found.contradicted), (2, 0));
+    let pinned: Vec<usize> = found.pins.keys().map(|&cw| layout.stream_index(cw).unwrap()).collect();
+    assert_eq!(pinned, [2, 3, 4]);
+    assert!(decode_pinned(&clean, &layout, mask, &found.pins).is_trustworthy());
+}
+
 /// The pins of text that a clean symbol holds agree with every bit of
 /// it, and of text it does not hold contradict it.
 fn assert_agrees(version: SymbolVersion, ec: EcLevel, segments: &[Segment], at: usize, text: &str, pinned: usize, other: &str) {
@@ -259,6 +295,55 @@ fn every_mode_is_pinned_as_an_encoder_packs_it() {
     assert_agrees(SymbolVersion::Micro(3), EcLevel::L, &[Segment::bytes("micro")], 1, "icr", 3, "icx");
     assert_agrees(SymbolVersion::Micro(2), EcLevel::L, &[Segment::numeric("123456").unwrap()], 0, "123456", 6, "123457");
     assert_agrees(SymbolVersion::Rmqr(11), EcLevel::M, &[Segment::bytes("rMQR")], 0, "rMQR", 4, "rMQr");
+}
+
+#[test]
+fn text_pinned_at_the_start_is_encoded_as_the_message_reads() {
+    // Byte data that no designator covers is read in the set chosen, or
+    // guessed from the bytes: "café élan" in ISO-8859-1 reads as such
+    // under Auto, and text pinned at the start of the message is the
+    // bytes of that set, as text pinned at a character is. It was once
+    // UTF-8 whatever the message read as, and "café" pinned at the start
+    // asserted two bytes for its last letter where the symbol held one.
+    let (version, ec, mask) = (SymbolVersion::Qr(2), EcLevel::M, 1);
+    let layout = layout(version, ec);
+    let clean = encode(version, ec, Some(mask), &[Segment::bytes(&b"caf\xE9 \xE9lan"[..])]).unwrap();
+    let report = decode_plain(&clean, &layout, mask);
+    assert!(report.is_trustworthy());
+    assert_eq!((report.text.plain().as_str(), report.text.encoding.as_deref()), ("café élan", Some("ISO-8859-1 (guessed)")));
+    for charset in [Charset::Auto, Charset::Latin1] {
+        let found = text_pins(&layout, &report, Place::Start(Mode::Byte), "café", charset).unwrap();
+        assert_eq!((found.pinned, found.contradicted), (4, 0), "{charset:?}");
+        for (&cw, pin) in &found.pins {
+            let value = report.codewords[cw].final_value.unwrap();
+            assert_eq!((value ^ pin.value) & pin.mask, 0, "{charset:?} codeword {cw}");
+        }
+        // The same bits as the text pinned at its first character, and
+        // the mode indicator besides.
+        let at_char = text_pins(&layout, &report, Place::Char(0), "café", charset).unwrap();
+        for (cw, pin) in &at_char.pins {
+            let start = found.pins[cw];
+            assert_eq!((start.mask & pin.mask, (start.value ^ pin.value) & pin.mask), (pin.mask, 0), "{charset:?} codeword {cw}");
+        }
+    }
+    // A set chosen is followed, as it is at a character: UTF-8 chosen
+    // makes the é two bytes, which the symbol contradicts.
+    let found = text_pins(&layout, &report, Place::Start(Mode::Byte), "café", Charset::Utf8).unwrap();
+    assert_eq!(found.pinned, 5);
+    assert!(found.contradicted > 0);
+    // With nothing read to guess from, under Auto the text is UTF-8, as
+    // it always was.
+    let (version, ec, mask) = (SymbolVersion::Qr(3), EcLevel::L, 2);
+    let layout = common::layout(version, ec);
+    let clean = encode(version, ec, Some(mask), &[Segment::bytes("https://example.com/q?id=7Q2M-XK4P-99AD")]).unwrap();
+    let mut grid = damaged(&clean, &layout, 3..=11);
+    for &cw in &layout.data_stream[..2] {
+        erase_codeword(&mut grid, &layout, cw);
+    }
+    let before = decode_plain(&grid, &layout, mask);
+    assert!(before.text.is_empty() && before.parse.segments.is_empty());
+    assert_eq!(text_pins(&layout, &before, Place::Start(Mode::Byte), "café", Charset::Auto).unwrap().pinned, 5);
+    assert_eq!(text_pins(&layout, &before, Place::Start(Mode::Byte), "café", Charset::Latin1).unwrap().pinned, 4);
 }
 
 #[test]
@@ -375,4 +460,45 @@ fn a_common_beginning_is_kept_only_when_error_correction_bears_it_out() {
     for text in BEGINNINGS {
         assert!(text_pins(&layout, &sound, Place::Start(Mode::Byte), text, Charset::Auto).is_ok(), "{text:?}");
     }
+}
+
+#[test]
+fn an_odd_length_beginning_is_tried_in_alphanumeric_mode() {
+    // An address in alphanumeric mode, its header's first bit wrong so
+    // that nothing parses, and eight codewords wrong under the beginning:
+    // one more than the block corrects. `HTTP://WWW.` is eleven
+    // characters, and alphanumeric characters are packed two to a group:
+    // five pairs are pinned and the odd full stop left out, which once
+    // kept every odd-length beginning from being tried in the mode at
+    // all. The message decoded under the pairs must still begin with the
+    // whole of it.
+    let (version, ec, mask) = (SymbolVersion::Qr(3), EcLevel::L, 2);
+    let layout = layout(version, ec);
+    let opts = unaided();
+    let none = Pins::new();
+    let text = "HTTP://WWW.EXAMPLE.COM/Q-7Q2M-XK4P-99AD";
+    let clean = encode(version, ec, Some(mask), &[Segment::alphanumeric(text).unwrap()]).unwrap();
+    let mut grid = damaged(&clean, &layout, 2..=9);
+    corrupt_codeword(&mut grid, &layout, layout.data_stream[0], 0);
+    let before = decode(&grid, &layout, mask, &none, &opts);
+    assert_eq!(before.blocks_solved(), 0);
+    assert!(before.text.is_empty());
+    let found = try_beginnings(&grid, &layout, mask, &none, &opts, &before).expect("a beginning is borne out");
+    assert_eq!((found.text, found.place), ("HTTP://WWW.", Place::Start(Mode::Alphanumeric)));
+    assert!(found.report.is_trustworthy());
+    assert_eq!(found.report.text.plain(), text);
+    // The pins are the five whole pairs after the mode indicator and the
+    // count, and nothing of the full stop: the mode indicator's four
+    // bits, then fifty-five from bit thirteen.
+    let pins = text_pins(&layout, &before, Place::Start(Mode::Alphanumeric), "HTTP://WWW.", Charset::Auto).unwrap();
+    assert_eq!((pins.pinned, pins.left_out), (10, 1));
+    let bits: u32 = pins.pins.values().map(|pin| pin.mask.count_ones()).sum();
+    assert_eq!(bits, 4 + 5 * 11);
+    // At a character as read the odd character is left out the same
+    // way, and there a beginning so cut is not tried; a symbol that
+    // decodes already has no block left for one to verify.
+    let sound = decode_plain(&clean, &layout, mask);
+    let at_char = text_pins(&layout, &sound, Place::Char(0), "HTTP://WWW.", Charset::Auto).unwrap();
+    assert_eq!((at_char.pinned, at_char.left_out), (10, 1));
+    assert!(try_beginnings(&clean, &layout, mask, &none, &opts, &sound).is_none());
 }

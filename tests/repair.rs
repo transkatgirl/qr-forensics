@@ -204,3 +204,95 @@ fn a_guessed_format_is_not_written_back() {
         assert_eq!(repaired.get(pos.x as usize, pos.y as usize), grid.get(pos.x as usize, pos.y as usize), "{pos:?}");
     }
 }
+
+#[test]
+fn a_format_nothing_verified_under_is_not_written_back() {
+    // The format bits gone, and as many codewords of the one block
+    // unknown as it has of error correction: the block solves, to the
+    // one filling of them that makes a codeword, with nothing to spare
+    // and nothing to confirm it, under this mask as under any other. The
+    // level and mask in effect are a guess still, and repairing must not
+    // paint their format word as if the decode had borne it out.
+    let (version, ec, mask) = (SymbolVersion::Qr(2), EcLevel::L, 0);
+    let layout = layout(version, ec);
+    let clean = encode(version, ec, Some(mask), &[Segment::bytes("format")]).unwrap();
+    let block = &layout.blocks[0];
+    let wipe = |erased: usize| {
+        let mut grid = clean.clone();
+        for pos in layout.func.format.iter().flat_map(|c| &c.bits) {
+            grid.set(pos.x as usize, pos.y as usize, Module::Unknown);
+        }
+        for &cw in &block.codewords[..erased] {
+            erase_codeword(&mut grid, &layout, cw);
+        }
+        grid
+    };
+    let grid = wipe(block.ec_len);
+    let report = decode_plain(&grid, &layout, mask);
+    assert!(report.blocks[0].is_solved() && !report.blocks[0].is_verified(), "{:?}", report.blocks[0].outcome);
+    let repaired = repaired_grid(&grid, &layout, mask, &report);
+    for pos in layout.func.format.iter().flat_map(|c| &c.bits) {
+        assert_eq!(repaired.get(pos.x as usize, pos.y as usize), Module::Unknown, "{pos:?}");
+    }
+    // Three codewords fewer unknown, the block verifies, and the format
+    // word is written back.
+    let grid = wipe(block.ec_len - 3);
+    let report = decode_plain(&grid, &layout, mask);
+    assert!(report.blocks[0].is_verified(), "{:?}", report.blocks[0].outcome);
+    let repaired = repaired_grid(&grid, &layout, mask, &report);
+    assert_eq!(repaired, clean);
+}
+
+#[test]
+fn the_codeword_slots_a_model_1_symbol_leaves_unused_are_cleared() {
+    // 13-H leaves two codeword slots, sixteen modules, that belong to no
+    // block: cleared as the remainder bits are, and known as such in the
+    // template, whatever the grid read there.
+    let (version, ec, mask) = (SymbolVersion::Model1(13), EcLevel::H, 2);
+    let layout = layout(version, ec);
+    let unused = layout.unused_modules();
+    assert_eq!(unused.len(), 16);
+    let mut grid = layout.func.blank_grid();
+    for pos in unused {
+        grid.set(pos.x as usize, pos.y as usize, Module::Dark);
+    }
+    let report = decode_plain(&grid, &layout, mask);
+    let repaired = repaired_grid(&grid, &layout, mask, &report);
+    let known = known_modules(&layout, mask, &report);
+    for pos in unused {
+        let (x, y) = (pos.x as usize, pos.y as usize);
+        let want = qr_forensics::symbol::mask::mask_bit(version, mask, x, y);
+        assert_eq!(repaired.get(x, y), Module::from_dark(want), "{pos:?}");
+        assert_eq!(known[y * grid.width() + x], Some(want), "{pos:?}");
+    }
+    // Model 2 has none, and its remainder bits are cleared as before.
+    assert!(common::layout(SymbolVersion::Qr(2), EcLevel::L).unused_modules().is_empty());
+}
+
+#[test]
+fn a_message_written_in_by_hand_carries_the_format_it_was_written_under() {
+    use qr_forensics::decode::codewords::{Pin, PinSource, Pins};
+    use qr_forensics::decode::pipeline::{DecodeOptions, decode};
+    let (version, ec, mask) = (SymbolVersion::Qr(1), EcLevel::L, 3);
+    let layout = layout(version, ec);
+    let clean = encode(version, ec, Some(mask), &[Segment::bytes("by hand")]).unwrap();
+    let truth = decode_plain(&clean, &layout, mask);
+    let pinned = |source: PinSource| -> Pins {
+        layout.data_stream.iter().map(|&cw| (cw, Pin::full(truth.codewords[cw].final_value.unwrap(), source))).collect()
+    };
+    let blank = layout.func.blank_grid();
+    let opts = DecodeOptions::default();
+    // Every data codeword pinned by hand into a blank grid: the block
+    // solves from the pins alone, with nothing to confirm it, and what
+    // is written back is the encoder's symbol, format word and all.
+    let report = decode(&blank, &layout, mask, &pinned(PinSource::Manual), &opts);
+    assert!(report.blocks[0].is_solved() && !report.blocks[0].is_verified(), "{:?}", report.blocks[0].outcome);
+    assert_eq!(repaired_grid(&blank, &layout, mask, &report), clean);
+    // The same pins placed by the decoder are no one's word for the
+    // layout, and the format bits stay as they were.
+    let report = decode(&blank, &layout, mask, &pinned(PinSource::Padding), &opts);
+    let repaired = repaired_grid(&blank, &layout, mask, &report);
+    for pos in layout.func.format.iter().flat_map(|c| &c.bits) {
+        assert_eq!(repaired.get(pos.x as usize, pos.y as usize), Module::Unknown, "{pos:?}");
+    }
+}

@@ -239,6 +239,12 @@ struct PendingJob {
     /// The document's version when the job began. A result that means
     /// something only at that version is dropped if the version changed.
     version: SymbolVersion,
+    /// The document's outline and anchors when the job began. A result
+    /// that would place the outline is of the outline the job set out
+    /// from: one the user has moved on meanwhile is not overwritten
+    /// with it.
+    corners: [[f64; 2]; 4],
+    anchors: Vec<Anchor>,
     receiver: std::sync::mpsc::Receiver<JobResult>,
     started: std::time::Instant,
     /// Calls the job off, as a search's does: see [`PendingSearch`].
@@ -280,6 +286,22 @@ impl JobKind {
     }
 }
 
+/// A row of a list under Alignment that a step was begun from, to put
+/// the outline on what it holds: marked as the one in use
+/// ([`Proposals::adopted`], [`Placements::adopted`]) once the outline
+/// is put there, and not as the step begins, since what the step hands
+/// back may be dropped. Marked as the step began, a row stayed marked
+/// after a drag of the outline had the result dropped, and the symbol
+/// in it was listed as in use and kept off the canvas, where the notice
+/// said to click it again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Picked {
+    /// The `i`-th symbol the search found.
+    Proposal(usize),
+    /// The `i`-th placement listed inside the outline.
+    Placement(usize),
+}
+
 /// What a job worked out, to be taken into the document on the UI thread.
 enum JobResult {
     /// Find in outline: the symbol found inside the outline, made ready to
@@ -287,8 +309,9 @@ enum JobResult {
     /// asked about; or nothing.
     Corners(Option<(Prepared, Option<Family>)>),
     /// A symbol the search found, or a placement the detector ranked,
-    /// made ready to adopt, and what to call it in a notice.
-    Adopt(Prepared, String),
+    /// made ready to adopt, what to call it in a notice, and the row of
+    /// a list under Alignment it was picked from, when it was.
+    Adopt(Prepared, String, Option<Picked>),
     /// Refine: the corners and anchors it set out from, and what it made
     /// of them, `None` when the corners form no usable outline. A result
     /// is for the outline it set out from: one the user has moved on
@@ -660,6 +683,7 @@ impl App {
         if version.family() != self.doc.version.family() {
             self.guesses = None;
         }
+        let (old, anchors) = (self.doc.version, self.doc.anchors.len());
         self.doc = self.doc.blank_like(version);
         self.view.selected = None;
         self.view.highlight_block = None;
@@ -668,6 +692,15 @@ impl App {
         self.brute = None;
         self.model = None;
         self.preview = None;
+        // The anchors named modules of the old version, and went with
+        // its grid: said, since nothing else shows that they did.
+        if anchors > 0 {
+            let what = if anchors == 1 { "1 anchor was".to_owned() } else { format!("{anchors} anchors were") };
+            self.notify(format!(
+                "Started a new {} {version} grid (undoable). {what} removed: they named modules of version {old}.",
+                version.family().label()
+            ));
+        }
     }
 
     /// Keep the modules as painted and read them as a symbol of `version`,
@@ -1262,24 +1295,24 @@ impl App {
     /// with the outline, where reads are loaded; otherwise it is adopted,
     /// which takes the outline and the anchors and leaves the grid to be
     /// sampled. `what` names the symbol in the notice of a read loaded.
-    fn take_in(&mut self, mut prepared: Prepared, what: &str) -> String {
+    fn take_in(&mut self, ctx: &egui::Context, mut prepared: Prepared, what: &str) -> String {
         let read = prepared.result.take().filter(|read| self.view.load_reads && read.is_trustworthy());
         // The photo's enlargement is still what the read was made at: a
         // job outlives no change of it.
         let enlarge = self.photo.as_ref().map(|photo| photo.adjust.enlarge);
         match (read, enlarge) {
             (Some(read), Some(enlarge)) => self.load_read_result(*read, prepared.searched_inverted, enlarge, what),
-            _ => self.adopt_prepared(prepared),
+            _ => self.adopt_prepared(ctx, prepared),
         }
     }
 
     /// Take in what Find in outline found, loading its read or adopting
     /// it ([`Self::take_in`]), or say that nothing was found. `searched`
     /// is the family the outline was searched for first.
-    fn finish_find_corners(&mut self, found: Option<(Prepared, Option<Family>)>, searched: Family) {
+    fn finish_find_corners(&mut self, ctx: &egui::Context, found: Option<(Prepared, Option<Family>)>, searched: Family) {
         match found {
             Some((prepared, other_family)) => {
-                let text = self.take_in(prepared, "the symbol inside the outline");
+                let text = self.take_in(ctx, prepared, "the symbol inside the outline");
                 match other_family {
                     Some(family) => self.notify(format!(
                         "What is inside the outline reads as a {} symbol, not a {} one. {text}",
@@ -1310,7 +1343,15 @@ impl App {
     /// and `what` names it for a notice. With `read`, it is read through
     /// to its message first, as Find in outline reads what it finds, and
     /// a read that decodes comes back with it, to be loaded.
-    fn adopt_proposal(&mut self, ctx: &egui::Context, found: Detection, searched_inverted: bool, what: String, read: bool) {
+    fn adopt_proposal(
+        &mut self,
+        ctx: &egui::Context,
+        found: Detection,
+        searched_inverted: bool,
+        what: String,
+        read: bool,
+        picked: Option<Picked>,
+    ) {
         if self.job_busy() {
             return;
         }
@@ -1336,7 +1377,7 @@ impl App {
                     ..prepare_adoption(&luma, &func, version, found, searched_inverted, &params)
                 },
             };
-            JobResult::Adopt(prepared, what)
+            JobResult::Adopt(prepared, what, picked)
         });
     }
 
@@ -1508,6 +1549,8 @@ impl App {
             kind,
             generation: self.photo_generation,
             version: self.doc.version,
+            corners: self.doc.corners,
+            anchors: self.doc.anchors.iter().map(|a| a.anchor).collect(),
             receiver,
             started: std::time::Instant::now(),
             cancel,
@@ -1517,9 +1560,11 @@ impl App {
     /// Take in a finished job, if one has finished. A result for a photo
     /// since replaced is dropped; so is one that means something only at
     /// the version the job began under, when the version changed
-    /// meanwhile. A detection carries its own version, and adopting it
-    /// reckons with the document as it is now.
-    fn poll_job(&mut self) {
+    /// meanwhile, and one made of the outline the job set out from, when
+    /// the outline or the anchors moved meanwhile. A detection carries
+    /// its own version, and adopting it reckons with the document as it
+    /// is now.
+    fn poll_job(&mut self, ctx: &egui::Context) {
         let Some(job) = &self.job else { return };
         let result = match job.receiver.try_recv() {
             Ok(result) => result,
@@ -1542,10 +1587,26 @@ impl App {
             return;
         }
         let version_changed = self.doc.version != job.version;
+        // A corner dragged or an anchor moved or dropped while the step
+        // ran: a result that would place the outline is of the outline
+        // before that, and taking it in would undo the hand's work; and
+        // a ranking made inside the outline is of the outline before
+        // that, and would be shown as one made on these corners.
+        let outline_moved =
+            job.corners != self.doc.corners || self.doc.anchors.iter().map(|a| a.anchor).ne(job.anchors.iter().copied());
         match result {
-            JobResult::Corners(found) => self.finish_find_corners(found, job.version.family()),
-            JobResult::Adopt(prepared, what) => {
-                let text = self.take_in(prepared, &what);
+            JobResult::Corners(_) if outline_moved => self.notify(
+                "The outline or the anchors changed while the symbol inside the outline was being found, so the \
+                 result was dropped; press Find in outline again.",
+            ),
+            JobResult::Corners(found) => self.finish_find_corners(ctx, found, job.version.family()),
+            JobResult::Adopt(..) if outline_moved => self.notify(
+                "The outline or the anchors changed while the corners were being placed on the symbol found, so the \
+                 result was dropped; click the symbol again.",
+            ),
+            JobResult::Adopt(prepared, what, picked) => {
+                let text = self.take_in(ctx, prepared, &what);
+                self.mark_picked(picked);
                 self.notify(text);
             }
             JobResult::Refine { .. } if version_changed => self.notify(
@@ -1568,8 +1629,16 @@ impl App {
                 "The version changed while the versions were being ranked, so the ranking was dropped; press \
                  Suggest version again.",
             ),
+            JobResult::Suggest(_) if outline_moved => self.notify(
+                "The outline or the anchors changed while the versions were being ranked, so the ranking was \
+                 dropped; press Suggest version again.",
+            ),
             JobResult::Suggest(guesses) => self.guesses = Some(guesses),
             JobResult::ReadFound { outlines, reads, photo_inverted } => self.finish_read_found(&outlines, reads, photo_inverted),
+            JobResult::Placements { .. } if outline_moved => self.notify(
+                "The outline or the anchors changed while the placements inside the outline were being ranked, so \
+                 the list was dropped; press Other placements again.",
+            ),
             JobResult::Placements { found, photo_inverted } => self.finish_placements(found, photo_inverted, job.version.family()),
         }
     }
@@ -1763,15 +1832,24 @@ impl App {
             return;
         };
         let decoded = reads.iter().flatten().filter(|read| read.is_trustworthy()).count();
-        let mut parts = 0;
-        for (i, read) in reads.iter().enumerate() {
-            if let Some(read) = read.as_ref().filter(|read| read.is_trustworthy())
-                && let Some(part) = Part::from_report(&read.report, format!("{name}, symbol {}", i + 1))
-            {
-                self.view.sequence.add(part);
-                parts += 1;
-            }
-        }
+        // The parts of a structured append message among the reads go
+        // into the sequence: of the message it holds, or, holding none,
+        // of the one most of them are of ([`Sequence::add_all`]). Parts
+        // of another message read from the same photo are no parts of
+        // it, and are said instead: they once went in with the rest, a
+        // part of one message taking the place of the other's by its
+        // index.
+        let found: Vec<(usize, Part)> = reads
+            .iter()
+            .enumerate()
+            .filter_map(|(i, read)| {
+                let read = read.as_ref().filter(|read| read.is_trustworthy())?;
+                Part::from_report(&read.report, format!("{name}, symbol {}", i + 1)).map(|part| (i, part))
+            })
+            .collect();
+        let left_out = self.view.sequence.add_all(found.iter().map(|(_, part)| part.clone()).collect());
+        let parts = found.len() - left_out.len();
+        let left_out: Vec<usize> = found.iter().filter(|(_, part)| left_out.contains(part)).map(|(i, _)| i + 1).collect();
         let total = reads.len();
         let enlarge = self.photo.as_ref().map_or(Enlarge::NONE, |photo| photo.adjust.enlarge);
         let decodes = |i: usize| reads.get(i).and_then(Option::as_ref).is_some_and(ReadResult::is_trustworthy);
@@ -1782,6 +1860,22 @@ impl App {
         if parts > 0 {
             let what = if parts == 1 { "1 part".to_owned() } else { format!("{parts} parts") };
             text.push_str(&format!(" {what} of a structured append message went into the sequence."));
+        }
+        if !left_out.is_empty() {
+            let symbols = left_out.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+            text.push_str(&if left_out.len() == 1 {
+                format!(
+                    " Symbol {symbols} carries a part of another structured append message, by its count or parity, and it \
+                     stayed out of the sequence: to collect that message, clear the sequence, then pick each of its symbols \
+                     and press Add to sequence."
+                )
+            } else {
+                format!(
+                    " Symbols {symbols} carry parts of another structured append message or more, by their count or parity, \
+                     and they stayed out of the sequence: to collect those, clear the sequence, then pick each symbol and \
+                     press Add to sequence."
+                )
+            });
         }
         match load.and_then(|i| self.load_read(i)) {
             Some(loaded) => {
@@ -1824,11 +1918,36 @@ impl App {
             }
             return;
         }
-        if let Some(proposals) = &mut self.proposals {
-            proposals.adopted = Some(i);
+        // One Read all read to no message is not read again for it. The
+        // symbol is marked as the one in use once the outline is put on
+        // it ([`Picked`]).
+        self.adopt_proposal(
+            ctx,
+            found,
+            photo_inverted,
+            format!("symbol {}", i + 1),
+            self.view.load_reads && unread,
+            Some(Picked::Proposal(i)),
+        );
+    }
+
+    /// Mark the row of a list under Alignment that a step has just put
+    /// the outline on as the one in use ([`Picked`]). The list may have
+    /// been cleared meanwhile, and then there is nothing to mark.
+    fn mark_picked(&mut self, picked: Option<Picked>) {
+        match picked {
+            Some(Picked::Proposal(i)) => {
+                if let Some(proposals) = self.proposals.as_mut().filter(|proposals| i < proposals.found.len()) {
+                    proposals.adopted = Some(i);
+                }
+            }
+            Some(Picked::Placement(i)) => {
+                if let Some(placements) = self.placements.as_mut().filter(|placements| i < placements.found.len()) {
+                    placements.adopted = Some(i);
+                }
+            }
+            None => {}
         }
-        // One Read all read to no message is not read again for it.
-        self.adopt_proposal(ctx, found, photo_inverted, format!("symbol {}", i + 1), self.view.load_reads && unread);
     }
 
     /// Whether Read all read the `i`-th symbol found through to a message.
@@ -1946,27 +2065,28 @@ impl App {
     /// bits or a clean fit vouch for it, or when it is of another family.
     /// A symbol that read light on dark has the photo inverted for it, as
     /// a reader retries inverted of its own accord. Returns the notice to
-    /// show.
-    fn adopt_prepared(&mut self, prepared: Prepared) -> String {
+    /// show. `ctx` is for a step this starts on a thread of its own,
+    /// where the versions are to be ranked again.
+    fn adopt_prepared(&mut self, ctx: &egui::Context, prepared: Prepared) -> String {
         let Prepared { found, agreement: (matching, fixed), guesses, searched_inverted, read, result: _ } = prepared;
         let Some(photo) = &self.photo else { return String::new() };
         // Whether the version found is adopted is judged against the
         // document as it is now, which may have changed while the job
         // ran. The ranking the job made serves when it was made for the
         // family in use; otherwise, which takes a change of family during
-        // the job, it is made here.
+        // the job, the versions are ranked again, on a thread of their
+        // own as Suggest version ranks them, once the outline is placed:
+        // ranked here, they would hold the window for as long as that
+        // step takes.
         let decoded = read.as_ref().is_some_and(|r| r.trustworthy);
         // What a read that decoded was made through, of the photo as it
         // is enlarged now.
         let through = read.as_ref().filter(|read| read.trustworthy).map(|read| (read.enhance, photo.adjust.enlarge));
         let adopt = adopts_version(&found, self.doc.version, decoded);
-        let guesses = (found.version != self.doc.version && !adopt).then(|| {
-            let family = self.doc.version.family();
-            match guesses {
-                Some((ranked, guesses)) if ranked == family => guesses,
-                _ => suggest_versions(&photo.luma, found.corners, family, &self.view.sample),
-            }
-        });
+        let suggest = found.version != self.doc.version && !adopt;
+        let family = self.doc.version.family();
+        let guesses = guesses.filter(|_| suggest).and_then(|(ranked, guesses)| (ranked == family).then_some(guesses));
+        let rank_again = suggest && guesses.is_none();
         self.checkpoint();
         if adopt {
             self.doc = self.doc.blank_like(found.version);
@@ -2041,11 +2161,19 @@ impl App {
         if adopt {
             text.push_str(&format!(" Switched to version {}, which the photo fits.", found.version));
         }
-        if let Some(guesses) = guesses {
+        if suggest {
             text.push_str(&format!(
-                " Looks like version {} rather than {}: pick it under Suggest version.",
-                found.version, self.doc.version
+                " Looks like version {} rather than {}: {}.",
+                found.version,
+                self.doc.version,
+                if rank_again {
+                    "the versions are being ranked on these corners, to pick from under Suggest version"
+                } else {
+                    "pick it under Suggest version"
+                }
             ));
+        }
+        if let Some(guesses) = guesses {
             self.guesses = Some(guesses);
         }
         if found.turns != 0 {
@@ -2141,6 +2269,13 @@ impl App {
             text.push(' ');
             text.push_str(&note);
         }
+        // Last of all, once the outline lies where the ranking is to be
+        // made and the photo is at the size it is read at: the step
+        // takes the corners as they stand when it starts, and a change
+        // of the photo's size would call it off.
+        if rank_again {
+            self.rank_versions(ctx);
+        }
         text
     }
 
@@ -2187,6 +2322,13 @@ impl App {
             Action::SetVersion(version) => self.set_version(version),
             Action::ReinterpretAs(version) => self.reinterpret_as(version),
             Action::Undo => {
+                // A stroke under way took its undo point as it began, and
+                // that is the point taken back here: the stroke ends, so
+                // that what the pointer paints from here on, still held
+                // down, is a stroke of its own with a point of its own.
+                // Painted on as part of the old stroke, it had none, and
+                // could neither be undone nor survive a redo.
+                self.view.stroke = None;
                 if self.history.undo(&mut self.doc) {
                     self.dirty = true;
                     self.view.edit_view.auto_fit |= self.doc.version != self.derived.func.version;
@@ -2196,6 +2338,8 @@ impl App {
                 }
             }
             Action::Redo => {
+                // As for Undo: the stroke under way ends here.
+                self.view.stroke = None;
                 if self.history.redo(&mut self.doc) {
                     self.dirty = true;
                     self.view.edit_view.auto_fit |= self.doc.version != self.derived.func.version;
@@ -2347,6 +2491,10 @@ impl App {
                         None => self.doc.grid.set(x, y, module),
                     }
                 }
+                // Inverting the photo above refreshed what follows from
+                // the document, and cleared the mark `begin_edit` made:
+                // the grid as sampled is what is to be derived from now.
+                self.dirty = true;
                 self.view.stage = Stage::Edit;
                 let mut text = match scope {
                     SampleScope::All => format!("Sampled the photo: {changed} modules changed. Check them against the photo."),
@@ -2414,10 +2562,14 @@ impl App {
                     self.fail("That placement is no longer in the list; press Other placements again.");
                     return;
                 };
-                if let Some(placements) = &mut self.placements {
-                    placements.adopted = Some(i);
-                }
-                self.adopt_proposal(ctx, found, photo_inverted, format!("placement {}", i + 1), self.view.load_reads);
+                self.adopt_proposal(
+                    ctx,
+                    found,
+                    photo_inverted,
+                    format!("placement {}", i + 1),
+                    self.view.load_reads,
+                    Some(Picked::Placement(i)),
+                );
             }
             Action::ClearPlacements => self.placements = None,
             Action::UseLead(i) => {
@@ -2508,6 +2660,19 @@ impl App {
                 }
             }
             Action::Unpin(cw) => {
+                // Only a pin in the document is the document's to take
+                // away, whatever its source: Pin the padding takes the
+                // decoder's pins in with the sources they came with. One
+                // the decoder placed by itself is placed again by the
+                // next decode, and is dropped by turning that off.
+                if self.doc.pins_ec != Some(self.derived.ec) || !self.doc.pins.contains_key(&cw) {
+                    self.fail(
+                        "That pin is the decoder's, not the document's: untick \"Pin the padding and headers found\" \
+                         under Decoding to drop it, or press Pin the padding to take the decoder's pins into the \
+                         document, where each can be unpinned.",
+                    );
+                    return;
+                }
                 self.begin_edit();
                 self.doc.pins.remove(&cw);
             }
@@ -3069,7 +3234,7 @@ impl App {
         }
         self.catch_up();
         self.poll_search(&ctx);
-        self.poll_job();
+        self.poll_job(&ctx);
         // A result just taken in may have switched the version: what
         // follows from the document is brought up to it before anything
         // is laid out or drawn from the two together.
@@ -4249,7 +4414,7 @@ mod tests {
         // stage shows. Sampling then read the old version's preview by
         // the new version's indices, and ran off its end.
         let found = detection(SymbolVersion::Qr(6), STRAIGHT);
-        bench.app.start_job(&ctx, JobKind::Adopt, move || JobResult::Adopt(prepared(found), String::new()));
+        bench.app.start_job(&ctx, JobKind::Adopt, move || JobResult::Adopt(prepared(found), String::new(), None));
         bench.settle();
         bench.assert_all_of(SymbolVersion::Qr(6));
         bench.act(Action::Sample { only_unknown: false, scope: SampleScope::All });
@@ -4260,7 +4425,7 @@ mod tests {
         bench.app.view.stage = Stage::Edit;
         bench.step();
         let found = detection(SymbolVersion::Micro(2), STRAIGHT);
-        bench.app.start_job(&ctx, JobKind::Adopt, move || JobResult::Adopt(prepared(found), String::new()));
+        bench.app.start_job(&ctx, JobKind::Adopt, move || JobResult::Adopt(prepared(found), String::new(), None));
         bench.settle();
         bench.assert_all_of(SymbolVersion::Micro(2));
     }
@@ -4280,6 +4445,34 @@ mod tests {
         bench.act(Action::Sample { only_unknown: false, scope: SampleScope::All });
         bench.step();
         bench.assert_all_of(SymbolVersion::Qr(5));
+    }
+
+    #[test]
+    fn sampling_that_turns_the_photo_s_inversion_round_derives_the_grid_as_sampled() {
+        let mut bench = Bench::new();
+        bench.app.doc.corners = STRAIGHT;
+        bench.step();
+        // Invert photo ticked wrongly for a dark-on-light symbol: Sample
+        // all turns it off first, and samples. Turning it off refreshed
+        // what follows from the document before the modules were
+        // written, and the decode shown stayed that of the blank grid
+        // until the next edit.
+        assert!(bench.app.view.auto_invert);
+        bench.act(Action::SetAdjust(Adjust { invert: true, ..bench.app.doc.adjust }));
+        bench.step();
+        assert!(bench.app.derived.report.codewords.iter().all(|c| c.known == 0));
+        let unknown_before = bench.app.doc.grid.count(Module::Unknown);
+        bench.act(Action::Sample { only_unknown: false, scope: SampleScope::All });
+        assert!(!bench.app.doc.adjust.invert, "the inversion was turned off first");
+        assert_eq!(bench.app.doc.grid.count(Module::Unknown), 0);
+        assert!(bench.app.dirty, "the grid as sampled is still to be derived from");
+        bench.step();
+        assert!(bench.app.derived.report.codewords.iter().all(|c| c.known == 0xFF), "the decode is of the grid as sampled");
+        assert!(!bench.app.dirty);
+        // One undo point takes back the modules and the inversion alike.
+        bench.act(Action::Undo);
+        assert!(bench.app.doc.adjust.invert);
+        assert_eq!(bench.app.doc.grid.count(Module::Unknown), unknown_before);
     }
 
     /// The bench's render with its ink in red, so that a photo shown in
@@ -4374,7 +4567,7 @@ mod tests {
         // was found before stays, carried to the new size.
         let elsewhere = || detection(SymbolVersion::Qr(2), square(0.0, 0.0, 10.0));
         bench.app.start_search(&ctx, false, None, move || slowly(vec![elsewhere()]));
-        bench.app.start_job(&ctx, JobKind::Adopt, move || slowly(JobResult::Adopt(prepared(elsewhere()), String::new())));
+        bench.app.start_job(&ctx, JobKind::Adopt, move || slowly(JobResult::Adopt(prepared(elsewhere()), String::new(), None)));
         bench.app.history.checkpoint(&bench.app.doc);
         bench.act(Action::SetAdjust(Adjust { enlarge: Enlarge::times(2), ..bench.app.doc.adjust }));
         assert!(bench.app.search.is_none() && bench.app.job.is_none());
@@ -4593,6 +4786,7 @@ mod tests {
     #[test]
     fn only_a_read_that_decoded_sets_the_sampling() {
         let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
         let before = bench.app.view.sample;
         assert_ne!(before.kernel, Kernel::Centre);
         assert_ne!(before.rule(), Rule::Surface);
@@ -4615,11 +4809,11 @@ mod tests {
         let copy = Enhance { enlarge: 2, sharpen: Sharpen::Light };
         // The best of the attempts at a read that decoded nothing says
         // nothing about how this photo wants sampling, or adjusting.
-        let text = bench.app.adopt_prepared(read(false, copy));
+        let text = bench.app.adopt_prepared(&ctx, read(false, copy));
         assert!(bench.app.view.sample == before);
         assert_eq!(bench.app.doc.adjust, Adjust::default());
         assert!(!text.contains("decoded it"), "{text}");
-        let text = bench.app.adopt_prepared(read(true, Enhance::NONE));
+        let text = bench.app.adopt_prepared(&ctx, read(true, Enhance::NONE));
         // The rule goes with the kernel, to the checkbox that asks for it.
         let sample = bench.app.view.sample;
         assert_eq!((sample.kernel, sample.rule(), sample.local, sample.surface), (Kernel::Centre, Rule::Surface, false, true));
@@ -4631,7 +4825,7 @@ mod tests {
         // enlarged and sharpened, has the whole photo so adjusted: the
         // outline and the detection go with it to its new size, and
         // Sampling reads it there as ever, through no copy of its own.
-        let text = bench.app.adopt_prepared(read(true, copy));
+        let text = bench.app.adopt_prepared(&ctx, read(true, copy));
         assert!(text.contains("It decoded only with the photo enlarged 2 times and sharpened lightly, so under Photo Enlarge was set to 2× and Sharpen to 0.50"), "{text}");
         assert_eq!(bench.app.doc.adjust, Adjust { enlarge: Enlarge::times(2), sharpen: 0.5, ..Adjust::default() });
         let photo = bench.app.photo.as_ref().expect("the bench has a photo");
@@ -4649,7 +4843,7 @@ mod tests {
         assert_eq!(bench.app.photo.as_ref().map(|photo| photo.width), Some(330));
         // A copy enlarged by a number of times that is no step of the
         // slider's is offered as one from then on.
-        let text = bench.app.adopt_prepared(read(true, Enhance { enlarge: 3, sharpen: Sharpen::Off }));
+        let text = bench.app.adopt_prepared(&ctx, read(true, Enhance { enlarge: 3, sharpen: Sharpen::Off }));
         assert!(text.contains("only with the photo enlarged 3 times, so under Photo Enlarge was set to 3×, and Sample reads it that way."), "{text}");
         let photo = bench.app.photo.as_ref().expect("the bench has a photo");
         assert_eq!((photo.width, photo.adjust.sharpen), (990, 0.0));
@@ -4663,9 +4857,8 @@ mod tests {
         // A photo too large to be enlarged so far without its being
         // asked for is sharpened, and says what to do about the rest:
         // the slider offers it.
-        let ctx = bench.ctx.clone();
         bench.app.set_photo(&ctx, "wide".into(), image::RgbaImage::from_pixel(1500, 300, image::Rgba([255; 4])));
-        let text = bench.app.adopt_prepared(read(true, Enhance { enlarge: 4, sharpen: Sharpen::Strong }));
+        let text = bench.app.adopt_prepared(&ctx, read(true, Enhance { enlarge: 4, sharpen: Sharpen::Strong }));
         assert!(text.contains("so under Photo Sharpen was set to 1.00, and Sample reads it that way. A photo this large is not enlarged to 4× unasked"), "{text}");
         assert_eq!(bench.app.doc.adjust, Adjust { sharpen: 1.0, ..Adjust::default() });
         assert_eq!(bench.app.doc.corners, STRAIGHT);
@@ -4950,18 +5143,20 @@ mod tests {
         // is nothing to click.
         bench.click(at([60.0, 60.0]), egui::PointerButton::Primary);
         assert_eq!(bench.app.running(), None);
-        // Where the two overlap, the click is the first one's.
+        // Where the two overlap, the click is the first one's, marked as
+        // the one in use once the outline is put on it.
         bench.click(at([200.0, 200.0]), egui::PointerButton::Primary);
         assert_eq!(bench.app.running(), Some(JobKind::Adopt));
-        assert_eq!(bench.app.proposals.as_ref().and_then(|p| p.adopted), Some(0));
+        assert_eq!(bench.app.proposals.as_ref().and_then(|p| p.adopted), None);
         bench.settle();
+        assert_eq!(bench.app.proposals.as_ref().and_then(|p| p.adopted), Some(0));
         // Inside the second alone, it is the second's.
         bench.app.doc.corners = ASIDE;
         bench.step();
         bench.click(at([300.0, 300.0]), egui::PointerButton::Primary);
         assert_eq!(bench.app.running(), Some(JobKind::Adopt));
-        assert_eq!(bench.app.proposals.as_ref().and_then(|p| p.adopted), Some(1));
         bench.settle();
+        assert_eq!(bench.app.proposals.as_ref().and_then(|p| p.adopted), Some(1));
     }
 
     #[test]
@@ -5159,7 +5354,7 @@ mod tests {
         // changes, and would move the outline were they taken in.
         let elsewhere = || detection(SymbolVersion::Qr(2), square(0.0, 0.0, 10.0));
         bench.app.start_search(&ctx, false, None, move || slowly(vec![elsewhere()]));
-        bench.app.start_job(&ctx, JobKind::Adopt, move || slowly(JobResult::Adopt(prepared(elsewhere()), String::new())));
+        bench.app.start_job(&ctx, JobKind::Adopt, move || slowly(JobResult::Adopt(prepared(elsewhere()), String::new(), None)));
         bench.app.history.checkpoint(&bench.app.doc);
         let adjust = Adjust { k1: -0.05, ..bench.app.doc.adjust };
         bench.act(Action::SetAdjust(adjust));
@@ -5327,6 +5522,140 @@ mod tests {
     }
 
     #[test]
+    fn a_symbol_found_inside_an_outline_moved_meanwhile_is_dropped() {
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        bench.app.doc.corners = STRAIGHT;
+        // Of the outline as it stands, the result is taken in: here,
+        // that nothing was found inside it.
+        bench.app.start_job(&ctx, JobKind::FindCorners, || JobResult::Corners(None));
+        bench.settle();
+        let notice = bench.notice();
+        assert!(notice.is_error && notice.text.starts_with("No finder pattern"), "{}", notice.text);
+        // A corner dragged while the step ran: the result is of the
+        // outline before the drag, and is dropped, with the drag kept.
+        bench.app.start_job(&ctx, JobKind::FindCorners, || JobResult::Corners(None));
+        bench.app.doc.corners[1][1] += 2.0;
+        bench.settle();
+        let notice = bench.notice();
+        assert!(!notice.is_error && notice.text.contains("changed while the symbol inside the outline was being found"), "{}", notice.text);
+        assert_eq!(bench.app.doc.corners[1][1], STRAIGHT[1][1] + 2.0);
+        // So is a symbol the search found being placed, when an anchor
+        // was dropped meanwhile: the version and the outline stay, and
+        // the symbol is not marked as the one in use, which it is not.
+        // Marked as the step began, it stayed marked with the result
+        // dropped, listed as in use and kept off the canvas, where the
+        // notice said to click it again.
+        let (version, corners) = (bench.app.doc.version, bench.app.doc.corners);
+        bench.app.doc.set_anchor(finder_anchor([75.0, 75.0]), AnchorSource::Manual);
+        let found = detection(SymbolVersion::Qr(6), STRAIGHT);
+        bench.app.proposals = Some(Proposals { found: vec![found.clone()], photo_inverted: false, adopted: None, reads: None });
+        bench.app.start_job(&ctx, JobKind::Adopt, move || JobResult::Adopt(prepared(found), String::new(), Some(Picked::Proposal(0))));
+        bench.app.doc.anchors.clear();
+        bench.settle();
+        assert!(bench.notice().text.contains("changed while the corners were being placed"), "{}", bench.notice().text);
+        assert_eq!((bench.app.doc.version, bench.app.doc.corners), (version, corners));
+        assert!(bench.app.doc.anchors.is_empty(), "the anchor dropped stays dropped");
+        assert_eq!(bench.app.proposals.as_ref().and_then(|p| p.adopted), None);
+        // Left alone, the symbol found is placed, and marked as in use.
+        let found = detection(SymbolVersion::Qr(6), STRAIGHT);
+        bench.app.start_job(&ctx, JobKind::Adopt, move || JobResult::Adopt(prepared(found), String::new(), Some(Picked::Proposal(0))));
+        bench.settle();
+        assert_eq!(bench.app.doc.version, SymbolVersion::Qr(6));
+        assert_eq!(bench.app.proposals.as_ref().and_then(|p| p.adopted), Some(0));
+    }
+
+    #[test]
+    fn a_ranking_made_inside_an_outline_moved_meanwhile_is_dropped() {
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        bench.app.doc.corners = STRAIGHT;
+        let guess = || VersionGuess { version: SymbolVersion::Qr(2), matching: 90, fixed: 100, inverted: false };
+        // Of the outline as it stands, the versions ranked are listed.
+        bench.app.start_job(&ctx, JobKind::Suggest, move || JobResult::Suggest(vec![guess()]));
+        bench.settle();
+        assert_eq!(bench.app.guesses.as_ref().map(Vec::len), Some(1));
+        bench.app.guesses = None;
+        // A corner dragged while they were being ranked: the ranking was
+        // of the outline before the drag, and would be shown as made on
+        // these corners. It is dropped, with the drag kept.
+        bench.app.start_job(&ctx, JobKind::Suggest, move || JobResult::Suggest(vec![guess()]));
+        bench.app.doc.corners[1][1] += 2.0;
+        bench.settle();
+        assert!(bench.app.guesses.is_none());
+        let notice = bench.notice();
+        assert!(!notice.is_error && notice.text.contains("changed while the versions were being ranked"), "{}", notice.text);
+        assert_eq!(bench.app.doc.corners[1][1], STRAIGHT[1][1] + 2.0);
+        // So are the placements inside the outline, when an anchor was
+        // dropped meanwhile.
+        bench.app.doc.set_anchor(finder_anchor([75.0, 75.0]), AnchorSource::Manual);
+        let found = detection(SymbolVersion::Qr(2), STRAIGHT);
+        bench.app.start_job(&ctx, JobKind::Placements, move || JobResult::Placements { found: vec![found], photo_inverted: false });
+        bench.app.doc.anchors.clear();
+        bench.settle();
+        assert!(bench.app.placements.is_none());
+        assert!(bench.notice().text.contains("changed while the placements inside the outline were being ranked"), "{}", bench.notice().text);
+        assert!(bench.app.doc.anchors.is_empty(), "the anchor dropped stays dropped");
+        // Left alone, they are listed.
+        let found = detection(SymbolVersion::Qr(2), STRAIGHT);
+        bench.app.start_job(&ctx, JobKind::Placements, move || JobResult::Placements { found: vec![found], photo_inverted: false });
+        bench.settle();
+        assert_eq!(bench.app.placements.as_ref().map(|placements| placements.found.len()), Some(1));
+    }
+
+    #[test]
+    fn a_pin_taken_into_the_document_from_padding_recovery_can_be_unpinned() {
+        let mut bench = Bench::new();
+        bench.act(Action::ClosePhoto);
+        // Two characters in a version 3 symbol, and sixteen codewords of
+        // the padding unknown, one more than the block's error correction
+        // restores; the rest of the padding shows the pattern.
+        let mut grid = symbol_of("hi");
+        let layout = SymbolLayout::new(Arc::new(FunctionMap::new(SymbolVersion::Qr(3))), EcLevel::L).expect("a level of the version");
+        for &cw in &layout.data_stream[20..36] {
+            for pos in layout.codeword_modules(cw) {
+                grid.set(pos.x as usize, pos.y as usize, Module::Unknown);
+            }
+        }
+        bench.hold(grid);
+        // The decoder pins the padding itself, and the block solves on
+        // those pins, which are the decoder's: in the report and not in
+        // the document, so there is nothing to unpin by hand.
+        assert!(bench.app.opts.derive_pins);
+        assert_eq!(bench.app.derived.report.text.plain(), "hi");
+        assert!(bench.app.doc.pins.is_empty());
+        let pad = layout.data_stream[20];
+        assert!(bench.app.derived.report.codewords[pad].pin.is_some_and(|pin| pin.source == PinSource::Padding));
+        bench.act(Action::Unpin(pad));
+        assert!(bench.notice().is_error && bench.notice().text.starts_with("That pin is the decoder's"), "{}", bench.notice().text);
+        assert!(bench.app.doc.pins.is_empty());
+        // Pin the padding takes them into the document with the source
+        // each came with, and each is then the user's to take away by
+        // the codeword, as a pin typed in is.
+        bench.act(Action::ApplyPadding);
+        assert!(!bench.notice().is_error, "{}", bench.notice().text);
+        let pinned = bench.app.doc.pins.len();
+        assert!(bench.app.doc.pins.get(&pad).is_some_and(|pin| pin.source == PinSource::Padding));
+        bench.act(Action::Unpin(pad));
+        assert_eq!(bench.app.doc.pins.len(), pinned - 1);
+        assert!(!bench.app.doc.pins.contains_key(&pad));
+        // The inspector offers Unpin for a pin in the document, and for
+        // one of the decoder's own says whose it is.
+        bench.size = egui::vec2(1440.0, 3000.0);
+        bench.app.view.selected = Some(layout.data_stream[21]);
+        bench.step();
+        bench.step();
+        let texts = bench.texts();
+        assert!(texts.iter().any(|text| text == "Unpin"), "{texts:?}");
+        bench.act(Action::ClearAllPins);
+        bench.step();
+        bench.step();
+        let texts = bench.texts();
+        assert!(texts.iter().any(|text| text == "pinned by padding recovery"), "{texts:?}");
+        assert!(!texts.iter().any(|text| text == "Unpin"), "{texts:?}");
+    }
+
+    #[test]
     fn the_versions_suggested_go_with_their_family() {
         let mut bench = Bench::new();
         let guess = |version| VersionGuess { version, matching: 90, fixed: 100, inverted: false };
@@ -5338,6 +5667,68 @@ mod tests {
         assert!(bench.app.guesses.is_some());
         bench.act(Action::SetVersion(SymbolVersion::Micro(2)));
         assert!(bench.app.guesses.is_none());
+    }
+
+    #[test]
+    fn the_versions_are_ranked_again_on_their_own_thread_when_the_family_changed_during_the_step() {
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        let guess = |version| VersionGuess { version, matching: 90, fixed: 100, inverted: false };
+        // A symbol found at another version of the family, fitting too
+        // poorly to be adopted outright: the version is suggested, from
+        // the ranking the step made while it ran, when that was made for
+        // the family in use.
+        let found = || Detection { agreement: (80, 100), ..detection(SymbolVersion::Qr(6), STRAIGHT) };
+        let ranked = Prepared { guesses: Some((Family::Qr, vec![guess(SymbolVersion::Qr(6))])), ..prepared(found()) };
+        let text = bench.app.adopt_prepared(&ctx, ranked);
+        assert!(text.contains("Looks like version 6 rather than 2: pick it under Suggest version."), "{text}");
+        assert_eq!((bench.app.doc.version, bench.app.doc.corners), (SymbolVersion::Qr(2), STRAIGHT));
+        assert_eq!(bench.app.guesses.as_ref().map(|guesses| guesses[0].version), Some(SymbolVersion::Qr(6)));
+        assert!(bench.app.running().is_none(), "nothing more to rank");
+        bench.app.guesses = None;
+        // Made for another family, as it was when the family changed
+        // during the step, the ranking is made again: on a thread of its
+        // own, as Suggest version makes one, not in the frame.
+        let elsewhere = Prepared { guesses: Some((Family::Micro, vec![guess(SymbolVersion::Micro(3))])), ..prepared(found()) };
+        let text = bench.app.adopt_prepared(&ctx, elsewhere);
+        assert!(text.contains("Looks like version 6 rather than 2: the versions are being ranked on these corners"), "{text}");
+        assert_eq!(bench.app.running(), Some(JobKind::Suggest));
+        assert!(bench.app.guesses.is_none(), "not until the step is done");
+        bench.settle();
+        let guesses = bench.app.guesses.as_ref().expect("the ranking was taken in");
+        assert!(!guesses.is_empty() && guesses.iter().all(|guess| guess.version.family() == Family::Qr), "{guesses:?}");
+        assert_eq!((bench.app.doc.version, bench.app.doc.corners), (SymbolVersion::Qr(2), STRAIGHT));
+    }
+
+    #[test]
+    fn a_new_blank_grid_keeps_the_outline_and_the_anchors() {
+        let mut bench = Bench::new();
+        bench.app.doc.corners = STRAIGHT;
+        bench.app.doc.set_anchor(finder_anchor([75.0, 75.0]), AnchorSource::Manual);
+        bench.act(Action::Sample { only_unknown: false, scope: SampleScope::All });
+        bench.act(Action::Pin(0, 0x40));
+        let before = bench.app.doc.clone();
+        assert_eq!(before.grid.count(Module::Unknown), 0);
+        assert!(!before.pins.is_empty());
+        // The grid starts afresh at the same version: the pins and the
+        // format go with the modules, and the outline and the anchors
+        // stay, since the fixed patterns they pin to the photo are where
+        // they were.
+        bench.act(Action::NewBlank);
+        assert_eq!(bench.app.doc.grid, bench.app.derived.func.blank_grid());
+        assert!(bench.app.doc.pins.is_empty() && bench.app.doc.pins_ec.is_none());
+        assert_eq!((bench.app.doc.corners, &bench.app.doc.anchors), (before.corners, &before.anchors));
+        bench.act(Action::Undo);
+        assert!(bench.app.doc == before);
+        // Another version is another grid, whose modules the anchors do
+        // not name: they go, and the notice says so.
+        bench.act(Action::SetVersion(SymbolVersion::Qr(3)));
+        assert!(bench.app.doc.anchors.is_empty());
+        assert_eq!(bench.app.doc.corners, before.corners);
+        let notice = bench.notice();
+        assert!(!notice.is_error && notice.text.contains("1 anchor was removed: they named modules of version 2"), "{}", notice.text);
+        bench.act(Action::Undo);
+        assert!(bench.app.doc == before);
     }
 
     #[test]
@@ -5433,7 +5824,7 @@ mod tests {
         });
         bench.app.start_job(&ctx, JobKind::Adopt, move || {
             stepping();
-            JobResult::Adopt(prepared(detection(SymbolVersion::Qr(6), STRAIGHT)), String::new())
+            JobResult::Adopt(prepared(detection(SymbolVersion::Qr(6), STRAIGHT)), String::new(), None)
         });
         bench.step();
         // Each is on show with a way to stop it, in the status bar and
@@ -6214,9 +6605,9 @@ mod tests {
         bench.app.doc.corners = ASIDE;
         bench.app.finish_search(&bench.ctx.clone(), found.clone(), false, None);
         assert_eq!(bench.app.running(), Some(JobKind::Adopt));
-        assert_eq!(bench.app.proposals.as_ref().and_then(|proposals| proposals.adopted), Some(0));
         assert!(bench.notice().text.contains("Symbol 1 decodes as found, and is being read through"), "{}", bench.notice().text);
         bench.settle();
+        assert_eq!(bench.app.proposals.as_ref().and_then(|proposals| proposals.adopted), Some(0));
         // Not with reads not loaded, nor while another step is under way.
         bench.app.doc.corners = ASIDE;
         bench.app.view.load_reads = false;
@@ -6742,5 +7133,40 @@ mod tests {
             assert!(bench.app.history.can_redo(&bench.app.doc), "guess {guess}: the state undone is still there to redo");
             assert!(!bench.app.history.can_undo(&bench.app.doc), "guess {guess}: the press left no step to undo");
         }
+    }
+
+    #[test]
+    fn a_stroke_that_goes_on_after_an_undo_is_a_step_of_its_own() {
+        let mut bench = Bench::new();
+        bench.act(Action::ClosePhoto);
+        bench.app.view.stage = Stage::Edit;
+        bench.app.view.ink = Ink::Module(Module::Dark);
+        bench.step();
+        bench.step();
+        let cell = bench.cells();
+        let dark = |bench: &Bench| (8..17).filter(|&x| bench.app.doc.grid.get(x, 10) == Module::Dark).collect::<Vec<usize>>();
+        // A stroke along row 10, from module 10 to 12, with the button
+        // still held.
+        bench.frame(vec![egui::Event::PointerMoved(cell(10, 10))]);
+        bench.button(cell(10, 10), egui::PointerButton::Primary, true);
+        bench.frame(vec![egui::Event::PointerMoved(cell(12, 10))]);
+        assert_eq!(dark(&bench), [10, 11, 12]);
+        // Undo, by its shortcut, while the button is held: the stroke is
+        // taken back whole, and ends there. What the pointer paints from
+        // here on is a stroke of its own, with an undo point of its own.
+        // Painted on as part of the old stroke, whose point the undo had
+        // taken, it could neither be undone nor survive a redo.
+        bench.act(Action::Undo);
+        assert!(bench.app.view.stroke.is_none());
+        assert_eq!(dark(&bench), Vec::<usize>::new());
+        bench.frame(vec![egui::Event::PointerMoved(cell(14, 10))]);
+        assert_eq!(dark(&bench), [14]);
+        bench.button(cell(14, 10), egui::PointerButton::Primary, false);
+        bench.step();
+        assert!(bench.app.history.can_undo(&bench.app.doc));
+        bench.act(Action::Undo);
+        assert_eq!(dark(&bench), Vec::<usize>::new());
+        bench.act(Action::Redo);
+        assert_eq!(dark(&bench), [14]);
     }
 }

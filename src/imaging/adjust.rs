@@ -425,18 +425,47 @@ impl Default for Adjust {
 
 /// Where a straightened pixel at normalised radius `r` (half the diagonal
 /// is 1) comes from in the photo as shot, by Brown's radial model to its
-/// first term.
+/// first term, `r (1 + k1 r²)`, out to the half diagonal, and along the
+/// model's tangent there beyond it. The model is for the photo, which
+/// lies within the half diagonal; a barrel term as strong as the slider
+/// allows turns it back on itself a little past the photo's corners, and
+/// the corner of an outline or an anchor dragged out there came from
+/// nearer the centre than a point within, or from across it. Along the
+/// tangent the source keeps climbing with the radius, so every point has
+/// one source and the inverse ([`straightened_radius`]) one answer.
 pub fn source_radius(r: f32, k1: f32) -> f32 {
-    r * (1.0 + k1 * r * r)
+    if r <= 1.0 { r * (1.0 + k1 * r * r) } else { (1.0 + k1) + (r - 1.0) * edge_slope(f64::from(k1)) as f32 }
+}
+
+/// [`source_radius`] in the precision the remapping of points works in.
+fn shot_radius(r: f64, k1: f64) -> f64 {
+    if r <= 1.0 { r * (1.0 + k1 * r * r) } else { (1.0 + k1) + (r - 1.0) * edge_slope(k1) }
+}
+
+/// The model's slope at the half diagonal, `1 + 3 k1`, which the source
+/// climbs at beyond it. The slider keeps `k1` above a third's barrel,
+/// where the slope is a tenth; a term from elsewhere is held to that.
+fn edge_slope(k1: f64) -> f64 {
+    (1.0 + 3.0 * k1).max(0.1)
 }
 
 /// The normalised radius of a straightened point whose source lies at
 /// normalised radius `source` in the photo as shot: the inverse of
-/// [`source_radius`], by Newton's method, which the gentle distortions a
-/// lens has converge in a few steps.
+/// [`source_radius`], by Newton's method within the half diagonal, which
+/// the gentle distortions a lens has converge in a few steps, and along
+/// the tangent beyond it.
 fn straightened_radius(source: f64, k1: f64) -> f64 {
     if k1 == 0.0 || source == 0.0 {
         return source;
+    }
+    // Past a third's barrel the model turns back within the half
+    // diagonal and a source has two radii, neither of which Newton's
+    // method is sure to find: every term set comes from the slider or
+    // the estimate, both held within [`K1_RANGE`].
+    debug_assert!(k1 > -1.0 / 3.0, "lens term {k1} is beyond the model's inverse");
+    let edge = 1.0 + k1;
+    if source > edge {
+        return 1.0 + (source - edge) / edge_slope(k1);
     }
     let mut r = source;
     for _ in 0..12 {
@@ -471,14 +500,22 @@ pub fn remap_point(point: [f64; 2], width: usize, height: usize, from_k1: f32, t
         return point;
     }
     // Out to the photo as shot, then in to the other straightening.
-    let shot = r * (1.0 + f64::from(from_k1) * r * r);
+    let shot = shot_radius(r, f64::from(from_k1));
     let back = straightened_radius(shot, f64::from(to_k1));
     [cx + dx * back / r, cy + dy * back / r]
 }
 
+/// The lens terms the slider offers, the widest barrel to the widest
+/// pincushion, and what an estimate is held to. Brown's model to its
+/// first term turns back on itself within the half diagonal once the
+/// barrel term passes a third, and a source then has two radii
+/// ([`straightened_radius`]): the range stops well short of that.
+pub const K1_MIN: f32 = -0.3;
+pub const K1_MAX: f32 = 0.3;
+pub const K1_RANGE: std::ops::RangeInclusive<f32> = K1_MIN..=K1_MAX;
 /// Lens distortions tried first, from the widest barrel to the widest
 /// pincushion the slider offers, and the step between them.
-const LENS_SEARCH: (f32, f32, f32) = (-0.3, 0.3, 0.01);
+const LENS_SEARCH: (f32, f32, f32) = (K1_MIN, K1_MAX, 0.01);
 /// Pairs needed before the lens term can be fitted with anything to spare:
 /// a perspective map has eight degrees of freedom and the lens one more.
 pub const LENS_MIN_PAIRS: usize = 7;
@@ -552,7 +589,10 @@ pub fn estimate_k1(width: usize, height: usize, current_k1: f32, pairs: &[([f64;
             }
         }
     }
-    let k = (k * 1000.0).round() / 1000.0;
+    // To the thousandth, and within the range the slider offers: the
+    // polish may step a hair past its end, and the model's inverse is
+    // vouched for within it alone.
+    let k = ((k * 1000.0).round() / 1000.0).clamp(K1_MIN, K1_MAX);
     let rms_after = residual(k)?;
     (rms_after < rms_before * (1.0 - LENS_MIN_GAIN) && k != current_k1).then_some(LensEstimate { k1: k, rms_before, rms_after })
 }
@@ -1112,8 +1152,51 @@ mod tests {
             assert!((back[0] - px[0]).abs() < 1e-6 && (back[1] - px[1]).abs() < 1e-6, "{px:?} -> {there:?} -> {back:?}");
         }
         assert_eq!(remap_point([400.0, 300.0], w, h, 0.0, 0.2), [400.0, 300.0], "the centre stays put");
+        // A barrel wider than the slider offers: the estimate stops at
+        // the slider's end, where the polish would have stepped a hair
+        // past it, so the term set is one the model's inverse is vouched
+        // for.
+        let wide = |p: [f64; 2]| remap_point(p, w, h, -0.32, 0.0);
+        let wider: Vec<([f64; 2], [f64; 2])> = sites.iter().map(|&at| (at, wide(plane.apply(at[0], at[1])))).collect();
+        let estimate = estimate_k1(w, h, 0.0, &wider).expect("a term is found");
+        assert_eq!(estimate.k1, K1_MIN, "{estimate:?}");
+        assert!(K1_RANGE.contains(&estimate.k1) && f64::from(K1_MIN) > -1.0 / 3.0);
         // Too few pairs: nothing.
         assert!(estimate_k1(w, h, 0.0, &pairs[..6]).is_none());
+    }
+
+    #[test]
+    fn the_lens_model_climbs_beyond_the_photo() {
+        // Within the half diagonal the model is Brown's; beyond it the
+        // source keeps climbing with the radius at every term the slider
+        // offers, where the barrel terms once turned back, so that a
+        // point far outside the photo has one source, further out than
+        // any within, and comes back where it was.
+        for k1 in [K1_MIN, -0.2, -0.1, 0.0, 0.1, K1_MAX] {
+            let mut last = 0.0f32;
+            for i in 1..=400 {
+                let r = i as f32 / 100.0;
+                let source = source_radius(r, k1);
+                if r <= 1.0 {
+                    assert!((source - r * (1.0 + k1 * r * r)).abs() < 1e-6, "k1 {k1}, r {r}");
+                }
+                assert!(source > last, "k1 {k1}: r {r} reads from {source}, a step nearer from {last}");
+                last = source;
+            }
+        }
+        let (w, h) = (4000, 3000);
+        for point in [[-3000.0, -2000.0], [9000.0, 1500.0], [2000.0, 12000.0], [100.0, 100.0]] {
+            for (from, to) in [(K1_MIN, 0.1f32), (K1_MAX, K1_MIN), (0.0, K1_MIN)] {
+                let there = remap_point(point, w, h, from, to);
+                // On the same ray from the centre, the same side of it.
+                for axis in 0..2 {
+                    let centre = [2000.0, 1500.0][axis];
+                    assert_eq!((there[axis] - centre).signum(), (point[axis] - centre).signum(), "{point:?} {from} -> {to}: {there:?}");
+                }
+                let back = remap_point(there, w, h, to, from);
+                assert!((back[0] - point[0]).abs() < 1e-5 && (back[1] - point[1]).abs() < 1e-5, "{point:?} {from} -> {to}: {there:?} -> {back:?}");
+            }
+        }
     }
 
     #[test]

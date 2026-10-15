@@ -699,6 +699,10 @@ pub(crate) fn descend_by(
         for _ in 0..MAX_PASSES {
             let mut improved = false;
             for &pattern in moves {
+                // Called off, the descent comes back with what it has.
+                if work::cancelled() {
+                    return Some((current, best));
+                }
                 for axis in 0..2 {
                     for direction in [1.0, -1.0] {
                         let mut trial = current;
@@ -975,6 +979,28 @@ mod tests {
             step /= 2.0;
         }
         Some((current, best))
+    }
+
+    #[test]
+    fn a_refinement_called_off_comes_back_at_once_with_the_corners_given() {
+        use crate::work::Cancel;
+        let func = FunctionMap::new(SymbolVersion::Qr(2));
+        let (image, corners) = drawn(&func, |_| 1.0);
+        let loose = corners.map(|[x, y]| [x + 1.5, y - 1.0]);
+        let params = SampleParams::default();
+        // Not called off, the refinement moves the corners given.
+        let refined = refine_corners(&image, &func, loose, &[], &params).expect("the corners given can be scored");
+        assert_ne!(refined.corners, loose);
+        assert!(refined.evaluations > 2);
+        // Called off before it starts, it scores the corners given and
+        // no trial, and comes back with them.
+        let request = Cancel::new();
+        request.cancel();
+        let started = std::time::Instant::now();
+        let refined = request.scope(|| refine_corners(&image, &func, loose, &[], &params)).expect("the corners given can be scored");
+        assert_eq!(refined.corners, loose);
+        assert_eq!(refined.evaluations, 2, "one score of the start at each polarity");
+        assert!(started.elapsed().as_secs() < 5, "{:?}", started.elapsed());
     }
 
     #[test]
