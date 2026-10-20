@@ -5,7 +5,7 @@ use std::sync::Arc;
 use eframe::egui;
 use qr_forensics::decode::codewords::Pins;
 use qr_forensics::decode::padding::{Filler, PadCandidate};
-use qr_forensics::decode::pipeline::{DecodeReport, GridAnalysis, Orientation};
+use qr_forensics::decode::pipeline::{DecodeOptions, DecodeReport, GridAnalysis, Orientation};
 use qr_forensics::decode::sequence::Sequence;
 use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::adjust::{Adjust, Enlarge};
@@ -913,6 +913,9 @@ pub struct ViewState {
     /// taken its undo point: a slider drag changes the value every frame
     /// and must make one step of undo, not one a frame.
     pub adjust_gesture: bool,
+    /// The decode options Restore defaults replaced, for Put back, kept
+    /// while the options stay at their defaults.
+    pub before_defaults: Option<DecodeOptions>,
     /// Show the photo in grey, as the luminance the pipeline reads, in
     /// place of its colours. A way of looking: what is read is the same
     /// either way.
@@ -1013,6 +1016,7 @@ impl Default for ViewState {
             binarize_auto: true,
             binarize_for_scan: false,
             adjust_gesture: false,
+            before_defaults: None,
             greyscale: false,
             wheel: WheelLatch::default(),
             own_family_only: false,

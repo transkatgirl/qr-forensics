@@ -65,6 +65,10 @@ pub type Propagated = (usize, Vec<u8>, RsSolution);
 pub const ABP_ROUNDS: usize = 20;
 /// Fewest rounds a decode that is one of many is given.
 pub const ABP_ROUNDS_MIN: usize = 6;
+/// Most rounds a block may be given ([`super::pipeline::DecodeOptions::abp_rounds`]):
+/// a tenth or a fifth of a second on the largest blocks, and a solution
+/// found in the last of them needs seven bits more to confirm it.
+pub const ABP_ROUNDS_MAX: usize = 100;
 /// How much of what the checks say a bit takes on each round. Jiang and
 /// Narayanan damp the propagation heavily, since the checks of a dense
 /// matrix repeat each other: a bit told the same thing by many checks

@@ -6,16 +6,18 @@ use qr_forensics::decode::bitstream::{Certainty, EndOfData, LostReason, SegmentC
 use qr_forensics::decode::codewords::PinSource;
 use qr_forensics::decode::known::{Place, TextPinError, text_pins};
 use qr_forensics::decode::padding::{Filler, padding_at};
-use qr_forensics::decode::pipeline::{BlockOutcome, BlockReport, CodewordReport, CwStatus, SolveMethod, VERIFIED_RISK_BITS};
-use qr_forensics::decode::rs::RsFailure;
+use qr_forensics::decode::abp::ABP_ROUNDS_MAX;
+use qr_forensics::decode::list::LIST_COST_MAX;
+use qr_forensics::decode::pipeline::{BlockOutcome, BlockReport, CodewordReport, CwStatus, DecodeOptions, SolveMethod, VERIFIED_RISK_BITS};
+use qr_forensics::decode::rs::{CHASE_MAX_BITS, RsFailure, TRIAL_SETS_MAX};
 use qr_forensics::decode::sequence::ParityCheck;
 use qr_forensics::decode::text::{Charset, TextReport, UNKNOWN_CHAR, control_picture};
-use qr_forensics::symbol::{Family, SymbolVersion};
+use qr_forensics::symbol::{EcLevel, Family, SymbolVersion};
 use qr_forensics::symbol::layout::{CodewordSpan, CwId};
-use qr_forensics::symbol::tables::Mode;
+use qr_forensics::symbol::tables::{Mode, block_shape, misdecode_protection};
 
 use super::state::*;
-use super::{Action, App, ExportFormat, Transform, ec_name};
+use super::{Action, App, ExportFormat, JobKind, Reach, Transform, count_run, ec_name, grouped, wrong_codewords};
 
 const GOOD: Color32 = Color32::from_rgb(40, 170, 80);
 /// How many of the readings of the format bits, and of the attempts of a
@@ -605,6 +607,99 @@ fn info_bits(read: &InfoRead) -> String {
         .collect()
 }
 
+/// What `level` gives `version` to correct with, as the format section
+/// says it ([`level_capacity`]).
+struct Capacity {
+    /// How many wrong or unknown codewords each block takes, less those
+    /// the standard reserves for detecting misreads
+    /// ([`misdecode_protection`]), and how much further list decoding
+    /// and the trials of erasures go where the options have them on
+    /// ([`Reach`]).
+    summary: String,
+    /// How many codewords are error correction, what share of the symbol
+    /// they correct, and what the standard reserves: for the summary's
+    /// hover.
+    details: String,
+}
+
+fn level_capacity(version: SymbolVersion, level: EcLevel, opts: &DecodeOptions, reach: Option<&Reach>) -> Capacity {
+    let Some(shape) = block_shape(version, level) else { return Capacity { summary: String::new(), details: String::new() } };
+    let reserved = misdecode_protection(version, level);
+    let per_block = shape.ec_per_block;
+    let usable = per_block.saturating_sub(reserved);
+    let total = shape.total_codewords;
+    let blocks = if shape.blocks > 1 { format!(", in {} blocks of {per_block}", shape.blocks) } else { String::new() };
+    let mut details = format!("{} of the {total} codewords are error correction{blocks}.", shape.blocks * per_block);
+    if usable == 0 {
+        let summary = "Corrects nothing: the standard reserves all its error correction for error detection.";
+        return Capacity { summary: summary.to_owned(), details };
+    }
+    let share = |n: usize| 100.0 * (shape.blocks * n) as f64 / total as f64;
+    details.push_str(&format!(
+        " A wrong codeword costs as much as two unknown ones, so about {:.0}% of the symbol can be wrong, or \
+         {:.0}% unknown, or a mix of both.",
+        share(usable / 2),
+        share(usable)
+    ));
+    if reserved > 0 {
+        let of = if shape.blocks > 1 { "each block's" } else { "them" };
+        details.push_str(&format!(
+            " The standard reserves {reserved} of {of} for error detection; a solution that uses them is never \
+             confirmed."
+        ));
+        // What list decoding reaches here it reaches only so, and the
+        // summary leaves it out.
+        if let Some(reach) = reach
+            && opts.list_decode
+            && reach.list_gains()
+        {
+            details.push_str(&format!(
+                " List decoding corrects at least {} wrong, but with every module certain, past {} it uses the \
+                 reserved ones.",
+                reach.list, reach.standard
+            ));
+        }
+        // Where the trials confirm a block past counts that plain
+        // decoding solves only so, the summary says which they leave, and
+        // why here.
+        if let Some(reach) = reach
+            && opts.erase_by_trial
+            && reach.trials_within > 0
+            && let Some((first, last)) = reach.unconfirmed()
+        {
+            details.push_str(&format!(
+                " A block {} wrong is never confirmed: plain Reed-Solomon solves it first, using the reserved ones.",
+                count_run(first, last)
+            ));
+        }
+    }
+    let subject = if shape.blocks > 1 { format!("Each of its {} blocks corrects", shape.blocks) } else { "Corrects".to_owned() };
+    let mut summary = format!("{subject} up to {} or {usable} unknown.", wrong_codewords(usable / 2));
+    // What list decoding and the trials reach within the standard's
+    // limit, which a solution must keep to to be confirmed, and past
+    // what plain decoding reaches, where they are not run.
+    let mut further = Vec::new();
+    if let Some(reach) = reach {
+        if opts.list_decode && reach.list_gains_within_standard() {
+            further.push(format!("with list decoding, at least {} wrong", reach.list));
+        }
+        if opts.erase_by_trial && reach.trials_within > 0 {
+            let most = reach.standard + reach.trials_within;
+            further.push(match reach.unconfirmed() {
+                None => format!("with erasing by trial, up to {most} wrong"),
+                Some((first, last)) => {
+                    format!("with erasing by trial, {} wrong too, but not {}", count_run(reach.half + 1, most), count_run(first, last))
+                }
+            });
+        }
+    }
+    if let Some(first) = further.first_mut() {
+        first.replace_range(..1, "W");
+        summary.push_str(&format!(" {}.", further.join("; ")));
+    }
+    Capacity { summary, details }
+}
+
 fn format_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     let derived = &app.derived;
     let version = app.doc.version;
@@ -634,11 +729,42 @@ fn format_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
             actions.push(Action::SetFormat(FormatSel::Manual { ec: derived.ec, mask: derived.mask }));
         }
     });
+    // Pins hold only under the level they were made under: the codewords
+    // they name are another level's.
+    let pinned = app.doc.pins.len();
+    let codewords = if pinned == 1 { "codeword" } else { "codewords" };
+    let pins_level = match app.doc.pins_ec {
+        Some(level) => format!("level {}", ec_name(version, level)),
+        None => "another level".to_owned(),
+    };
     if let FormatSel::Manual { ec, mask } = app.doc.format {
+        // The level and mask of the format word the bits lie nearest;
+        // nothing while no format bit is painted. What the underline means
+        // is said below the row, and whether the bits are to be trusted
+        // further down.
+        let nearest = analysis.best().filter(|best| best.best_compared > 0).map(|best| best.fields);
         ui.horizontal(|ui| {
             ui.label("EC level");
             for &level in version.ec_levels() {
-                if ui.selectable_label(level == ec, ec_name(version, level)).clicked() {
+                let is_nearest = nearest.is_some_and(|fields| fields.ec == level);
+                let text = RichText::new(ec_name(version, level));
+                let text = if is_nearest { text.underline() } else { text };
+                // Another level's capacity and pins, to set beside what
+                // is said below of the level in effect.
+                let response = ui.selectable_label(level == ec, text);
+                let response = if level == derived.ec {
+                    response
+                } else {
+                    let capacity = level_capacity(version, level, &app.opts, app.reach(version, level).as_ref());
+                    let mut hover = format!("Level {}: {} {}", level.letter(), capacity.summary, capacity.details);
+                    if pinned > 0 && app.doc.pins_ec != Some(level) {
+                        hover.push_str(&format!(
+                            "\n\nPins on {pinned} {codewords} were made under {pins_level} and don't apply at this level."
+                        ));
+                    }
+                    response.on_hover_text(hover)
+                };
+                if response.clicked() {
                     actions.push(Action::SetFormat(FormatSel::Manual { ec: level, mask }));
                 }
             }
@@ -646,15 +772,45 @@ fn format_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                 ui.separator();
                 ui.label("Mask");
                 for m in 0..version.mask_count() {
-                    if ui.selectable_label(m == mask, m.to_string()).clicked() {
+                    let is_nearest = nearest.is_some_and(|fields| fields.mask == m);
+                    let text = if is_nearest { RichText::new(m.to_string()).underline() } else { RichText::new(m.to_string()) };
+                    if ui.selectable_label(m == mask, text).clicked() {
                         actions.push(Action::SetFormat(FormatSel::Manual { ec, mask: m }));
                     }
                 }
             }
         });
+        if nearest.is_some() {
+            ui.weak("Underlined: the closest match to the format bits as read.");
+        }
     }
     let how = if derived.format_by_brute { " (chosen by brute force)" } else { "" };
     ui.label(format!("In effect: EC level {}, mask {}{how}", ec_name(version, derived.ec), derived.mask));
+    let capacity = level_capacity(version, derived.ec, &app.opts, app.reach(version, derived.ec).as_ref());
+    ui.weak(capacity.summary).on_hover_text(capacity.details);
+    if pinned > 0 && app.doc.pins_ec != Some(derived.ec) {
+        ui.colored_label(
+            warn,
+            format!(
+                "Pins on {pinned} {codewords} were made under {pins_level}, so they don't apply at level {}. Switch \
+                 back, or remove them under Padding recovery and pins.",
+                ec_name(version, derived.ec)
+            ),
+        );
+        if let Some(level) = app.doc.pins_ec
+            && version.ec_levels().contains(&level)
+            && ui
+                .button(format!("Use level {}", ec_name(version, level)))
+                .on_hover_text(format!(
+                    "Set the format by hand to level {}, mask {}, so the pins apply again. Undoable.",
+                    ec_name(version, level),
+                    derived.mask
+                ))
+                .clicked()
+        {
+            actions.push(Action::SetFormat(FormatSel::Manual { ec: level, mask: derived.mask }));
+        }
+    }
     if analysis.is_doubtful()
         && let Some(best) = analysis.best()
     {
@@ -786,7 +942,7 @@ fn format_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
         if ui
             .button("Brute force")
-            .on_hover_text("Decode under every EC level and mask and rank the results")
+            .on_hover_text("Decode under every EC level and mask, with the budgets set under Decoding, and rank the results")
             .clicked()
         {
             actions.push(Action::BruteForce);
@@ -963,6 +1119,7 @@ fn blocks_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     let report = &app.derived.report;
     let layout = &app.derived.layout;
     let has_photo = app.photo.is_some();
+    let (running, opts) = (app.job.as_ref().map(|job| job.kind), app.opts);
     let error = ui.visuals().error_fg_color;
     let warn = ui.visuals().warn_fg_color;
     // Wrapping rows rather than a table: the result text is long and the
@@ -1025,6 +1182,7 @@ fn blocks_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                 {
                     actions.push(Action::Sample { only_unknown: false, scope: SampleScope::Block(b) });
                 }
+                try_harder(ui, running, &opts, b, block, actions);
             });
         }
     });
@@ -1054,6 +1212,51 @@ fn blocks_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     }
     if report.blocks.iter().any(|b| !b.is_solved()) {
         ui.small("A block is solved once its unknown codewords, plus twice its wrong ones, fit inside its EC count.");
+    }
+}
+
+/// What a block offers for searching it with every budget at its most
+/// ([`Action::TryHarder`]): while it is searched or once it has been as
+/// it reads now, a word saying so, confirmed or not, since a block the
+/// search confirmed is confirmed only while the search holds; and
+/// otherwise the button, where it is not confirmed.
+fn try_harder(ui: &mut egui::Ui, running: Option<JobKind>, opts: &DecodeOptions, b: usize, block: &BlockReport, actions: &mut Vec<Action>) {
+    if running == Some(JobKind::TryHarder(b)) {
+        ui.weak("searching harder…");
+        return;
+    }
+    if block.tried_harder {
+        ui.weak("searched harder").on_hover_text(
+            "Searched with every Decoding budget at its maximum; the better of that and the normal result is shown. \
+             Kept until the block's modules, the level, the mask or the options change, after which Try harder is \
+             offered again if the block isn't confirmed.",
+        );
+        return;
+    }
+    if block.is_verified() {
+        return;
+    }
+    let budgeted = (opts.reliability && (opts.flip_bits || opts.belief_propagation)) || opts.list_decode || opts.erase_by_trial;
+    let why_not = if running.is_some() {
+        "Wait for the step under way to finish"
+    } else {
+        "Turn on a solver with a budget under Decoding: Flip the faintest bits, Belief propagation, Use list \
+         decoding or Erase codewords by trial."
+    };
+    if ui
+        .add_enabled(running.is_none() && budgeted, egui::Button::new("Try harder").small())
+        .on_hover_text(format!(
+            "Decode this block again with the solvers ticked under Decoding at their maximum budgets: \
+             {CHASE_MAX_BITS} bits flipped, {ABP_ROUNDS_MAX} rounds, {} constraints, {} sets. Runs in the background \
+             and can take a minute on a large block (Stop is in the status bar). The result is used only if it beats \
+             the normal one, and is kept until the block's modules, the level, the mask or the options change.",
+            grouped(LIST_COST_MAX),
+            grouped(TRIAL_SETS_MAX)
+        ))
+        .on_disabled_hover_text(why_not)
+        .clicked()
+    {
+        actions.push(Action::TryHarder(b));
     }
 }
 
@@ -1535,4 +1738,67 @@ fn stream_section(ui: &mut egui::Ui, app: &mut App) {
     }
     ui.label(job);
     ui.small("Data codewords in message order, after error correction where it succeeded.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_level_says_what_it_corrects_and_how_much_further_the_decoder_goes() {
+        let opts = super::super::default_decode_options();
+        let capacity = |version, level, opts: &DecodeOptions| level_capacity(version, level, opts, Reach::of(version, level, opts).as_ref());
+        // 1-H: 17 of error correction in one block, 1 of them kept. List
+        // decoding reaches 11 wrong only by spending it, and is said in
+        // the hover alone; the single codewords the trials erase reach
+        // past the code only so too, and the triples one past it within
+        // the standard's limit. Both were once said in the summary as
+        // reaching 11 and two past the code, which no solution confirmed.
+        let Capacity { summary, details } = capacity(SymbolVersion::Qr(1), EcLevel::H, &opts);
+        assert_eq!(summary, "Corrects up to 8 wrong codewords or 16 unknown. With erasing by trial, up to 9 wrong.");
+        assert!(details.starts_with("17 of the 26 codewords are error correction. A wrong codeword costs as much as two"), "{details}");
+        assert!(
+            details.ends_with(
+                "The standard reserves 1 of them for error detection; a solution that uses them is never confirmed. List \
+                 decoding corrects at least 11 wrong, but with every module certain, past 8 it uses the reserved ones."
+            ),
+            "{details}"
+        );
+        // Where nothing is kept, list decoding's reach is said.
+        let summary = capacity(SymbolVersion::Qr(40), EcLevel::H, &opts).summary;
+        assert!(summary.starts_with("Each of its 81 blocks corrects up to 15 wrong codewords or 30 unknown. With list decoding, at least "), "{summary}");
+        assert!(summary.ends_with("wrong; with erasing by trial, up to 16 wrong."), "{summary}");
+        // Neither is said while it is off, nor list decoding where it
+        // gains nothing, as at level L.
+        let off = DecodeOptions { list_decode: false, erase_by_trial: false, ..opts };
+        assert_eq!(capacity(SymbolVersion::Qr(1), EcLevel::H, &off).summary, "Corrects up to 8 wrong codewords or 16 unknown.");
+        let summary = capacity(SymbolVersion::Qr(5), EcLevel::L, &opts).summary;
+        assert!(summary.starts_with("Corrects up to 13 wrong codewords or 26 unknown. With erasing by trial, up to "), "{summary}");
+        assert!(!summary.contains("list decoding"), "{summary}");
+        // A level of many blocks says so, and M1 that it corrects nothing.
+        let summary = capacity(SymbolVersion::Qr(5), EcLevel::H, &opts).summary;
+        assert!(summary.starts_with("Each of its 4 blocks corrects up to 11 wrong codewords or 22 unknown."), "{summary}");
+        let summary = capacity(SymbolVersion::Micro(1), EcLevel::L, &opts).summary;
+        assert!(summary.starts_with("Corrects nothing"), "{summary}");
+        // M2-L keeps three of its five: the trials reach past its one wrong
+        // codeword only by spending them, and are not said to. The one was
+        // once said to be "1 wrong codewords".
+        let summary = capacity(SymbolVersion::Micro(2), EcLevel::L, &opts).summary;
+        assert_eq!(summary, "Corrects up to 1 wrong codeword or 2 unknown.");
+        // 2-L keeps two of ten: the pairs reach five within the standard's
+        // limit, but plain decoding reaches five first, spending them, and
+        // the trials never see such a block. 1-M keeps two of ten too, and
+        // its sets of four reach six, but not five, which plain decoding
+        // solves first. Both were once said to reach every count up to
+        // what the sets reach, and no solution confirmed five.
+        assert_eq!(capacity(SymbolVersion::Qr(2), EcLevel::L, &opts).summary, "Corrects up to 4 wrong codewords or 8 unknown.");
+        let Capacity { summary, details } = capacity(SymbolVersion::Qr(1), EcLevel::M, &opts);
+        assert_eq!(summary, "Corrects up to 4 wrong codewords or 8 unknown. With erasing by trial, 6 wrong too, but not 5.");
+        assert!(
+            details.ends_with(
+                "A block 5 wrong is never confirmed: plain Reed-Solomon solves it first, using the reserved ones."
+            ),
+            "{details}"
+        );
+    }
 }

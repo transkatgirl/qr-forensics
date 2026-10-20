@@ -133,8 +133,8 @@ pub const DISTANCE_MARGIN: u32 = 64;
 
 /// Sets of codewords a solver erases by trial, at the most, over every
 /// size of set it tries: every codeword alone, every pair, which fit for
-/// any block, the largest having a hundred and fifty-three codewords
-/// and eleven thousand six hundred pairs, every triple up to
+/// any block, the largest having two hundred and thirty-eight codewords,
+/// in Model 1, and twenty-eight thousand pairs, every triple up to
 /// seventy-three codewords and every four up to thirty. Each set is a
 /// decode of a few thousand field operations, and each is a fresh
 /// chance for a block of noise to solve, which what the solution
@@ -143,9 +143,12 @@ pub const DISTANCE_MARGIN: u32 = 64;
 pub const TRIAL_SETS: usize = 1 << 16;
 
 /// Fewest sets a solver may be given to erase by trial
-/// ([`Trials::sets`]): the pairs of the largest block, so that one
+/// ([`Trials::sets`]): the pairs of the largest block of Model 2, Micro
+/// QR and rMQR, a hundred and fifty-three codewords, so that one
 /// codeword past the code is reached in any block however many tries
-/// the decode is one of.
+/// the decode is one of. Model 1's larger blocks, of up to two hundred
+/// and thirty-eight codewords, are given their pairs whatever the
+/// budget ([`rs_decode_trying`]).
 pub const TRIAL_SETS_MIN: usize = 12 * 1024;
 
 /// Most sets a solver may be given to erase by trial, where the budget
@@ -1391,7 +1394,10 @@ fn restated(block: &[CwRead], mut solution: RsSolution) -> RsSolution {
 /// as a chased one is. A codeword pinned whole is never erased. `sets`
 /// is how many sets may be tried in all, [`TRIAL_SETS`] at the most: a
 /// decode that is one of many has less to spend on each
-/// ([`super::pipeline::DecodeOptions::trial_sets`]).
+/// ([`super::pipeline::DecodeOptions::trial_sets`]). Every set of the
+/// smallest size is tried however few that is, so that one codeword
+/// past the code is reached in any block: the pairs of Model 1's largest
+/// blocks are more than [`TRIAL_SETS_MIN`].
 pub fn rs_decode_trying(
     block: &[CwRead],
     bit_reliability: &[[u8; 8]],
@@ -1412,8 +1418,8 @@ pub fn rs_decode_trying(
     let mut tried = 0;
     let mut beyond: Vec<(Vec<usize>, RsSolution)> = Vec::new();
     let mut size = if left % 2 == 1 { 1 } else { 2 };
+    let budget = sets.max(sets_of(candidates.len(), size, TRIAL_SETS_MAX).unwrap_or(0)).min(TRIAL_SETS_MAX);
     while size < left {
-        let budget = sets.min(TRIAL_SETS_MAX);
         let Some(count) = sets_of(candidates.len(), size, budget).filter(|&count| count > 0 && tried + count <= budget) else { break };
         tried += count;
         let mut found: Vec<(u32, (Vec<usize>, RsSolution))> = Vec::new();
@@ -1465,6 +1471,74 @@ pub fn rs_decode_trying(
         size += 2;
     }
     beyond
+}
+
+/// How far the trials of erasures ([`rs_decode_trying`]) go in a block
+/// of `n` codewords read whole with `ec_len` of error correction, given
+/// `sets` to try: a size of set at a time, as they do, while every set
+/// of the sizes so far fits, and the smallest size whatever `sets` is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrialReach {
+    /// Sizes of set tried in full, the smallest first: each reaches a
+    /// codeword more past half the code's distance than the last.
+    pub past: usize,
+    /// The smallest size tried: one where the error correction is odd
+    /// and two where it is even, each size after it two more.
+    pub first_size: usize,
+    /// Sets tried in all.
+    pub sets: usize,
+    /// Sets the next size would take in all, those tried among them;
+    /// `None` where no size of set goes further.
+    pub further: Option<usize>,
+}
+
+impl TrialReach {
+    /// Of the wrong codewords past what the standard corrects, half of
+    /// `ec_len` less the `reserved`, those the sets tried reach leaving
+    /// the reserved codewords unused ([`RsSolution::within_standard`]),
+    /// as a solution that spends them is never confirmed: a set of `s`
+    /// erased, every one of them wrong, leaves the code half of
+    /// `ec_len - reserved + s` wrong codewords to correct within the
+    /// standard's limit. As many as [`Self::past`] where the reserve is
+    /// even or nothing, and one fewer where it is odd: there the
+    /// smallest sets reach past the code only by spending it. A set of
+    /// more than `ec_len - reserved` leaves less than the reserve
+    /// unused however few it corrects, and reaches nothing within the
+    /// standard: where three are reserved, as at 1-L and M2-L, the
+    /// largest sets tried may be so, and the sets before them say how
+    /// far the trials go. And nothing unless the sets go past half of
+    /// `ec_len`: the trials run only where the exact decoder finds
+    /// nothing, and it finds a block up to half `ec_len` wrong, spending
+    /// the reserve past the standard's limit. Where two or more are
+    /// reserved, the sets may reach no further within the standard than
+    /// that, as at 2-L and 1-L, which were once said to gain a codeword
+    /// the trials never see; and where they reach further, as at 1-M, a
+    /// block between the standard's limit and half `ec_len` wrong is
+    /// still the exact decoder's, and never confirmed.
+    pub fn within_standard(&self, ec_len: usize, reserved: usize) -> usize {
+        let capacity = ec_len.saturating_sub(reserved);
+        let Some(largest) = (0..self.past).map(|i| self.first_size + 2 * i).rfind(|&size| size <= capacity) else { return 0 };
+        let reached = (capacity + largest) / 2;
+        if reached <= ec_len / 2 { 0 } else { reached - capacity / 2 }
+    }
+}
+
+pub fn trial_reach(n: usize, ec_len: usize, sets: usize) -> TrialReach {
+    let first_size = if ec_len % 2 == 1 { 1 } else { 2 };
+    let budget = sets.max(sets_of(n, first_size, TRIAL_SETS_MAX).unwrap_or(0)).min(TRIAL_SETS_MAX);
+    let mut reach = TrialReach { past: 0, first_size, sets: 0, further: None };
+    let mut size = first_size;
+    while size < ec_len && size <= n {
+        let all = reach.sets.saturating_add(sets_of(n, size, usize::MAX).unwrap_or(usize::MAX));
+        if all > budget {
+            reach.further = Some(all);
+            break;
+        }
+        reach.past += 1;
+        reach.sets = all;
+        size += 2;
+    }
+    reach
 }
 
 /// A block solved by doubting single bits, or by flipping a few bits
@@ -2673,6 +2747,65 @@ impl<'a, const W: usize> Freeing<'a, W> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_trials_reach_said_is_the_one_they_go() {
+        // A 1-H block, of odd error correction: every codeword and every
+        // triple, and every set of five is past the default.
+        assert_eq!(trial_reach(26, 17, TRIAL_SETS), TrialReach { past: 2, first_size: 1, sets: 26 + 2_600, further: Some(26 + 2_600 + 65_780) });
+        // A 40-H block, of even: every pair, and every set of four is past it.
+        assert_eq!(trial_reach(45, 30, TRIAL_SETS), TrialReach { past: 1, first_size: 2, sets: 990, further: Some(990 + 148_995) });
+        // Nothing goes past where the error correction is two.
+        assert_eq!(trial_reach(5, 2, TRIAL_SETS), TrialReach { past: 0, first_size: 2, sets: 0, further: None });
+        // Within the standard's limit: as far where nothing is reserved,
+        // as at 40-H. Where an odd number is, as at 1-H, the single
+        // codewords reach nine wrong only by spending it, and the triples
+        // reach nine within it.
+        assert_eq!(trial_reach(45, 30, TRIAL_SETS).within_standard(30, 0), 1);
+        assert_eq!(trial_reach(26, 17, TRIAL_SETS).within_standard(17, 1), 1);
+        // Where two are, as at 2-L, the pairs reach five wrong of ten
+        // within it, one past its four, but the exact decoder reaches five
+        // too, spending them, and the trials never run on such a block.
+        // It was once said to reach five, which nothing confirmed. At 1-M
+        // the sets of four reach six, past the exact decoder's five.
+        assert_eq!(trial_reach(44, 10, TRIAL_SETS).within_standard(10, 2), 0);
+        let one_m = trial_reach(26, 10, TRIAL_SETS);
+        assert_eq!((one_m.past, one_m.within_standard(10, 2)), (2, 2));
+        // And at 3-L, where the least budget tries the single codewords
+        // alone, nothing past the code within it.
+        let singles = trial_reach(70, 15, TRIAL_SETS_MIN);
+        assert_eq!((singles.past, singles.within_standard(15, 1)), (1, 0));
+        assert_eq!(trial_reach(70, 15, TRIAL_SETS).within_standard(15, 1), 1);
+        // Where three are reserved, a set of more than the rest leaves
+        // less than the reserve unused, and reaches nothing within it.
+        // At M2-L, two of five, the single codewords and the triples
+        // reach past the code's one only so; at 1-L, four of seven, the
+        // sets of five a raised budget tries add nothing to the triples,
+        // which reach three within it, as far as the exact decoder goes.
+        // Both were once said to reach a codeword further.
+        let m2_l = trial_reach(10, 5, TRIAL_SETS);
+        assert_eq!((m2_l.past, m2_l.within_standard(5, 3)), (2, 0));
+        let raised = trial_reach(26, 7, TRIAL_SETS_MAX);
+        assert_eq!((raised.past, raised.within_standard(7, 3)), (3, 0));
+        assert_eq!(trial_reach(26, 7, TRIAL_SETS).within_standard(7, 3), 0);
+        // The least budget reaches one codeword past the code in any
+        // block that has room to erase in, Model 1's largest, of 238
+        // codewords, among them.
+        use crate::symbol::Family;
+        use crate::symbol::tables::block_shape;
+        assert_eq!(trial_reach(238, 46, TRIAL_SETS_MIN), TrialReach { past: 1, first_size: 2, sets: 28_203, further: Some(28_203 + 130_344_865) });
+        for family in Family::ALL {
+            for version in family.versions() {
+                for &ec in version.ec_levels() {
+                    let shape = block_shape(version, ec).unwrap();
+                    let longest = shape.data_len(shape.blocks - 1) + shape.ec_per_block;
+                    if shape.ec_per_block > 2 {
+                        assert!(trial_reach(longest, shape.ec_per_block, TRIAL_SETS_MIN).past >= 1, "{version} {ec:?}");
+                    }
+                }
+            }
+        }
+    }
+
     /// Small deterministic generator so the tests need no extra dependency.
     struct Rng(u64);
     impl Rng {
@@ -3515,6 +3648,16 @@ mod tests {
         assert_eq!(only(rs_decode_trying(&read, &certain, 29, 0, TRIAL_SETS)).map(|(erased, s)| (erased.len(), s.errors)), Some((1, 15)));
         read[15].value ^= rng.nonzero();
         assert!(rs_decode_trying(&read, &certain, 29, 0, TRIAL_SETS).is_empty());
+        // A block of Model 1's largest, 238 codewords, has more pairs
+        // than the least budget, and is given them all the same.
+        let block = codeword(&mut rng, 192, 46);
+        let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+        for &i in &rng.distinct(24, 238) {
+            read[i].value ^= rng.nonzero();
+        }
+        assert!(sets_of(238, 2, TRIAL_SETS_MIN).is_none());
+        let found = only(rs_decode_trying(&read, &vec![[CERTAIN; 8]; 238], 46, 0, TRIAL_SETS_MIN));
+        assert_eq!(found.map(|(erased, s)| (erased.len(), s.errors, s.corrected == block)), Some((2, 24, true)));
     }
 
     #[test]

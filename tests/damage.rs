@@ -6,12 +6,15 @@ mod common;
 use common::*;
 use qr_forensics::decode::bitstream::Certainty;
 use qr_forensics::decode::codewords::Pins;
-use qr_forensics::decode::pipeline::{BlockOutcome, CwStatus, DecodeOptions, SolveMethod, decode};
+use qr_forensics::decode::pipeline::{
+    BlockOutcome, CwStatus, DecodeOptions, Harder, SolveMethod, brute_force, brute_force_mirrored, brute_force_mirrored_whole, brute_force_whole,
+    decode, decode_keeping, decode_trying_harder,
+};
 use qr_forensics::decode::rs::{
     AIDED_VERIFIED_BITS, CHASE_BITS, RsFailure, TRIAL_SETS, VERIFIED_BITS, located_error_bits, sets_of, tries_charge,
 };
 use qr_forensics::decode::text::UNKNOWN_CHAR;
-use qr_forensics::symbol::grid::{CERTAIN, Module, ModuleGrid};
+use qr_forensics::symbol::grid::{CERTAIN, Mirror, Module, ModuleGrid};
 use qr_forensics::symbol::layout::SymbolLayout;
 use qr_forensics::symbol::{EcLevel, Family, SymbolVersion};
 use qrcode_generator::Segment;
@@ -999,6 +1002,90 @@ fn chasing_flips_faint_bits_where_erasing_them_costs_too_much() {
     assert!(report.blocks[0].is_verified() && report.text.plain() == text);
 }
 
+/// The 8-Q block of [`chasing_flips_faint_bits_where_erasing_them_costs_too_much`]
+/// painted by hand thirteen codewords wrong of forty: past what list
+/// decoding reaches at its usual budget, and within what it reaches at
+/// four times that.
+fn thirteen_wrong(rng: &mut Rng) -> (SymbolLayout, ModuleGrid, String, u8) {
+    let (version, ec, mask) = (SymbolVersion::Qr(8), EcLevel::Q, 2);
+    let (layout, mut grid, text) = sample(version, ec, mask, rng);
+    let block = &layout.blocks[0];
+    for i in 0..block.ec_len / 2 + 2 {
+        corrupt_codeword(&mut grid, &layout, block.codewords[i], i);
+    }
+    (layout, grid, text, mask)
+}
+
+#[test]
+fn a_block_tried_harder_is_searched_at_the_most_and_kept_while_it_reads_the_same() {
+    let mut rng = Rng(0x4A2D);
+    let (layout, grid, text, mask) = thirteen_wrong(&mut rng);
+    let opts = DecodeOptions::default();
+    let own = decode(&grid, &layout, mask, &Pins::new(), &opts);
+    assert!(!own.blocks[0].is_verified() && !own.blocks[0].tried_harder, "{:?}", own.blocks[0].outcome);
+    let (report, harder) = decode_trying_harder(&grid, &layout, mask, &Pins::new(), &opts, &Harder::default(), &[0]);
+    assert!(report.blocks[0].tried_harder);
+    assert!(matches!(report.blocks[0].outcome, BlockOutcome::Solved { errors: 13, .. }), "{:?}", report.blocks[0].outcome);
+    assert!(report.blocks[0].is_verified() && report.text.plain() == text);
+    assert!(report.blocks[1..].iter().all(|block| !block.tried_harder), "only the block asked about");
+    // A later decode takes the search while the block reads the same,
+    // whatever another block does meanwhile.
+    let again = decode_keeping(&grid, &layout, mask, &Pins::new(), &opts, &harder);
+    assert_eq!(again.blocks[0].outcome, report.blocks[0].outcome);
+    assert!(again.blocks[0].tried_harder && again.text.plain() == text);
+    let mut elsewhere = grid.clone();
+    corrupt_codeword(&mut elsewhere, &layout, layout.blocks[1].codewords[0], 0);
+    let again = decode_keeping(&elsewhere, &layout, mask, &Pins::new(), &opts, &harder);
+    assert!(again.blocks[0].tried_harder && again.blocks[0].is_verified());
+    assert_eq!(again.text.plain(), text);
+    // Once it reads otherwise, the search is of another block.
+    let mut changed = grid.clone();
+    corrupt_codeword(&mut changed, &layout, layout.blocks[0].codewords[layout.blocks[0].codewords.len() - 1], 0);
+    let again = decode_keeping(&changed, &layout, mask, &Pins::new(), &opts, &harder);
+    assert!(!again.blocks[0].tried_harder && !again.blocks[0].is_verified());
+}
+
+#[test]
+fn the_brute_force_asked_for_gives_every_attempt_the_budgets_whole() {
+    let mut rng = Rng(0x4A2D);
+    let (layout, grid, text, mask) = thirteen_wrong(&mut rng);
+    let listing = DecodeOptions { list_cost: 8192, erase_by_trial: false, message_evidence: false, ..Default::default() };
+    let attempt = |attempts: Vec<qr_forensics::decode::pipeline::Attempt>| {
+        attempts.into_iter().find(|a| (a.ec, a.mask) == (layout.ec, mask)).expect("the symbol's own format is tried")
+    };
+    // Shared out over the 32 levels and masks, the curve's budget falls
+    // to its floor and reaches no further than usual.
+    let shared = attempt(brute_force(&grid, &layout.func, None, &listing));
+    assert!(!shared.report.blocks[0].is_verified(), "{:?}", shared.report.blocks[0].outcome);
+    let whole = attempt(brute_force_whole(&grid, &layout.func, None, &listing));
+    assert!(matches!(whole.report.blocks[0].outcome, BlockOutcome::Solved { method: SolveMethod::List { .. }, errors: 13, .. }));
+    assert!(whole.report.is_trustworthy() && whole.report.text.plain() == text);
+    // Still one of 32 decodes, for what confirms it.
+    let alone = decode(&grid, &layout, mask, &Pins::new(), &listing);
+    assert_eq!(
+        alone.blocks[0].outcome.confidence_bits(),
+        whole.report.blocks[0].outcome.confidence_bits() + tries_charge(32),
+        "{:?} {:?}",
+        alone.blocks[0].outcome,
+        whole.report.blocks[0].outcome
+    );
+    // So with the mirror images, which are set beside a decode with the
+    // budgets whole: the grid as painted is the transposed grid's mirror
+    // image. They were once shared out, whatever they were set beside.
+    let transposed = grid.mirrored(Mirror::Transpose);
+    let mirrored = |attempts: Vec<qr_forensics::decode::pipeline::Attempt>| {
+        attempts
+            .into_iter()
+            .find(|a| (a.ec, a.mask, a.mirror) == (layout.ec, mask, Some(Mirror::Transpose)))
+            .expect("the symbol's own format is tried transposed")
+    };
+    let shared = mirrored(brute_force_mirrored(&transposed, &layout.func, &listing));
+    assert!(!shared.report.blocks[0].is_verified(), "{:?}", shared.report.blocks[0].outcome);
+    let whole = mirrored(brute_force_mirrored_whole(&transposed, &layout.func, &listing));
+    assert!(matches!(whole.report.blocks[0].outcome, BlockOutcome::Solved { method: SolveMethod::List { .. }, errors: 13, .. }));
+    assert!(whole.report.is_trustworthy() && whole.report.text.plain() == text);
+}
+
 #[test]
 fn a_lost_block_still_yields_the_rest_of_the_text() {
     let mut rng = Rng(0x10057);
@@ -1117,11 +1204,14 @@ fn brute_force_timing() {
         let report = decode_plain(&grid, &layout, mask);
         let single = start.elapsed();
         let start = Instant::now();
-        let attempts = qr_forensics::decode::pipeline::brute_force(&grid, &layout.func, None, &DecodeOptions::default());
+        let attempts = brute_force(&grid, &layout.func, None, &DecodeOptions::default());
         let brute = start.elapsed();
+        let start = Instant::now();
+        brute_force_whole(&grid, &layout.func, None, &DecodeOptions::default());
+        let whole = start.elapsed();
         let best = &attempts[0];
         println!(
-            "{name}: {wrong} faint wrong modules: single decode {single:?} ({} of 81 blocks verified); brute force {brute:?}: best {:?} mask {} {}, {} verified, text {}",
+            "{name}: {wrong} faint wrong modules: single decode {single:?} ({} of 81 blocks verified); brute force {brute:?}, with the budgets whole {whole:?}: best {:?} mask {} {}, {} verified, text {}",
             report.blocks_verified(),
             best.ec,
             best.mask,

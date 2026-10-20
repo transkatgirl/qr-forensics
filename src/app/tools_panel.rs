@@ -1,19 +1,21 @@
 //! Left panel: which symbol this is, the photo, and how to get modules in.
 
 use eframe::egui;
-use qr_forensics::decode::list::{LIST_COST_MAX, LIST_COST_MIN};
-use qr_forensics::decode::rs::{CHASE_MAX_BITS, TRIAL_SETS_MAX};
+use qr_forensics::decode::abp::ABP_ROUNDS_MAX;
+use qr_forensics::decode::list::{LIST_COST, LIST_COST_MAX, LIST_COST_MIN};
+use qr_forensics::decode::pipeline::DecodeOptions;
+use qr_forensics::decode::rs::{CHASE_MAX_BITS, TRIAL_SETS_MAX, TRIAL_SETS_MIN, tries_charge};
 use qr_forensics::imaging::adjust::{Adjust, Channel, Enlarge, Filter, K1_RANGE, LENS_MIN_PAIRS, MAX_ENLARGED_SIDE};
 use qr_forensics::imaging::binarize::{BinarizeParams, WINDOW_RADII};
 use qr_forensics::imaging::detect::{AnchorKind, Detection, anchor_sites};
 use qr_forensics::imaging::sample::{BLUR_MIN_GAIN, Kernel, POOR_SEPARABILITY, SHARPEN_BELOW_PX, misread_odds, reliability_bits};
 use qr_forensics::symbol::function_map::looks_inverted;
 use qr_forensics::symbol::grid::{CERTAIN, Module};
-use qr_forensics::symbol::{Family, SymbolVersion};
+use qr_forensics::symbol::{EcLevel, Family, SymbolVersion};
 
 use super::canvas::one_in;
 use super::state::*;
-use super::{Action, App, JobKind, Transform};
+use super::{Action, App, JobKind, Reach, Transform, count_run, count_word, grouped, wrong_codewords};
 
 /// Why a button is disabled while a job runs.
 const BUSY_HINT: &str = "Wait for the step under way to finish";
@@ -33,6 +35,8 @@ pub(super) fn show(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) 
     }
     ui.separator();
     edit_section(ui, app, actions);
+    ui.separator();
+    decoding_section(ui, app, actions);
 }
 
 fn percent(part: usize, whole: usize) -> String {
@@ -1092,121 +1096,478 @@ fn edit_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         )
         .on_hover_text("Either the grid is misaligned or the wrong version is selected");
     }
+}
 
-    ui.separator();
+/// A logarithmic slider over a count of tries, shown and typed with its
+/// thousands set apart.
+fn count_slider<'a>(value: &'a mut usize, range: std::ops::RangeInclusive<usize>, text: &str) -> egui::Slider<'a> {
+    egui::Slider::new(value, range)
+        .logarithmic(true)
+        .text(text)
+        .custom_formatter(|n, _| grouped(n.round() as usize))
+        .custom_parser(|s| s.trim().replace(',', "").parse::<f64>().ok())
+}
+
+/// What a solver's tries cost `what` it finds, said below its slider:
+/// each doubling of them is a bit more it needs to be confirmed
+/// ([`tries_charge`]).
+fn confirmation_cost(what: &str, tries: usize) -> String {
+    match tries_charge(tries) {
+        0 => format!("{what} needs no extra confirmation."),
+        1 => format!("{what} needs up to 1 extra bit of confirmation."),
+        bits => format!("{what} needs up to {bits} extra bits of confirmation."),
+    }
+}
+
+/// The switch of a solver that is tried only while what it `needs` is
+/// on: as set while it is, and otherwise off and greyed, with what it
+/// needs said first in its hover, so that it shows what is tried. What it
+/// was set to is kept for when it can be tried again. Whether it is.
+fn needing(ui: &mut egui::Ui, value: &mut bool, needs: Option<&str>, text: &str, hover: &str) -> bool {
+    match needs {
+        None => {
+            ui.checkbox(value, text).on_hover_text(hover);
+            *value
+        }
+        Some(needs) => {
+            ui.add_enabled(false, egui::Checkbox::new(&mut false, text)).on_disabled_hover_text(format!("{needs}\n\n{hover}"));
+            false
+        }
+    }
+}
+
+/// What the list decoder's budget costs, said below its slider: time
+/// alone, which grows with the square of the constraints, against the
+/// default's, for the `used` of the `cost` set that this symbol's
+/// largest block uses ([`Reach::list_used`]).
+fn list_cost_time(cost: usize, used: usize) -> String {
+    let ratio = (used as f64 / LIST_COST as f64).powi(2);
+    let time = if ratio >= 1.5 {
+        format!("Costs only time, not confirmation: about {:.0}× the default.", ratio)
+    } else if ratio <= 1.0 / 1.5 {
+        format!("Costs only time, not confirmation: about 1/{:.0} of the default.", 1.0 / ratio)
+    } else {
+        "Costs only time, not confirmation: about the same as the default.".to_owned()
+    };
+    if used < cost {
+        format!("This symbol's blocks use at most {}; more won't reach further. {time}", grouped(used))
+    } else {
+        time
+    }
+}
+
+/// How far list decoding reaches in this symbol's blocks at `cost`
+/// constraints, said under its switch and in its hover ([`Reach::list`]).
+fn list_note(reach: &Reach, version: SymbolVersion, level: EcLevel, cost: usize) -> String {
+    let (blocks, standard) = (reach.blocks_phrase(), reach.standard);
+    // What plain decoding reaches as far as list decoding does: past the
+    // standard's limit, half the distance, spending the reserved
+    // codewords as list decoding would.
+    let plain = |list: usize| if list <= standard { standard } else { reach.half };
+    if !reach.list_gains() && !reach.list_default_gains() {
+        let level = match version {
+            SymbolVersion::Micro(1) => String::new(),
+            _ => format!(" at level {}", level.letter()),
+        };
+        let plain = plain(reach.list.max(reach.list_default));
+        let mut text = format!(
+            "No gain{level}: in this symbol's {blocks}, it's guaranteed to correct {}, the same as plain Reed-Solomon.",
+            wrong_codewords(plain)
+        );
+        if plain > standard {
+            text.push_str(&format!(" Past {standard}, both use the reserved error-detection codewords, so neither is confirmed."));
+        }
+        return text;
+    }
+    let mut text = if reach.list_gains() {
+        format!("In this symbol's {blocks}: corrects at least {}, vs. {standard} for plain Reed-Solomon.", wrong_codewords(reach.list))
+    } else {
+        format!("In this symbol's {blocks}: at this budget, no gain over plain Reed-Solomon's {}.", wrong_codewords(plain(reach.list)))
+    };
+    if reach.list_default > reach.list {
+        let which = if cost > LIST_COST { "Fewer" } else { "More" };
+        text.push_str(&format!(
+            " {which} constraints reach further here: the default, {}, corrects at least {}.",
+            grouped(LIST_COST),
+            reach.list_default
+        ));
+    }
+    if reach.reserved > 0 && reach.list.max(reach.list_default) > standard {
+        text.push_str(&format!(
+            " With every module certain, going past {standard} uses the reserved error-detection codewords, so the \
+             result is never confirmed."
+        ));
+    }
+    text
+}
+
+/// A size of set the trials of erasures try, as their note names it.
+fn every_set(size: usize) -> String {
+    match size {
+        1 => "every single codeword".to_owned(),
+        2 => "every pair".to_owned(),
+        3 => "every triple".to_owned(),
+        n => format!("every set of {}", count_word(n)),
+    }
+}
+
+/// Phrases joined as a list is said: "a", "a and b", "a, b and c".
+fn joined(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// What the trials of erasures cover in this symbol's blocks at the
+/// budget set, and how far past the code that reaches within the
+/// standard's limit and past what plain decoding reaches, said below its
+/// slider, and what the next size of set would take ([`Reach::trials`],
+/// [`Reach::trials_within`], [`Reach::unconfirmed`]).
+fn trial_note(reach: &Reach) -> String {
+    let trials = reach.trials;
+    let (blocks, standard) = (reach.blocks_phrase(), reach.standard);
+    let next = every_set(trials.first_size + 2 * trials.past);
+    let takes = |all: usize| {
+        if all <= TRIAL_SETS_MAX { format!("a budget of {}", grouped(all)) } else { format!("more than the maximum, {}", grouped(TRIAL_SETS_MAX)) }
+    };
+    let mut text = match (trials.past, trials.further) {
+        (0, None) => return format!("Nothing to try in this symbol's {blocks}: too little error correction."),
+        (0, Some(all)) => return format!("In this symbol's {blocks}: the budget is too small for {next}, which would need {}.", takes(all)),
+        (past, _) => {
+            let sizes: Vec<String> = (0..past).map(|i| every_set(trials.first_size + 2 * i)).collect();
+            let tried = format!("In this symbol's {blocks}: tries {} ({} sets)", joined(&sizes), grouped(trials.sets));
+            // Where the standard keeps an odd number of codewords, the
+            // smallest sets reach past the code only by spending them; and
+            // where it keeps two or more, the sets may reach within its
+            // limit no further than plain decoding does by spending them,
+            // or past counts plain decoding solves first, unconfirmed.
+            match (reach.trials_within, reach.unconfirmed()) {
+                (0, _) => format!(
+                    "{tried}, but these only beat plain Reed-Solomon by using the reserved error-detection codewords, \
+                     so they are never confirmed."
+                ),
+                (within, None) => {
+                    format!("{tried}, correcting up to {}, vs. {standard} for plain Reed-Solomon.", wrong_codewords(standard + within))
+                }
+                (within, Some((first, last))) => format!(
+                    "{tried}, correcting {} wrong codewords, vs. {standard} for plain Reed-Solomon. Not {}: plain \
+                     Reed-Solomon solves that first, using the reserved error-detection codewords, so it's never \
+                     confirmed.",
+                    count_run(reach.half + 1, standard + within),
+                    count_run(first, last)
+                ),
+            }
+        }
+    };
+    if let Some(all) = trials.further {
+        text.push_str(&format!(" Adding {next} would need {}.", takes(all)));
+    }
+    text
+}
+
+fn decoding_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     ui.heading("Decoding");
     let mut opts = app.opts;
-    ui.checkbox(&mut opts.bit_level, "Solve unknown bits individually").on_hover_text(
-        "When a block has more unknown codewords than Reed-Solomon can restore, solve for the unknown \
-         modules one by one instead. Assumes every painted module is right, but for a codeword or two that \
-         Erase codewords by trial may find wrong.",
+    let has_reliability = app.doc.grid.has_reliability();
+    let (version, level) = (app.doc.version, app.derived.ec);
+    let reach = app.reach(version, level);
+
+    ui.checkbox(&mut opts.reliability, "Use module reliability").on_hover_text(
+        "Let the solvers use how clearly each module was read. Leave on for a grid sampled from a photo. Turn off \
+         to treat every module as certain, as if painted by hand: doubting, Flip the faintest bits, Belief \
+         propagation and error clustering are skipped, and the message prior only fills in unknown modules. Modules \
+         painted at certain are always certain.",
     );
-    ui.checkbox(&mut opts.erase_by_trial, "Erase codewords by trial").on_hover_text(
-        "When a block fails, take its codewords as unknown by trial, every set of the smallest size that goes \
-         past what its error correction corrects and then of the next, whatever the reliability of their \
-         modules, and keep a solution the rest of the block confirms. Reaches a block wrong in one codeword more \
-         than its error correction corrects, or two in a small block, and one whose unknown bits solve \
-         individually but for a wrong codeword or two or three: on a grid painted by hand as on one sampled. \
-         Many tries are many chances of a wrong answer, so a solution found this way needs more to confirm it, \
-         and where two disagree the message is asked which it is, or neither is kept.",
-    );
-    if opts.erase_by_trial {
-        ui.indent("trial_sets", |ui| {
-            ui.add(egui::Slider::new(&mut opts.trial_sets, 1024..=TRIAL_SETS_MAX).logarithmic(true).text("sets tried"))
-                .on_hover_text(
-                    "Most codeword sets to erase by trial, across all set sizes. The default, 65,536, covers every \
-                     triple in a 73-codeword block; every pair in the largest block is about 12,000, and every \
-                     triple in a 180-codeword block about a million. Each set is another chance of a wrong answer, \
-                     so a solution needs one more bit of confirmation for each doubling. When decoding under many \
-                     formats or samplings, the budget is split between them, but never below every pair.",
-                );
+    if opts.reliability && !has_reliability {
+        ui.indent("reliability_note", |ui| {
+            ui.weak("Takes effect once modules are sampled from a photo, or painted below certain.");
         });
     }
+    let needs_reliability = (!opts.reliability).then_some("Turn on Use module reliability first.");
+
+    ui.add_space(4.0);
+    ui.weak("Tried on every unconfirmed block, best result kept:").on_hover_text(
+        "These all run on every block plain Reed-Solomon doesn't confirm, and the best-confirmed solution is kept. \
+         Blocks says which one solved each block; its Show outlines the doubted modules.",
+    );
+    ui.checkbox(&mut opts.bit_level, "Solve unknown bits individually").on_hover_text(
+        "For unknown modules spread over more codewords than Reed-Solomon can restore: solves for the unknown bits \
+         from the parity equations, rather than for whole codewords. Assumes the other modules are right, except for \
+         a codeword or two that Erase codewords by trial may catch. Needed by Single bits, by the equation-guided \
+         flips of Flip the faintest bits, and by the bit-by-bit trials of Erase codewords by trial.",
+    );
+    ui.label("Doubt the least reliable modules:").on_hover_text(
+        "For a photo with faint, smudged or glared modules: marks the least clearly read codewords or bits unknown, \
+         a few at a time, until the block solves with redundancy to spare. Hand-painted modules are doubted only if \
+         painted below certain.",
+    );
+    ui.indent("doubting", |ui| {
+        needing(
+            ui,
+            &mut opts.doubt_codewords,
+            needs_reliability,
+            "Whole codewords",
+            "For faint modules concentrated in a few codewords: mark the least reliable codewords unknown, one more \
+             at a time. An unknown codeword costs one error correction codeword; a wrong one left in costs two.",
+        );
+        let single_bits_needs = match (opts.reliability, opts.bit_level) {
+            (true, true) => None,
+            (false, false) => Some("Turn on Use module reliability and Solve unknown bits individually first."),
+            (false, true) => needs_reliability,
+            (true, false) => Some("Turn on Solve unknown bits individually first."),
+        };
+        needing(
+            ui,
+            &mut opts.doubt_bits,
+            single_bits_needs,
+            "Single bits",
+            "For faint modules scattered about one per codeword, across more codewords than Whole codewords can \
+             handle: marks the least reliable modules unknown one at a time and solves bit by bit.",
+        );
+    });
+
+    ui.add_space(4.0);
+    ui.weak("Then, one at a time, until the block is confirmed:").on_hover_text(
+        "Each runs only if nothing before it has confirmed the block. List decoding and Erase codewords by trial run \
+         only if plain Reed-Solomon found no solution at all; otherwise they'd find the same one. The \
+         equation-guided flips and bit-by-bit trials run earlier, as part of Solve unknown bits individually.",
+    );
+    let flipping = needing(
+        ui,
+        &mut opts.flip_bits,
+        needs_reliability,
+        "Flip the faintest bits",
+        "For a block with a few more errors than its error correction can fix, where the wrong modules read \
+         faintly. Chase decoding: tries every combination of flips on the least reliable bits (how many is set \
+         below), decoding each. Also flips up to three solidly misread bits that the parity equations point to, when \
+         solving bit by bit fails. Every pattern that solves must agree, or the message decides between them. Turn \
+         it off if a solution it found looks wrong.",
+    );
+    if flipping {
+        ui.indent("chase_bits", |ui| {
+            if !opts.bit_level {
+                ui.weak("Solve unknown bits individually is off, so equation-guided flips are skipped.");
+            }
+            ui.add(egui::Slider::new(&mut opts.chase_bits, 1..=CHASE_MAX_BITS).text("bits flipped")).on_hover_text(
+                "Raise it if a block still fails and has more faint modules than this. Each bit doubles the decodes: \
+                 16 takes about a second on a large block. Default 10. When reading the photo, the budget is split \
+                 across the placements, samplings and formats tried, down to 6.",
+            );
+            let patterns = (1usize << opts.chase_bits) - 1;
+            ui.weak(format!("Up to {} decodes per block. {}", grouped(patterns), confirmation_cost("A solution", patterns)));
+        });
+    }
+
+    let propagating = needing(
+        ui,
+        &mut opts.belief_propagation,
+        needs_reliability,
+        "Belief propagation",
+        "For a noisy photo of a small symbol, with more faint modules than doubting can mark unknown or Flip the \
+         faintest bits can try. Adaptive belief propagation (Jiang and Narayanan): each round, the parity checks \
+         refine every bit's reliability, and the block is decoded again. A solution is confirmed by how rarely random \
+         data lands that close to a codeword.",
+    );
+    if propagating {
+        ui.indent("abp_rounds", |ui| {
+            ui.add(egui::Slider::new(&mut opts.abp_rounds, 1..=ABP_ROUNDS_MAX).text("rounds")).on_hover_text(
+                "Raise it if a block is still changing when the rounds run out. A block that settles stops early; a \
+                 round takes a millisecond or two on the largest blocks. Default 20. When reading the photo, the \
+                 rounds are split across the placements, samplings and formats tried, down to 6.",
+            );
+            ui.weak(confirmation_cost("A solution", opts.abp_rounds));
+        });
+    }
+
     ui.checkbox(&mut opts.list_decode, "Use list decoding").on_hover_text(
-        "When a block fails, run soft-decision list decoding (Koetter–Vardy): weight each codeword by its modules' \
-         reliability and find every valid codeword close enough to the block as read. Corrects past half the code's \
-         distance, more so the lower the block's rate: up to 11 wrong codewords in a version 1-H block (8 normally, \
-         10 with trial erasures) and 19 in a 40-H block (15 normally, 16 with trial erasures). At level L it gains \
-         nothing. Faint modules are tried as both colours at once, so it covers every faint module rather than the \
-         few Flip the faintest bits tries. A solution is confirmed by how rarely random data lands that close to a \
-         codeword, and if two are found, the message decides between them.",
+        "For a block with more wrong codewords than its error correction can fix; helps more at higher levels. \
+         Soft-decision list decoding (Koetter–Vardy): finds every valid codeword close enough to the block as read, \
+         weighting each codeword by its modules' reliability. Faint modules count as both colours at once, so it \
+         reaches further when they're faint than when every module is certain. If it finds two solutions, the \
+         message decides between them.",
     );
     if opts.list_decode {
         ui.indent("list_cost", |ui| {
-            ui.add(egui::Slider::new(&mut opts.list_cost, LIST_COST_MIN..=LIST_COST_MAX).logarithmic(true).text("constraints"))
-                .on_hover_text(
-                    "Interpolation budget: more constraints reach further but take longer. A point of multiplicity m \
-                     costs m(m+1)/2 constraints, so multiplicities grow with the square root of the budget, and run \
-                     time with its square. The default, 2,048, reaches 19 wrong codewords of 45 in a 40-H block and \
-                     takes about 0.1 s on the largest blocks; 32,768 takes seconds. When decoding under many formats \
-                     or samplings, the budget is split between them, down to 512.",
-                );
+            if !opts.reliability {
+                ui.weak("Use module reliability is off, so every module counts as certain.");
+            }
+            if let Some(reach) = &reach {
+                ui.weak(list_note(reach, version, level, opts.list_cost));
+            }
+            ui.add(count_slider(&mut opts.list_cost, LIST_COST_MIN..=LIST_COST_MAX, "constraints")).on_hover_text(
+                "Interpolation budget. Raise it for a block list decoding still can't reach, if you can wait: more \
+                 constraints reach further, and run time grows with the square of the budget. The list is capped at \
+                 32 codewords, so a small block at a high level reaches less far past a few thousand constraints and \
+                 is given no more (see the note below). Default 2,048: about 0.1 s on the largest blocks; 32,768 takes \
+                 seconds. When reading the photo, the budget is split across the placements, samplings and formats \
+                 tried, down to 512.",
+            );
+            ui.weak(list_cost_time(opts.list_cost, reach.as_ref().map_or(opts.list_cost, |reach| reach.list_used)));
         });
     }
+
+    ui.checkbox(&mut opts.erase_by_trial, "Erase codewords by trial").on_hover_text(
+        "The last resort, and the most expensive. For a hand-painted grid (which the reliability-based solvers can't \
+         help) with a codeword or two more wrong than its error correction can fix. Erases every set of codewords of \
+         the smallest size that gets past plain Reed-Solomon, then the next size up, regardless of reliability, and \
+         keeps a solution the rest of the block confirms. Reaches one wrong codeword past plain Reed-Solomon (two in \
+         a small block), or a block whose unknown bits solve except for one to three wrong codewords. Works on \
+         sampled grids too. If two solutions disagree, the message decides, or neither is kept.",
+    );
+    if opts.erase_by_trial {
+        ui.indent("trial_sets", |ui| {
+            if !opts.bit_level {
+                ui.weak("Solve unknown bits individually is off, so bit-by-bit trials are skipped.");
+            }
+            ui.add(count_slider(&mut opts.trial_sets, TRIAL_SETS_MIN..=TRIAL_SETS_MAX, "sets tried")).on_hover_text(
+                format!(
+                    "Most codeword sets to erase by trial, across all sizes. Sets are tried smallest first, and each \
+                     size reaches one more wrong codeword than the last; the note below says which sizes this symbol's \
+                     blocks get. Raise it to reach further, at the confirmation cost shown below. Default 65,536. The \
+                     minimum, {}, always covers the smallest size in any block. When reading the photo, the budget is \
+                     split across the placements, samplings and formats tried, but never below the minimum.",
+                    grouped(TRIAL_SETS_MIN)
+                ),
+            );
+            if let Some(reach) = &reach {
+                ui.weak(trial_note(reach));
+            }
+            ui.weak(confirmation_cost("A solution", opts.trial_sets));
+        });
+    }
+
+    ui.add_space(4.0);
+    ui.weak("Using the rest of the message:").on_hover_text(
+        "After each block has been tried on its own, the rest of the message is used to help the ones that \
+         failed.",
+    );
     ui.checkbox(&mut opts.derive_pins, "Pin the padding and headers found").on_hover_text(
-        "When the decode doesn't verify, find where the padding starts (from the segment headers or the pad \
-         pattern), pin the pad codewords, the terminator, and any header bits with only one reading that parses, \
-         then re-solve the blocks those pins touch until nothing more changes. This is Pin the padding, done \
-         automatically on every decode; a pinned codeword costs no error correction. Pins are kept only if they \
-         solve or verify another block, or the segment headers confirm them. They show under Pins and in the Pins \
-         overlay; Pin the padding, under Padding recovery, adds them to the document.",
+        "For a message shorter than the symbol's capacity, as most are: the padding after it is a known pattern, \
+         and a pinned codeword costs no error correction. When the decode doesn't verify, finds where the padding \
+         starts (from the segment headers or the pad pattern), pins the pad codewords, the terminator and any header \
+         bits with only one valid reading, then re-solves the blocks those pins touch until nothing changes. This is \
+         Pin the padding, done automatically. Pins are kept only if they solve or verify another block, or the \
+         segment headers confirm them. They show under Pins and in the Pins overlay; Pin the padding, under Padding \
+         recovery, adds them to the document. Turn it off if a pin it made looks wrong.",
     );
     ui.checkbox(&mut opts.message_evidence, "Use the message as a prior").on_hover_text(
-        "When a block fails, retry it with a prior on its bits taken from the rest of the message. Each byte, group \
-         of digits or alphanumerics, or Kanji character biases its bits toward what the message's other readable \
-         groups of the same kind hold there. Bytes start out biased toward plain ASCII, and a digit never exceeds \
-         nine. A module read against the prior is doubted sooner, and an unreadable one is solved for at the prior. \
-         The prior only guides the search: a solution is still confirmed against the modules as read. Blocks says \
-         when a block was solved this way.",
+        "For a block that still fails, when the readable rest of the message shows what kind of data it holds, as \
+         plain text or digits do: retries the block with each bit biased toward what the message's other readable \
+         groups of the same kind (bytes, digit groups and so on) hold there. Bytes start out biased toward plain \
+         ASCII, and a digit never exceeds nine. A module read against the prior is doubted sooner, and an unreadable \
+         one is filled in from it. The prior only guides the search: a solution is still confirmed against the \
+         modules as read. Blocks says when a block was solved this way.",
     );
-    ui.checkbox(&mut opts.reliability, "Doubt the least reliable modules").on_hover_text(
-        "When a block fails, treat its codewords with the faintest sampled modules as unknown, a few at a \
-         time, until it solves with something to spare. Modules painted by hand are never doubted unless they \
-         were painted below certain. Each method below is tried, and the \
-         solution with the most to confirm it kept; Blocks says which solved a block, and \
-         its Show outlines the modules that were doubted.",
-    );
-    ui.indent("doubting", |ui| {
-        ui.add_enabled_ui(opts.reliability, |ui| {
-            ui.checkbox(&mut opts.doubt_codewords, "Whole codewords").on_hover_text(
-                "Take the least reliable codewords as unknown, one more at a time: each costs one error correction \
-                 codeword, where a wrong one that is not doubted costs two.",
-            );
-            ui.add_enabled(opts.bit_level, egui::Checkbox::new(&mut opts.doubt_bits, "Single bits"))
-                .on_hover_text(
-                    "Take the least reliable modules as unknown one by one and solve bit by bit: reaches damage spread \
-                     a faint module to a codeword over more codewords than doubting them whole can take.",
-                )
-                .on_disabled_hover_text("Needs Solve unknown bits individually");
-            ui.checkbox(&mut opts.flip_bits, "Flip the faintest bits").on_hover_text(
-                "Try every pattern of flips on the least reliable modules (how many is set below) and decode each: \
-                 reaches a block wrong in a little more than its error correction takes. And where the block solves bit \
-                 by bit but for a module or two or three read solidly wrong, flip the ones the equations name. Many tries are \
-                 many chances of a wrong answer, so every pattern that solves must agree, or the message is asked which \
-                 it is; turn this off where a solution it reached looks wrong.",
-            );
-            if opts.flip_bits {
-                ui.add(egui::Slider::new(&mut opts.chase_bits, 1..=CHASE_MAX_BITS).text("bits flipped")).on_hover_text(
-                    "How many of the least reliable bits to try every pattern of: n bits is 2^n decodes. The default, 10, \
-                     is about a thousand; 16 is 65,536, around a second on a large block. Each decode is another chance \
-                     of a wrong answer, so a solution needs one more bit of confirmation per bit flipped. When decoding \
-                     under many formats or samplings, fewer are flipped, but never fewer than 6.",
-                );
-            }
-            ui.checkbox(&mut opts.belief_propagation, "Belief propagation").on_hover_text(
-                "Run adaptive belief propagation (Jiang and Narayanan): over several rounds, the block's parity checks \
-                 update each bit's reliability from the other bits in the same checks, and the block is decoded from \
-                 the updated reliabilities. Each round the checks are rearranged so the least reliable bits each sit \
-                 in a check of their own. Finds faint misreads among more faint but correct modules than doubting can \
-                 treat as unknown, and more misreads than Flip the faintest bits tries. A solution is confirmed by how \
-                 rarely random data lands that close to a codeword; the bits it flipped add nothing to that.",
-            );
+    if opts.message_evidence && !opts.reliability {
+        ui.indent("evidence_note", |ui| {
+            ui.weak("Use module reliability is off, so the prior only fills in unknown modules.");
         });
+    }
+
+    ui.add_space(4.0);
+    // The character set is chosen under Result, and is left as it is.
+    let defaults = DecodeOptions { charset: opts.charset, ..super::default_decode_options() };
+    // What Restore defaults replaced can be put back until the options
+    // are changed some other way.
+    if opts != defaults {
+        app.view.before_defaults = None;
+    }
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(opts != defaults, egui::Button::new("Restore defaults"))
+            .on_hover_text("Reset every option and budget above to its default")
+            .on_disabled_hover_text("Everything above is already at its default")
+            .clicked()
+        {
+            app.view.before_defaults = Some(opts);
+            opts = defaults;
+        }
+        if let Some(before) = app.view.before_defaults
+            && ui.button("Put back").on_hover_text("Go back to the options and budgets you had before Restore defaults").clicked()
+        {
+            app.view.before_defaults = None;
+            opts = DecodeOptions { charset: opts.charset, ..before };
+        }
     });
     if opts != app.opts {
         actions.push(Action::SetDecodeOptions(opts));
     }
-    if opts.reliability && !app.doc.grid.has_reliability() {
-        ui.weak("Takes effect once modules are sampled from a photo, or painted below certain.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_notes_on_reach_say_what_spends_the_codewords_the_standard_keeps() {
+        let opts = super::super::default_decode_options();
+        // 1-H keeps one codeword: list decoding reaches past the code only
+        // by spending it, and of the trials, only the triples go past it
+        // within the standard's limit.
+        let reach = Reach::of(SymbolVersion::Qr(1), EcLevel::H, &opts).unwrap();
+        assert_eq!(
+            list_note(&reach, SymbolVersion::Qr(1), EcLevel::H, opts.list_cost),
+            "In this symbol's block of 26 codewords: corrects at least 11 wrong codewords, vs. 8 for plain \
+             Reed-Solomon. With every module certain, going past 8 uses the reserved error-detection codewords, so the \
+             result is never confirmed."
+        );
+        // 1-M keeps two: list decoding reaches half the distance, five,
+        // and no further, which plain decoding reaches as well by spending
+        // them. It was once said to correct five where plain decoding
+        // corrects four.
+        let one_m = Reach::of(SymbolVersion::Qr(1), EcLevel::M, &opts).unwrap();
+        assert_eq!(
+            list_note(&one_m, SymbolVersion::Qr(1), EcLevel::M, opts.list_cost),
+            "No gain at level M: in this symbol's block of 26 codewords, it's guaranteed to correct 5 wrong codewords, \
+             the same as plain Reed-Solomon. Past 4, both use the reserved error-detection codewords, so neither is \
+             confirmed."
+        );
+        assert_eq!(
+            trial_note(&reach),
+            "In this symbol's block of 26 codewords: tries every single codeword and every triple (2,626 sets), \
+             correcting up to 9 wrong codewords, vs. 8 for plain Reed-Solomon. Adding every set of five would need a \
+             budget of 68,406."
+        );
+        // 3-L at the least budget tries the single codewords alone.
+        let least = DecodeOptions { trial_sets: TRIAL_SETS_MIN, ..opts };
+        let reach = Reach::of(SymbolVersion::Qr(3), EcLevel::L, &least).unwrap();
+        assert_eq!(
+            trial_note(&reach),
+            "In this symbol's block of 70 codewords: tries every single codeword (70 sets), but these only beat plain \
+             Reed-Solomon by using the reserved error-detection codewords, so they are never confirmed. Adding every \
+             triple would need a budget of 54,810."
+        );
+        // M2-L keeps three of five: even its triples beat plain
+        // Reed-Solomon only by spending them.
+        let reach = Reach::of(SymbolVersion::Micro(2), EcLevel::L, &opts).unwrap();
+        assert!(trial_note(&reach).ends_with("so they are never confirmed."), "{}", trial_note(&reach));
+        // Its one wrong codeword was once "1 wrong codewords".
+        assert_eq!(
+            list_note(&reach, SymbolVersion::Micro(2), EcLevel::L, opts.list_cost),
+            "No gain at level L: in this symbol's block of 10 codewords, it's guaranteed to correct 1 wrong codeword, \
+             the same as plain Reed-Solomon."
+        );
+        // 2-L keeps two of ten: the pairs reach five within the standard's
+        // limit, where plain decoding goes first by spending them, and six
+        // only by spending them too. It was once said to correct five.
+        let reach = Reach::of(SymbolVersion::Qr(2), EcLevel::L, &opts).unwrap();
+        assert_eq!(
+            trial_note(&reach),
+            "In this symbol's block of 44 codewords: tries every pair (946 sets), but these only beat plain \
+             Reed-Solomon by using the reserved error-detection codewords, so they are never confirmed. Adding every \
+             set of four would need a budget of 136,697."
+        );
+        // 1-M keeps two of ten too: the sets of four reach six, but a block
+        // five wrong is plain decoding's, and never confirmed. It was once
+        // said to correct up to six.
+        assert_eq!(
+            trial_note(&one_m),
+            "In this symbol's block of 26 codewords: tries every pair and every set of four (15,275 sets), correcting \
+             6 wrong codewords, vs. 4 for plain Reed-Solomon. Not 5: plain Reed-Solomon solves that first, using the \
+             reserved error-detection codewords, so it's never confirmed. Adding every set of six would need a budget \
+             of 245,505."
+        );
     }
 }

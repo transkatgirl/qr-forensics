@@ -3,18 +3,19 @@
 
 use std::sync::Arc;
 
-use super::abp::{ABP_ROUNDS, ABP_ROUNDS_MIN, rs_decode_propagating};
+use super::abp::{ABP_ROUNDS, ABP_ROUNDS_MAX, ABP_ROUNDS_MIN, rs_decode_propagating};
 use super::bch::{self, FormatAnalysis, VersionAnalysis};
 use super::bitstream::{self, Certainty, EndOfData, ParseReport, StreamBits};
 use super::clustering::Clustering;
 use super::codewords::{Pin, Pins, apply_pins, codeword_bit_mask, read_codewords};
 use super::evidence::{Laid, MessageEvidence};
-use super::list::{LIST_COST, LIST_COST_MIN, rs_decode_listing};
+use super::list::{LIST_COST, LIST_COST_MAX, LIST_COST_MIN, rs_decode_listing};
 use super::padding::{self, TailCheck};
 use super::rs::{
-    AIDED_VERIFIED_BITS, BitDoubt, BitSolveFailure, CHASE_BITS, CwRead, DISTANCE_MARGIN, RsFailure, RsSolution, TRIAL_SETS, TRIAL_SETS_MIN,
-    Trials, VERIFIED_BITS, chase_bits_among, judged, rs_decode_chasing_bits, rs_decode_doubting, rs_decode_reserving, rs_decode_trying,
-    soft_count_bits, soft_distance, solve_bit_erasures, solve_bit_erasures_doubting, solve_bit_erasures_trying, tries_charge,
+    AIDED_VERIFIED_BITS, BitDoubt, BitSolveFailure, CHASE_BITS, CHASE_MAX_BITS, CwRead, DISTANCE_MARGIN, RsFailure, RsSolution, TRIAL_SETS,
+    TRIAL_SETS_MAX, TRIAL_SETS_MIN, Trials, VERIFIED_BITS, chase_bits_among, judged, rs_decode_chasing_bits, rs_decode_doubting,
+    rs_decode_reserving, rs_decode_trying, soft_count_bits, soft_distance, solve_bit_erasures, solve_bit_erasures_doubting,
+    solve_bit_erasures_trying, tries_charge,
 };
 use super::text::{self, Charset, TextReport};
 use crate::symbol::EcLevel;
@@ -62,6 +63,13 @@ pub struct DecodeOptions {
     /// a bit for each doubling of them ([`super::rs::RsSolution::among`]).
     /// One where the decode stands alone.
     pub tries: usize,
+    /// Of the [`Self::tries`], those the dear solvers' budgets are shared
+    /// out over ([`Self::among`]): the chase flips a bit fewer and the
+    /// propagation runs a share of its rounds for each of them, as the
+    /// trials and the curve are given a share of theirs. Those
+    /// [`Self::one_of`] counts, as a brute force's, each have the budgets
+    /// whole. One where the decode stands alone.
+    pub shared: usize,
     /// Sets of codewords a block's trials of erasures may try, over
     /// every size of set, at the most ([`super::rs::TRIAL_SETS`]): what
     /// a block nothing else solves costs, since every set is a decode. A
@@ -100,6 +108,11 @@ pub struct DecodeOptions {
     /// chase cannot: faint misreads among more faint bits read right
     /// than the doubting can take as unknown.
     pub belief_propagation: bool,
+    /// Rounds the propagation is given at the most ([`ABP_ROUNDS`]), from
+    /// one to [`ABP_ROUNDS_MAX`]: each is a decode, and a chance of a
+    /// misdecode. A share of them where the decode is one of many, never
+    /// fewer than [`ABP_ROUNDS_MIN`].
+    pub abp_rounds: usize,
     /// When the decode is no read, find the padding, terminator and
     /// headers the stream shows, pin them, and solve again the blocks
     /// the pins touch, to a fixed point, as padding recovery does by
@@ -135,11 +148,13 @@ impl Default for DecodeOptions {
             flip_bits: true,
             erase_by_trial: true,
             tries: 1,
+            shared: 1,
             trial_sets: TRIAL_SETS,
             chase_bits: CHASE_BITS,
             list_decode: true,
             list_cost: LIST_COST,
             belief_propagation: true,
+            abp_rounds: ABP_ROUNDS,
             derive_pins: false,
             message_evidence: true,
         }
@@ -150,16 +165,56 @@ impl DecodeOptions {
     /// These options for a decode that is one of `tries` the caller
     /// makes of the grid, keeping the best, besides those already
     /// counted: the budgets of the dear solvers are shared out over the
-    /// tries, down to their floors.
+    /// tries, down to their floors. The trials' and the curve's are held
+    /// already shared over those counted before ([`Self::shared`]), and
+    /// are shared out over these alone, so that a decode one of `a` and
+    /// then of `b` has what one of `a·b` has.
     pub fn among(self, tries: usize) -> Self {
-        let tries = self.tries.max(1) * tries.max(1);
+        let tries = tries.max(1);
         Self {
-            tries,
-            trial_sets: (self.trial_sets / tries).clamp(TRIAL_SETS_MIN.min(self.trial_sets), self.trial_sets),
-            list_cost: (self.list_cost / tries).clamp(LIST_COST_MIN.min(self.list_cost), self.list_cost),
+            tries: self.tries.max(1) * tries,
+            shared: self.shared.max(1) * tries,
+            trial_sets: share(self.trial_sets, TRIAL_SETS_MIN, tries),
+            list_cost: share(self.list_cost, LIST_COST_MIN, tries),
             ..self
         }
     }
+
+    /// These options for a decode that is one of `tries` the caller
+    /// makes of the grid, as [`Self::among`], but given the budgets
+    /// whole: counted, for what confirms a solution, and not shared.
+    pub fn one_of(self, tries: usize) -> Self {
+        Self { tries: self.tries.max(1) * tries.max(1), ..self }
+    }
+
+    /// These options with the budget of every dear solver at its most:
+    /// what a block tried harder is searched with ([`decode_trying_harder`]).
+    /// The trials' and the curve's are shared out over the decodes the
+    /// options are one of ([`Self::shared`]), as the chase's and the
+    /// propagation's are where they are spent.
+    pub fn at_most(self) -> Self {
+        let shared = self.shared.max(1);
+        Self {
+            chase_bits: CHASE_MAX_BITS,
+            abp_rounds: ABP_ROUNDS_MAX,
+            list_cost: share(LIST_COST_MAX, LIST_COST_MIN, shared),
+            trial_sets: share(TRIAL_SETS_MAX, TRIAL_SETS_MIN, shared),
+            ..self
+        }
+    }
+
+    /// Rounds the propagation runs here: the options' share of them
+    /// ([`Self::shared`]), and never fewer than [`ABP_ROUNDS_MIN`] unless
+    /// fewer were set.
+    fn rounds(&self) -> usize {
+        (self.abp_rounds / self.shared.max(1)).max(ABP_ROUNDS_MIN.min(self.abp_rounds))
+    }
+}
+
+/// Each of `over` decodes' share of `budget`: never less than `floor`,
+/// unless the budget is, and never more than the whole.
+fn share(budget: usize, floor: usize, over: usize) -> usize {
+    (budget / over.max(1)).clamp(floor.min(budget), budget)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,6 +370,10 @@ pub struct BlockReport {
     /// when the solution was reached so ([`DecodeOptions::message_evidence`]).
     /// Nought where it was not.
     pub message_evidence: usize,
+    /// The block, as it reads now, was searched with every dear solver's
+    /// budget at its most ([`decode_trying_harder`]), whether or not that
+    /// found anything better than its own options did.
+    pub tried_harder: bool,
 }
 
 impl BlockReport {
@@ -785,7 +844,7 @@ fn solve_block(
         weigh(Candidate::new(outcome, doubt.solution.corrected, doubt.doubted, tries_charge(doubt.tries) + tries_charge(opts.tries)))
     };
     let flips = opts.reliability && opts.flip_bits;
-    let chase_bits = chase_bits_among(opts.chase_bits, opts.tries);
+    let chase_bits = chase_bits_among(opts.chase_bits, opts.shared);
 
     let mut exact_solved = false;
     let failure = match rs_decode_reserving(search, ec_len, reserved).map(|s| s.among(opts.tries)) {
@@ -895,7 +954,7 @@ fn solve_block(
         && !verified_so_far(&pool)
         && search_bits.iter().flatten().any(|&r| r < CERTAIN)
     {
-        let rounds = (ABP_ROUNDS / opts.tries.max(1)).max(ABP_ROUNDS_MIN);
+        let rounds = opts.rounds();
         let trials = Trials { flips, free: opts.erase_by_trial && exact_failed, sets: opts.trial_sets };
         let chase = if flips { chase_bits } else { 0 };
         let found = rs_decode_propagating(search, search_bits, ec_len, reserved, rounds, trials, chase).into_iter().filter_map(
@@ -1193,6 +1252,7 @@ fn report_block(
         rivals: solve.arbitrated_among,
         near_errors: solve.near_errors,
         message_evidence: solve.message_evidence,
+        tried_harder: false,
     }
 }
 
@@ -1433,6 +1493,60 @@ fn remember(solved: &mut Vec<Solved>, entry: Solved) {
     solved.push(entry);
 }
 
+/// Blocks searched harder than a decode's options search them
+/// ([`DecodeOptions::at_most`]), each search with the reads,
+/// reliabilities and evidence it was made from: for later decodes of the
+/// grid to take where a block reads the same and the search ranks better
+/// than their own ([`decode_keeping`]). They hold only under the layout,
+/// mask and options they were found under, since those say what the
+/// codewords are and which solvers were switched on; a decode under
+/// others is not to be given them. None is forgotten, as a decode
+/// forgets its own ways of solving a block ([`REMEMBERED`]): each was
+/// asked for and cost far more than it keeps, and a decode searching a
+/// block harder searches it under every reliability and evidence its
+/// rounds and its padding pins give it, more than a decode remembers.
+/// The first, of the block as read under the caller's pins, which
+/// [`BlockReport::tried_harder`] asks after, was once forgotten first.
+#[derive(Clone, Default)]
+pub struct Harder {
+    solved: Vec<Vec<Solved>>,
+}
+
+impl Harder {
+    fn of(&self, b: usize) -> &[Solved] {
+        self.solved.get(b).map_or(&[], Vec::as_slice)
+    }
+
+    fn keep(&mut self, b: usize, entry: Solved) {
+        if self.solved.len() <= b {
+            self.solved.resize(b + 1, Vec::new());
+        }
+        self.solved[b].push(entry);
+    }
+
+    /// Block `b` was searched harder from `reads` and `bits`, searched as
+    /// read or with the evidence `laid` over them.
+    fn holds(&self, b: usize, reads: &[CwRead], bits: &[[u8; 8]], laid: Option<&Laid>) -> bool {
+        self.of(b).iter().any(|s| s.reads == reads && s.bits == bits && s.laid.as_ref() == laid)
+    }
+
+    /// Of `solve`, the block solved under the decode's own options, and
+    /// the block searched harder from the same reads, reliabilities and
+    /// evidence, when it was, the better: a search at the most is charged
+    /// for its many tries, and may rank below what fewer found.
+    fn better(&self, b: usize, reads: &[CwRead], bits: &[[u8; 8]], laid: Option<&Laid>, solve: BlockSolve) -> BlockSolve {
+        match recall(self.of(b), reads, bits, laid) {
+            Some(harder) if harder.rank() > solve.rank() => harder,
+            _ => solve,
+        }
+    }
+
+    /// Block `b` was searched harder as it reads from `reads` and `bits`.
+    fn searched(&self, b: usize, reads: &[CwRead], bits: &[[u8; 8]]) -> bool {
+        self.holds(b, reads, bits, None)
+    }
+}
+
 /// `solve` done on every item, side by side on the spare cores when
 /// there are two or more ([`work::map`]).
 fn solve_each<T: Sync>(items: &[T], solve: impl Fn(&T) -> BlockSolve + Sync) -> Vec<BlockSolve> {
@@ -1450,13 +1564,20 @@ fn solve_each<T: Sync>(items: &[T], solve: impl Fn(&T) -> BlockSolve + Sync) -> 
 /// rounds of [`Decoding::solve`] only the blocks whose reliabilities or
 /// evidence moved. Of the rest, the exact decoder settles the sound ones
 /// alone, and the hard ones, each a search of its fallbacks, are solved
-/// side by side on the spare cores ([`work::map`]). None for the blocks
-/// not asked for.
+/// side by side on the spare cores ([`work::map`]). A hard one that is
+/// `trying` and does not verify so is searched again at the most
+/// ([`DecodeOptions::at_most`]), unless `harder` holds a search of it
+/// from the same inputs already, and the search kept in `harder`; and
+/// of a hard one's solve and a search of it at the most from the same
+/// inputs that `harder` holds, the better is taken ([`Harder::better`]).
+/// None for the blocks not asked for.
 #[allow(clippy::too_many_arguments)]
 fn solve_blocks(
     layout: &SymbolLayout,
     opts: &DecodeOptions,
     solved: &mut [Vec<Solved>],
+    harder: &mut Harder,
+    trying: &[bool],
     pinned: &[CwRead],
     bit_reliability: &[[u8; 8]],
     evidence: Option<&MessageEvidence>,
@@ -1482,8 +1603,20 @@ fn solve_blocks(
         }
     }
     let solves = solve_each(&hard, |&b| solve_spec(layout, &layout.blocks[b], pinned, bit_reliability, None, opts));
+    let at_most = opts.at_most();
+    let searching = |harder: &Harder, b: usize, solve: &BlockSolve, laid: Option<&Laid>| {
+        let (reads, bits) = inputs(&layout.blocks[b]);
+        trying[b] && !solve.rank().0 && !harder.holds(b, &reads, &bits, laid)
+    };
+    let harder_of: Vec<usize> = hard.iter().zip(&solves).filter(|&(&b, solve)| searching(harder, b, solve, None)).map(|(&b, _)| b).collect();
+    let found = solve_each(&harder_of, |&b| solve_spec(layout, &layout.blocks[b], pinned, bit_reliability, None, &at_most));
+    for (&b, solve) in harder_of.iter().zip(found) {
+        let (reads, bits) = inputs(&layout.blocks[b]);
+        harder.keep(b, Solved { reads, bits, laid: None, solve });
+    }
     for (&b, solve) in hard.iter().zip(solves) {
         let (reads, bits) = inputs(&layout.blocks[b]);
+        let solve = harder.better(b, &reads, &bits, None, solve);
         remember(&mut solved[b], Solved { reads, bits, laid: None, solve: solve.clone() });
         out[b] = Some(solve);
     }
@@ -1506,15 +1639,25 @@ fn solve_blocks(
             None => again.push((b, laid)),
         }
     }
-    let solves = solve_each(&again, |(b, laid)| {
-        let mut solve = solve_spec(layout, &layout.blocks[*b], pinned, bit_reliability, Some(laid), &guided_opts);
+    let guided = |b: usize, laid: &Laid, opts: &DecodeOptions| {
+        let mut solve = solve_spec(layout, &layout.blocks[b], pinned, bit_reliability, Some(laid), opts);
         if solve.corrected.is_some() {
             solve.message_evidence = laid.moved;
         }
         solve
-    });
+    };
+    let solves = solve_each(&again, |(b, laid)| guided(*b, laid, &guided_opts));
+    let at_most_guided = at_most.among(2);
+    let harder_of: Vec<&(usize, Laid)> =
+        again.iter().zip(&solves).filter(|&((b, laid), solve)| searching(harder, *b, solve, Some(laid))).map(|(item, _)| item).collect();
+    let found = solve_each(&harder_of, |(b, laid)| guided(*b, laid, &at_most_guided));
+    for ((b, laid), solve) in harder_of.into_iter().zip(found) {
+        let (reads, bits) = inputs(&layout.blocks[*b]);
+        harder.keep(*b, Solved { reads, bits, laid: Some(laid.clone()), solve });
+    }
     for ((b, laid), solve) in again.into_iter().zip(solves) {
         let (reads, bits) = inputs(&layout.blocks[b]);
+        let solve = harder.better(b, &reads, &bits, Some(&laid), solve);
         remember(&mut solved[b], Solved { reads, bits, laid: Some(laid), solve: solve.clone() });
         take(&mut out, b, solve);
     }
@@ -1536,6 +1679,10 @@ pub struct Decoding<'a> {
     /// The ways each block was solved, from whatever reads and
     /// reliabilities, searched as read or with the message's evidence.
     solved: Vec<Vec<Solved>>,
+    /// The blocks searched harder, before this decode or in it.
+    harder: Harder,
+    /// The blocks this decode searches harder ([`decode_trying_harder`]).
+    trying: Vec<bool>,
 }
 
 impl<'a> Decoding<'a> {
@@ -1553,7 +1700,21 @@ impl<'a> Decoding<'a> {
             module_reliability,
             bit_reliability,
             solved: vec![Vec::new(); layout.blocks.len()],
+            harder: Harder::default(),
+            trying: vec![false; layout.blocks.len()],
         }
+    }
+
+    /// This decode, taking the searches `kept` holds, and searching the
+    /// blocks `trying` harder.
+    fn trying_harder(mut self, kept: &Harder, trying: &[usize]) -> Self {
+        self.harder = kept.clone();
+        for &b in trying {
+            if let Some(trying) = self.trying.get_mut(b) {
+                *trying = true;
+            }
+        }
+        self
     }
 
     /// The grid decoded under `pins`.
@@ -1578,7 +1739,8 @@ impl<'a> Decoding<'a> {
             })
             .collect();
 
-        let mut solves: Vec<BlockSolve> = solve_blocks(layout, opts, &mut self.solved, &pinned, &self.bit_reliability, None, &|_| true)
+        let mut solves: Vec<BlockSolve> =
+            solve_blocks(layout, opts, &mut self.solved, &mut self.harder, &self.trying, &pinned, &self.bit_reliability, None, &|_| true)
             .into_iter()
             .map(|solve| solve.expect("every block asked"))
             .collect();
@@ -1625,6 +1787,8 @@ impl<'a> Decoding<'a> {
                 layout,
                 opts,
                 &mut self.solved,
+                &mut self.harder,
+                &self.trying,
                 &pinned,
                 lowered_bits.as_deref().unwrap_or(&self.bit_reliability),
                 evidence.as_ref(),
@@ -1654,6 +1818,11 @@ impl<'a> Decoding<'a> {
             arbitrate(layout, raw, &pinned, &mut solves, &mut codewords, &mut blocks, &mut asked, opts.charset);
         }
 
+        for (b, (spec, block)) in layout.blocks.iter().zip(&mut blocks).enumerate() {
+            let reads: Vec<CwRead> = spec.codewords.iter().map(|&cw| pinned[cw]).collect();
+            let bits: Vec<[u8; 8]> = spec.codewords.iter().map(|&cw| self.bit_reliability[cw]).collect();
+            block.tried_harder = self.harder.searched(b, &reads, &bits);
+        }
         let Assembled { stream, parse, tail, text, stream_valid, tail_plausible } = assemble(layout, &codewords, &blocks, &pinned, opts.charset);
         let blocks_solved = blocks.iter().filter(|b| b.is_solved()).count();
         let blocks_verified = blocks.iter().filter(|b| b.is_verified()).count();
@@ -1679,12 +1848,35 @@ impl<'a> Decoding<'a> {
 }
 
 pub fn decode(grid: &ModuleGrid, layout: &SymbolLayout, mask: u8, pins: &Pins, opts: &DecodeOptions) -> DecodeReport {
-    let mut decoding = Decoding::new(grid, layout, mask, opts);
+    decode_keeping(grid, layout, mask, pins, opts, &Harder::default())
+}
+
+/// [`decode`], taking from `kept` the searches of blocks made harder
+/// before, where a block reads as it did and the search ranks better
+/// ([`Harder`]). `kept` must be of this layout, mask and options.
+pub fn decode_keeping(grid: &ModuleGrid, layout: &SymbolLayout, mask: u8, pins: &Pins, opts: &DecodeOptions, kept: &Harder) -> DecodeReport {
+    decode_trying_harder(grid, layout, mask, pins, opts, kept, &[]).0
+}
+
+/// [`decode_keeping`], with the blocks `trying` searched again, wherever
+/// the options leave one unconfirmed, with every dear solver's budget
+/// at its most ([`DecodeOptions::at_most`]), the better solution taken:
+/// a search that may take a minute on a large block, for the blocks
+/// asked about, called off as any work is ([`work::cancelled`]). With
+/// `kept` and the searches this decode made, for later decodes to take.
+pub fn decode_trying_harder(
+    grid: &ModuleGrid,
+    layout: &SymbolLayout,
+    mask: u8,
+    pins: &Pins,
+    opts: &DecodeOptions,
+    kept: &Harder,
+    trying: &[usize],
+) -> (DecodeReport, Harder) {
+    let mut decoding = Decoding::new(grid, layout, mask, opts).trying_harder(kept, trying);
     let report = decoding.solve(pins);
-    if !opts.derive_pins || report.is_trustworthy() || work::cancelled() {
-        return report;
-    }
-    derive_pins(&mut decoding, pins, report)
+    let report = if !opts.derive_pins || report.is_trustworthy() || work::cancelled() { report } else { derive_pins(&mut decoding, pins, report) };
+    (report, decoding.harder)
 }
 
 /// The decode made again with the padding, terminator and headers the
@@ -1857,8 +2049,38 @@ const DOUBTING_MIN_ATTEMPTS: usize = 4;
 /// then the few that rank best with them. The exact decoder and the bit-level solver,
 /// which the first pass keeps, already tell the right mask from the rest
 /// when any block of it is clean. Every attempt is one of as many
-/// decodes as there are levels and masks ([`DecodeOptions::tries`]).
+/// decodes as there are levels and masks ([`DecodeOptions::among`]),
+/// and has that share of the dear solvers' budgets.
 pub fn brute_force(
+    grid: &ModuleGrid,
+    func: &Arc<FunctionMap>,
+    pins: Option<(EcLevel, &Pins)>,
+    opts: &DecodeOptions,
+) -> Vec<Attempt> {
+    attempt_every_format(grid, func, pins, &opts.among(formats(func)))
+}
+
+/// [`brute_force`] with every attempt given the budgets of `opts` whole
+/// ([`DecodeOptions::one_of`]): counted as one of as many decodes as
+/// there are levels and masks, for what confirms a solution, but
+/// searched as a decode of the one level and mask would be, so that an
+/// attempt ranks as it decodes once it is taken.
+pub fn brute_force_whole(
+    grid: &ModuleGrid,
+    func: &Arc<FunctionMap>,
+    pins: Option<(EcLevel, &Pins)>,
+    opts: &DecodeOptions,
+) -> Vec<Attempt> {
+    attempt_every_format(grid, func, pins, &opts.one_of(formats(func)))
+}
+
+/// The levels and masks a brute force of `func`'s version tries.
+fn formats(func: &FunctionMap) -> usize {
+    func.version.ec_levels().len() * func.version.mask_count() as usize
+}
+
+/// The decodes of [`brute_force`], under `opts` as counted for them.
+fn attempt_every_format(
     grid: &ModuleGrid,
     func: &Arc<FunctionMap>,
     pins: Option<(EcLevel, &Pins)>,
@@ -1866,7 +2088,6 @@ pub fn brute_force(
 ) -> Vec<Attempt> {
     let format = bch::analyze_format(grid, func);
     let no_pins = Pins::new();
-    let opts = &opts.among(func.version.ec_levels().len() * func.version.mask_count() as usize);
     let two_passes =
         (opts.reliability && grid.has_reliability()) || opts.erase_by_trial || opts.list_decode || opts.derive_pins || opts.message_evidence;
     let first_pass = DecodeOptions {
@@ -1931,6 +2152,24 @@ pub fn brute_force(
 /// say so whatever the state of the format bits. Pins do not carry over:
 /// they name codewords of the grid as it stands.
 pub fn brute_force_mirrored(grid: &ModuleGrid, func: &Arc<FunctionMap>, opts: &DecodeOptions) -> Vec<Attempt> {
+    mirror_every_way(grid, func, opts, brute_force)
+}
+
+/// [`brute_force_mirrored`] with every attempt given the budgets of
+/// `opts` whole, as [`brute_force_whole`] gives them: to set beside a
+/// decode, or a brute force, of the grid as it stands that has them
+/// whole, which the mirror images were once held to less than.
+pub fn brute_force_mirrored_whole(grid: &ModuleGrid, func: &Arc<FunctionMap>, opts: &DecodeOptions) -> Vec<Attempt> {
+    mirror_every_way(grid, func, opts, brute_force_whole)
+}
+
+/// A decode of a grid under every level and mask: [`brute_force`] or
+/// [`brute_force_whole`].
+type BruteForce = fn(&ModuleGrid, &Arc<FunctionMap>, Option<(EcLevel, &Pins)>, &DecodeOptions) -> Vec<Attempt>;
+
+/// The attempts of `brute_force` on each of the grid's mirror images,
+/// best first.
+fn mirror_every_way(grid: &ModuleGrid, func: &Arc<FunctionMap>, opts: &DecodeOptions, brute_force: BruteForce) -> Vec<Attempt> {
     let mut attempts = Vec::new();
     for &mirror in func.version.mirrors() {
         let reflected = grid.mirrored(mirror);
@@ -1962,6 +2201,41 @@ mod tests {
             beyond_standard: false,
         };
         Candidate { alone: confidence, held: confidence, ..Candidate::new(outcome, corrected, Vec::new(), 0) }
+    }
+
+    #[test]
+    fn budgets_shared_in_turn_are_shared_once() {
+        // A decode one of four, and that one of eight, as a photo's read
+        // is one of its placements and then of its samplings, has what
+        // one of thirty-two has: the trials' and the curve's budgets were
+        // once shared out over the four again, which the floors hide at
+        // the defaults and a budget raised by hand shows.
+        let raised = DecodeOptions { list_cost: LIST_COST_MAX, trial_sets: TRIAL_SETS_MAX, ..DecodeOptions::default() };
+        for opts in [DecodeOptions::default(), raised] {
+            assert_eq!(opts.among(4).among(8), opts.among(32));
+        }
+        assert_eq!(raised.among(4).among(8).list_cost, LIST_COST_MAX / 32);
+        // The most a block of such a decode is searched with is shared out
+        // as its own budgets are.
+        assert_eq!(raised.among(32).at_most(), raised.at_most().among(32));
+        assert_eq!(DecodeOptions::default().at_most().trial_sets, TRIAL_SETS_MAX);
+    }
+
+    #[test]
+    fn a_block_searched_harder_is_never_forgotten() {
+        // A decode searching a block harder searches it under each round's
+        // reliabilities and evidence, and again under each set of padding
+        // pins it tries: more searches than a decode remembers of its own
+        // solves. The first, of the block as read, was once forgotten first,
+        // and the block said not to have been searched.
+        let mut harder = Harder::default();
+        let bits = vec![[CERTAIN; 8]];
+        let reads = |i: usize| vec![CwRead::known(i as u8)];
+        for i in 0..3 * REMEMBERED {
+            harder.keep(1, Solved { reads: reads(i), bits: bits.clone(), laid: None, solve: BlockSolve::solved(candidate(vec![i as u8], 10)) });
+        }
+        assert!((0..3 * REMEMBERED).all(|i| harder.searched(1, &reads(i), &bits)));
+        assert!(!harder.searched(0, &reads(0), &bits) && !harder.searched(1, &reads(3 * REMEMBERED), &bits));
     }
 
     #[test]

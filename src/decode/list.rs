@@ -48,7 +48,10 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use super::gf256::{self, Scale, div, exp, mul, poly_eval};
-use super::rs::{CwRead, DOUBT_CONFIRMING_BITS, RsSolution, doubted_agreement, list_solution_bits, nearest, preferring_the_standard, settle, soft_distance};
+use super::rs::{
+    AIDED_VERIFIED_BITS, CwRead, DOUBT_CONFIRMING_BITS, RsSolution, doubted_agreement, list_solution_bits, nearest, preferring_the_standard, settle,
+    soft_distance,
+};
 use crate::symbol::grid::CERTAIN;
 use crate::work;
 
@@ -69,7 +72,7 @@ pub const LIST_COST: usize = 2048;
 pub const LIST_COST_MIN: usize = 512;
 /// Most constraints the interpolation may be set to by hand
 /// ([`super::pipeline::DecodeOptions::list_cost`]): seconds on the
-/// largest blocks.
+/// largest blocks. A block of low rate uses fewer ([`usable_cost`]).
 pub const LIST_COST_MAX: usize = 1 << 15;
 
 /// Values a codeword is given points for, at the most: the one it read
@@ -84,6 +87,11 @@ const FLIP_BITS: usize = 4;
 const UNKNOWN_BITS_MAX: usize = 3;
 /// Largest degree in `y` the curve is given, which is how many codewords
 /// the list may hold and how many polynomials the interpolation carries.
+/// A block of low rate given many constraints would want more, and is
+/// given no more constraints than this lets it use ([`usable_cost`]): a
+/// list of over a hundred, which the most constraints would want on the
+/// smallest blocks, reaches a codeword further on a few of them, at ten
+/// times the time and more.
 const LIST_SIZE_MAX: usize = 32;
 
 /// How likely a module read at `reliability` is to have been misread:
@@ -405,8 +413,13 @@ impl Curve {
 /// monomial `x^d y^t` with `d + t·w ≤ Δ`, and the constraints are met,
 /// one way at least, once there are more coefficients than constraints.
 fn list_size(cost: usize, w: usize) -> (usize, usize) {
+    list_size_within(cost, w, LIST_SIZE_MAX)
+}
+
+/// [`list_size`], with the degree in `y` held to `most`.
+fn list_size_within(cost: usize, w: usize, most: usize) -> (usize, usize) {
     let mut best: Option<(usize, usize)> = None;
-    for l in 1..=LIST_SIZE_MAX {
+    for l in 1..=most {
         let monomials = |delta: usize| (0..=l).map(|t| (delta + 1).saturating_sub(t * w)).sum::<usize>();
         let (mut lo, mut hi) = (0usize, cost + l * w + 1);
         while lo < hi {
@@ -424,6 +437,38 @@ fn list_size(cost: usize, w: usize) -> (usize, usize) {
     }
     let (delta, l) = best.unwrap_or((cost, 1));
     (l, delta)
+}
+
+/// Constraints the interpolation spends on a block of `n` codewords with
+/// `ec_len` of error correction, given `cost`: no more than
+/// [`LIST_COST_MAX`], and no more than a list of [`LIST_SIZE_MAX`] lets
+/// the curve use. Past that the curve would need a greater degree in `y`
+/// to keep its weighted degree to the square root of the constraints;
+/// held to the list, its weighted degree grows with the constraints
+/// themselves, which the multiplicities, growing with their square root,
+/// do not keep up with, and more constraints reach less far, at more
+/// cost. The constraints stop short of the first count the list holds
+/// the curve back at, however many more `cost` gives: a 40-H block uses
+/// about eight thousand, a 1-H block about five thousand, and a block
+/// of high rate every one it is given.
+pub fn usable_cost(n: usize, ec_len: usize, cost: usize) -> usize {
+    let cost = cost.min(LIST_COST_MAX);
+    if ec_len >= n {
+        return cost;
+    }
+    let w = n - ec_len - 1;
+    // The list is too short where one codeword more would lower the
+    // curve's weighted degree. That comes and goes, as the weighted
+    // degree steps, for some hundreds of constraints before it holds
+    // for good, and was once halved over as if it came once: a block
+    // used more constraints or fewer as more were given. It cannot come
+    // until the curve's weighted degree passes `w` times one more than
+    // the list, below which a monomial of one more degree in `y` has no
+    // room; a curve of the list's degree in `y` has every monomial up to
+    // that degree, and needs a greater, at `first` constraints.
+    let held = |cost: usize| list_size_within(cost, w, LIST_SIZE_MAX + 1).1 < list_size(cost, w).1;
+    let first = (LIST_SIZE_MAX + 1) * (LIST_SIZE_MAX + 2) / 2 * w + LIST_SIZE_MAX + 1;
+    (first..=cost).find(|&cost| held(cost)).map_or(cost, |held_at| held_at - 1)
 }
 
 /// Koetter's interpolation: the curve of least `(1, w)`-weighted degree
@@ -559,7 +604,7 @@ pub fn rs_decode_listing(block: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: 
         return Vec::new();
     }
     let pts = points(block, bit_reliability);
-    let m = multiplicities(&pts, cost.min(LIST_COST_MAX));
+    let m = multiplicities(&pts, usable_cost(n, ec_len, cost));
     let grs = grs_points(n, ec_len);
     let constraints: Vec<(u8, u8, usize)> = pts
         .iter()
@@ -620,10 +665,41 @@ pub fn rs_decode_listing(block: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: 
     nearest(found, |a, b| a.1.corrected == b.1.corrected, |a, b| a.1.confidence_bits() > b.1.confidence_bits())
 }
 
+/// Wrong codewords [`rs_decode_listing`] is sure to reach in a block of
+/// `n` codewords with `ec_len` of error correction, read whole and every
+/// module certain, for `cost` constraints, and with enough to confirm
+/// it as a decode standing alone is held to ([`AIDED_VERIFIED_BITS`]):
+/// for the app to say how far it goes in a symbol. Each codeword is a
+/// point of likelihood one, given its multiplicity as [`multiplicities`]
+/// gives it, and a codeword of the code agreeing with the block on
+/// points whose multiplicities sum past the curve's weighted degree is a
+/// factor of the curve; the wrong codewords are put where the
+/// multiplicities are greatest. Unknown codewords and faint bits, which
+/// take it less far or further, are left out. The codewords the standard
+/// reserves for detecting misreads are left out too: past half the
+/// distance a block read certain has none of its redundancy to spare,
+/// so where any are reserved, a solution reached past what the standard
+/// corrects spends them, and is never confirmed however much else
+/// confirms it ([`super::rs::RsSolution::within_standard`]).
+pub fn hard_reach(n: usize, ec_len: usize, cost: usize) -> usize {
+    if cost == 0 || ec_len == 0 || ec_len >= n {
+        return 0;
+    }
+    let block = vec![CwRead::known(0); n];
+    let mut m = multiplicities(&points(&block, &vec![[CERTAIN; 8]; n]), usable_cost(n, ec_len, cost));
+    let total: usize = m.iter().map(|&m| m * (m + 1) / 2).sum();
+    let (_, delta) = list_size(total, n - ec_len - 1);
+    m.sort_unstable();
+    (0..n)
+        .take_while(|&t| m[..n - t].iter().sum::<usize>() > delta && list_solution_bits(n, ec_len, t) >= AIDED_VERIFIED_BITS)
+        .last()
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::rs::{AIDED_VERIFIED_BITS, rs_decode, rs_encode};
+    use crate::decode::rs::{rs_decode, rs_encode};
 
     struct Rng(u64);
     impl Rng {
@@ -862,6 +938,72 @@ mod tests {
         assert_eq!(list_solution_bits(33, 18, 9), super::super::rs::located_error_bits(33, 9));
         assert_eq!(list_solution_bits(26, 17, 11), 25);
         assert_eq!(list_solution_bits(45, 30, 19), 46);
+    }
+
+    #[test]
+    fn the_reach_said_is_the_reach_found() {
+        // What list_decoding_reaches_past_half_the_distance finds.
+        assert_eq!(hard_reach(26, 17, LIST_COST), 11);
+        assert_eq!(hard_reach(45, 30, LIST_COST), 19);
+        // At level L no further than half the distance, versions 2 and 5,
+        // however many constraints.
+        for cost in [LIST_COST, LIST_COST_MAX] {
+            assert!(hard_reach(44, 10, cost) <= 5, "{cost}");
+            assert!(hard_reach(134, 26, cost) <= 13, "{cost}");
+        }
+        assert_eq!(hard_reach(26, 17, 0), 0);
+        // The most constraints reach as far as the default in the blocks
+        // of low rate, which use no more than their list lets them, and a
+        // block of high rate uses every one.
+        assert_eq!(hard_reach(26, 17, LIST_COST_MAX), 11);
+        assert_eq!(hard_reach(45, 30, LIST_COST_MAX), 19);
+        assert!(usable_cost(45, 30, LIST_COST_MAX) < LIST_COST_MAX / 2);
+        assert_eq!(usable_cost(148, 30, LIST_COST_MAX), LIST_COST_MAX);
+        assert_eq!(usable_cost(45, 30, LIST_COST), LIST_COST);
+        // And as far as is said, the decoder goes, in a 5-Q and a 10-H
+        // block too, the wrong codewords wherever they fall.
+        let mut rng = Rng(0x2EAC);
+        for (n, ec_len) in [(33, 18), (43, 28)] {
+            let reach = hard_reach(n, ec_len, LIST_COST);
+            assert!(reach > ec_len / 2, "{n}, {ec_len}: {reach}");
+            for round in 0..5 {
+                let block = codeword(&mut rng, n - ec_len, ec_len);
+                let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+                for &i in &rng.distinct(reach, n) {
+                    read[i].value ^= rng.nonzero();
+                }
+                let found = rs_decode_listing(&read, &vec![[CERTAIN; 8]; n], ec_len, 0, LIST_COST);
+                assert!(found.iter().any(|(_, s)| s.corrected == block), "{n}, {ec_len} round {round}: {found:?}");
+            }
+        }
+        // A 40-H block wrong in nineteen, at the most constraints: held to
+        // its list, the curve once reached fifteen there.
+        let block = codeword(&mut rng, 15, 30);
+        let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+        for &i in &rng.distinct(19, 45) {
+            read[i].value ^= rng.nonzero();
+        }
+        let found = rs_decode_listing(&read, &vec![[CERTAIN; 8]; 45], 30, 0, LIST_COST_MAX);
+        assert!(found.iter().any(|(_, s)| s.corrected == block), "{found:?}");
+    }
+
+    #[test]
+    fn the_constraints_used_stop_where_the_list_first_holds_the_curve_back() {
+        // Where the list holds the curve back comes and goes before it
+        // holds for good, and the constraints used were once halved over
+        // it: a block given more past it used more constraints or fewer.
+        // They are now the same however many more are given.
+        for (n, ec_len) in [(26, 17), (34, 18)] {
+            let w = n - ec_len - 1;
+            let held = |cost: usize| list_size_within(cost, w, LIST_SIZE_MAX + 1).1 < list_size(cost, w).1;
+            let used = usable_cost(n, ec_len, LIST_COST_MAX);
+            assert!(held(used + 1) && !(0..=used).any(held), "{n}, {ec_len}: {used}");
+            assert!((used + 2..used + 1000).any(|cost| !held(cost)), "{n}, {ec_len}: it comes and goes past {used}");
+            for cost in [used + 1, used + 2, used + 500, 20_000, LIST_COST_MAX] {
+                assert_eq!(usable_cost(n, ec_len, cost), used, "{n}, {ec_len} given {cost}");
+            }
+            assert_eq!(usable_cost(n, ec_len, used - 1), used - 1);
+        }
     }
 
     #[test]

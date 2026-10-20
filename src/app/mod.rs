@@ -9,15 +9,21 @@ mod selftest;
 mod state;
 mod tools_panel;
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 
 use eframe::egui;
 use qr_forensics::decode::codewords::{Pin, PinSource, Pins};
 use qr_forensics::decode::known::{Place, lay_over, text_pins, try_beginnings};
+use qr_forensics::decode::list::{LIST_COST, hard_reach, usable_cost};
 use qr_forensics::decode::padding::{Filler, clear_padding_pins, detect_padding, pin_padding_at, recover_padding};
-use qr_forensics::decode::pipeline::{Attempt, DecodeOptions, analyze, brute_force, brute_force_mirrored, decode, orientation_of};
+use qr_forensics::decode::pipeline::{
+    Attempt, BlockOutcome, BlockReport, DecodeOptions, Harder, analyze, brute_force_mirrored_whole, brute_force_whole, decode, decode_keeping,
+    decode_trying_harder, orientation_of,
+};
 use qr_forensics::decode::repair::{quiet_zone, render_rgba, render_svg, repaired_grid};
+use qr_forensics::decode::rs::{TrialReach, trial_reach};
 use qr_forensics::decode::sequence::Part;
 use qr_forensics::decode::text::Charset;
 use qr_forensics::imaging::adjust::{Adjust, Enlarge, LENS_MIN_PAIRS, estimate_k1, remap_point, undistort};
@@ -37,6 +43,7 @@ use qr_forensics::imaging::sample::{
 use qr_forensics::symbol::function_map::{FunctionMap, looks_inverted};
 use qr_forensics::symbol::grid::{CERTAIN, Mirror, Module, ModuleGrid, Symmetry};
 use qr_forensics::symbol::layout::{CwId, SymbolLayout};
+use qr_forensics::symbol::tables::{block_shape, misdecode_protection};
 use qr_forensics::symbol::{EcLevel, Family, SymbolVersion};
 use qr_forensics::work::{self, Cancel};
 use state::*;
@@ -124,6 +131,10 @@ pub(crate) enum Action {
     EstimateLens,
     SetFormat(FormatSel),
     BruteForce,
+    /// Search a block again with every dear solver's budget at its most,
+    /// on a thread of its own, and keep what it finds for as long as the
+    /// block reads the same ([`KeptHarder`]).
+    TryHarder(usize),
     Pin(CwId, u8),
     /// Pin the bits of a codeword that `mask` names at their values in
     /// `value`, in place of whatever pin it had; no bits, and it has none.
@@ -200,6 +211,38 @@ pub(crate) struct BruteResults {
     pub stale: bool,
 }
 
+/// Blocks searched harder at the user's asking ([`Harder`]), with the
+/// version, level, mask and decode options they were searched under:
+/// a decode under those takes them, where a block reads as it did, and
+/// a decode under any other does not ([`Self::holds`]).
+struct KeptHarder {
+    version: SymbolVersion,
+    ec: EcLevel,
+    mask: u8,
+    opts: DecodeOptions,
+    searched: Harder,
+}
+
+impl KeptHarder {
+    /// The searches hold under these, the character set aside: a search
+    /// of a block as read never asks it, and one guided by the message
+    /// holds only for the evidence it was guided by, whatever set read
+    /// that. Choosing the set under Result once dropped every search.
+    fn holds(&self, version: SymbolVersion, ec: EcLevel, mask: u8, opts: &DecodeOptions) -> bool {
+        (self.version, self.ec, self.mask) == (version, ec, mask) && self.opts == DecodeOptions { charset: self.opts.charset, ..*opts }
+    }
+}
+
+/// What a block of the layout in effect is read from in the document:
+/// the modules of its codewords, with their reliability, and the pins on
+/// its codewords. A search of the block is of the block as it is while
+/// these stay as they were ([`App::finish_try_harder`]).
+#[derive(PartialEq)]
+struct BlockRead {
+    modules: Vec<(Module, u8)>,
+    pins: Vec<Option<Pin>>,
+}
+
 /// A search of the whole photo for symbols, running on a thread of its
 /// own: it takes seconds a photo, a few per family, and the window must
 /// keep answering while it runs. The result arrives through the channel.
@@ -270,6 +313,9 @@ enum JobKind {
     ReadFound,
     /// Ranking the placements of the symbol inside the outline.
     Placements,
+    /// Searching the block with every budget at its most. Of the grid,
+    /// not the photo: its result stands whatever becomes of the photo.
+    TryHarder(usize),
 }
 
 impl JobKind {
@@ -282,7 +328,14 @@ impl JobKind {
             JobKind::Suggest => "Ranking the versions on these corners",
             JobKind::ReadFound => "Reading the symbols found",
             JobKind::Placements => "Ranking the placements inside the outline",
+            JobKind::TryHarder(_) => "Searching a block harder",
         }
+    }
+
+    /// The step works on the photo, and is dropped with it: a step on the
+    /// grid alone runs on whatever becomes of the photo.
+    fn of_photo(self) -> bool {
+        !matches!(self, JobKind::TryHarder(_))
     }
 }
 
@@ -326,6 +379,10 @@ enum JobResult {
     /// outline, best first, and the photo's Invert setting they were
     /// made under.
     Placements { found: Vec<Detection>, photo_inverted: bool },
+    /// Try harder: the block searched, what it was read from when the
+    /// search began, and every block searched harder so far, with what
+    /// they were searched under ([`KeptHarder`]).
+    Harder { block: usize, read: BlockRead, kept: KeptHarder },
 }
 
 /// A detection refined against the photo, with everything else that
@@ -399,6 +456,12 @@ pub struct App {
     /// the clock, as in a test.
     notice_seconds: f32,
     brute: Option<BruteResults>,
+    /// Blocks searched harder, and what they were searched under.
+    harder: Option<KeptHarder>,
+    /// How far the solvers reach under each version and level asked
+    /// about lately, at the budgets they were asked about at ([`Reach`]):
+    /// the panels ask every frame, and it takes a moment to work out.
+    reaches: RefCell<Vec<(ReachKey, Option<Reach>)>>,
     guesses: Option<Vec<VersionGuess>>,
     /// The projection for the current outline and anchors.
     model: Option<Model>,
@@ -442,10 +505,13 @@ pub struct App {
 /// bits cannot settle the EC level and mask, brute force chooses them and
 /// its attempts are returned as well; while `settle` is false the previous
 /// choice is carried over instead, which keeps a brush stroke responsive.
+/// The blocks searched harder are taken from `harder` where it holds for
+/// the level and mask chosen.
 fn derive(
     doc: &Document,
     previous: Option<&Derived>,
     opts: &DecodeOptions,
+    harder: Option<&KeptHarder>,
     settle: bool,
 ) -> (Derived, Option<Vec<Attempt>>) {
     let func = match previous {
@@ -469,7 +535,7 @@ fn derive(
             }
             _ => {
                 let pins = doc.pins_ec.map(|level| (level, &doc.pins));
-                let tried = brute_force(&doc.grid, &func, pins, opts);
+                let tried = brute_force_whole(&doc.grid, &func, pins, opts);
                 let (ec, mask) = tried.first().map_or((levels[0], 0), |a| (a.ec, a.mask));
                 attempts = Some(tried);
                 (ec, mask, true)
@@ -484,12 +550,15 @@ fn derive(
     // other they would land on the wrong codewords.
     let no_pins = Pins::new();
     let pins = if doc.pins_ec == Some(ec) { &doc.pins } else { &no_pins };
-    let report = decode(&doc.grid, &layout, mask, pins, opts);
+    let no_harder = Harder::default();
+    let harder = harder.filter(|kept| kept.holds(doc.version, ec, mask, opts)).map_or(&no_harder, |kept| &kept.searched);
+    let report = decode_keeping(&doc.grid, &layout, mask, pins, opts, harder);
     let padding = if report.is_complete() { None } else { detect_padding(&layout, &report) };
     // When nothing decodes and the format bits could not say the grid is
     // a mirror image, try its mirror images outright, as ZXing and ZBar
-    // retry a failed decode transposed. Only once a stroke has ended: it
-    // is a brute force of its own.
+    // retry a failed decode transposed, with the budgets whole, as the
+    // decode they are set beside has them. Only once a stroke has ended:
+    // it is a brute force of its own.
     let mirror_by_decode = (settle
         && format_by_brute
         && !report.is_trustworthy()
@@ -497,7 +566,7 @@ fn derive(
         && analysis.mirrored.is_none()
         && doc.grid.count(Module::Unknown) < doc.grid.cells().len())
     .then(|| {
-        let best = brute_force_mirrored(&doc.grid, &func, opts).into_iter().next()?;
+        let best = brute_force_mirrored_whole(&doc.grid, &func, opts).into_iter().next()?;
         let better = best.report.blocks_verified() > report.blocks_verified()
             && (best.report.is_trustworthy() || best.report.blocks_verified() * 2 > best.report.blocks.len());
         better.then_some(best.mirror).flatten()
@@ -516,13 +585,12 @@ impl App {
         app
     }
 
-    /// The app as it starts: a blank grid and no photo. The decoder pins
-    /// the padding and headers it finds of its own accord here, which the
-    /// library leaves to its callers.
+    /// The app as it starts: a blank grid and no photo, decoded under
+    /// [`default_decode_options`].
     fn blank() -> Self {
         let doc = Document::blank(SymbolVersion::Qr(2));
-        let opts = DecodeOptions { derive_pins: true, ..DecodeOptions::default() };
-        let (derived, _) = derive(&doc, None, &opts, true);
+        let opts = default_decode_options();
+        let (derived, _) = derive(&doc, None, &opts, None, true);
         Self {
             doc,
             history: History::default(),
@@ -533,6 +601,8 @@ impl App {
             opts,
             notice_seconds: NOTICE_SECONDS,
             brute: None,
+            harder: None,
+            reaches: RefCell::default(),
             guesses: None,
             model: None,
             preview: None,
@@ -569,7 +639,7 @@ impl App {
 
     fn refresh(&mut self) {
         let settle = self.view.stroke.is_none();
-        let (derived, attempts) = derive(&self.doc, Some(&self.derived), &self.opts, settle);
+        let (derived, attempts) = derive(&self.doc, Some(&self.derived), &self.opts, self.harder.as_ref(), settle);
         // A start of the padding given by hand counts codewords of the
         // layout it was given under.
         if (derived.func.version, derived.ec) != (self.derived.func.version, self.derived.ec) {
@@ -802,7 +872,7 @@ impl App {
         self.leads.clear();
         self.placements = None;
         self.search = None;
-        self.job = None;
+        self.drop_photo_job();
         self.photo_generation += 1;
     }
 
@@ -1030,10 +1100,17 @@ impl App {
         if self.search.take().is_some() {
             dropped.push("the search under way was stopped".to_owned());
         }
-        if let Some(job) = self.job.take() {
+        if let Some(job) = self.drop_photo_job() {
             dropped.push(format!("{} was stopped", job.kind.label().to_lowercase()));
         }
         dropped
+    }
+
+    /// Call off the step under way when it works on the photo
+    /// ([`JobKind::of_photo`]), and say which it was. A step on the grid
+    /// alone is left to run.
+    fn drop_photo_job(&mut self) -> Option<PendingJob> {
+        if self.job.as_ref().is_some_and(|job| job.kind.of_photo()) { self.job.take() } else { None }
     }
 
     /// The lens term has changed, which moves every pixel of the photo:
@@ -1441,6 +1518,71 @@ impl App {
         self.notify(text);
     }
 
+    /// Search `block` again with every dear solver's budget at its most
+    /// ([`decode_trying_harder`]), on a thread of its own: on a large
+    /// block that can take a minute.
+    fn try_harder(&mut self, ctx: &egui::Context, block: usize) {
+        if self.job_busy() || block >= self.derived.report.blocks.len() {
+            return;
+        }
+        let Some(read) = self.block_read(block) else { return };
+        let grid = self.doc.grid.clone();
+        let layout = self.derived.layout.clone();
+        let pins = self.active_pins();
+        let (version, ec, mask, opts) = (self.doc.version, self.derived.ec, self.derived.mask, self.opts);
+        let kept = self.harder.as_ref().filter(|kept| kept.holds(version, ec, mask, &opts)).map(|kept| kept.searched.clone()).unwrap_or_default();
+        self.start_job(ctx, JobKind::TryHarder(block), move || {
+            let (_, searched) = decode_trying_harder(&grid, &layout, mask, &pins, &opts, &kept, &[block]);
+            JobResult::Harder { block, read, kept: KeptHarder { version, ec, mask, opts, searched } }
+        });
+    }
+
+    /// What `block` of the layout in effect is read from in the document
+    /// now ([`BlockRead`]).
+    fn block_read(&self, block: usize) -> Option<BlockRead> {
+        let layout = &self.derived.layout;
+        let spec = layout.blocks.get(block)?;
+        let grid = &self.doc.grid;
+        let modules = spec
+            .codewords
+            .iter()
+            .flat_map(|&cw| layout.codeword_modules(cw))
+            .map(|p| (grid.get(p.x as usize, p.y as usize), grid.reliability(p.x as usize, p.y as usize)))
+            .collect();
+        let pins = self.active_pins();
+        Some(BlockRead { modules, pins: spec.codewords.iter().map(|cw| pins.get(cw).copied()).collect() })
+    }
+
+    /// Take in a block searched harder, and say what came of it: what it
+    /// found holds only under the version, level, mask and options it was
+    /// searched under, and only while the block reads as it did. Whether
+    /// it does is asked of the block's own modules and pins, as `read`
+    /// holds them from when the search began: a block the search solved
+    /// may be confirmed in the end under padding pins found once it
+    /// read, with no search of it as it reads under them, and is not
+    /// marked [`BlockReport::tried_harder`]. That was once taken for the
+    /// block having changed.
+    fn finish_try_harder(&mut self, block: usize, read: BlockRead, kept: KeptHarder) {
+        let n = block + 1;
+        // The derived values of the document as it is now: it may have
+        // changed while the block was searched.
+        self.catch_up();
+        if !kept.holds(self.doc.version, self.derived.ec, self.derived.mask, &self.opts) {
+            self.notify(format!(
+                "The version, EC level, mask or decoding options changed while block {n} was being searched, so the \
+                 result was dropped. Press Try harder again."
+            ));
+            return;
+        }
+        let changed = self.block_read(block).as_ref() != Some(&read);
+        let before = self.derived.report.blocks.get(block).map(|b| b.outcome);
+        self.harder = Some(kept);
+        self.refresh();
+        let Some(after) = self.derived.report.blocks.get(block) else { return };
+        let text = try_harder_notice(n, changed, before, after);
+        self.notify(text);
+    }
+
     /// Rank every version of the family on the corners, on a thread of
     /// its own. Nothing to rank against without a photo.
     fn rank_versions(&mut self, ctx: &egui::Context) {
@@ -1583,6 +1725,10 @@ impl App {
             }
         };
         let job = self.job.take().expect("a job was pending");
+        if let JobResult::Harder { block, read, kept } = result {
+            self.finish_try_harder(block, read, kept);
+            return;
+        }
         if job.generation != self.photo_generation || self.photo.is_none() {
             return;
         }
@@ -1640,6 +1786,7 @@ impl App {
                  the list was dropped; press Other placements again.",
             ),
             JobResult::Placements { found, photo_inverted } => self.finish_placements(found, photo_inverted, job.version.family()),
+            JobResult::Harder { .. } => unreachable!("taken in above, photo or none"),
         }
     }
 
@@ -2305,7 +2452,7 @@ impl App {
                 self.leads.clear();
                 self.placements = None;
                 self.search = None;
-                self.job = None;
+                self.drop_photo_job();
                 self.photo_generation += 1;
                 self.view.stage = Stage::Edit;
                 // The photo's ink goes with the photo.
@@ -2631,7 +2778,7 @@ impl App {
             }
             Action::BruteForce => {
                 let pins = self.active_pins();
-                let attempts = brute_force(
+                let attempts = brute_force_whole(
                     &self.doc.grid,
                     &self.derived.func,
                     Some((self.derived.ec, &pins)),
@@ -2639,6 +2786,7 @@ impl App {
                 );
                 self.brute = Some(BruteResults { attempts, stale: false });
             }
+            Action::TryHarder(block) => self.try_harder(ctx, block),
             Action::Pin(cw, value) => {
                 self.begin_edit();
                 if self.doc.pins_ec != Some(self.derived.ec) {
@@ -3333,9 +3481,204 @@ fn paste_asked(pasted: bool, released: bool, typing: bool, pasted_on_press: &mut
     asked
 }
 
+/// The decode options the app starts with, and Restore defaults goes
+/// back to: the library's, but with the decoder pinning the padding and
+/// headers it finds of its own accord, which the library leaves to its
+/// callers.
+pub(crate) fn default_decode_options() -> DecodeOptions {
+    DecodeOptions { derive_pins: true, ..DecodeOptions::default() }
+}
+
+/// What a search of block `n`, counted from one, with every budget at its
+/// most came to, said once it is taken in: whether the block's own
+/// modules or pins `changed` while it was searched, and its outcome
+/// `before` the search was taken in and `after`. Where they are as they
+/// were and the block is neither confirmed nor marked as searched as it
+/// reads now, it reads otherwise all the same: under the padding and
+/// header pins found anew, since other blocks changed.
+fn try_harder_notice(n: usize, changed: bool, before: Option<BlockOutcome>, after: &BlockReport) -> String {
+    // Said where Try harder is offered for the block as it reads now.
+    let again = if after.is_verified() || after.tried_harder { "" } else { " Press Try harder again to search it as it is now." };
+    let moved = before != Some(after.outcome);
+    if changed {
+        format!("Block {n} changed while it was being searched.{again}")
+    } else if after.is_verified() && moved {
+        format!("Block {n} is solved and confirmed after searching harder.")
+    } else if !after.is_verified() && !after.tried_harder {
+        format!("Other blocks changed while block {n} was being searched, so it is now decoded under different padding and header pins.{again}")
+    } else if after.is_solved() && moved {
+        format!("Searching block {n} harder found a solution, but it is not confirmed.")
+    } else {
+        format!("Searching block {n} harder found nothing better.")
+    }
+}
+
 /// Short name for an EC level in the context of a version.
 pub(crate) fn ec_name(version: SymbolVersion, ec: EcLevel) -> &'static str {
     version.ec_label(ec)
+}
+
+/// How far error correction reaches in the blocks of a version at a
+/// level, in wrong codewords of a block read whole, for the notes that
+/// say so: by the standard, and by list decoding and the trials of
+/// erasures at the budgets the decode options give them. Where the
+/// blocks differ in length, list decoding is of the one it reaches
+/// least far in, and the trials of the longest, which takes the most
+/// sets.
+#[derive(Clone, Copy)]
+pub(crate) struct Reach {
+    pub blocks: usize,
+    /// Codewords of the shortest block and of the longest.
+    pub lengths: (usize, usize),
+    /// What the standard corrects, keeping the codewords it reserves for
+    /// detecting misreads ([`misdecode_protection`]).
+    pub standard: usize,
+    pub reserved: usize,
+    /// What plain Reed-Solomon reaches spending the reserved codewords
+    /// too, half the code's distance: past [`Self::standard`], never
+    /// confirmed.
+    pub half: usize,
+    /// What list decoding is sure to reach at the options' constraints
+    /// ([`hard_reach`]), and at the default's.
+    pub list: usize,
+    pub list_default: usize,
+    /// Constraints the largest block uses of the options' ([`usable_cost`]).
+    pub list_used: usize,
+    pub trials: TrialReach,
+    /// Codewords past [`Self::standard`] the trials reach leaving the
+    /// reserved codewords unused ([`TrialReach::within_standard`]): a
+    /// solution that spends them is never confirmed. Nought unless that
+    /// is past [`Self::half`], where plain Reed-Solomon finds a solution
+    /// first and the trials are not run.
+    pub trials_within: usize,
+}
+
+/// What [`Reach::of`] depends on: the version, the level, and the
+/// budgets of list decoding and of the trials.
+type ReachKey = (SymbolVersion, EcLevel, usize, usize);
+
+/// Reaches [`App::reach`] keeps, at the most, the oldest forgotten first:
+/// a level for each of a few versions, and the budgets a slider passes
+/// through as it is dragged.
+const REACHES_KEPT: usize = 16;
+
+impl App {
+    /// [`Reach::of`] at the decode options' budgets, worked out once for
+    /// each version, level and budgets asked about.
+    pub(crate) fn reach(&self, version: SymbolVersion, level: EcLevel) -> Option<Reach> {
+        let key = (version, level, self.opts.list_cost, self.opts.trial_sets);
+        let mut reaches = self.reaches.borrow_mut();
+        if let Some((_, reach)) = reaches.iter().find(|(k, _)| *k == key) {
+            return *reach;
+        }
+        let reach = Reach::of(version, level, &self.opts);
+        if reaches.len() == REACHES_KEPT {
+            reaches.remove(0);
+        }
+        reaches.push((key, reach));
+        reach
+    }
+}
+
+impl Reach {
+    pub fn of(version: SymbolVersion, level: EcLevel, opts: &DecodeOptions) -> Option<Self> {
+        let shape = block_shape(version, level)?;
+        let ec = shape.ec_per_block;
+        let lengths = (shape.data_len(0) + ec, shape.data_len(shape.blocks - 1) + ec);
+        let list = |cost| hard_reach(lengths.0, ec, cost).min(hard_reach(lengths.1, ec, cost));
+        let reserved = misdecode_protection(version, level);
+        let trials = trial_reach(lengths.1, ec, opts.trial_sets);
+        Some(Self {
+            blocks: shape.blocks,
+            lengths,
+            standard: ec.saturating_sub(reserved) / 2,
+            reserved,
+            half: ec / 2,
+            list: list(opts.list_cost),
+            list_default: list(LIST_COST),
+            list_used: usable_cost(lengths.1, ec, opts.list_cost),
+            trials,
+            trials_within: trials.within_standard(ec, reserved),
+        })
+    }
+
+    /// The blocks, as the notes name them: "block of 26 codewords", or
+    /// "blocks of 44 and 45 codewords".
+    pub fn blocks_phrase(&self) -> String {
+        let (short, long) = self.lengths;
+        let lengths = if short == long { long.to_string() } else { format!("{short} and {long}") };
+        if self.blocks == 1 { format!("block of {lengths} codewords") } else { format!("blocks of {lengths} codewords") }
+    }
+
+    /// List decoding is sure to reach further than the code alone: past
+    /// half its distance, where plain Reed-Solomon goes too, spending
+    /// the reserved codewords. It was once held to the standard's limit,
+    /// and a 1-M block, whose list reaches half the distance and no
+    /// further, was said to gain a codeword that plain decoding gets as
+    /// well, and that list decoding, run only where plain decoding finds
+    /// nothing, never tries for.
+    pub fn list_gains(&self) -> bool {
+        self.list > self.half
+    }
+
+    /// [`Self::list_gains`] at the default's constraints.
+    pub fn list_default_gains(&self) -> bool {
+        self.list_default > self.half
+    }
+
+    /// List decoding is sure to reach further than the code alone with
+    /// the reserved codewords unused, so that what it reaches may be
+    /// confirmed: only where none are, since a block read certain spends
+    /// them past half the distance ([`hard_reach`]).
+    pub fn list_gains_within_standard(&self) -> bool {
+        self.list_gains() && self.reserved == 0
+    }
+
+    /// The wrong codewords, first and last, that plain Reed-Solomon
+    /// solves only by spending the reserved codewords, past the
+    /// standard's limit and up to half the distance: never confirmed,
+    /// and never tried by list decoding or the trials, which run only
+    /// where plain decoding finds nothing. None where the standard's limit
+    /// is half the distance, as at every level that reserves fewer than
+    /// two, its error correction being odd. The trials at 1-M confirm a
+    /// block six wrong, and were
+    /// once said to reach every count up to it, five among them.
+    pub fn unconfirmed(&self) -> Option<(usize, usize)> {
+        (self.half > self.standard).then_some((self.standard + 1, self.half))
+    }
+}
+
+/// A count with its thousands set apart by commas, as the hover texts
+/// write them.
+pub(crate) fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A count in words, as the notes on reach say it: "one", "two", and
+/// so on to ten, and digits past that.
+pub(crate) fn count_word(n: usize) -> String {
+    const WORDS: [&str; 11] = ["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"];
+    WORDS.get(n).map_or_else(|| n.to_string(), |word| (*word).to_owned())
+}
+
+/// A count of wrong codewords, as the notes on reach say it: "1 wrong
+/// codeword", "2 wrong codewords".
+pub(crate) fn wrong_codewords(n: usize) -> String {
+    if n == 1 { "1 wrong codeword".to_owned() } else { format!("{n} wrong codewords") }
+}
+
+/// The counts from `first` to `last`, as the notes on reach say them:
+/// "5", or "5 to 6".
+pub(crate) fn count_run(first: usize, last: usize) -> String {
+    if first == last { first.to_string() } else { format!("{first} to {last}") }
 }
 
 /// Share of fixed modules a detection of another family must read right
@@ -3825,7 +4168,8 @@ fn quad_contains(quad: &[[f64; 2]; 4], point: [f64; 2]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use qr_forensics::decode::pipeline::BlockOutcome;
+    use qr_forensics::decode::list::LIST_COST_MAX;
+    use qr_forensics::decode::pipeline::{BlockOutcome, BlockReport};
     use qr_forensics::decode::rs::RsFailure;
     use qr_forensics::imaging::detect::InfoEvidence;
     use qr_forensics::imaging::enhance::Sharpen;
@@ -6994,12 +7338,26 @@ mod tests {
         bench.size = egui::vec2(1440.0, 3000.0);
         bench.step();
         let texts = bench.texts();
-        for label in ["Doubt the least reliable modules", "Whole codewords", "Single bits", "Flip the faintest bits"] {
+        for label in [
+            "Use module reliability",
+            "Tried on every unconfirmed block, best result kept:",
+            "Doubt the least reliable modules:",
+            "Whole codewords",
+            "Single bits",
+            "Then, one at a time, until the block is confirmed:",
+            "Flip the faintest bits",
+            "bits flipped",
+            "Belief propagation",
+            "rounds",
+            "Restore defaults",
+        ] {
             assert!(texts.iter().any(|text| text == label), "{label}: {texts:?}");
         }
-        // The app has the decoder pin what it finds, which the library's
-        // defaults leave to the caller.
-        let base = DecodeOptions { derive_pins: true, ..DecodeOptions::default() };
+        // The budgets are shown with their thousands set apart.
+        for value in ["65,536", "2,048"] {
+            assert!(texts.iter().any(|text| text == value), "{value}: {texts:?}");
+        }
+        let base = default_decode_options();
         assert_eq!(bench.app.opts, base);
         bench.click(bench.text_at("Flip the faintest bits"), egui::PointerButton::Primary);
         assert_eq!(bench.app.opts, DecodeOptions { flip_bits: false, ..base });
@@ -7012,12 +7370,278 @@ mod tests {
         assert!(!bench.app.opts.derive_pins);
         bench.click(bench.text_at("Use list decoding"), egui::PointerButton::Primary);
         assert!(!bench.app.opts.list_decode);
-        // With doubting off altogether the three have nothing to say,
-        // and keep what they were set to.
-        bench.click(bench.text_at("Doubt the least reliable modules"), egui::PointerButton::Primary);
+        // With module reliability off the ways that work from it have
+        // nothing to say, and keep what they were set to.
+        bench.click(bench.text_at("Use module reliability"), egui::PointerButton::Primary);
         assert!(!bench.app.opts.reliability && !bench.app.opts.flip_bits && bench.app.opts.doubt_bits);
         bench.click(bench.text_at("Single bits"), egui::PointerButton::Primary);
         assert!(bench.app.opts.doubt_bits, "a switch that is greyed out takes no click");
+        bench.click(bench.text_at("Belief propagation"), egui::PointerButton::Primary);
+        assert!(bench.app.opts.belief_propagation, "a switch that is greyed out takes no click");
+        // Restore defaults puts every switch back, and leaves the
+        // character set, which is chosen under Result, as it is.
+        bench.act(Action::SetCharset(Charset::ShiftJis));
+        bench.step();
+        let tuned = bench.app.opts;
+        assert!(!bench.texts().iter().any(|text| text == "Put back"), "nothing was restored yet");
+        bench.click(bench.text_at("Restore defaults"), egui::PointerButton::Primary);
+        assert_eq!(bench.app.opts, DecodeOptions { charset: Charset::ShiftJis, ..base });
+        // Put back takes the restore back, with the character set as it
+        // is now.
+        bench.act(Action::SetCharset(Charset::Utf8));
+        bench.step();
+        bench.click(bench.text_at("Put back"), egui::PointerButton::Primary);
+        assert_eq!(bench.app.opts, DecodeOptions { charset: Charset::Utf8, ..tuned });
+        assert!(!bench.texts().iter().any(|text| text == "Put back"));
+        // And is offered only until the options are changed otherwise.
+        bench.click(bench.text_at("Restore defaults"), egui::PointerButton::Primary);
+        assert!(bench.texts().iter().any(|text| text == "Put back"));
+        bench.click(bench.text_at("Use list decoding"), egui::PointerButton::Primary);
+        assert!(!bench.texts().iter().any(|text| text == "Put back"));
+    }
+
+    #[test]
+    fn the_notes_on_reach_are_of_the_symbol_in_hand() {
+        let mut bench = Bench::new();
+        bench.size = egui::vec2(1440.0, 3000.0);
+        let painted = |bench: &Bench, text: &str| bench.texts().iter().any(|painted| painted == text);
+        let starting = |bench: &Bench, start: &str| bench.texts().into_iter().find(|text| text.starts_with(start));
+        // Version 2 at level L, a block of 44 codewords with 10 of error
+        // correction, 2 of them kept for detecting misreads.
+        bench.act(Action::SetFormat(FormatSel::Manual { ec: EcLevel::L, mask: 0 }));
+        bench.step();
+        // Under the format, what the level in effect corrects, and nothing
+        // past that: the pairs erased by trial reach five within the
+        // standard's limit, which plain decoding reaches first by spending
+        // the two, and the trials never see such a block. It was once said
+        // that they reach five.
+        assert!(painted(&bench, "Corrects up to 4 wrong codewords or 8 unknown."), "{:?}", bench.texts());
+        assert!(
+            painted(
+                &bench,
+                "No gain at level L: in this symbol's block of 44 codewords, it's guaranteed to correct 4 wrong \
+                 codewords, the same as plain Reed-Solomon."
+            ),
+            "{:?}",
+            bench.texts()
+        );
+        assert!(
+            painted(
+                &bench,
+                "In this symbol's block of 44 codewords: tries every pair (946 sets), but these only beat plain \
+                 Reed-Solomon by using the reserved error-detection codewords, so they are never confirmed. Adding every \
+                 set of four would need a budget of 136,697."
+            ),
+            "{:?}",
+            bench.texts()
+        );
+        // At level H, with 28 of error correction, list decoding reaches
+        // past the code's 14.
+        bench.act(Action::SetFormat(FormatSel::Manual { ec: EcLevel::H, mask: 0 }));
+        bench.step();
+        let note = starting(&bench, "In this symbol's block of 44 codewords: corrects at least ").expect("a note on list decoding");
+        assert!(note.ends_with("wrong codewords, vs. 14 for plain Reed-Solomon."), "{note}");
+        // A block so small has no use for the most constraints: it uses
+        // what its list lets it, reaches as far as the default, and the
+        // note under the slider says how many it uses.
+        bench.act(Action::SetDecodeOptions(DecodeOptions { list_cost: LIST_COST_MAX, ..bench.app.opts }));
+        bench.step();
+        assert_eq!(starting(&bench, "In this symbol's block of 44 codewords: corrects at least ").as_ref(), Some(&note));
+        let used = starting(&bench, "This symbol's blocks use ").expect("a note on the constraints used");
+        assert!(used.contains("; more won't reach further."), "{used}");
+    }
+
+    #[test]
+    fn a_switch_says_where_it_is_off_what_it_needs() {
+        let mut bench = Bench::new();
+        bench.size = egui::vec2(1440.0, 3000.0);
+        bench.step();
+        let painted = |bench: &Bench, text: &str| bench.texts().iter().any(|painted| painted == text);
+        let notes = [
+            "Solve unknown bits individually is off, so equation-guided flips are skipped.",
+            "Solve unknown bits individually is off, so bit-by-bit trials are skipped.",
+            "Use module reliability is off, so every module counts as certain.",
+            "Use module reliability is off, so the prior only fills in unknown modules.",
+        ];
+        assert!(notes.iter().all(|note| !painted(&bench, note)), "everything is on");
+        bench.click(bench.text_at("Solve unknown bits individually"), egui::PointerButton::Primary);
+        assert!(painted(&bench, notes[0]) && painted(&bench, notes[1]));
+        assert!(!painted(&bench, notes[2]) && !painted(&bench, notes[3]));
+        // Without module reliability, the flips and the propagation are not
+        // tried, and their budgets are not offered.
+        bench.click(bench.text_at("Use module reliability"), egui::PointerButton::Primary);
+        assert!(painted(&bench, notes[2]) && painted(&bench, notes[3]));
+        assert!(!painted(&bench, notes[0]), "nothing is flipped at all");
+        assert!(!painted(&bench, "bits flipped") && !painted(&bench, "rounds"));
+        assert!(bench.app.opts.flip_bits && bench.app.opts.belief_propagation, "what they were set to is kept");
+        bench.click(bench.text_at("Use module reliability"), egui::PointerButton::Primary);
+        assert!(painted(&bench, "bits flipped") && painted(&bench, "rounds"));
+    }
+
+    #[test]
+    fn a_block_tried_harder_is_kept_while_it_reads_the_same_under_the_same_options() {
+        use qrcode_generator::{Segment, qr};
+        let mut bench = Bench::new();
+        bench.size = egui::vec2(1440.0, 3000.0);
+        bench.act(Action::ClosePhoto);
+        // An 8-Q symbol painted by hand with its first block thirteen
+        // codewords wrong of forty: past what list decoding reaches at its
+        // usual budget, and within what it reaches at its most.
+        let text = "it was the best of times, it was the worst of times, it was the age of wisdom, it was the age";
+        let symbol = qr::Encoder::new(qr::ErrorCorrection::Quartile)
+            .version(qr::Version::new(8).unwrap())
+            .boost_error_correction(false)
+            .encode_segments(&[Segment::bytes(text)])
+            .unwrap();
+        let clean = ModuleGrid::from_bools(symbol.width(), symbol.height(), symbol.modules());
+        bench.app.doc = Document { grid: clean.clone(), ..Document::blank(SymbolVersion::Qr(8)) };
+        bench.app.dirty = true;
+        bench.step();
+        assert!(bench.app.derived.report.is_trustworthy());
+        let layout = bench.app.derived.layout.clone();
+        let wrong = |grid: &mut ModuleGrid, cw: CwId, bit: usize| {
+            let module = layout.codeword_modules(cw)[bit];
+            let (x, y) = (module.x as usize, module.y as usize);
+            grid.set(x, y, grid.get(x, y).inverted());
+        };
+        let mut grid = clean;
+        let block = &layout.blocks[0];
+        for i in 0..block.ec_len / 2 + 2 {
+            wrong(&mut grid, block.codewords[i], i % 8);
+        }
+        bench.app.doc.grid = grid.clone();
+        bench.app.dirty = true;
+        bench.step();
+        bench.step();
+        let report = &bench.app.derived.report;
+        assert!(!report.blocks[0].is_verified() && report.blocks[1..].iter().all(BlockReport::is_verified), "{:?}", report.blocks[0].outcome);
+        bench.click(bench.text_at("Try harder"), egui::PointerButton::Primary);
+        assert_eq!(bench.app.job.as_ref().map(|job| job.kind), Some(JobKind::TryHarder(0)));
+        // The search is of the grid: a photo loaded and closed meanwhile
+        // leaves it running. Both once called it off, and said nothing.
+        let ctx = bench.ctx.clone();
+        bench.app.set_photo(&ctx, "another".into(), image::RgbaImage::from_pixel(400, 300, image::Rgba([255; 4])));
+        assert_eq!(bench.app.running(), Some(JobKind::TryHarder(0)));
+        bench.act(Action::ClosePhoto);
+        assert_eq!(bench.app.running(), Some(JobKind::TryHarder(0)));
+        bench.settle();
+        assert_eq!(bench.notice().text, "Block 1 is solved and confirmed after searching harder.");
+        let report = &bench.app.derived.report;
+        assert!(report.blocks[0].is_verified() && report.blocks[0].tried_harder, "{:?}", report.blocks[0].outcome);
+        assert_eq!(report.text.plain(), text);
+        assert!(!bench.texts().iter().any(|text| text == "Try harder"));
+        // Its row says it was searched harder, confirmed though it is: it is
+        // confirmed only while the search holds. It once said nothing.
+        assert!(bench.texts().iter().any(|text| text == "searched harder"));
+        // Painting another block leaves the search standing.
+        let mut elsewhere = grid.clone();
+        wrong(&mut elsewhere, layout.blocks[2].codewords[0], 0);
+        bench.app.doc.grid = elsewhere;
+        bench.app.dirty = true;
+        bench.step();
+        assert!(bench.app.derived.report.blocks[0].is_verified() && bench.app.derived.report.text.plain() == text);
+        // So does reading the message in another character set, which no
+        // search of a block asks: it was once dropped for it.
+        let charset = bench.app.opts.charset;
+        bench.act(Action::SetCharset(Charset::Latin1));
+        bench.step();
+        let first = &bench.app.derived.report.blocks[0];
+        assert!(first.is_verified() && first.tried_harder && bench.app.derived.report.text.plain() == text);
+        bench.act(Action::SetCharset(charset));
+        bench.step();
+        // Under other options it does not hold, and is offered again; back
+        // under these, it holds again.
+        let opts = bench.app.opts;
+        bench.act(Action::SetDecodeOptions(DecodeOptions { chase_bits: 12, ..opts }));
+        bench.step();
+        assert!(!bench.app.derived.report.blocks[0].is_verified() && !bench.app.derived.report.blocks[0].tried_harder);
+        assert!(bench.texts().iter().any(|text| text == "Try harder"));
+        assert!(!bench.texts().iter().any(|text| text == "searched harder"));
+        bench.act(Action::SetDecodeOptions(opts));
+        bench.step();
+        assert!(bench.app.derived.report.blocks[0].is_verified());
+        // Once the block reads otherwise, it is no longer searched harder.
+        wrong(&mut grid, block.codewords[block.codewords.len() - 1], 0);
+        bench.app.doc.grid = grid.clone();
+        bench.app.dirty = true;
+        bench.step();
+        assert!(!bench.app.derived.report.blocks[0].tried_harder);
+        assert!(bench.texts().iter().any(|text| text == "Try harder"));
+        // Painted while it is searched, it has changed, and is offered
+        // again as it is now.
+        bench.click(bench.text_at("Try harder"), egui::PointerButton::Primary);
+        assert_eq!(bench.app.running(), Some(JobKind::TryHarder(0)));
+        wrong(&mut grid, block.codewords[block.codewords.len() - 2], 0);
+        bench.app.doc.grid = grid.clone();
+        bench.app.dirty = true;
+        bench.settle();
+        assert_eq!(
+            bench.notice().text,
+            "Block 1 changed while it was being searched. Press Try harder again to search it as it is now."
+        );
+        assert!(!bench.app.derived.report.blocks[0].tried_harder);
+        // Another block painted meanwhile leaves it as it was.
+        bench.click(bench.text_at("Try harder"), egui::PointerButton::Primary);
+        assert_eq!(bench.app.running(), Some(JobKind::TryHarder(0)));
+        let mut elsewhere = grid.clone();
+        wrong(&mut elsewhere, layout.blocks[2].codewords[0], 0);
+        bench.app.doc.grid = elsewhere;
+        bench.app.dirty = true;
+        bench.settle();
+        assert_eq!(bench.notice().text, "Searching block 1 harder found nothing better.");
+        assert!(bench.app.derived.report.blocks[0].tried_harder);
+    }
+
+    #[test]
+    fn a_block_the_search_solved_is_said_to_be_solved_however_it_came_to_be_confirmed() {
+        use qrcode_generator::{Segment, qr};
+        // A block the search solves may be confirmed in the end under the
+        // padding pins the decode finds once it reads, with no search of
+        // it as it reads under them, and is not marked as searched harder.
+        // It was once said to have changed while it was searched.
+        let symbol = qr::Encoder::new(qr::ErrorCorrection::High)
+            .version(qr::Version::new(1).unwrap())
+            .mask(qr::Mask::new(2).unwrap())
+            .boost_error_correction(false)
+            .encode_segments(&[Segment::bytes("seen")])
+            .unwrap();
+        let grid = ModuleGrid::from_bools(symbol.width(), symbol.height(), symbol.modules());
+        let layout = SymbolLayout::new(Arc::new(FunctionMap::new(SymbolVersion::Qr(1))), EcLevel::H).unwrap();
+        let mut block = decode(&grid, &layout, 2, &Pins::new(), &default_decode_options()).blocks[0];
+        assert!(block.is_verified() && !block.tried_harder);
+        let failed = BlockOutcome::Failed(RsFailure::BudgetExceeded);
+        assert_eq!(try_harder_notice(1, false, Some(failed), &block), "Block 1 is solved and confirmed after searching harder.");
+        // What is offered again is said only where it is.
+        assert_eq!(try_harder_notice(1, true, Some(failed), &block), "Block 1 changed while it was being searched.");
+        // Neither confirmed nor searched as it reads now, though its own
+        // modules and pins are as they were: other blocks moved its
+        // padding pins.
+        block.outcome = failed;
+        assert_eq!(
+            try_harder_notice(1, false, Some(failed), &block),
+            "Other blocks changed while block 1 was being searched, so it is now decoded under different padding and header \
+             pins. Press Try harder again to search it as it is now."
+        );
+        block.tried_harder = true;
+        assert_eq!(try_harder_notice(1, false, Some(failed), &block), "Searching block 1 harder found nothing better.");
+    }
+
+    #[test]
+    fn pins_made_under_another_level_are_a_click_from_applying() {
+        let mut bench = Bench::new();
+        bench.size = egui::vec2(1440.0, 3000.0);
+        bench.act(Action::SetFormat(FormatSel::Manual { ec: EcLevel::M, mask: 3 }));
+        bench.act(Action::Pin(0, 0x40));
+        assert_eq!(bench.app.doc.pins_ec, Some(EcLevel::M));
+        bench.act(Action::SetFormat(FormatSel::Manual { ec: EcLevel::Q, mask: 3 }));
+        bench.step();
+        assert!(bench.texts().iter().any(|text| text.starts_with("Pins on 1 codeword were made under level M")));
+        bench.click(bench.text_at("Use level M"), egui::PointerButton::Primary);
+        assert_eq!(bench.app.doc.format, FormatSel::Manual { ec: EcLevel::M, mask: 3 });
+        assert_eq!(bench.app.derived.ec, EcLevel::M);
+        assert!(!bench.texts().iter().any(|text| text == "Use level M"), "the pins apply, and the warning is gone");
+        bench.act(Action::Undo);
+        assert_eq!(bench.app.doc.format, FormatSel::Manual { ec: EcLevel::Q, mask: 3 });
     }
 
     #[test]

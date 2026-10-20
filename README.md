@@ -234,8 +234,16 @@ Overlays colour the grid by what the decoder knows:
   weighted by its reliability. The count of bits differing from the
   cleanest word the two copies assemble shows whether the read is within
   what the code corrects. Choose them from the format bits or by hand.
-  **Brute force** decodes under every EC level and mask and ranks the
-  results.
+  Below the level in effect, a line gives its capacity: how many wrong
+  or unknown codewords each block can correct, and how many more list
+  decoding and erasing by trial add when they're on. Hover it for
+  details. When choosing by hand, hover a level to see its capacity; the
+  level and mask closest to the format bits are underlined. Pins apply
+  only under the level they were made under. If another level is in
+  effect, the section warns you and offers a button to switch back.
+  **Brute force** decodes under every EC level and mask, with the budgets
+  set under Decoding, and ranks the results. Because each is one of many
+  attempts, it needs a little more evidence to be confirmed.
 - **Blocks.** Each Reed-Solomon block: how it was solved, or what it still
   needs, and the chance the solution is wrong, given as at most 1 in 2^n.
   That figure combines all the evidence for the solution, and is capped
@@ -243,7 +251,12 @@ Overlays colour the grid by what the decoder knows:
   codeword the solvers found. A block counts as confirmed at 1 in 256 or
   better (n ≥ 8). **Show** outlines its unknown codewords on the grid,
   or the modules that were doubted to solve it, and **Sample** re-reads
-  that block alone from the photo.
+  that block alone from the photo. **Try harder** re-decodes an
+  unconfirmed block with every Decoding budget at its maximum. It runs in
+  the background and can take a minute on a large block (Stop is in the
+  status bar). Its result is used only if it beats the normal decode,
+  and is kept until the block's modules, the level, the mask or the
+  decoding options change. The row then says "searched harder".
 - **Codewords.** Every codeword with its bits as read, final value and
   status. Click a row, or a module with the **Inspect** tool, to see where a
   codeword lives.
@@ -270,38 +283,58 @@ address being plain ASCII. The decoder uses that as a soft prior itself
 (see **Use the message as a prior**, below).
 
 The **Decoding** section on the left sets what is tried on a block that
-fails:
+plain Reed-Solomon decoding doesn't confirm.
 
-- solving unknown bits one by one;
-- doubting the least reliable modules, as whole codewords, as single
-  bits, or by flipping the faintest every way;
-- flipping a bit or two or three read solidly wrong, where the equations
-  name them;
-- erasing codewords by trial: every set of the smallest size that goes
-  past what the code corrects, then the next size, whatever their
-  reliability;
-- adaptive belief propagation: over several rounds, the block's parity
-  checks update each bit's reliability from the other bits in the same
-  checks, and the block is decoded from the updated reliabilities. Each
-  round the checks are rearranged so the least reliable bits each sit in
-  a check of their own;
-- soft-decision list decoding, which weights each codeword by its
-  reliability and finds every valid codeword close enough to the block as
-  read.
+**Use module reliability**, at the top, lets the solvers use how
+clearly each module was read. Turn it off to treat every module as
+certain, as if painted by hand; doubting, flipping and belief
+propagation are then skipped. An option that depends on one that's off
+is greyed out but keeps its setting, and a note says when an option
+loses part of what it does.
 
-Modules painted by hand are never doubted unless they were painted below
-certain. Erasing by trial is what reaches a hand-painted block with one
-codeword more wrong than its error correction corrects (two in a small
-block), or a block whose unknown bits solve bit by bit except for a stain
-over a few codewords. List decoding goes further the lower the block's
-rate: up to 11 wrong codewords in a version 1-H block, where the usual
-limit is 8, and 19 in a 40-H block, where it is 15; at level L it gains
-nothing. Belief propagation finds faint misreads among more faint but
-correct modules than doubting can treat as unknown, which is typical of
-a noisy photo of a small symbol. Sliders set how much the expensive solvers try:
-sets erased, bits flipped, and the list decoder's constraint budget.
-Every extra try is another chance of a wrong answer, so solutions found
-with a bigger budget need more to confirm them.
+The solvers run in two groups. Everything in the first group runs, and
+the best-confirmed result is kept:
+
+- **Solve unknown bits individually** solves for unknown bits from the
+  parity equations, rather than for whole codewords. If the bits as read
+  can't all be right, it also flips up to three solidly misread bits the
+  equations point to (if flipping is on), and erases a codeword or two
+  by trial (if erasing by trial is on).
+- **Doubt the least reliable modules** marks the faintest codewords, or
+  single bits, as unknown, a few at a time. Single bits needs the option
+  above. Modules painted by hand are never doubted unless they were
+  painted below certain.
+
+The second group runs in order, and stops once the block is confirmed:
+
+- **Flip the faintest bits** (Chase decoding) tries every combination of
+  flips on the least reliable bits.
+- **Belief propagation** (adaptive, after Jiang and Narayanan) uses the
+  parity checks to refine each bit's reliability over several rounds,
+  re-decoding each time. It suits a noisy photo of a small symbol, with
+  more faint modules than doubting can mark unknown.
+- **List decoding** (soft-decision, Koetter–Vardy) finds every valid
+  codeword close enough to the block as read, weighting each codeword by
+  its reliability. It gains more at higher levels: up to 11 wrong
+  codewords in a 1-H block instead of 8, and 19 in a 40-H block instead
+  of 15. At level L it gains nothing.
+- **Erase codewords by trial** erases every set of codewords of the
+  smallest size that gets past plain Reed-Solomon, then the next size
+  up, regardless of reliability. It reaches a hand-painted block with
+  one codeword too many wrong (two in a small block), or a block whose
+  unknown bits solve except for a stain over a few codewords.
+
+List decoding and erasing by trial run only when plain Reed-Solomon
+finds no solution at all.
+
+Notes under each solver say how far it reaches in the current symbol's
+blocks. Sliders set how hard the expensive solvers try: bits flipped,
+belief propagation rounds, list decoding constraints, and sets erased.
+More tries mean more chances of a wrong answer, so a solution found with
+a bigger budget needs more evidence to be confirmed; the note under each
+slider says how much. The list decoding budget costs only time. **Restore
+defaults** resets every option and budget, and **Put back** undoes that
+until you change something else.
 
 A solution is confirmed by how rarely random data would pass the same
 tests: the redundancy it left unused, the errors it located, and, for a
@@ -311,7 +344,11 @@ smallest symbols the standard reserves some error correction codewords
 for detecting misreads rather than correcting them. A solution that
 uses them is marked as beyond the standard and is never confirmed,
 whichever solver found it, and each fallback prefers a solution that
-leaves them unused if it finds one.
+leaves them unused if it finds one. This is why list decoding and
+erasing by trial gain less, or nothing, at some small levels such as
+1-H and 2-L. The capacity line under the EC level counts only what can
+be confirmed, and the notes under Decoding point out reach that can't
+be.
 
 **Pin the padding and headers found**, also under Decoding, does what
 Padding recovery does by hand, on every decode: it finds where the
