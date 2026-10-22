@@ -29,8 +29,8 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use super::bitstream::{Certainty, SegmentContent, alphanumeric_value, hanzi_value, kanji_value};
-use super::codewords::{Pin, PinSource, Pins, codeword_bit_mask};
-use super::pipeline::{DecodeOptions, DecodeReport, decode};
+use super::codewords::{Pin, PinSource, Pins, codeword_bit_mask, picked_among};
+use super::pipeline::{DecodeOptions, DecodeReport, Decoding};
 use super::text::{self, Charset, GROUP_SEPARATOR};
 use crate::symbol::grid::ModuleGrid;
 use crate::symbol::layout::SymbolLayout;
@@ -285,7 +285,7 @@ fn pins_at(layout: &SymbolLayout, report: &DecodeReport, mut bits: Vec<(usize, b
         // A bit the symbol has no module for, as the fixed nibble of
         // Model 1's corner codeword is, is no bit to pin.
         let mask = (0x80u8 >> place) & codeword_bit_mask(layout, cw);
-        let pin = pins.entry(cw).or_insert(Pin { mask: 0, value: 0, source: PinSource::Text });
+        let pin = pins.entry(cw).or_insert(Pin::new(0, 0, PinSource::Text));
         pin.mask |= mask;
         if value {
             pin.value |= mask;
@@ -297,11 +297,14 @@ fn pins_at(layout: &SymbolLayout, report: &DecodeReport, mut bits: Vec<(usize, b
 
 /// Lay `more` over `pins`: every bit `more` asserts takes the place of
 /// what `pins` had for it, and a codeword it touches counts as pinned
-/// from where `more` came.
+/// from where `more` came. It counts as picked among as many ways as
+/// the pin laid over it was ([`Pin::among`]), or as the one it lies over
+/// where that still asserts a bit of its own and was picked among more.
 pub fn lay_over(pins: &mut Pins, more: &Pins) {
     for (&cw, new) in more {
         pins.entry(cw)
             .and_modify(|old| {
+                old.among = if old.mask & !new.mask == 0 { new.among } else { old.among.max(new.among) };
                 old.value = (old.value & !new.mask) | (new.value & new.mask);
                 old.mask |= new.mask;
                 old.source = new.source;
@@ -366,7 +369,8 @@ pub struct Beginning {
     pub place: Place,
     /// Every pin in force with it: those given, and its own over them.
     pub pins: Pins,
-    /// The decode under those pins.
+    /// The decode under those pins, the beginning's own pins picked among
+    /// every beginning tried ([`Pin::among`]).
     pub report: DecodeReport,
 }
 
@@ -389,6 +393,18 @@ pub struct Beginning {
 /// them must still begin with the whole beginning, odd character and
 /// all. Most beginnings are of odd length, `WIFI:` and `BEGIN:VCARD`
 /// among them, and were never tried in alphanumeric mode before.
+///
+/// Each beginning decoded is a fresh chance for a block of noise to
+/// verify under pins that are not its own, and the one kept is the pick
+/// of them all, so the beginning's pins are picked among as many as are
+/// made, times the ways the pins in force were picked among
+/// ([`Pin::among`]), and every search they reach is charged so: those
+/// whose pins the modules as read do not rule out first, which is
+/// settled by the pinned bits alone, before any decode is made. The
+/// decodes once went uncounted, and a block of noise had a hundred
+/// chances to verify under one beginning or another. The plain search
+/// of a block holding no pin of the beginning's is the same under every
+/// beginning, and is charged as the pins it holds were.
 pub fn try_beginnings(
     grid: &ModuleGrid,
     layout: &SymbolLayout,
@@ -400,7 +416,7 @@ pub fn try_beginnings(
     // The decodes made here are trials of a beginning, and derive no
     // pins of their own.
     let opts = &DecodeOptions { derive_pins: false, ..*opts };
-    let mut best: Option<Beginning> = None;
+    let mut tried: Vec<(&'static str, Place, Pins)> = Vec::new();
     for text in BEGINNINGS {
         let mut places = vec![Place::Start(Mode::Byte)];
         if !before.text.sources.is_empty() {
@@ -424,17 +440,34 @@ pub fn try_beginnings(
             if differing * BEGINNING_MISREAD.1 > compared * BEGINNING_MISREAD.0 {
                 continue;
             }
-            let mut trial = pins.clone();
-            lay_over(&mut trial, &found.pins);
-            let report = decode(grid, layout, mask, &trial, opts);
-            let blocks: BTreeSet<usize> = found.pins.keys().map(|&cw| layout.codewords[cw].block as usize).collect();
-            let borne_out = blocks.iter().all(|&b| report.blocks[b].is_verified())
-                && blocks.iter().any(|&b| !before.blocks[b].is_verified())
-                && report.text.plain().starts_with(text);
-            let does_more = |held: &Beginning| (report.blocks_verified(), text.len()) > (held.report.blocks_verified(), held.text.len());
-            if borne_out && best.as_ref().is_none_or(does_more) {
-                best = Some(Beginning { text, place, pins: trial, report });
-            }
+            tried.push((text, place, found.pins));
+        }
+    }
+    if tried.is_empty() {
+        return None;
+    }
+    // Each beginning's decode solves anew only the blocks its pins, or
+    // the evidence they move, reach: the rest are as the pins given had
+    // them, and charged as those were ([`Decoding`]). Every beginning was
+    // once a decode afresh, and charged every block holding a pin given.
+    let among = picked_among(pins) * tried.len();
+    let mut decoding = Decoding::new(grid, layout, mask, opts);
+    decoding.solve(pins);
+    let mut best: Option<Beginning> = None;
+    for (text, place, mut own) in tried {
+        for pin in own.values_mut() {
+            pin.among = among;
+        }
+        let mut trial = pins.clone();
+        lay_over(&mut trial, &own);
+        let report = decoding.solve(&trial);
+        let blocks: BTreeSet<usize> = own.keys().map(|&cw| layout.codewords[cw].block as usize).collect();
+        let borne_out = blocks.iter().all(|&b| report.blocks[b].is_verified())
+            && blocks.iter().any(|&b| !before.blocks[b].is_verified())
+            && report.text.plain().starts_with(text);
+        let does_more = |held: &Beginning| (report.blocks_verified(), text.len()) > (held.report.blocks_verified(), held.text.len());
+        if borne_out && best.as_ref().is_none_or(does_more) {
+            best = Some(Beginning { text, place, pins: trial, report });
         }
     }
     best
@@ -498,14 +531,19 @@ mod tests {
     #[test]
     fn pins_laid_over_others_take_their_bits_and_leave_the_rest() {
         let mut pins = Pins::new();
-        pins.insert(3, Pin { mask: 0xF0, value: 0xA0, source: PinSource::Padding });
+        pins.insert(3, Pin { among: 6, ..Pin::new(0xF0, 0xA0, PinSource::Padding) });
         pins.insert(4, Pin::full(0x11, PinSource::Manual));
         let mut more = Pins::new();
-        more.insert(3, Pin { mask: 0x3C, value: 0x14, source: PinSource::Text });
+        more.insert(3, Pin::new(0x3C, 0x14, PinSource::Text));
         more.insert(9, Pin::full(0x77, PinSource::Text));
         lay_over(&mut pins, &more);
-        assert_eq!(pins[&3], Pin { mask: 0xFC, value: 0x94, source: PinSource::Text });
+        // The padding's top two bits are left under the text's name, and
+        // the codeword is still as much a pick as the padding was.
+        assert_eq!(pins[&3], Pin { among: 6, ..Pin::new(0xFC, 0x94, PinSource::Text) });
         assert_eq!(pins[&4], Pin::full(0x11, PinSource::Manual));
         assert_eq!(pins[&9], Pin::full(0x77, PinSource::Text));
+        // Laid over every bit of it, the codeword is the new pin's alone.
+        lay_over(&mut pins, &[(3, Pin { among: 2, ..Pin::full(0x55, PinSource::Text) })].into());
+        assert_eq!(pins[&3], Pin { among: 2, ..Pin::full(0x55, PinSource::Text) });
     }
 }

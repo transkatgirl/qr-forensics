@@ -573,6 +573,9 @@ fn sequence_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
             );
         }
     }
+    if let Some(bits) = sequence.risk_bits().filter(|&bits| bits > 0) {
+        ui.weak(format!("At most a 1 in 2^{bits} chance the assembled message is wrong, summed over its {} parts.", sequence.len()));
+    }
     let assembled = sequence.assembled();
     egui::Frame::new().fill(visuals.extreme_bg_color).inner_margin(8.0).corner_radius(4.0).show(ui, |ui| {
         ui.set_min_width(ui.available_width());
@@ -864,9 +867,9 @@ fn format_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         egui::Grid::new("format_candidates").num_columns(3).striped(true).show(ui, |ui| {
             ui.weak("Reads as");
             ui.weak("Bits differing").on_hover_text(
-                "Counted against the best word the copies make between them, each half taken from the copy that \
-                 agrees better. Words are ranked likeliest first: by their differing bits over all copies, each \
-                 weighted by its reliability. Hover a count to see each copy and the weight.",
+                "Counted against the best mix of the copies, taking each half from whichever copy agrees better. \
+                 Words are ranked likeliest first by their differing bits across all copies, each weighted by how \
+                 confidently it was read. Hover a count to see each copy and the weighted total.",
             );
             ui.weak("");
             ui.end_row();
@@ -1052,8 +1055,7 @@ fn outcome_text(block: &BlockReport) -> (String, bool) {
             }
             if block.rivals > 1 {
                 text.push_str(&format!(
-                    " — one of {} solutions the block as read lay as near to, told from the rest by the message: under it \
-                     alone the stream parses",
+                    " — picked from {} equally close solutions because the message parses best under it",
                     block.rivals
                 ));
             }
@@ -1066,8 +1068,8 @@ fn outcome_text(block: &BlockReport) -> (String, bool) {
             }
             if block.message_evidence > 0 {
                 text.push_str(&format!(
-                    " — found using the message as a prior on {} of its bits, which guided the search but does not \
-                     count toward confirming it",
+                    " — found using the message as a prior on {} of its bits, which counts for or against it only where \
+                     a bit was unreadable",
                     block.message_evidence
                 ));
             }

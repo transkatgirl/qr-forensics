@@ -3,6 +3,7 @@
 
 use std::cmp::Reverse;
 
+use super::rs::bit_cost;
 use crate::symbol::function_map::{FunctionMap, InfoCopy};
 use crate::symbol::grid::{CERTAIN, ModuleGrid};
 use crate::symbol::{EcLevel, Family, SymbolVersion, tables};
@@ -35,17 +36,30 @@ const CORRECTABLE: u32 = 3;
 pub const MIN_INFO_BITS: u32 = 8;
 /// How much less the bits a candidate overturns must weigh, summed over
 /// every known bit of every copy, than those the runner-up overturns,
-/// for the bits to decide between them: a quarter of the sampler's
-/// scale, eight bits of likelihood, so that one bit read well inside its
+/// for the bits to decide between them: eight bits of likelihood, in the
+/// eighths of a bit a bit overturned costs ([`bit_cost`]), a likelihood
+/// ratio of two hundred and fifty-six to one between the two words, as
+/// the codewords of a block are told apart
+/// ([`super::rs::DISTANCE_MARGIN`]). So one bit read well inside its
 /// colour against one read near the threshold settles it, one certain
 /// bit settles it, and two bits of middling margin do not. The weights
-/// are log-odds, so their sum over the copies is the likelihood of the
-/// read under each word, and the word of least summed weight is the
-/// likeliest: the maximum-likelihood rule over both copies at once, as
-/// a repetition code is decoded. ZXing and ZBar rank format words by
-/// Hamming distance alone, and ZBar assembles the cleanest word from the
-/// halves of the two copies; a module sampled from a photo comes with a
-/// margin, and a faint bit is the one most likely misread.
+/// are log-odds, so their sum over the copies is the log of the
+/// likelihood ratio of the read under each word against the read itself,
+/// and the word of least summed weight is the likeliest: the
+/// maximum-likelihood rule over both copies at once, as a repetition
+/// code is decoded. ZXing and ZBar rank format words by Hamming distance
+/// alone, and ZBar assembles the cleanest word from the halves of the
+/// two copies; a module sampled from a photo comes with a margin, and a
+/// faint bit is the one most likely misread.
+///
+/// The weights were once the sampler's reliabilities themselves, which
+/// fall short of the log-odds by up to a bit of likelihood a bit, the
+/// most for the solid ones: a word that overturned two bits of middling
+/// margin was ranked above one that overturned a single bit read a byte
+/// inside its colour, though the single bit is the likelier misread,
+/// and the margin of eight bits was nearer seven where the words differ
+/// in a solid bit or two, and the figure shown for a word's weight was
+/// not the bits of likelihood it said it was.
 pub const WEIGHT_MARGIN: u32 = 64;
 
 /// Remainder of `data · x^degree` divided by `generator`.
@@ -81,7 +95,8 @@ pub struct InfoRead {
     /// How sure each known bit is, least significant first: the sampler's
     /// reliability for a module read from a photo, [`CERTAIN`] for one
     /// painted by hand. Overturning a faint bit costs a candidate little,
-    /// overturning a solid one much.
+    /// overturning a solid one much: the log of the odds that it was read
+    /// right ([`bit_cost`]).
     pub weights: [u8; 18],
 }
 
@@ -101,14 +116,19 @@ impl InfoRead {
         (((self.bits ^ word) & known).count_ones(), known.count_ones())
     }
 
-    /// Summed weights of the known bits in `mask` that disagree with a
-    /// codeword: what overturning them costs.
+    /// What overturning the known bits in `mask` that disagree with a
+    /// codeword costs, in eighths of a bit of likelihood: each the log of
+    /// the odds that it was read right ([`bit_cost`]), nothing for a bit
+    /// read on its threshold and two hundred and sixty-three for a
+    /// certain one. Summed, it is the log of how much less likely the
+    /// read is under the codeword than as it reads.
     pub fn weight_within(&self, word: u32, mask: u32) -> u32 {
         let wrong = (self.bits ^ word) & self.known & mask;
-        (0..self.len as usize).filter(|&i| wrong >> i & 1 != 0).map(|i| u32::from(self.weights[i])).sum()
+        (0..self.len as usize).filter(|&i| wrong >> i & 1 != 0).map(|i| bit_cost(self.weights[i])).sum()
     }
 
-    /// Summed weights of the known bits that disagree with a codeword.
+    /// What overturning the known bits that disagree with a codeword
+    /// costs ([`Self::weight_within`]).
     pub fn weight(&self, word: u32) -> u32 {
         self.weight_within(word, u32::MAX)
     }
@@ -211,14 +231,16 @@ pub struct FormatCandidate {
     pub best_mismatches: u32,
     pub best_compared: u32,
     /// Summed weights of the bits that assembly overturns: what the
-    /// mismatches cost, in the sampler's reliability.
+    /// mismatches cost, in eighths of a bit of likelihood
+    /// ([`InfoRead::weight_within`]).
     pub best_weight: u32,
     /// Summed weights of every known bit of every copy that disagrees
-    /// with the word: the whole of what the bits say against it, and
-    /// what the candidates are ranked by ([`WEIGHT_MARGIN`]). A bit
-    /// painted by hand weighs [`CERTAIN`], so on a grid painted by hand
-    /// this is the mismatches over both copies, two hundred and
-    /// fifty-five times.
+    /// with the word, in eighths of a bit of likelihood: the whole of
+    /// what the bits say against it, the log of how much less likely the
+    /// read is under it than as it reads, and what the candidates are
+    /// ranked by ([`WEIGHT_MARGIN`]). A bit painted by hand is
+    /// [`CERTAIN`], so on a grid painted by hand this is the mismatches
+    /// over both copies, two hundred and sixty-three times.
     pub weight: u32,
     /// The word matches only as painted without the standard's XOR mask,
     /// which some encoders leave out.
@@ -528,8 +550,9 @@ pub struct VersionAnalysis {
     /// of the best's.
     pub margin: u32,
     /// Summed weights of every known bit of every copy that disagrees
-    /// with the best version's word: what the versions are ranked by, as
-    /// the format words are ([`FormatCandidate::weight`]).
+    /// with the best version's word, in eighths of a bit of likelihood:
+    /// what the versions are ranked by, as the format words are
+    /// ([`FormatCandidate::weight`]).
     pub weight: u32,
     /// How much more the bits disagreeing with the next best version
     /// weigh than those disagreeing with the best, over every copy.
@@ -900,10 +923,10 @@ mod tests {
         let faint = read(other ^ 0x5412, 20, 0x5412);
         let analysis = analyze_format_reads(version, vec![solid, faint]);
         let best = analysis.best().unwrap();
-        assert_eq!((best.word, best.best_mismatches, best.weight), (right, 0, 7 * 20));
+        assert_eq!((best.word, best.best_mismatches, best.weight), (right, 0, 7 * bit_cost(20)));
         let rival = analysis.candidates.iter().find(|c| c.word == other && c.is_standard()).unwrap();
-        assert_eq!((rival.best_mismatches, rival.weight), (0, 7 * 200));
-        assert_eq!(analysis.weight_margin(), 7 * 180);
+        assert_eq!((rival.best_mismatches, rival.weight), (0, 7 * bit_cost(200)));
+        assert_eq!(analysis.weight_margin(), 7 * (bit_cost(200) - bit_cost(20)));
         assert!(analysis.is_reliable() && !analysis.is_ambiguous());
         assert_eq!(analysis.verdict(), Some(true));
         // Read as solidly as each other, the copies cancel and the bits
@@ -932,7 +955,30 @@ mod tests {
         let analysis = analyze_format_reads(version, vec![a, b]);
         let best = analysis.best().unwrap();
         assert_eq!(best.word, right, "{:?}", analysis.candidates.iter().take(3).map(|c| (c.word, c.weight)).collect::<Vec<_>>());
-        assert_eq!(best.weight, 2 * 10);
+        assert_eq!(best.weight, 2 * bit_cost(10));
+
+        // One bit read a byte inside its colour against two read about
+        // half a byte inside theirs: the right word overturns the one,
+        // the other word the two, and every other bit where they differ
+        // is unknown. By the reliabilities themselves the two weighed 64
+        // against 60, and the other word ranked first; by the log of the
+        // odds each was read right the single bit is the likelier
+        // misread, by half a bit of likelihood, which is too little to
+        // settle the format but enough to rank it.
+        let (one, two) = (differ[0], [differ[1], differ[2]]);
+        let painted = (right ^ 0x5412) ^ (1 << one);
+        let mut read = info_read_weighted(&copy(0x5412), |i| {
+            let reliability = if i as u32 == one { 64 } else if two.contains(&(i as u32)) { 30 } else { 200 };
+            Some((painted >> i & 1 != 0, reliability))
+        });
+        for &i in &differ[3..] {
+            read.known &= !(1 << i);
+        }
+        let analysis = analyze_format_reads(version, vec![read]);
+        let best = analysis.best().unwrap();
+        assert_eq!((best.word, best.weight), (right, bit_cost(64)));
+        assert_eq!(analysis.weight_margin(), 2 * bit_cost(30) - bit_cost(64));
+        assert!(analysis.is_ambiguous());
     }
 
     #[test]

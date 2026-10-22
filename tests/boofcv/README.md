@@ -100,11 +100,13 @@ does not find. When it read 1187, every one of BoofCV's was among them,
 each with the message BoofCV reads. Three of those 1187 are found now
 and not read, `brightness/image012.jpg` 0, `curved/image017.jpg` 0 and
 `curved/image024.jpg` 0: each decodes only with its padding pinned and
-codewords doubted or filled in besides, on less than the three
-codewords' worth of confirmation such a decode has since been asked to
-show (`AIDED_VERIFIED_BITS` in `src/decode/rs.rs`), and whether BoofCV
-reads any of the three has not been looked at again. BoofCV takes a
-third of a second over a twelve-megapixel photograph where this search
-takes tens of seconds, and where it finds the position patterns of a
-symbol and cannot decode it, it says where: several of the choices in
+some codewords doubted or filled in, and fell short of the fixed three
+codewords' worth of confirmation such a decode needed then. That fixed
+bar has since been replaced by charging each solution for every search
+that could have found it (`Search` in `src/decode/pipeline.rs`), and
+nobody has rechecked whether BoofCV or this decoder reads the three now.
+BoofCV takes a third of a second over a twelve-megapixel photograph
+where this search takes tens of seconds, and where it finds the
+position patterns of a symbol and cannot decode it, it says where:
+several of the choices in
 `src/imaging/detect.rs` are answers to one or the other.

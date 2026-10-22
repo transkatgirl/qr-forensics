@@ -12,7 +12,7 @@
 //! to another message, shows up as a parity that does not match.
 
 use super::bitstream::{Certainty, SegmentContent};
-use super::pipeline::DecodeReport;
+use super::pipeline::{DecodeReport, combined_risk_bits};
 use super::text::{TextReport, TextSpan, hex_of};
 
 /// One symbol's share of a message.
@@ -28,6 +28,10 @@ pub struct Part {
     pub label: String,
     /// The part's own text, with its certainties.
     pub text: TextReport,
+    /// How rarely the part's message is wrong, in bits
+    /// ([`DecodeReport::message_risk_bits`]): None while a block of it
+    /// is unsolved.
+    pub risk_bits: Option<u32>,
 }
 
 impl Part {
@@ -38,7 +42,14 @@ impl Part {
             SegmentContent::StructuredAppend { index, total, parity } => Some((index, total, parity)),
             _ => None,
         })?;
-        Some(Self { index: header.0, total: header.1, parity: header.2, label: label.into(), text: report.text.clone() })
+        Some(Self {
+            index: header.0,
+            total: header.1,
+            parity: header.2,
+            label: label.into(),
+            text: report.text.clone(),
+            risk_bits: report.message_risk_bits(),
+        })
     }
 
     /// XOR of the part's own data bytes; `None` while any is unreadable.
@@ -188,6 +199,22 @@ impl Sequence {
         ParityCheck::Complete { computed, claimed }
     }
 
+    /// How rarely the message the parts make up is wrong, in bits, once
+    /// every part is in: the parts' chances added, since any one of them
+    /// wrong makes it wrong ([`combined_risk_bits`]), and nought where
+    /// the parity says one is. A parity that checks is not counted as
+    /// confirming anything besides: it is the XOR of the data bytes
+    /// alone, and a part wrong in its other data, or in two bytes that
+    /// cancel, passes it. None while a part is missing or has a block
+    /// unsolved, or the parts disagree about the sequence.
+    pub fn risk_bits(&self) -> Option<u32> {
+        match self.check() {
+            ParityCheck::Complete { computed, claimed } if computed != claimed => Some(0),
+            ParityCheck::Complete { .. } | ParityCheck::Unreadable => combined_risk_bits(self.parts.iter().map(|p| p.risk_bits)),
+            ParityCheck::Empty | ParityCheck::Inconsistent | ParityCheck::Incomplete { .. } => None,
+        }
+    }
+
     /// The parts' text in order, with a gap marked where a part is
     /// missing: one unknown span per missing part.
     pub fn assembled(&self) -> TextReport {
@@ -259,6 +286,7 @@ mod tests {
                 bytes,
                 ..TextReport::default()
             },
+            risk_bits: (certainty == Certainty::Verified).then_some(8),
         }
     }
 
@@ -336,5 +364,24 @@ mod tests {
         assert_eq!(sequence.check(), ParityCheck::Unreadable);
         assert_eq!(sequence.hex(), "61 62 63 ??");
         assert_eq!(sequence.assembled().parity, None);
+    }
+    #[test]
+    fn the_message_of_the_parts_is_wrong_as_often_as_its_parts_together() {
+        let message = b"hello, world";
+        let parity = message.iter().fold(0u8, |a, &b| a ^ b);
+        let mut sequence = Sequence::default();
+        sequence.add(part(1, 3, parity, "hell", Certainty::Verified));
+        // Parts still missing say nothing of the whole.
+        assert_eq!(sequence.risk_bits(), None);
+        sequence.add(part(2, 3, parity, "o, w", Certainty::Verified));
+        sequence.add(part(3, 3, parity, "orld", Certainty::Verified));
+        // Three parts each wrong once in 2^8: the message once in 2^6.
+        assert_eq!(sequence.risk_bits(), Some(6));
+        // One part with a block unsolved leaves the whole unsaid.
+        sequence.add(part(2, 3, parity, "o, w", Certainty::Unverified));
+        assert_eq!(sequence.risk_bits(), None);
+        // A parity that does not check says one part is wrong.
+        sequence.add(part(2, 3, parity, "o, x", Certainty::Verified));
+        assert_eq!(sequence.risk_bits(), Some(0));
     }
 }

@@ -52,6 +52,12 @@ impl StreamBits {
         self.certainty.push(certainty);
     }
 
+    /// Bit `i` laid again, as [`Self::push`] lays a bit.
+    pub fn set(&mut self, i: usize, value: bool, certainty: Certainty) {
+        self.values[i] = value && certainty != Certainty::Unknown;
+        self.certainty[i] = certainty;
+    }
+
     pub fn field(&self, range: Range<usize>) -> Field {
         let mut field = Field { value: 0, certainty: Certainty::Verified };
         for i in range {

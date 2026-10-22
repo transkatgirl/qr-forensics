@@ -19,12 +19,15 @@
 //! sit in a check of their own, where the solid bits of the rest of the
 //! check speak to them and nothing speaks back. The hard decision after
 //! each round is decoded as any read is, and the solution restated
-//! against the block as read; after the last, the word and the
-//! reliabilities the beliefs leave are given to the doubting of the
-//! faintest bits one by one ([`super::rs::solve_bit_erasures_doubting`]),
-//! which is where the propagation earns its keep, since the doubting
-//! reaches what the beliefs have sorted right that the reliabilities as
-//! read had not, and to the chase ([`super::rs::rs_decode_chasing_bits`]).
+//! against the block as read; after the third round and every doubling
+//! of it, the word and the reliabilities the beliefs leave are given to
+//! the doubting of the faintest bits one by one
+//! ([`super::rs::solve_bit_erasures_doubting`]), which is where the
+//! propagation earns its keep, since the doubting reaches what the
+//! beliefs have sorted right that the reliabilities as read had not,
+//! and to the chase ([`super::rs::rs_decode_chasing_bits`]). The rounds
+//! stop at the first that finds a solution, so that a block given more
+//! rounds is given back what fewer found, whenever they found anything.
 //! On the blocks of a photo the doubting alone, over the reliabilities
 //! as read, is the stronger solver; over the beliefs it reads blocks
 //! besides that nothing else does, where the misread bits are faint but
@@ -42,13 +45,16 @@
 //! soft count confirms however many codewords they lie in. Nothing is
 //! credited to the bits the propagation overturned as such, which were
 //! chosen by what the equations wanted and not before any solution was
-//! seen, and the rounds are charged as tries.
+//! seen, and the rounds are charged as tries: the rounds, the doubting
+//! among them and the chase are each given an equal share of the
+//! propagation's chances, and each round, set of doubted bits or pattern
+//! a share of its own, the same however many rounds follow it.
 
 use std::f32::consts::LN_2;
 
 use super::gf256::{exp, mul};
 use super::rs::{
-    CHASE_MAX_BITS, CwRead, RsSolution, Trials, judged, nearest, preferring_the_standard, rs_decode_chasing_bits, rs_decode_core,
+    CHASE_MAX_BITS, CwRead, RsSolution, Sightings, Trials, judged, nearest, preferring_the_standard, rs_decode_chasing_bits, rs_decode_core,
     rs_syndromes, soft_distance, solve_bit_erasures_doubting, tries_charge,
 };
 use crate::symbol::grid::CERTAIN;
@@ -61,14 +67,89 @@ pub type Propagated = (usize, Vec<u8>, RsSolution);
 /// Rounds of adapting and propagating a block is given at the most.
 /// Each is a reduction of the parity-check matrix and a pass over it,
 /// a millisecond or two on the largest blocks, and a decode of the
-/// hard decision; a block that settles on a codeword stops early.
+/// hard decision; a block that settles on a codeword, or that a round
+/// finds a solution of, stops early.
 pub const ABP_ROUNDS: usize = 20;
 /// Fewest rounds a decode that is one of many is given.
 pub const ABP_ROUNDS_MIN: usize = 6;
 /// Most rounds a block may be given ([`super::pipeline::DecodeOptions::abp_rounds`]):
 /// a tenth or a fifth of a second on the largest blocks, and a solution
-/// found in the last of them needs seven bits more to confirm it.
+/// found in the last of them needs eleven bits more to confirm it, nine
+/// for the round and two for the share of the propagation's chances the
+/// rounds leave the doubting and the chase.
 pub const ABP_ROUNDS_MAX: usize = 100;
+/// The first round the doubting and the chase run after: half the
+/// fewest a decode that is one of many is given, so that the last of
+/// those is one of them too ([`is_checkpoint`]).
+const FIRST_CHECKPOINT: usize = ABP_ROUNDS_MIN / 2;
+/// Fewest rounds a block may be given
+/// ([`super::pipeline::DecodeOptions::abp_rounds`]): as far as the first
+/// round the doubting and the chase run after, the third. Given fewer,
+/// the propagation never handed its beliefs to them, which it once did
+/// after the last round whatever that was; and run after the last round
+/// given, they would take from a block given more rounds what it found
+/// with fewer.
+pub const ABP_ROUNDS_LEAST: usize = FIRST_CHECKPOINT;
+/// Rounds the doubting and the chase run after, at the most: those of
+/// the rounds up to [`ABP_ROUNDS_MAX`] ([`is_checkpoint`]).
+const CHECKPOINTS_MAX: usize = (ABP_ROUNDS_MAX / FIRST_CHECKPOINT).ilog2() as usize + 1;
+
+/// What a solution the decode of round `round` reaches is charged for,
+/// as tries, `chased` where the chase runs among the rounds: the round's
+/// share of the rounds' share of the propagation's chances, which the
+/// doubting and the chase share equally with them ([`nth_of`]). The same
+/// however many rounds follow it, so that the last of the rounds a block
+/// is given is the dearest.
+pub fn round_tries(round: usize, chased: bool) -> usize {
+    as_tries(kinds_of_search(chased) as f64 * nth_of(round, ABP_ROUNDS_MAX))
+}
+
+/// The kinds of search a propagation makes, each given an equal share of
+/// its chances: the rounds, the doubting among them, and the chase where
+/// it is `chased`.
+fn kinds_of_search(chased: bool) -> usize {
+    2 + usize::from(chased)
+}
+
+/// What the `nth` of as many as `most` searches of a kind is found
+/// among, as a share of the kind's chances: one in `nth` times the
+/// harmonic number of `most`, which over all `most` comes to the whole.
+/// A share that falls as the searches go on, and that is the same
+/// however many of them follow, where an equal share of as many as are
+/// made shrinks for every search made after it. Charged for the
+/// searches up to its own, as the rounds once were, the `nth` was given
+/// one in `nth`, and twenty rounds together the chances of three
+/// decodes and more.
+pub(super) fn nth_of(nth: usize, most: usize) -> f64 {
+    nth as f64 * (1..=most).map(|k| 1.0 / k as f64).sum::<f64>()
+}
+
+/// A count of tries reckoned in shares, to the try above.
+pub(super) fn as_tries(tries: f64) -> usize {
+    tries.ceil() as usize
+}
+
+/// Whether the doubting and the chase run after `round`: after the
+/// [`FIRST_CHECKPOINT`] and every doubling of it, the third, the sixth,
+/// the twelfth and so on, which are the same however many rounds a
+/// block is given. The beliefs move most in the first rounds, and the
+/// doubting reaches the most from them. Run after the last round alone,
+/// as they once were, the doubting and the chase reached a quarter
+/// fewer blocks with three bits in a hundred read as a speck or a stain
+/// reads after twenty rounds than after six, the beliefs having settled
+/// on a wrong codeword in the meantime. Run after the first round and
+/// every doubling of it, they reached a block in two hundred more, at
+/// nearly three times the cost on a block of noise.
+fn is_checkpoint(round: usize) -> bool {
+    round.is_multiple_of(FIRST_CHECKPOINT) && (round / FIRST_CHECKPOINT).is_power_of_two()
+}
+
+/// Which of the rounds the doubting and the chase run after `round` is,
+/// from one ([`is_checkpoint`]).
+fn checkpoint(round: usize) -> usize {
+    (round / FIRST_CHECKPOINT).trailing_zeros() as usize + 1
+}
+
 /// How much of what the checks say a bit takes on each round. Jiang and
 /// Narayanan damp the propagation heavily, since the checks of a dense
 /// matrix repeat each other: a bit told the same thing by many checks
@@ -231,7 +312,9 @@ fn hard_decision(block: &[CwRead], llr: &[f32]) -> Vec<CwRead> {
 /// confirm, each in a bit or two that read faintly; the soft count is
 /// what confirms those. The bits the propagation overturned that the
 /// solution keeps are its `flipped`. `None` for a solution refused, or
-/// one with less than [`DOUBT_CONFIRMING_BITS`] behind it.
+/// one it would not offer ([`super::rs::Offering`]). Either way the
+/// codeword is noted in `seen`, unless it overturns a pin
+/// ([`Sightings`]).
 #[allow(clippy::too_many_arguments)]
 fn account(
     block: &[CwRead],
@@ -242,8 +325,10 @@ fn account(
     tries: usize,
     refined: &[CwRead],
     rounds: usize,
+    seen: &mut Sightings,
 ) -> Option<(u32, Propagated)> {
     let n = block.len();
+    seen.see_unless_pinned(block, &corrected);
     let solution = judged(block, bit_reliability, ec_len, reserved, corrected, tries_charge(tries))?;
     let flipped: Vec<u8> =
         (0..n).map(|i| (solution.corrected[i] ^ block[i].value) & (refined[i].value ^ block[i].value) & block[i].known).collect();
@@ -253,8 +338,8 @@ fn account(
 /// Decode a block by adaptive belief propagation: `rounds` of adapting
 /// the checks to the bits' reliability and passing beliefs along them,
 /// the hard decision after each decoded as errors and erasures; and
-/// after the last, over the word and the reliabilities the beliefs
-/// leave, the doubting of the faintest bits one by one
+/// after some ([`is_checkpoint`]), over the word and the reliabilities
+/// the beliefs leave, the doubting of the faintest bits one by one
 /// ([`solve_bit_erasures_doubting`], with `trials`), which is where the
 /// propagation earns its keep, and the chase over the `chase_bits`
 /// faintest, none when `chase_bits` is nought. Every codeword so found
@@ -268,6 +353,26 @@ fn account(
 /// Pinned bits and bits painted by hand are never moved; nothing for a
 /// block with no other, whose every EC codeword the standard reserves,
 /// or that has no redundancy left after its erasures.
+///
+/// The rounds, the doubting and the chase are each a fresh chance for
+/// a block of noise to pass, and each is given an equal share of the
+/// propagation's, a solution of one charged for every try of its own
+/// and for its round's share ([`nth_of`]): what a round, or a doubting
+/// or chase after it, reaches is charged alike however many rounds
+/// follow it. The rounds stop at the first that finds a solution, the
+/// doubting and the chase after it among them. Given more rounds, a
+/// block is so given back what fewer found, whenever they found
+/// anything: never a solution more to stand against it, nor one charged
+/// more. Every round's solution was once charged for all the rounds, so
+/// that more of them confirmed it the less, and the doubting and the
+/// chase ran after the last round alone, on beliefs that more rounds
+/// had carried elsewhere: a block that six rounds solved was lost to
+/// twenty.
+///
+/// Every codeword the rounds, the doubting and the chase reach that
+/// overturns no pin is noted in `seen`, those returned among them
+/// ([`Sightings`]).
+#[allow(clippy::too_many_arguments)]
 pub fn rs_decode_propagating(
     block: &[CwRead],
     bit_reliability: &[[u8; 8]],
@@ -276,8 +381,9 @@ pub fn rs_decode_propagating(
     rounds: usize,
     trials: Trials,
     chase_bits: usize,
+    seen: &mut Sightings,
 ) -> Vec<Propagated> {
-    propagating_damped(block, bit_reliability, ec_len, reserved, rounds, trials, chase_bits, ABP_DAMPING)
+    propagating_damped(block, bit_reliability, ec_len, reserved, rounds, trials, chase_bits, ABP_DAMPING, seen)
 }
 
 /// [`rs_decode_propagating`] with the damping given, for finding out
@@ -292,6 +398,7 @@ fn propagating_damped(
     trials: Trials,
     chase_bits: usize,
     damping: f32,
+    seen: &mut Sightings,
 ) -> Vec<Propagated> {
     assert_eq!(block.len(), bit_reliability.len());
     let n = block.len();
@@ -304,46 +411,45 @@ fn propagating_damped(
         return Vec::new();
     }
     let mut found: Vec<(u32, Propagated)> = Vec::new();
-    let Some(beliefs) = believe(block, bit_reliability, ec_len, rounds, damping, |round, refined| {
+    let chased = chase_bits > 0;
+    believe(block, bit_reliability, ec_len, rounds, damping, |beliefs| {
+        let round = beliefs.rounds;
+        let refined = beliefs.decided(block);
         let received: Vec<u8> = refined.iter().map(|c| c.value & c.known).collect();
         let syndromes = rs_syndromes(&received, ec_len);
-        if let Ok(solution) = rs_decode_core(refined, &[], ec_len, reserved, &syndromes)
-            && let Some(kept) = account(block, bit_reliability, ec_len, solution.corrected, reserved, round, refined, round)
+        if let Ok(solution) = rs_decode_core(&refined, &[], ec_len, reserved, &syndromes, seen)
+            && let Some(kept) = account(block, bit_reliability, ec_len, solution.corrected, reserved, round_tries(round, chased), &refined, round, seen)
         {
             found.push(kept);
         }
-        syndromes.iter().all(|&s| s == 0)
-    }) else {
-        return Vec::new();
-    };
-    let done = beliefs.rounds;
-    if done > 0 && !work::cancelled() {
-        let refined = beliefs.decided(block);
-        let refined_bits = beliefs.reliabilities();
-        for doubt in solve_bit_erasures_doubting(&refined, &refined_bits, ec_len, trials) {
-            if let Some(kept) =
-                account(block, bit_reliability, ec_len, doubt.solution.corrected, reserved, done + doubt.tries, &refined, done)
-            {
-                found.push(kept);
-            }
-        }
-        if chase_bits > 0 && !work::cancelled() {
-            let bits = chase_bits.clamp(1, CHASE_MAX_BITS);
-            let patterns = (1usize << bits) - 1;
-            for (_, solution) in rs_decode_chasing_bits(&refined, &refined_bits, ec_len, reserved, bits) {
-                if let Some(kept) =
-                    account(block, bit_reliability, ec_len, solution.corrected, reserved, done + patterns, &refined, done)
-                {
+        if is_checkpoint(round) && !work::cancelled() {
+            let share = kinds_of_search(chased) as f64 * nth_of(checkpoint(round), CHECKPOINTS_MAX);
+            let refined_bits = beliefs.reliabilities();
+            for doubt in solve_bit_erasures_doubting(&refined, &refined_bits, ec_len, trials, seen) {
+                let tries = as_tries(share * doubt.tries as f64);
+                if let Some(kept) = account(block, bit_reliability, ec_len, doubt.solution.corrected, reserved, tries, &refined, round, seen) {
                     found.push(kept);
                 }
             }
+            if chased && !work::cancelled() {
+                let bits = chase_bits.clamp(1, CHASE_MAX_BITS);
+                let tries = as_tries(share * ((1usize << bits) - 1) as f64);
+                for (_, solution) in rs_decode_chasing_bits(&refined, &refined_bits, ec_len, reserved, bits, seen) {
+                    if let Some(kept) = account(block, bit_reliability, ec_len, solution.corrected, reserved, tries, &refined, round, seen) {
+                        found.push(kept);
+                    }
+                }
+            }
         }
-    }
+        // A round with a solution is the last, so that more rounds
+        // never add to what it found.
+        !found.is_empty() || syndromes.iter().all(|&s| s == 0)
+    });
     let found = preferring_the_standard(found, |(_, _, solution)| solution);
     nearest(found, |a, b| a.2.corrected == b.2.corrected, |a, b| a.2.confidence_bits() > b.2.confidence_bits())
 }
 
-/// The beliefs about a block's bits after the rounds, as log-odds.
+/// The beliefs about a block's bits after the rounds made, as log-odds.
 struct Beliefs {
     n: usize,
     llr: Vec<f32>,
@@ -368,17 +474,16 @@ impl Beliefs {
     }
 }
 
-/// The rounds of adapting and propagating, `each_round` told the round
-/// and the hard decision after it, and stopping early when it says to
-/// or when the work is called off. `None` for a block with no bit to
-/// move.
+/// The rounds of adapting and propagating, `each_round` given the
+/// beliefs after each, and stopping early when it says to or when the
+/// work is called off. `None` for a block with no bit to move.
 fn believe(
     block: &[CwRead],
     bit_reliability: &[[u8; 8]],
     ec_len: usize,
     rounds: usize,
     damping: f32,
-    mut each_round: impl FnMut(usize, &[CwRead]) -> bool,
+    mut each_round: impl FnMut(&Beliefs) -> bool,
 ) -> Option<Beliefs> {
     let n = block.len();
     let cols = 8 * n;
@@ -405,32 +510,33 @@ fn believe(
     let mut rows = checks(n, ec_len);
     let mut ext = vec![0f32; cols];
     let mut order: Vec<usize> = (0..cols).collect();
-    let mut done = 0;
+    let mut beliefs = Beliefs { n, llr, fixed, rounds: 0 };
     for round in 1..=rounds {
         if work::cancelled() {
             break;
         }
+        let llr = &mut beliefs.llr;
         order.sort_by(|&a, &b| llr[a].abs().total_cmp(&llr[b].abs()));
         adapt(&mut rows, &order);
         ext.fill(0.0);
-        propagate(&rows, &llr, &mut ext);
+        propagate(&rows, llr, &mut ext);
         for (col, said) in ext.iter().enumerate() {
-            if !fixed[col] {
+            if !beliefs.fixed[col] {
                 llr[col] += damping * said;
             }
         }
-        done = round;
-        if each_round(round, &hard_decision(block, &llr)) {
+        beliefs.rounds = round;
+        if each_round(&beliefs) {
             break;
         }
     }
-    Some(Beliefs { n, llr, fixed, rounds: done })
+    Some(beliefs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::rs::{AIDED_VERIFIED_BITS, Trials, rs_decode, rs_decode_doubting, rs_encode, solve_bit_erasures_doubting};
+    use crate::decode::rs::{Trials, VERIFIED_BITS, rs_decode, rs_decode_doubting, rs_encode, solve_bit_erasures_doubting};
 
     struct Rng(u64);
     impl Rng {
@@ -442,6 +548,9 @@ mod tests {
         }
         fn byte(&mut self) -> u8 {
             (self.next() >> 24) as u8
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
         }
         fn unit(&mut self) -> f32 {
             ((self.next() >> 11) as f64 / (1u64 << 53) as f64) as f32
@@ -514,15 +623,15 @@ mod tests {
                     let (read, reliability) = through_noise(&mut rng, &block, sigma, gross);
                     let by_codeword: Vec<u8> = reliability.iter().map(|r| *r.iter().min().unwrap()).collect();
                     let plain = rs_decode(&read, 18).is_ok_and(|s| s.corrected == block);
-                    let cw = rs_decode_doubting(&read, &by_codeword, 18, 0).is_some_and(|(_, s)| s.corrected == block);
-                    let bits = solve_bit_erasures_doubting(&read, &reliability, 18, Trials::ALL).first().is_some_and(|d| d.solution.corrected == block);
+                    let cw = rs_decode_doubting(&read, &by_codeword, 18, 0, &mut Sightings::default()).is_some_and(|(_, s)| s.corrected == block);
+                    let bits = solve_bit_erasures_doubting(&read, &reliability, 18, Trials::ALL, &mut Sightings::default()).first().is_some_and(|d| d.solution.corrected == block);
                     let chase = rs_decode_chasing(&read, &reliability, 18, 0, CHASE_BITS).first().is_some_and(|(_, s)| s.corrected == block);
-                    let list = rs_decode_listing(&read, &reliability, 18, 0, LIST_COST).first().is_some_and(|(_, s)| s.corrected == block);
+                    let list = rs_decode_listing(&read, &reliability, 18, 0, LIST_COST, &mut Sightings::default()).first().is_some_and(|(_, s)| s.corrected == block);
                     let others = plain || cw || bits || chase || list;
-                    let found = propagating_damped(&read, &reliability, 18, 0, rounds, Trials::NONE, 0, damping);
+                    let found = propagating_damped(&read, &reliability, 18, 0, rounds, Trials::NONE, 0, damping, &mut Sightings::default());
                     assert!(found.iter().all(|(_, _, s)| s.corrected == block), "a wrong codeword offered");
                     let abp = !found.is_empty();
-                    let found = propagating_damped(&read, &reliability, 18, 0, rounds, Trials::ALL, CHASE_BITS, damping);
+                    let found = propagating_damped(&read, &reliability, 18, 0, rounds, Trials::ALL, CHASE_BITS, damping, &mut Sightings::default());
                     assert!(found.iter().all(|(_, _, s)| s.corrected == block), "a wrong codeword offered: {found:?}");
                     let abp_chase = !found.is_empty();
                     // The beliefs as a refiner: the bits and the list
@@ -530,11 +639,11 @@ mod tests {
                     // beliefs leave, and judged by whether they reach
                     // the block.
                     let (mut abp_bits, mut abp_list) = (false, false);
-                    if let Some(beliefs) = believe(&read, &reliability, 18, rounds, damping, |_, _| false) {
+                    if let Some(beliefs) = believe(&read, &reliability, 18, rounds, damping, |_| false) {
                         let refined = beliefs.decided(&read);
                         let refined_bits = beliefs.reliabilities();
-                        abp_bits = solve_bit_erasures_doubting(&refined, &refined_bits, 18, Trials::ALL).first().is_some_and(|d| d.solution.corrected == block);
-                        abp_list = rs_decode_listing(&refined, &refined_bits, 18, 0, LIST_COST).first().is_some_and(|(_, s)| s.corrected == block);
+                        abp_bits = solve_bit_erasures_doubting(&refined, &refined_bits, 18, Trials::ALL, &mut Sightings::default()).first().is_some_and(|d| d.solution.corrected == block);
+                        abp_list = rs_decode_listing(&refined, &refined_bits, 18, 0, LIST_COST, &mut Sightings::default()).first().is_some_and(|(_, s)| s.corrected == block);
                     }
                     for (k, hit) in [plain, cw, bits, chase, list, others, abp, abp_chase, abp_bits, abp_list].into_iter().enumerate() {
                         counts[k] += usize::from(hit);
@@ -583,6 +692,27 @@ mod tests {
     }
 
     #[test]
+    fn the_shares_come_to_no_more_than_the_whole() {
+        // Every round up to the most a block may be given, and every
+        // round the doubting and the chase run after, each at its share:
+        // together no more than the chances of each kind of search.
+        let rounds: f64 = (1..=ABP_ROUNDS_MAX).map(|r| 1.0 / nth_of(r, ABP_ROUNDS_MAX)).sum();
+        assert!(rounds <= 1.0 + 1e-9, "{rounds}");
+        let checkpoints: Vec<usize> = (1..=ABP_ROUNDS_MAX).filter(|&r| is_checkpoint(r)).collect();
+        assert_eq!(checkpoints, [3, 6, 12, 24, 48, 96]);
+        // The fewest rounds a block may be given reach the first of them.
+        assert_eq!(checkpoints[0], ABP_ROUNDS_LEAST);
+        assert_eq!(checkpoints.iter().map(|&r| checkpoint(r)).collect::<Vec<_>>(), (1..=CHECKPOINTS_MAX).collect::<Vec<_>>());
+        let doubtings: f64 = (1..=CHECKPOINTS_MAX).map(|k| 1.0 / nth_of(k, CHECKPOINTS_MAX)).sum();
+        assert!(doubtings <= 1.0 + 1e-9, "{doubtings}");
+        // The first round is charged four bits, and the twentieth nine,
+        // however many follow; every one of twenty was once charged six.
+        assert_eq!(tries_charge(round_tries(1, true)), 4);
+        assert_eq!(tries_charge(round_tries(ABP_ROUNDS, true)), 9);
+        assert_eq!(tries_charge(round_tries(ABP_ROUNDS_MAX, true)), 11);
+    }
+
+    #[test]
     fn propagation_reaches_misreads_the_other_solvers_do_not() {
         // A 5-Q block through noise that misreads one bit in twenty or
         // so: a dozen codewords wrong, past the nine the code corrects,
@@ -598,9 +728,9 @@ mod tests {
             let (read, reliability) = through_noise(&mut rng, &block, sigma, 0.0);
             plain += usize::from(rs_decode(&read, 18).is_ok_and(|s| s.corrected == block));
             let by_codeword: Vec<u8> = reliability.iter().map(|r| *r.iter().min().unwrap()).collect();
-            doubted += usize::from(rs_decode_doubting(&read, &by_codeword, 18, 0).is_some_and(|(_, s)| s.corrected == block));
-            doubted_bits += usize::from(solve_bit_erasures_doubting(&read, &reliability, 18, Trials::NONE).first().is_some_and(|d| d.solution.corrected == block));
-            let found = rs_decode_propagating(&read, &reliability, 18, 0, ABP_ROUNDS, Trials::ALL, 0);
+            doubted += usize::from(rs_decode_doubting(&read, &by_codeword, 18, 0, &mut Sightings::default()).is_some_and(|(_, s)| s.corrected == block));
+            doubted_bits += usize::from(solve_bit_erasures_doubting(&read, &reliability, 18, Trials::NONE, &mut Sightings::default()).first().is_some_and(|d| d.solution.corrected == block));
+            let found = rs_decode_propagating(&read, &reliability, 18, 0, ABP_ROUNDS, Trials::ALL, 0, &mut Sightings::default());
             for (rounds, flipped, solution) in &found {
                 assert_eq!(solution.corrected, block, "round {round}: a wrong codeword offered");
                 assert!(*rounds >= 1 && *rounds <= ABP_ROUNDS);
@@ -611,6 +741,36 @@ mod tests {
         println!("plain {plain}, doubted codewords {doubted}, doubted bits {doubted_bits}, propagated {propagated} of {blocks}");
         assert!(propagated > doubted && propagated > doubted_bits && propagated > plain, "plain {plain}, doubted {doubted}, doubted bits {doubted_bits}, propagated {propagated}");
         assert!(propagated * 2 >= blocks, "propagated {propagated} of {blocks}");
+    }
+
+    #[test]
+    fn more_rounds_give_back_what_fewer_found() {
+        // Blocks through faint noise, some stained besides, given ever
+        // more rounds: whatever a count of rounds finds, every count past
+        // it finds the same, charged the same. With every round's
+        // solution charged for all the rounds, and the doubting and the
+        // chase after the last alone, twenty rounds once solved a quarter
+        // fewer of the stained blocks than six.
+        let mut rng = Rng(0xAB7);
+        let counts = [1usize, 2, 3, 4, 6, 9, 12, 20, 40];
+        let mut solved = 0;
+        for (sigma, gross) in [(0.62f32, 0.0f32), (0.62, 0.03), (0.7, 0.03)] {
+            for round in 0..12 {
+                let block = codeword(&mut rng, 15, 18);
+                let (read, reliability) = through_noise(&mut rng, &block, sigma, gross);
+                let mut first: Option<(usize, Vec<Propagated>)> = None;
+                for &rounds in &counts {
+                    let found = rs_decode_propagating(&read, &reliability, 18, 0, rounds, Trials::ALL, 10, &mut Sightings::default());
+                    match &first {
+                        Some((fewer, before)) => assert_eq!(&found, before, "{sigma} {gross}, block {round}: {rounds} rounds against {fewer}"),
+                        None if !found.is_empty() => first = Some((rounds, found)),
+                        None => {}
+                    }
+                }
+                solved += usize::from(first.is_some());
+            }
+        }
+        assert!(solved >= 24, "solved {solved} of 36");
     }
 
     /// What noise comes to through the beliefs and then the bit-level
@@ -626,15 +786,15 @@ mod tests {
             for _ in 0..blocks {
                 let read: Vec<CwRead> = (0..n).map(|_| CwRead::known(rng.byte())).collect();
                 let reliability: Vec<[u8; 8]> = (0..n).map(|_| std::array::from_fn(|_| rng.byte().min(CERTAIN - 1))).collect();
-                for (_, _, solution) in rs_decode_propagating(&read, &reliability, ec_len, 0, ABP_ROUNDS, Trials::ALL, 10) {
+                for (_, _, solution) in rs_decode_propagating(&read, &reliability, ec_len, 0, ABP_ROUNDS, Trials::ALL, 10, &mut Sightings::default()) {
                     offered += 1;
                     let bits = solution.confidence_bits();
                     most = most.max(bits);
-                    verified += usize::from(bits >= AIDED_VERIFIED_BITS);
+                    verified += usize::from(bits >= 3 * VERIFIED_BITS);
                     doubted_at.push(solution.errors);
                 }
             }
-            println!("({n}, {ec_len}): {offered} offered of {blocks}, {verified} at {AIDED_VERIFIED_BITS} bits or more, the most {most}; errors {doubted_at:?}");
+            println!("({n}, {ec_len}): {offered} offered of {blocks}, {verified} at {} bits or more, the most {most}; errors {doubted_at:?}", 3 * VERIFIED_BITS);
         }
     }
 
@@ -645,16 +805,42 @@ mod tests {
             for round in 0..100 {
                 let read: Vec<CwRead> = (0..n).map(|_| CwRead::known(rng.byte())).collect();
                 let reliability: Vec<[u8; 8]> = (0..n).map(|_| std::array::from_fn(|_| rng.byte().min(CERTAIN - 1))).collect();
-                for (_, _, solution) in rs_decode_propagating(&read, &reliability, ec_len, 0, ABP_ROUNDS, Trials::ALL, 10) {
-                    assert!(solution.confidence_bits() < AIDED_VERIFIED_BITS, "({n}, {ec_len}) round {round}: {solution:?}");
+                for (_, _, solution) in rs_decode_propagating(&read, &reliability, ec_len, 0, ABP_ROUNDS, Trials::ALL, 10, &mut Sightings::default()) {
+                    assert!(solution.confidence_bits() < 3 * VERIFIED_BITS, "({n}, {ec_len}) round {round}: {solution:?}");
                 }
+            }
+        }
+        // Noise with five of a 1-L block's codewords read but for a bit or
+        // three: the propagation carries it to codewords a dozen and more
+        // from the block as read, where noise has some two to the hundred
+        // as near, and the thirty known bits of the five agree with one
+        // of those as often as chance has them. Counted from nought, the
+        // codewords' count once let them confirm such a codeword by thirty
+        // bits, one block of noise in twenty.
+        for round in 0..200 {
+            let mut read: Vec<CwRead> = (0..26).map(|_| CwRead::known(rng.byte())).collect();
+            let mut unread = 0;
+            while unread < 5 {
+                let i = rng.below(26);
+                if read[i].is_erasure() {
+                    continue;
+                }
+                unread += 1;
+                for _ in 0..1 + rng.below(3) {
+                    read[i].known &= !(1 << rng.below(8));
+                }
+                read[i].value &= read[i].known;
+            }
+            let reliability: Vec<[u8; 8]> = (0..26).map(|_| std::array::from_fn(|_| rng.byte().min(CERTAIN - 1))).collect();
+            for (_, _, solution) in rs_decode_propagating(&read, &reliability, 7, 0, ABP_ROUNDS, Trials::ALL, 10, &mut Sightings::default()) {
+                assert!(solution.confidence_bits() < 3 * VERIFIED_BITS, "partly unread, round {round}: {solution:?}");
             }
         }
         // A block painted by hand has nothing to move, and a block with
         // every EC codeword reserved nothing to offer.
         let block = codeword(&mut rng, 15, 18);
         let read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
-        assert!(rs_decode_propagating(&read, &vec![[CERTAIN; 8]; 33], 18, 0, ABP_ROUNDS, Trials::ALL, 10).is_empty());
-        assert!(rs_decode_propagating(&read, &vec![[100; 8]; 33], 18, 18, ABP_ROUNDS, Trials::ALL, 10).is_empty());
+        assert!(rs_decode_propagating(&read, &vec![[CERTAIN; 8]; 33], 18, 0, ABP_ROUNDS, Trials::ALL, 10, &mut Sightings::default()).is_empty());
+        assert!(rs_decode_propagating(&read, &vec![[100; 8]; 33], 18, 18, ABP_ROUNDS, Trials::ALL, 10, &mut Sightings::default()).is_empty());
     }
 }

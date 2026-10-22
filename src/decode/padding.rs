@@ -20,8 +20,8 @@
 //! would be.
 
 use super::bitstream::{Certainty, EndOfData, PAD_BYTES, StreamBits, TailAgreement, standard_tail, tail_agreement};
-use super::codewords::{Pin, PinSource, Pins, codeword_bit_mask};
-use super::pipeline::{DecodeOptions, DecodeReport, decode};
+use super::codewords::{Pin, PinSource, Pins, codeword_bit_mask, picked_among};
+use super::pipeline::{DecodeOptions, DecodeReport, Decoding, decode};
 use super::rs::rs_encode;
 use crate::symbol::grid::ModuleGrid;
 use crate::symbol::layout::{BlockSpec, SymbolLayout};
@@ -376,8 +376,8 @@ fn pad_pins(layout: &SymbolLayout, candidate: &PadCandidate, pins: &mut Pins) ->
             continue;
         }
         let Some(value) = pad_value(layout, j, candidate.first_pad_codeword, candidate.filler) else { continue };
-        let pin = Pin { mask: codeword_bit_mask(layout, cw), value, source: PinSource::Padding };
-        if pins.insert(cw, pin) != Some(pin) {
+        let pin = Pin::new(codeword_bit_mask(layout, cw), value, PinSource::Padding);
+        if pins.insert(cw, pin).is_none_or(|old| !old.asserts_as(&pin)) {
             added += 1;
         }
     }
@@ -411,9 +411,9 @@ fn terminator_pins(layout: &SymbolLayout, end_bit: usize, first_pad: usize, pins
                 Pin { mask: existing.mask | mask, ..*existing }
             }
             Some(existing) if existing.source != PinSource::Terminator => continue,
-            _ => Pin { mask, value: 0, source: PinSource::Terminator },
+            _ => Pin::new(mask, 0, PinSource::Terminator),
         };
-        if pins.get(&cw) != Some(&pin) {
+        if pins.get(&cw).is_none_or(|old| !old.asserts_as(&pin)) {
             pins.insert(cw, pin);
             changed += 1;
         }
@@ -445,12 +445,12 @@ fn header_pins(layout: &SymbolLayout, inferred: &[(usize, bool)], pins: &mut Pin
             // again, with no end.
             Some(existing) if existing.source == PinSource::Terminator => Pin { source: PinSource::Header, ..*existing },
             Some(_) => continue,
-            None => Pin { mask: 0, value: 0, source: PinSource::Header },
+            None => Pin::new(0, 0, PinSource::Header),
         };
         let before = pin;
         pin.mask |= mask;
         pin.value = if value { pin.value | mask } else { pin.value & !mask };
-        if pin != before {
+        if !pin.asserts_as(&before) {
             pins.insert(cw, pin);
             changed.insert(cw);
         }
@@ -493,7 +493,11 @@ pub fn recover_padding(
 /// [`recover_padding`] for a caller that has already decoded the grid
 /// under these pins: `before` is that decode. The decodes made here
 /// derive no pins of their own ([`DecodeOptions::derive_pins`]): this
-/// is the derivation.
+/// is the derivation. Each solves anew only the blocks whose pins or
+/// evidence moved since the pass before ([`Decoding`]), the pins each
+/// pass placed picked among as many ways as the pass's share of the
+/// recovery's chances says ([`pass_tries`]): every pass was once a
+/// decode afresh, and charged every block.
 pub fn recover_padding_after(
     grid: &ModuleGrid,
     layout: &SymbolLayout,
@@ -503,12 +507,41 @@ pub fn recover_padding_after(
     before: &DecodeReport,
 ) -> Option<PaddingRecovery> {
     let opts = DecodeOptions { derive_pins: false, ..*opts };
-    recover_padding_with(layout, pins, before, |pins| decode(grid, layout, mask, pins, &opts))
+    let mut decoding = Decoding::new(grid, layout, mask, &opts);
+    recover_padding_with(layout, pins, before, |pins| decoding.solve(pins))
+}
+
+/// What the pins the `pass`th decode of padding recovery is the first
+/// to make under are picked among ([`Pin::among`]), times the ways the
+/// pins given were: `pass` times one more. Every decode under pins of
+/// the recovery's placing is a fresh chance for a block of noise to
+/// verify, and the recovery is kept where one verifies; the decodes are
+/// made in turn, as many as the pins keep giving more to, and the
+/// `pass`th is given that share of the chances, which over every pass
+/// there may be comes to one: half to the first, a sixth to the second,
+/// and so on. The decodes under pins once went uncharged, each a chance
+/// the recovery did not count.
+pub fn pass_tries(pass: usize) -> usize {
+    pass.max(1) * (pass.max(1) + 1)
+}
+
+/// Each pin of `pins` placed or changed since `decoded`, the pins the
+/// last decode was made under, picked among `among` ways, and every
+/// other as it was ([`Pin::among`]). The pins a recovery leaves as they
+/// were are the picks they were.
+fn stamp(pins: &mut Pins, decoded: &Pins, among: usize) {
+    for (cw, pin) in pins.iter_mut() {
+        pin.among = match decoded.get(cw) {
+            Some(old) if old.asserts_as(pin) => old.among,
+            _ => among,
+        };
+    }
 }
 
 /// [`recover_padding_after`] with the grid decoded by `redecode`, given
-/// the pins to decode under: for a caller holding a decode it can make
-/// again under more pins without solving every block anew
+/// the pins to decode under, each carrying what it was picked among
+/// ([`pass_tries`]): for a caller holding a decode it can make again
+/// under more pins without solving every block anew
 /// ([`super::pipeline::Decoding`]).
 pub fn recover_padding_with(
     layout: &SymbolLayout,
@@ -516,6 +549,14 @@ pub fn recover_padding_with(
     before: &DecodeReport,
     mut redecode: impl FnMut(&Pins) -> DecodeReport,
 ) -> Option<PaddingRecovery> {
+    let given = picked_among(pins);
+    let (mut passes, mut decoded) = (0, pins.clone());
+    let mut redecode = |pins: &mut Pins| {
+        passes += 1;
+        stamp(pins, &decoded, given * pass_tries(passes));
+        decoded = pins.clone();
+        redecode(pins)
+    };
     let mut candidate = detect_padding(layout, before)?;
     let mut first_pad = candidate.first_pad_codeword;
 
@@ -523,7 +564,7 @@ pub fn recover_padding_with(
     let mut added = pad_pins(layout, &candidate, &mut new_pins);
     let mut header_pins_added = 0;
     let mut header_codewords: Vec<usize> = Vec::new();
-    let mut report = redecode(&new_pins);
+    let mut report = redecode(&mut new_pins);
     let mut confirmed = false;
 
     // Each pass can verify more headers, which can locate the terminator,
@@ -539,7 +580,7 @@ pub fn recover_padding_with(
                 added += changed;
                 header_pins_added += changed;
                 header_codewords.extend(inference.inferred.iter().filter_map(|&(bit, _)| layout.data_stream.get(bit / 8)));
-                report = redecode(&new_pins);
+                report = redecode(&mut new_pins);
                 continue;
             }
         }
@@ -576,7 +617,7 @@ pub fn recover_padding_with(
             candidate.end_bit = Some(bit);
             candidate.header_certainty = Some(certainty);
             added += pad_pins(layout, &candidate, &mut new_pins);
-            report = redecode(&new_pins);
+            report = redecode(&mut new_pins);
             continue;
         }
         // Inferred header bits are taken on trust by the pins; the blocks
@@ -588,7 +629,7 @@ pub fn recover_padding_with(
             break;
         }
         added += changed;
-        report = redecode(&new_pins);
+        report = redecode(&mut new_pins);
     }
 
     Some(PaddingRecovery {
@@ -681,11 +722,11 @@ mod tests {
         let layout = SymbolLayout::new(Arc::new(FunctionMap::new(SymbolVersion::Qr(1))), EcLevel::L).unwrap();
         let cw = layout.data_stream[1];
         let inferred = [(8, false), (9, true), (10, false), (11, true)];
-        let both = Pin { mask: 0xFF, value: 0x50, source: PinSource::Header };
+        let both = Pin::new(0xFF, 0x50, PinSource::Header);
 
         let mut pins = Pins::new();
         assert_eq!(terminator_pins(&layout, 12, 2, &mut pins), 1);
-        assert_eq!(pins[&cw], Pin { mask: 0x0F, value: 0, source: PinSource::Terminator });
+        assert_eq!(pins[&cw], Pin::new(0x0F, 0, PinSource::Terminator));
         assert_eq!(header_pins(&layout, &inferred, &mut pins), 1);
         assert_eq!(pins[&cw], both);
         assert_eq!(terminator_pins(&layout, 12, 2, &mut pins), 0);
@@ -700,7 +741,7 @@ mod tests {
         // A pin by hand, or the padding's, is left alone by both.
         for source in [PinSource::Manual, PinSource::Text, PinSource::Padding] {
             let mut pins = Pins::new();
-            let held = Pin { mask: 0xFF, value: 0xEC, source };
+            let held = Pin::new(0xFF, 0xEC, source);
             pins.insert(cw, held);
             assert_eq!(terminator_pins(&layout, 12, 2, &mut pins), 0);
             assert_eq!(header_pins(&layout, &inferred, &mut pins), 0);

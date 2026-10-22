@@ -228,12 +228,15 @@ Overlays colour the grid by what the decoder knows:
   wrong. If many blocks each only just pass, the sum can be worse than
   the 1 in 256 each block must meet, and Result warns about that even
   though every block is confirmed.
-- **Format and version.** Each copy of the format bits as read, the format
-  words they lie nearest, and the EC level and mask in effect. Words are
-  ranked likeliest first, by their differing bits over both copies, each
-  weighted by its reliability. The count of bits differing from the
-  cleanest word the two copies assemble shows whether the read is within
-  what the code corrects. Choose them from the format bits or by hand.
+- **Format and version.** Each copy of the format bits as read, the
+  closest valid format words, and the EC level and mask in effect.
+  Words are ranked by the bits they disagree on across both copies,
+  each weighted by how confidently it was read; hover a count to see
+  the weighted total. The count itself is taken against the best mix of
+  the two copies, so it shows whether the damage is within what the
+  format code corrects. The format bits settle on a word only if it's
+  at least 256 times likelier than the runner-up, the same bar a block
+  must clear. Choose the level and mask from the format bits or by hand.
   Below the level in effect, a line gives its capacity: how many wrong
   or unknown codewords each block can correct, and how many more list
   decoding and erasing by trial add when they're on. Hover it for
@@ -246,12 +249,12 @@ Overlays colour the grid by what the decoder knows:
   attempts, it needs a little more evidence to be confirmed.
 - **Blocks.** Each Reed-Solomon block: how it was solved, or what it still
   needs, and the chance the solution is wrong, given as at most 1 in 2^n.
-  That figure combines all the evidence for the solution, and is capped
-  by how much closer the solution is to the block as read than any other
-  codeword the solvers found. A block counts as confirmed at 1 in 256 or
-  better (n ≥ 8). **Show** outlines its unknown codewords on the grid,
-  or the modules that were doubted to solve it, and **Sample** re-reads
-  that block alone from the photo. **Try harder** re-decodes an
+  Every other codeword the search turned up counts against the
+  solution, even ones too weak to offer, and the closer one is to the
+  block as read, the more it counts. A block counts as confirmed at 1
+  in 256 or better (n ≥ 8). **Show** outlines its unknown codewords on
+  the grid, or the modules that were doubted to solve it, and **Sample**
+  re-reads that block alone from the photo. **Try harder** re-decodes an
   unconfirmed block with every Decoding budget at its maximum. It runs in
   the background and can take a minute on a large block (Stop is in the
   status bar). Its result is used only if it beats the normal decode,
@@ -312,7 +315,9 @@ The second group runs in order, and stops once the block is confirmed:
 - **Belief propagation** (adaptive, after Jiang and Narayanan) uses the
   parity checks to refine each bit's reliability over several rounds,
   re-decoding each time. It suits a noisy photo of a small symbol, with
-  more faint modules than doubting can mark unknown.
+  more faint modules than doubting can mark unknown. It stops at the
+  first round that finds a solution, so raising the rounds can't lose
+  one.
 - **List decoding** (soft-decision, Koetter–Vardy) finds every valid
   codeword close enough to the block as read, weighting each codeword by
   its reliability. It gains more at higher levels: up to 11 wrong
@@ -326,6 +331,15 @@ The second group runs in order, and stops once the block is confirmed:
 
 List decoding and erasing by trial run only when plain Reed-Solomon
 finds no solution at all.
+
+Turning on flipping, erasing by trial or **Use the message as a prior**
+(below) never loses a symbol that reads without them. The grid is first
+decoded with all three off. If that doesn't read (every block confirmed
+and the message parsing), it's decoded again with each combination of
+the ones that are on, cheapest first, and the first decode that reads
+is kept, or the best-ranked one if none does. Each is exactly the
+decode those settings would make on their own. The cost is time: a
+symbol that doesn't read takes longer to give up on.
 
 Notes under each solver say how far it reaches in the current symbol's
 blocks. Sliders set how hard the expensive solvers try: bits flipped,
@@ -350,6 +364,44 @@ erasing by trial gain less, or nothing, at some small levels such as
 be confirmed, and the notes under Decoding point out reach that can't
 be.
 
+Every attempt is another chance for random data to pass, so a solution
+needs one more bit of confirmation for each doubling of the attempts
+that could have produced it. The decoder counts:
+
+- **The solver's own tries:** patterns flipped, sets erased, rounds
+  run, and bits doubted.
+- **Other solvers and retries on the same block:** message prior and
+  error clustering rounds, the retry with a four-bit codeword padded
+  with ones, and **Try harder**. Solvers that work from module
+  reliability count only if some module in the block is less than
+  certain, since they find nothing in a hand-painted block. The first
+  search and the later rounds are charged in turn rather than all at
+  once: a solution found early needs less, whether or not later rounds
+  are on, and one found late needs more.
+- **Other decodes of the whole grid:** each level and mask in a brute
+  force, each placement, sampling and retry in a photo read, and each
+  symbol type an outline is read as.
+- **Other pins tried:** padding recovery passes and common beginnings.
+  Each pin carries the count of the search that placed it. A block is
+  charged for the pins it holds, and the searches that draw on the
+  whole symbol (the message prior and error clustering) for every pin.
+
+These counts stick: a grid loaded from a photo search keeps its count
+until you resample the whole grid, and a pin placed by **Pin the
+padding** or **Try common beginnings** keeps its count until it's
+removed. A few things are exempt:
+
+- The plain Reed-Solomon decode of a block as read, which any reader
+  makes, is charged only for other decodes of the whole grid and for
+  the pins its block holds.
+- In a photo read, the detector's first placement, sampled with your
+  settings, isn't charged for the search's other reads (or, when an
+  outline is read as each symbol type, only as the type you chose).
+- The decodes with flipping, erasing by trial and the message prior on
+  or off aren't charged for each other, so turning one on can't lose a
+  read.
+- Anything you do by hand, such as painting or resampling.
+
 **Pin the padding and headers found**, also under Decoding, does what
 Padding recovery does by hand, on every decode: it finds where the
 padding starts (from the segment headers or the pad pattern), pins the
@@ -368,18 +420,19 @@ position. Bytes start out biased toward plain ASCII (high bit set 1
 time in 16) until the message shows otherwise, so a message in UTF-8
 Cyrillic soon flips that bias. Digit groups are biased toward the
 values they can hold, so a lone digit never exceeds nine. A module read
-against the prior is doubted sooner, and an unreadable one is solved
-for at the prior, as a pin would do, but without asserting anything.
-The prior only guides the search: a solution is still confirmed
-against the modules as read, so a good prior finds the answer faster
-without making it more certain.
+against the prior is doubted sooner, but its confidence still comes
+from its reading alone. An unreadable module is filled in from the
+prior, like a pin only as sure as the prior is: a solution that agrees
+with it gains that much confirmation, and one that contradicts it is
+penalised as if it had overturned a module read that confidently.
 
 Three more fallbacks use the rest of the symbol:
 
 - **Tie-breaking.** When a solver that tries many candidates finds two
   solutions equally close to the block as read, the stream is parsed
   under each and the one that parses best is kept, rather than giving
-  up on the block.
+  up on the block. The pick is confirmed by how rarely random data
+  would parse as well where the candidates differ.
 - **Error clustering.** A confirmed block shows exactly which of its
   modules were misread. Stains and tears hit neighbouring modules
   together, so when unconfirmed blocks are retried, modules next to a
@@ -404,7 +457,9 @@ Blocks says when a block was solved in any of these ways.
   quiet zone. Modules still unknown are drawn grey.
 - **Structured append.** For a message split over several symbols, decode
   each and press **Add to sequence**. The parts are assembled, and the
-  parity byte checked once all are in.
+  parity byte checked once all are in. Once every part is solved, it
+  also shows the chance the assembled message is wrong: the parts'
+  chances added up.
 
 ## Keys and mouse
 

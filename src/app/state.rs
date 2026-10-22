@@ -126,6 +126,16 @@ pub struct Document {
     pub pins: Pins,
     /// The EC level the pins were made under; codeword numbering depends on it.
     pub pins_ec: Option<EcLevel>,
+    /// The decodes the grid was picked among, when it is the read of a
+    /// photo that ranked best of every read the search made, as loaded
+    /// ([`qr_forensics::decode::pipeline::DecodeReport::tries`]): what a
+    /// decode of it is one of, and is charged for. One where a person
+    /// made it, by painting or sampling: what a person tries goes
+    /// uncounted, as every reader leaves it. The pins carry what they
+    /// were picked among themselves
+    /// ([`qr_forensics::decode::codewords::Pin::among`]), and are charged
+    /// for it where they reach, each until it is taken away.
+    pub grid_among: usize,
     pub format: FormatSel,
     /// Symbol outline on the photo: top-left, top-right, bottom-right,
     /// bottom-left, in photo pixels. Kept here so that moving a corner is
@@ -149,6 +159,7 @@ impl Document {
             grid: FunctionMap::new(version).blank_grid(),
             pins: Pins::new(),
             pins_ec: None,
+            grid_among: 1,
             format: FormatSel::Auto,
             corners: [[0.0; 2]; 4],
             anchors: Vec::new(),
@@ -164,6 +175,17 @@ impl Document {
     pub fn blank_like(&self, version: SymbolVersion) -> Self {
         let anchors = if version == self.version { self.anchors.clone() } else { Vec::new() };
         Self { corners: self.corners, anchors, adjust: self.adjust, ..Self::blank(version) }
+    }
+
+    /// `opts` for a decode of the document: one of the decodes the grid
+    /// was picked among. The grid's count reaches every block. The pins'
+    /// reach only the searches the pins do, and each pin carries its own
+    /// ([`qr_forensics::decode::codewords::Pin::among`]): one count once
+    /// stood for every pin in force, and a pick of pins was charged to
+    /// blocks holding only pins picked before it, and to pins placed by
+    /// hand after the picked ones were taken away.
+    pub fn picked(&self, opts: &DecodeOptions) -> DecodeOptions {
+        opts.one_of(self.grid_among)
     }
 
     /// The anchors as control points of the projection.
@@ -199,6 +221,7 @@ impl Document {
             && self.grid == other.grid
             && self.pins == other.pins
             && self.pins_ec == other.pins_ec
+            && self.grid_among == other.grid_among
             && self.format == other.format
     }
 

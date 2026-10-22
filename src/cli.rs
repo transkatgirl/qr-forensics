@@ -33,13 +33,13 @@
 //!
 //! `--details` adds what the decode settled on the way to the message:
 //! the error correction level and mask, `risk 1 in 2^n` once every block
-//! is solved (an upper bound on the chance the message is wrong: the sum
-//! of the blocks' own chances), the character set the bytes were read
-//! in, the symbology identifier, the symbol's place in a structured
-//! append sequence when it has one, and how many codewords of padding
-//! were pinned when the read took that, and as what when the padding is
-//! not the standard's, and what the photo was read through when that was
-//! not the photo as it is, enlarged or sharpened, and `threshold surface`
+//! is solved (an upper bound on the chance the message is wrong: the
+//! blocks' chances added up), the character set the bytes were read in,
+//! the symbology identifier, the symbol's place in a structured append
+//! sequence when it has one, and how many codewords of padding were
+//! pinned when the read took that, and as what when the padding is not
+//! the standard's, and what the photo was read through when that was not
+//! the photo as it is, enlarged or sharpened, and `threshold surface`
 //! when its modules were read against one, as OpenCV's detector hands
 //! back each symbol's ECI and BoofCV its level, mask and encoding.
 //! If every block is confirmed but their combined risk is worse than the
@@ -128,24 +128,26 @@
 //! there costs no error correction: the window's Pin the padding, tried
 //! of every decode that is no read, and kept when every block then
 //! confirms and the segment headers bear out where the padding lies;
-//! `unconfirmed` when every block solved and the message parses but a
-//! block has too little to confirm it: one whose every error correction
-//! codeword went on filling in codewords that could not be read has
-//! nothing, and one that filled in any must have three codewords' worth
-//! to show for itself, a block of noise passing one spare codeword once
-//! in 256, where one read whole that corrected as many wrong codewords
-//! as its error correction reaches is confirmed by having found them,
-//! and one of the smallest symbols that spent the codewords the standard
-//! reserves for detecting a misdecode is not to be trusted whatever it
-//! found; `malformed` when every block is confirmed and the message does
-//! not parse to its end; and `partial` otherwise, with the blocks that
+//! `unconfirmed` when every block solved and the message parses, but
+//! some block's chance of being wrong is worse than 1 in 256. Each
+//! spare error correction codeword is a 1 in 256 check, so a block that
+//! spent them all filling in unreadable codewords can't be confirmed.
+//! Locating wrong codewords counts too, so a block with nothing unknown
+//! can be confirmed even when it corrected as many as it can. Each
+//! doubling of the decodes tried, and a photo read tries many, costs a
+//! bit. In the smallest symbols, a solution that uses the codewords the
+//! standard reserves for detecting misdecodes is never trusted. A read
+//! is `malformed` when every block is confirmed and the message does
+//! not parse to its end, and `partial` otherwise, with the blocks that
 //! solved.
 //!
 //! Symbols that carry a structured append header are parts of one
 //! message, and after the symbols of an image a line gives each message
 //! its parts make up, in order, with the parts found and whether the
 //! parity the headers claim is the parity of the bytes, as OpenCV's
-//! `decodeMulti` joins the parts it finds in one image, unchecked.
+//! `decodeMulti` joins the parts it finds in one image, unchecked. With
+//! `--details`, once every part is in and solved, the line also gives the
+//! message's `risk 1 in 2^n`: the parts' chances added up.
 //!
 //! The exit status is 0 when every image gave a trustworthy read, 1 when
 //! one did not, and 2 for a bad command line or an image that would not
@@ -552,8 +554,10 @@ fn sequences(parts: Vec<Part>) -> Vec<Sequence> {
 }
 
 /// A sequence's line: the image, the parts found, what the parity says,
-/// and the parts' messages in order, with each missing part marked.
-fn describe_sequence(path: &Path, sequence: &Sequence, show: Show) -> String {
+/// with `details` how rarely the message the parts make up is wrong
+/// once every part is in ([`Sequence::risk_bits`]), and the parts'
+/// messages in order, with each missing part marked.
+fn describe_sequence(path: &Path, sequence: &Sequence, show: Show, details: bool) -> String {
     let total = sequence.header().map_or(0, |h| h.0);
     let found = format!("structured append, {} of {total} parts", sequence.len());
     let parity = match sequence.check() {
@@ -563,12 +567,16 @@ fn describe_sequence(path: &Path, sequence: &Sequence, show: Show) -> String {
         ParityCheck::Inconsistent => ", parts disagree".to_owned(),
         ParityCheck::Empty | ParityCheck::Incomplete { .. } => String::new(),
     };
+    let risk = match sequence.risk_bits() {
+        Some(bits) if details => format!(", risk 1 in 2^{bits}"),
+        _ => String::new(),
+    };
     let message = match show {
         Show::Text => one_line(&sequence.assembled().plain()),
         Show::Hex => sequence.hex(),
         Show::Escaped => sequence.assembled().escaped(),
     };
-    format!("{}: {found}{parity}: {message}", path.display())
+    format!("{}: {found}{parity}{risk}: {message}", path.display())
 }
 
 /// The modules of a grid as `--grid` prints them: a row to a line,
@@ -702,7 +710,7 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
         // the reads that are to be believed, whose headers are.
         let parts = results.iter().filter(|r| r.is_trustworthy()).filter_map(|r| Part::from_report(&r.report, String::new()));
         for sequence in sequences(parts.collect()) {
-            if writeln!(out, "{}", describe_sequence(path, &sequence, options.show)).is_err() {
+            if writeln!(out, "{}", describe_sequence(path, &sequence, options.show, options.details)).is_err() {
                 return status;
             }
         }
@@ -826,7 +834,7 @@ mod tests {
             bytes: text.bytes().map(Some).collect(),
             ..TextReport::default()
         };
-        Part { index, total, parity, label: String::new(), text: report }
+        Part { index, total, parity, label: String::new(), text: report, risk_bits: None }
     }
 
     #[test]
@@ -845,16 +853,16 @@ mod tests {
         let joined = sequences(found);
         assert_eq!(joined.len(), 2);
         assert_eq!(
-            describe_sequence(path, &joined[0], Show::Text),
+            describe_sequence(path, &joined[0], Show::Text, false),
             format!("sheet.png: structured append, 3 of 3 parts, parity verified: {message}")
         );
         assert_eq!(
-            describe_sequence(path, &joined[1], Show::Text),
+            describe_sequence(path, &joined[1], Show::Text, false),
             "sheet.png: structured append, 1 of 2 parts: another [part 2 missing]"
         );
         // Every part in and a byte of one misread: the parity says so.
         let wrong = sequences(vec![part(1, 2, parity, &message[..20]), part(2, 2, parity, &message[20..].replace('z', "s"))]);
-        let line = describe_sequence(path, &wrong[0], Show::Text);
+        let line = describe_sequence(path, &wrong[0], Show::Text, false);
         assert!(line.starts_with(&format!("sheet.png: structured append, 2 of 2 parts, parity {:02X} where the parts claim {parity:02X}: ", parity ^ b'z' ^ b's')), "{line}");
     }
 

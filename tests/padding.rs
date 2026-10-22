@@ -9,9 +9,9 @@ use qr_forensics::decode::bitstream::{Certainty, EndOfData, LostReason};
 use qr_forensics::decode::codewords::{PinSource, Pins};
 use qr_forensics::decode::codewords::Pin;
 use qr_forensics::decode::padding::{
-    Filler, check_tail, clear_padding_pins, detect_padding, pad_tail, padding_at, pin_padding_at, pinned_filler, recover_padding,
+    Filler, check_tail, clear_padding_pins, detect_padding, pad_tail, padding_at, pass_tries, pin_padding_at, pinned_filler, recover_padding,
 };
-use qr_forensics::decode::pipeline::{BlockOutcome, DecodeOptions, SolveMethod, decode};
+use qr_forensics::decode::pipeline::{BlockOutcome, DecodeOptions, DecodeReport, SolveMethod, decode};
 use qr_forensics::decode::repair::render_rgba;
 use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::adjust::Adjust;
@@ -154,15 +154,42 @@ fn finds_padding_without_readable_headers() {
     assert_eq!(true_first_pad, 26);
     assert_eq!(candidate.first_pad_codeword, true_first_pad);
 
-    let recovery = recover(&grid, &layout, mask).unwrap();
     // Blocks 2 and 4 are rescued. Block 0 is left with 26 unknown codewords
     // against 26 EC codewords: solvable, with nothing to spare, so its text
     // is reported as unverified.
+    let unguided = DecodeOptions { message_evidence: false, ..DecodeOptions::default() };
+    let recovery = recover_padding(&grid, &layout, mask, &Pins::new(), &unguided).unwrap();
     assert_eq!(recovery.solved_after, 5, "{:?}", recovery.report.blocks);
     assert!(!recovery.report.blocks[0].is_verified());
     assert!(!recovery.confirmed);
     assert!(!recovery.report.is_trustworthy());
     assert_eq!(recovery.report.text.plain(), text);
+    for (got, want) in recovery.report.codewords.iter().zip(&truth.codewords) {
+        assert_eq!(got.final_value, want.final_value);
+    }
+    // What the message makes likely of the bytes filled in confirms them:
+    // the text is lowercase, and the bits of the unread bytes the other
+    // blocks say are set or clear a wrong filling bears out half as often
+    // each. With block 0 verified so its headers bear out where the
+    // padding was placed, and the read is made, charged as the second
+    // decode under the pins the recovery placed.
+    let recovery = recover(&grid, &layout, mask).unwrap();
+    assert_eq!(recovery.solved_after, 5, "{:?}", recovery.report.blocks);
+    assert!(recovery.report.blocks[0].is_verified() && recovery.report.blocks[0].message_evidence > 0, "{:?}", recovery.report.blocks[0]);
+    assert!(recovery.confirmed && recovery.report.is_trustworthy());
+    assert_eq!((recovery.report.tries, recovery.report.pin_tries), (1, pass_tries(2)));
+    assert_eq!(recovery.report.text.plain(), text);
+    // The pins carry what they were picked among, those the first pass
+    // placed as its pick and those of the second as the second's, and a
+    // decode of the grid under them is the decode the recovery ended on:
+    // what the document decodes once they are pinned. The second pass's
+    // count was once laid on every pin, and the blocks only the first
+    // pass pinned stood two bits lower in every decode after.
+    let picks: std::collections::BTreeSet<usize> = recovery.pins.values().map(|pin| pin.among).collect();
+    assert_eq!(picks, [pass_tries(1), pass_tries(2)].into());
+    let again = decode(&grid, &layout, mask, &recovery.pins, &DecodeOptions::default());
+    let risks = |report: &DecodeReport| report.blocks.iter().map(|b| b.outcome.risk_bits()).collect::<Vec<_>>();
+    assert_eq!(risks(&again), risks(&recovery.report));
     for (got, want) in recovery.report.codewords.iter().zip(&truth.codewords) {
         assert_eq!(got.final_value, want.final_value);
     }

@@ -388,6 +388,7 @@ fn faint_bits_decide_between_words_at_the_same_distance() {
     // the threshold and the bit the other overturns well inside its
     // colour, and a faint bit is the one most likely misread.
     use qr_forensics::decode::bch::{WEIGHT_MARGIN, format_word_for, format_words};
+    use qr_forensics::decode::rs::bit_cost;
     let mut shown = 0;
     for (version, ec, mask) in cases() {
         let layout = layout(version, ec);
@@ -414,7 +415,7 @@ fn faint_bits_decide_between_words_at_the_same_distance() {
         }
         shown += 1;
         assert_eq!((best.fields.ec, best.fields.mask), (ec, mask), "{what}");
-        assert_eq!((best.best_weight, rival.best_weight), (10, 200), "{what}");
+        assert_eq!((best.best_weight, rival.best_weight), (bit_cost(10), bit_cost(200)), "{what}");
         assert_eq!(analysis.margin(), 0, "{what}");
         assert!(analysis.weight_margin() >= WEIGHT_MARGIN, "{what}");
         assert!(!analysis.is_ambiguous() && analysis.is_reliable(), "{what}");
@@ -440,6 +441,7 @@ fn faint_bits_decide_between_words_at_the_same_distance() {
 #[test]
 fn faint_bits_decide_between_versions_at_the_same_distance() {
     use qr_forensics::decode::bch::{WEIGHT_MARGIN, info18};
+    use qr_forensics::decode::rs::bit_cost;
     let mut shown = 0;
     for v in [7u8, 11, 19, 27, 33, 40] {
         let version = SymbolVersion::Qr(v);
@@ -458,7 +460,7 @@ fn faint_bits_decide_between_versions_at_the_same_distance() {
             continue;
         }
         shown += 1;
-        assert_eq!((analysis.best_version, analysis.weight), (v, 10), "{what}");
+        assert_eq!((analysis.best_version, analysis.weight), (v, bit_cost(10)), "{what}");
         assert!(analysis.weight_margin >= WEIGHT_MARGIN, "{what}: {}", analysis.weight_margin);
         assert!(analysis.is_reliable(), "{what}");
         let pos = copy.bits[p];

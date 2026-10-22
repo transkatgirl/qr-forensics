@@ -122,7 +122,7 @@ fn the_unread_high_bit_of_every_byte_leans_toward_ascii_without_a_pin() {
     // taken at their lean, less what the search and the leans cost, and
     // no more: the known bits the solution was solved from are not
     // counted again as checks of it.
-    assert!(matches!(after.blocks[0].outcome, BlockOutcome::Solved { risk_bits: 8..=20, .. }), "{:?}", after.blocks[0].outcome);
+    assert!(matches!(after.blocks[0].outcome, BlockOutcome::Solved { risk_bits: 8..=29, .. }), "{:?}", after.blocks[0].outcome);
     assert!(after.codewords.iter().all(|cw| cw.pin.is_none()));
 
     // A message with bytes above 127 leans the same way and is wrong in
@@ -425,12 +425,24 @@ fn a_common_beginning_is_kept_only_when_error_correction_bears_it_out() {
     assert!(found.report.is_trustworthy());
     assert_eq!(found.report.text.plain(), text);
     assert!(found.pins.values().all(|pin| pin.source == PinSource::Text));
-    // Pins already in force are kept under those of the beginning.
+    // The pick of every beginning tried, which the searches its pins reach
+    // are charged for, and not every decode of the grid.
+    assert!(found.report.tries == 1 && found.report.pin_tries > 1, "{} {}", found.report.tries, found.report.pin_tries);
+    // The beginning's pins carry that pick with them, and a decode of the
+    // grid under them is the decode the beginning was kept on: what the
+    // document decodes once they are pinned. The count was once the
+    // document's, laid on every pin in force.
+    assert!(found.pins.values().all(|pin| pin.among == found.report.pin_tries));
+    let again = decode(&grid, &layout, mask, &found.pins, &DecodeOptions { derive_pins: false, ..opts });
+    let risks = |report: &DecodeReport| report.blocks.iter().map(|b| b.outcome.risk_bits()).collect::<Vec<_>>();
+    assert_eq!(risks(&again), risks(&found.report));
+    // Pins already in force are kept under those of the beginning, each
+    // as the pick it was.
     let mut held = Pins::new();
     let serial = text.find("7Q2M").unwrap();
     lay_over(&mut held, &text_pins(&layout, &before, Place::Char(serial), "7Q2M", Charset::Auto).unwrap().pins);
     let with_held = try_beginnings(&grid, &layout, mask, &held, &opts, &decode_pinned(&grid, &layout, mask, &held)).unwrap();
-    assert!(held.keys().all(|cw| with_held.pins.contains_key(cw)));
+    assert!(held.keys().all(|cw| with_held.pins.get(cw).is_some_and(|pin| pin.among == 1)));
     // The same damage under a message that begins no common way: no
     // beginning is forced on it.
     let other = "Invoice 2026-1010 for the lathe, due on receipt.";

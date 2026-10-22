@@ -49,8 +49,8 @@ use std::collections::BinaryHeap;
 
 use super::gf256::{self, Scale, div, exp, mul, poly_eval};
 use super::rs::{
-    AIDED_VERIFIED_BITS, CwRead, DOUBT_CONFIRMING_BITS, RsSolution, doubted_agreement, list_solution_bits, nearest, preferring_the_standard, settle,
-    soft_distance,
+    CwRead, Offering, RsSolution, Sightings, doubted_agreement, list_solution_balance, list_solution_bits, nearest, preferring_the_standard,
+    settle, soft_distance,
 };
 use crate::symbol::grid::CERTAIN;
 use crate::work;
@@ -567,7 +567,7 @@ fn y_roots(curve: &Curve, k: usize) -> Vec<Vec<u8>> {
 /// constraints to spend on the curve ([`LIST_COST`]): every codeword of
 /// the code the curve through the block's points, weighed by their
 /// reliability, passes through, each restated against the block as read
-/// as any solution is, kept when [`DOUBT_CONFIRMING_BITS`] confirm it,
+/// as any solution is, kept when it is offered ([`Offering`]),
 /// those within the standard over any that spend its reserve
 /// ([`preferring_the_standard`]), and of those the nearest the
 /// block as read by a clear margin, or every one within the margin,
@@ -591,7 +591,18 @@ fn y_roots(curve: &Curve, k: usize) -> Vec<Vec<u8>> {
 /// those errors leave of the redundancy, as a chased solution's is what
 /// its flipped block's decode left, and the standard's reserve is held
 /// against it.
-pub fn rs_decode_listing(block: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: usize, reserved: usize, cost: usize) -> Vec<(usize, RsSolution)> {
+///
+/// Every codeword the curve passes through that overturns no pin is
+/// noted in `seen`, those returned among them, whether or not anything
+/// confirms it ([`Sightings`]).
+pub fn rs_decode_listing(
+    block: &[CwRead],
+    bit_reliability: &[[u8; 8]],
+    ec_len: usize,
+    reserved: usize,
+    cost: usize,
+    seen: &mut Sightings,
+) -> Vec<(usize, RsSolution)> {
     assert_eq!(block.len(), bit_reliability.len());
     let n = block.len();
     if cost == 0 || ec_len == 0 || ec_len >= n || reserved >= ec_len {
@@ -631,9 +642,11 @@ pub fn rs_decode_listing(block: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: 
     let (list_size, _) = list_size(total, k - 1);
     let Some(curve) = interpolate(&constraints, k - 1, list_size) else { return Vec::new() };
     let (read, redundancy) = (n - f, ec_len - f);
+    let mut offering = Offering::new(block, bit_reliability, ec_len, seen);
     let mut found: Vec<(u32, (usize, RsSolution))> = Vec::new();
     for h in y_roots(&curve, k) {
         let corrected: Vec<u8> = (0..n).map(|i| mul(grs[i].1, poly_eval(&h, grs[i].0))).collect();
+        offering.seen().see_unless_pinned(block, &corrected);
         let (mut hard, mut errors, mut agreeing, mut flipped) = (0usize, 0usize, 0u32, 0u32);
         for i in 0..n {
             if block[i].is_erasure() {
@@ -650,13 +663,25 @@ pub fn rs_decode_listing(block: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: 
                 flipped += (doubted[i] & diff).count_ones();
             }
         }
-        let bits = list_solution_bits(read, redundancy, hard).saturating_sub(agreeing + flipped) + doubted_agreement(agreeing, flipped);
+        // Each doubted bit spends an equation, and its agreement beyond
+        // chance is credited back; the equations are taken from the two
+        // together. Taken from the codewords' count alone, where there
+        // are more doubted bits than equations, the shortfall was lost:
+        // the codewords that agree with every bit not doubted are then
+        // two to the shortfall, any block of noise has them, and the one
+        // the curve finds is the one that agrees with the most doubted
+        // bits, an agreement the search made and not chance. Blocks of
+        // noise read as faint were so confirmed by a hundred and fifty
+        // bits and more.
+        let bits = list_solution_balance(read, redundancy, hard) + i64::from(doubted_agreement(agreeing, flipped)) - i64::from(agreeing + flipped);
         // The slack never claims more than the bits confirm: the doubted
-        // bits spent equations of it.
-        let slack = redundancy.saturating_sub(2 * hard).min(bits as usize / 8);
-        let located = bits - 8 * slack as u32;
-        let Ok(solution) = settle(block, &doubted_erased, &erased, corrected, errors, slack, located, reserved) else { continue };
-        if solution.confidence_bits() < DOUBT_CONFIRMING_BITS {
+        // bits spent equations of it. What the count falls short of
+        // nothing by is taken from the known bits of the erased codewords
+        // ([`settle`]).
+        let slack = redundancy.saturating_sub(2 * hard).min(bits.max(0) as usize / 8);
+        let located = bits - 8 * slack as i64;
+        let Ok(solution) = settle(block, &doubted_erased, &erased, corrected, errors, slack, located, reserved, offering.seen()) else { continue };
+        if !offering.offers_solution(&solution) {
             continue;
         }
         found.push((soft_distance(block, bit_reliability, &solution.corrected), (multiplicity, solution)));
@@ -667,9 +692,10 @@ pub fn rs_decode_listing(block: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: 
 
 /// Wrong codewords [`rs_decode_listing`] is sure to reach in a block of
 /// `n` codewords with `ec_len` of error correction, read whole and every
-/// module certain, for `cost` constraints, and with enough to confirm
-/// it as a decode standing alone is held to ([`AIDED_VERIFIED_BITS`]):
-/// for the app to say how far it goes in a symbol. Each codeword is a
+/// module certain, for `cost` constraints, and with `needed` bits to
+/// confirm it, which is what verifies a block charged for what the
+/// solution was found among ([`super::pipeline::verifying_bits`]): for
+/// the app to say how far it goes in a symbol. Each codeword is a
 /// point of likelihood one, given its multiplicity as [`multiplicities`]
 /// gives it, and a codeword of the code agreeing with the block on
 /// points whose multiplicities sum past the curve's weighted degree is a
@@ -681,7 +707,7 @@ pub fn rs_decode_listing(block: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: 
 /// so where any are reserved, a solution reached past what the standard
 /// corrects spends them, and is never confirmed however much else
 /// confirms it ([`super::rs::RsSolution::within_standard`]).
-pub fn hard_reach(n: usize, ec_len: usize, cost: usize) -> usize {
+pub fn hard_reach(n: usize, ec_len: usize, cost: usize, needed: u32) -> usize {
     if cost == 0 || ec_len == 0 || ec_len >= n {
         return 0;
     }
@@ -691,7 +717,7 @@ pub fn hard_reach(n: usize, ec_len: usize, cost: usize) -> usize {
     let (_, delta) = list_size(total, n - ec_len - 1);
     m.sort_unstable();
     (0..n)
-        .take_while(|&t| m[..n - t].iter().sum::<usize>() > delta && list_solution_bits(n, ec_len, t) >= AIDED_VERIFIED_BITS)
+        .take_while(|&t| m[..n - t].iter().sum::<usize>() > delta && list_solution_bits(n, ec_len, t) >= needed)
         .last()
         .unwrap_or(0)
 }
@@ -699,7 +725,9 @@ pub fn hard_reach(n: usize, ec_len: usize, cost: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::rs::{rs_decode, rs_encode};
+    use crate::decode::pipeline::{DecodeOptions, verifying_bits};
+    use crate::decode::rs::{VERIFIED_BITS, rs_decode, rs_encode};
+    use crate::symbol::SymbolVersion;
 
     struct Rng(u64);
     impl Rng {
@@ -824,19 +852,19 @@ mod tests {
             }
             let certain = vec![[CERTAIN; 8]; 26];
             assert!(rs_decode(&read, 17).is_err(), "round {round}");
-            let found = rs_decode_listing(&read, &certain, 17, 0, LIST_COST);
+            let found = rs_decode_listing(&read, &certain, 17, 0, LIST_COST, &mut Sightings::default());
             assert_eq!(found.len(), 1, "round {round}: {found:?}");
             let (multiplicity, solution) = &found[0];
             assert_eq!(solution.corrected, block, "round {round}");
             assert_eq!((solution.errors, solution.erasures, solution.slack), (11, 0, 0), "round {round}");
-            assert!(solution.confidence_bits() >= AIDED_VERIFIED_BITS, "round {round}: {}", solution.confidence_bits());
+            assert!(solution.confidence_bits() >= 3 * VERIFIED_BITS, "round {round}: {}", solution.confidence_bits());
             assert!(*multiplicity >= 6, "round {round}: multiplicity {multiplicity}");
             // One more is past the algebra: whatever is found is not the
             // block, and not verified.
             read[wrong[11]].value ^= rng.nonzero();
-            for (_, solution) in rs_decode_listing(&read, &certain, 17, 0, LIST_COST) {
+            for (_, solution) in rs_decode_listing(&read, &certain, 17, 0, LIST_COST, &mut Sightings::default()) {
                 assert_ne!(solution.corrected, block, "round {round} and one more");
-                assert!(solution.confidence_bits() < AIDED_VERIFIED_BITS, "round {round} and one more");
+                assert!(solution.confidence_bits() < 3 * VERIFIED_BITS, "round {round} and one more");
             }
         }
         // A 40-H block: half the distance is fifteen, pairs reach sixteen,
@@ -848,10 +876,10 @@ mod tests {
                 read[i].value ^= rng.nonzero();
             }
             let certain = vec![[CERTAIN; 8]; 45];
-            let found = rs_decode_listing(&read, &certain, 30, 0, LIST_COST);
+            let found = rs_decode_listing(&read, &certain, 30, 0, LIST_COST, &mut Sightings::default());
             assert_eq!(found.len(), 1, "40-H round {round}: {found:?}");
             assert_eq!((found[0].1.corrected == block, found[0].1.errors), (true, 19), "40-H round {round}");
-            assert!(found[0].1.confidence_bits() >= AIDED_VERIFIED_BITS);
+            assert!(found[0].1.confidence_bits() >= 3 * VERIFIED_BITS);
         }
         // Erasures take their codewords out of the count: a 1-H block
         // with four unknown and eight wrong of the twenty-two read, where
@@ -867,15 +895,15 @@ mod tests {
             read[i].value ^= rng.nonzero();
         }
         assert!(rs_decode(&read, 17).is_err());
-        let found = rs_decode_listing(&read, &vec![[CERTAIN; 8]; 26], 17, 0, LIST_COST);
+        let found = rs_decode_listing(&read, &vec![[CERTAIN; 8]; 26], 17, 0, LIST_COST, &mut Sightings::default());
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!((found[0].1.corrected == block, found[0].1.errors, found[0].1.erasures), (true, 8, 4));
         // A pinned codeword is never overturned, and a block with its
         // every EC codeword reserved is not decoded so.
         let mut pinned = read.clone();
         pinned[picked[4]].pinned = 0xFF;
-        assert!(rs_decode_listing(&pinned, &vec![[CERTAIN; 8]; 26], 17, 0, LIST_COST).is_empty());
-        assert!(rs_decode_listing(&read, &vec![[CERTAIN; 8]; 26], 17, 17, LIST_COST).is_empty());
+        assert!(rs_decode_listing(&pinned, &vec![[CERTAIN; 8]; 26], 17, 0, LIST_COST, &mut Sightings::default()).is_empty());
+        assert!(rs_decode_listing(&read, &vec![[CERTAIN; 8]; 26], 17, 17, LIST_COST, &mut Sightings::default()).is_empty());
     }
 
     #[test]
@@ -895,8 +923,8 @@ mod tests {
                 read[i].value ^= 1 << b;
                 reliability[i][b] = rng.below(12) as u8;
             }
-            assert!(rs_decode_listing(&read, &vec![[200u8; 8]; 33], 18, 0, LIST_COST).iter().all(|(_, s)| s.corrected != block), "round {round}: reached as read");
-            let found = rs_decode_listing(&read, &reliability, 18, 0, LIST_COST);
+            assert!(rs_decode_listing(&read, &vec![[200u8; 8]; 33], 18, 0, LIST_COST, &mut Sightings::default()).iter().all(|(_, s)| s.corrected != block), "round {round}: reached as read");
+            let found = rs_decode_listing(&read, &reliability, 18, 0, LIST_COST, &mut Sightings::default());
             assert_eq!(found.len(), 1, "round {round}: {found:?}");
             assert_eq!((found[0].1.corrected == block, found[0].1.errors), (true, 13), "round {round}");
             // Nothing but doubted bits was overturned: the solution is
@@ -904,7 +932,7 @@ mod tests {
             // hundred and forty-four.
             assert_eq!(found[0].1.confidence_bits(), list_solution_bits(33, 18, 0) - 13, "round {round}");
             assert_eq!(found[0].1.slack, 16, "round {round}");
-            assert!(found[0].1.confidence_bits() >= AIDED_VERIFIED_BITS, "round {round}: {}", found[0].1.confidence_bits());
+            assert!(found[0].1.confidence_bits() >= 3 * VERIFIED_BITS, "round {round}: {}", found[0].1.confidence_bits());
             // Bits unknown, the codewords are read at half a byte each;
             // with two unknown bits in each of a few, the fillings are
             // points too.
@@ -913,7 +941,7 @@ mod tests {
                 read[i].known &= 0xFC;
                 read[i].value &= 0xFC;
             }
-            let found = rs_decode_listing(&read, &reliability, 18, 0, LIST_COST);
+            let found = rs_decode_listing(&read, &reliability, 18, 0, LIST_COST, &mut Sightings::default());
             assert!(found.iter().any(|(_, s)| s.corrected == block), "round {round} with unknown bits: {found:?}");
         }
     }
@@ -925,38 +953,62 @@ mod tests {
             for round in 0..150 {
                 let read: Vec<CwRead> = (0..n).map(|_| CwRead::known(rng.byte())).collect();
                 let reliability: Vec<[u8; 8]> = (0..n).map(|_| [rng.byte().min(CERTAIN - 1); 8]).collect();
-                for (_, solution) in rs_decode_listing(&read, &reliability, ec_len, 0, LIST_COST) {
-                    assert!(solution.confidence_bits() < AIDED_VERIFIED_BITS, "({n}, {ec_len}) round {round}: {solution:?}");
+                for (_, solution) in rs_decode_listing(&read, &reliability, ec_len, 0, LIST_COST, &mut Sightings::default()) {
+                    assert!(solution.confidence_bits() < 3 * VERIFIED_BITS, "({n}, {ec_len}) round {round}: {solution:?}");
+                }
+            }
+        }
+        // Noise read faint throughout: four faint bits a codeword have a
+        // point at their other colour, more doubted bits than a block of
+        // fifteen of error correction has equations, and the curve finds
+        // codewords that agree with all but a few of them, as the
+        // codewords that agree with every bit not doubted, which are two
+        // to the shortfall, would. Such a codeword was once confirmed by
+        // a hundred and fifty bits, the shortfall left uncounted.
+        for (n, ec_len) in [(70usize, 15usize), (26, 7)] {
+            for round in 0..40 {
+                let read: Vec<CwRead> = (0..n).map(|_| CwRead::known(rng.byte())).collect();
+                let reliability: Vec<[u8; 8]> = (0..n).map(|_| std::array::from_fn(|_| rng.byte() % 48)).collect();
+                for (_, solution) in rs_decode_listing(&read, &reliability, ec_len, 0, LIST_COST, &mut Sightings::default()) {
+                    assert!(solution.confidence_bits() < 3 * VERIFIED_BITS, "faint ({n}, {ec_len}) round {round}: {solution:?}");
                 }
             }
         }
         // A 2-L block has a codeword within six of noise once in six
-        // hundred blocks: nothing so far out is offered at all.
-        assert!(list_solution_bits(44, 10, 6) < DOUBT_CONFIRMING_BITS);
-        assert!(list_solution_bits(44, 10, 5) >= DOUBT_CONFIRMING_BITS);
+        // hundred blocks: nothing so far out is verified, charged as one
+        // of the solvers of the searches of a block a decode makes, those
+        // that run on a block painted by hand, where one within five is.
+        let needed = verifying_bits(SymbolVersion::Qr(2), &DecodeOptions::default(), false);
+        assert_eq!((list_solution_bits(44, 10, 6), needed), (9, 12));
+        assert!(list_solution_bits(44, 10, 5) >= needed);
         // Within half the distance the count is the plain decoder's.
         assert_eq!(list_solution_bits(33, 18, 9), super::super::rs::located_error_bits(33, 9));
         assert_eq!(list_solution_bits(26, 17, 11), 25);
         assert_eq!(list_solution_bits(45, 30, 19), 46);
     }
 
+    /// What a solution the reach is said for must show in these tests:
+    /// three codewords' worth, more than a decode of a block painted by
+    /// hand asks of any of its fallbacks ([`verifying_bits`]).
+    const NEEDED: u32 = 3 * VERIFIED_BITS;
+
     #[test]
     fn the_reach_said_is_the_reach_found() {
         // What list_decoding_reaches_past_half_the_distance finds.
-        assert_eq!(hard_reach(26, 17, LIST_COST), 11);
-        assert_eq!(hard_reach(45, 30, LIST_COST), 19);
+        assert_eq!(hard_reach(26, 17, LIST_COST, NEEDED), 11);
+        assert_eq!(hard_reach(45, 30, LIST_COST, NEEDED), 19);
         // At level L no further than half the distance, versions 2 and 5,
         // however many constraints.
         for cost in [LIST_COST, LIST_COST_MAX] {
-            assert!(hard_reach(44, 10, cost) <= 5, "{cost}");
-            assert!(hard_reach(134, 26, cost) <= 13, "{cost}");
+            assert!(hard_reach(44, 10, cost, NEEDED) <= 5, "{cost}");
+            assert!(hard_reach(134, 26, cost, NEEDED) <= 13, "{cost}");
         }
-        assert_eq!(hard_reach(26, 17, 0), 0);
+        assert_eq!(hard_reach(26, 17, 0, NEEDED), 0);
         // The most constraints reach as far as the default in the blocks
         // of low rate, which use no more than their list lets them, and a
         // block of high rate uses every one.
-        assert_eq!(hard_reach(26, 17, LIST_COST_MAX), 11);
-        assert_eq!(hard_reach(45, 30, LIST_COST_MAX), 19);
+        assert_eq!(hard_reach(26, 17, LIST_COST_MAX, NEEDED), 11);
+        assert_eq!(hard_reach(45, 30, LIST_COST_MAX, NEEDED), 19);
         assert!(usable_cost(45, 30, LIST_COST_MAX) < LIST_COST_MAX / 2);
         assert_eq!(usable_cost(148, 30, LIST_COST_MAX), LIST_COST_MAX);
         assert_eq!(usable_cost(45, 30, LIST_COST), LIST_COST);
@@ -964,7 +1016,7 @@ mod tests {
         // block too, the wrong codewords wherever they fall.
         let mut rng = Rng(0x2EAC);
         for (n, ec_len) in [(33, 18), (43, 28)] {
-            let reach = hard_reach(n, ec_len, LIST_COST);
+            let reach = hard_reach(n, ec_len, LIST_COST, NEEDED);
             assert!(reach > ec_len / 2, "{n}, {ec_len}: {reach}");
             for round in 0..5 {
                 let block = codeword(&mut rng, n - ec_len, ec_len);
@@ -972,7 +1024,7 @@ mod tests {
                 for &i in &rng.distinct(reach, n) {
                     read[i].value ^= rng.nonzero();
                 }
-                let found = rs_decode_listing(&read, &vec![[CERTAIN; 8]; n], ec_len, 0, LIST_COST);
+                let found = rs_decode_listing(&read, &vec![[CERTAIN; 8]; n], ec_len, 0, LIST_COST, &mut Sightings::default());
                 assert!(found.iter().any(|(_, s)| s.corrected == block), "{n}, {ec_len} round {round}: {found:?}");
             }
         }
@@ -983,7 +1035,7 @@ mod tests {
         for &i in &rng.distinct(19, 45) {
             read[i].value ^= rng.nonzero();
         }
-        let found = rs_decode_listing(&read, &vec![[CERTAIN; 8]; 45], 30, 0, LIST_COST_MAX);
+        let found = rs_decode_listing(&read, &vec![[CERTAIN; 8]; 45], 30, 0, LIST_COST_MAX, &mut Sightings::default());
         assert!(found.iter().any(|(_, s)| s.corrected == block), "{found:?}");
     }
 
@@ -1015,7 +1067,7 @@ mod tests {
             read[i].value ^= rng.nonzero();
         }
         let started = std::time::Instant::now();
-        let found = rs_decode_listing(&read, &vec![[CERTAIN; 8]; 148], 30, 0, LIST_COST);
+        let found = rs_decode_listing(&read, &vec![[CERTAIN; 8]; 148], 30, 0, LIST_COST, &mut Sightings::default());
         let took = started.elapsed();
         println!("40-L block, sixteen wrong, {LIST_COST} constraints: {took:?}, {} found", found.len());
         assert!(took.as_secs() < 5, "{took:?}");

@@ -1,7 +1,7 @@
 //! Left panel: which symbol this is, the photo, and how to get modules in.
 
 use eframe::egui;
-use qr_forensics::decode::abp::ABP_ROUNDS_MAX;
+use qr_forensics::decode::abp::{ABP_ROUNDS_LEAST, ABP_ROUNDS_MAX, round_tries};
 use qr_forensics::decode::list::{LIST_COST, LIST_COST_MAX, LIST_COST_MIN};
 use qr_forensics::decode::pipeline::DecodeOptions;
 use qr_forensics::decode::rs::{CHASE_MAX_BITS, TRIAL_SETS_MAX, TRIAL_SETS_MIN, tries_charge};
@@ -1342,8 +1342,9 @@ fn decoding_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
         "For a block with a few more errors than its error correction can fix, where the wrong modules read \
          faintly. Chase decoding: tries every combination of flips on the least reliable bits (how many is set \
          below), decoding each. Also flips up to three solidly misread bits that the parity equations point to, when \
-         solving bit by bit fails. Every pattern that solves must agree, or the message decides between them. Turn \
-         it off if a solution it found looks wrong.",
+         solving bit by bit fails. Every pattern that solves must agree, or the message decides between them. Used \
+         only if the symbol doesn't read without it, so turning it on never loses a read. Turn it off if a solution \
+         it found looks wrong.",
     );
     if flipping {
         ui.indent("chase_bits", |ui| {
@@ -1372,12 +1373,14 @@ fn decoding_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
     );
     if propagating {
         ui.indent("abp_rounds", |ui| {
-            ui.add(egui::Slider::new(&mut opts.abp_rounds, 1..=ABP_ROUNDS_MAX).text("rounds")).on_hover_text(
-                "Raise it if a block is still changing when the rounds run out. A block that settles stops early; a \
-                 round takes a millisecond or two on the largest blocks. Default 20. When reading the photo, the \
-                 rounds are split across the placements, samplings and formats tried, down to 6.",
+            ui.add(egui::Slider::new(&mut opts.abp_rounds, ABP_ROUNDS_LEAST..=ABP_ROUNDS_MAX).text("rounds")).on_hover_text(
+                "Raise it if a block is still changing when the rounds run out. A block stops early once it settles \
+                 or solves, so more rounds can't lose a solution. A round takes a millisecond or two on the largest \
+                 blocks. Default 20, and at least 3: the faintest bits are doubted again after the 3rd round, the \
+                 6th, the 12th and so on. When reading the photo, the rounds are split across the placements, \
+                 samplings and formats tried, down to 6.",
             );
-            ui.weak(confirmation_cost("A solution", opts.abp_rounds));
+            ui.weak(confirmation_cost("A solution", round_tries(opts.abp_rounds, flipping)));
         });
     }
 
@@ -1414,7 +1417,8 @@ fn decoding_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
          the smallest size that gets past plain Reed-Solomon, then the next size up, regardless of reliability, and \
          keeps a solution the rest of the block confirms. Reaches one wrong codeword past plain Reed-Solomon (two in \
          a small block), or a block whose unknown bits solve except for one to three wrong codewords. Works on \
-         sampled grids too. If two solutions disagree, the message decides, or neither is kept.",
+         sampled grids too. If two solutions disagree, the message decides, or neither is kept. Used only if the \
+         symbol doesn't read without it, so turning it on never loses a read.",
     );
     if opts.erase_by_trial {
         ui.indent("trial_sets", |ui| {
@@ -1434,7 +1438,10 @@ fn decoding_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
             if let Some(reach) = &reach {
                 ui.weak(trial_note(reach));
             }
-            ui.weak(confirmation_cost("A solution", opts.trial_sets));
+            // Each size of set tried has an equal share of the trials'
+            // chances, and a solution of the largest the least of it.
+            let tried = reach.as_ref().map_or(opts.trial_sets, |reach| reach.trials.most_tries());
+            ui.weak(confirmation_cost("A solution", tried));
         });
     }
 
@@ -1457,8 +1464,9 @@ fn decoding_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
          plain text or digits do: retries the block with each bit biased toward what the message's other readable \
          groups of the same kind (bytes, digit groups and so on) hold there. Bytes start out biased toward plain \
          ASCII, and a digit never exceeds nine. A module read against the prior is doubted sooner, and an unreadable \
-         one is filled in from it. The prior only guides the search: a solution is still confirmed against the \
-         modules as read. Blocks says when a block was solved this way.",
+         one is filled in from it. The prior counts toward confirming a solution only where it filled a module in: \
+         for the solution if they agree, against it if not, by how sure the prior is. Blocks says when a block was \
+         solved this way. Used only if the symbol doesn't read without it, so turning it on never loses a read.",
     );
     if opts.message_evidence && !opts.reliability {
         ui.indent("evidence_note", |ui| {
@@ -1543,11 +1551,16 @@ mod tests {
         // Reed-Solomon only by spending them.
         let reach = Reach::of(SymbolVersion::Micro(2), EcLevel::L, &opts).unwrap();
         assert!(trial_note(&reach).ends_with("so they are never confirmed."), "{}", trial_note(&reach));
-        // Its one wrong codeword was once "1 wrong codewords".
+        // The curve reaches half the distance with what a fallback needs
+        // to be verified, as plain decoding does, and both spend the
+        // reserve past the one the standard corrects. Said once against
+        // three codewords' worth, it reached the one, as "1 wrong
+        // codewords".
         assert_eq!(
             list_note(&reach, SymbolVersion::Micro(2), EcLevel::L, opts.list_cost),
-            "No gain at level L: in this symbol's block of 10 codewords, it's guaranteed to correct 1 wrong codeword, \
-             the same as plain Reed-Solomon."
+            "No gain at level L: in this symbol's block of 10 codewords, it's guaranteed to correct 2 wrong codewords, \
+             the same as plain Reed-Solomon. Past 1, both use the reserved error-detection codewords, so neither is \
+             confirmed."
         );
         // 2-L keeps two of ten: the pairs reach five within the standard's
         // limit, where plain decoding goes first by spending them, and six

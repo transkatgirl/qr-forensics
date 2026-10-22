@@ -31,12 +31,38 @@ pub struct Pin {
     pub mask: u8,
     pub value: u8,
     pub source: PinSource,
+    /// Ways the pin was picked among, keeping the best, the picks of the
+    /// pins in force when it was counted in: the beginnings tried, the
+    /// passes of padding recovery. A search the pin reaches is a fresh
+    /// chance under each way, and is charged as one of them
+    /// ([`super::pipeline::DecodeReport::pin_tries`]). One for a pin
+    /// placed by hand, which nothing picked. The ways were once one count
+    /// for every pin in force, and the latest pick was charged to blocks
+    /// that held only pins picked before it.
+    pub among: usize,
 }
 
 impl Pin {
-    pub fn full(value: u8, source: PinSource) -> Self {
-        Self { mask: 0xFF, value, source }
+    /// Bits `value` asserted where `mask` is set, picked among nothing.
+    pub fn new(mask: u8, value: u8, source: PinSource) -> Self {
+        Self { mask, value, source, among: 1 }
     }
+
+    pub fn full(value: u8, source: PinSource) -> Self {
+        Self::new(0xFF, value, source)
+    }
+
+    /// Whether the two assert the same bits, from the same source,
+    /// however many ways each was picked among.
+    pub fn asserts_as(&self, other: &Pin) -> bool {
+        (self.mask, self.value, self.source) == (other.mask, other.value, other.source)
+    }
+}
+
+/// The most ways any of `pins` was picked among ([`Pin::among`]), one
+/// where there are none: what a pick made under them compounds.
+pub fn picked_among(pins: &Pins) -> usize {
+    pins.values().map(|pin| pin.among.max(1)).max().unwrap_or(1)
 }
 
 impl PinSource {

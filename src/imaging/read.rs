@@ -133,7 +133,6 @@ use crate::decode::bch::{FormatAnalysis, FormatCandidate};
 use crate::decode::codewords::Pins;
 use crate::decode::padding::recover_padding_after;
 use crate::decode::pipeline::{DecodeOptions, DecodeReport, GridAnalysis, analyze, brute_force, decode};
-use crate::decode::rs::AIDED_VERIFIED_BITS;
 use crate::decode::repair::known_modules;
 use crate::symbol::function_map::FunctionMap;
 use crate::symbol::{Family, SymbolVersion};
@@ -247,8 +246,106 @@ pub fn read_outline(
     params: &SampleParams,
     opts: &DecodeOptions,
 ) -> Option<ReadResult> {
+    read_outline_as(image, version, region, params, Reads::new(opts))
+}
+
+/// [`read_outline`] as one of `ways` the caller reads the outline, the
+/// best of which is kept, as a reader tries every family it knows: the
+/// read asked for is the first of the way `asked` for, and goes
+/// uncounted as [`read_outline`]'s does, and every other read of every
+/// way is charged as one of all those the ways may make ([`Reads`]).
+/// The other ways' reads were once each a read of their own, the first
+/// of each uncounted.
+pub fn read_outline_one_of(
+    image: &Luma,
+    version: SymbolVersion,
+    region: [[f64; 2]; 4],
+    params: &SampleParams,
+    opts: &DecodeOptions,
+    ways: usize,
+    asked: bool,
+) -> Option<ReadResult> {
+    let reads = Reads::new(opts).one_of(ways);
+    read_outline_as(image, version, region, params, if asked { reads } else { reads.past() })
+}
+
+/// What a read of a photo is charged for the others its search may
+/// make, as the options it decodes under: the read asked for, and every
+/// other. The read asked for is the first at every turn of the search,
+/// the detector's first placement sampled with the kernel and rule
+/// asked for, through the photo as asked, as the format bits settle it,
+/// and nothing refitted: the read every reader makes, charged for
+/// nothing but the decodes its caller counts, as the plain decode of a
+/// block as read stands on its own count ([`crate::decode::pipeline`]).
+/// Every other read, the runners-up and the other samplings, the
+/// photo's other turns and copies, the reads in mirror order and
+/// without anchors, as the other QR Code model and refitted, and with
+/// the padding pinned, is a fresh chance for a block of noise to verify,
+/// and the best read is kept: each is charged as one of every read the
+/// search may make, and a bit more for the share the read asked for
+/// leaves the rest. Those reads were once charged in part, the
+/// placements and samplings counted, the read asked for among them, and
+/// the rest uncounted; and then, past the read asked for, the first way
+/// tried at each turn beneath went uncounted for that turn's others, as
+/// though it were the read asked for, and every sampling of a turned
+/// photo was counted as the only one.
+#[derive(Clone, Copy, Debug)]
+struct Reads {
+    first: DecodeOptions,
+    again: DecodeOptions,
+    /// `first` is the read asked for, and goes uncounted at each turn.
+    /// Past it, `first` is one of the others, counted as `again` is.
+    asked: bool,
+}
+
+impl Reads {
+    fn new(opts: &DecodeOptions) -> Self {
+        Self { first: *opts, again: opts.one_of(2), asked: true }
+    }
+
+    /// These reads at a turn of the search that tries `n` ways, the first
+    /// of them going on as asked where these are the read asked for:
+    /// every other read counted as one of them, and the budgets of the
+    /// dear solvers shared over them all ([`DecodeOptions::among`]).
+    fn among(self, n: usize) -> Self {
+        let again = self.again.among(n);
+        Self { first: if self.asked { self.first.sharing(n) } else { again }, again, ..self }
+    }
+
+    /// As [`Self::among`], with the budgets whole.
+    fn one_of(self, n: usize) -> Self {
+        let again = self.again.one_of(n);
+        Self { first: if self.asked { self.first } else { again }, again, ..self }
+    }
+
+    /// The reads past the first way tried at a turn: none of them asked
+    /// for, at this turn or any beneath it.
+    fn past(self) -> Self {
+        Self { first: self.again, asked: false, ..self }
+    }
+
+    /// These reads for each way tried at a turn, in the order tried: the
+    /// first as these are, and every other past it ([`Self::past`]).
+    fn first_then_past(self) -> impl Iterator<Item = Self> {
+        std::iter::once(self).chain(std::iter::repeat(self.past()))
+    }
+}
+
+/// [`read_outline`], charging its reads as `reads` says.
+fn read_outline_as(image: &Luma, version: SymbolVersion, region: [[f64; 2]; 4], params: &SampleParams, reads: Reads) -> Option<ReadResult> {
     let asked = params.enhance;
-    let mut best = read_outline_through(image, version, region, params, opts, asked);
+    // Every read is one of those through each way of seeing the photo
+    // that may be tried, the best of which is kept: the way asked for,
+    // the photo as it is, and the rungs, each once. The way asked for was
+    // once counted again where it is a rung.
+    let mut ways = vec![asked];
+    for way in std::iter::once(Enhance::NONE).chain(Enhance::rungs(region)) {
+        if !ways.contains(&way) {
+            ways.push(way);
+        }
+    }
+    let reads = reads.one_of(ways.len());
+    let mut best = read_outline_through(image, version, region, params, reads, asked);
     if best.as_ref().is_some_and(ReadResult::is_trustworthy) || work::cancelled() {
         return best;
     }
@@ -265,7 +362,7 @@ pub fn read_outline(
     rungs.retain(|rung| *rung != asked);
     work::in_turn(
         &rungs,
-        |&rung| if work::cancelled() { None } else { read_outline_through(image, version, region, params, opts, rung) },
+        |&rung| if work::cancelled() { None } else { read_outline_through(image, version, region, params, reads.past(), rung) },
         |result| result.is_some_and(|result| consider(&mut best, result)),
     );
     best
@@ -304,20 +401,20 @@ fn read_outline_through(
     version: SymbolVersion,
     region: [[f64; 2]; 4],
     params: &SampleParams,
-    opts: &DecodeOptions,
+    reads: Reads,
     enhance: Enhance,
 ) -> Option<ReadResult> {
     // Whatever is read, it is read off the pixels handed on: the copy's,
     // which are enlarged and sharpened already, or the photo's.
     let plain = SampleParams { enhance: Enhance::NONE, ..*params };
     if enhance.is_none() {
-        return read_outline_plain(image, version, region, &plain, opts, false);
+        return read_outline_plain(image, version, region, &plain, reads, false);
     }
     let view = Enhanced::around(image, region, enhance)?;
     // A reading set for the scan reaches as far across the copy as it
     // was set to reach across the photo.
     let plain = SampleParams { binarizer: plain.binarizer.scaled(view.factor), ..plain };
-    let mut result = read_outline_plain(&view.luma, version, region.map(|p| view.to_view(p)), &plain, opts, true)?;
+    let mut result = read_outline_plain(&view.luma, version, region.map(|p| view.to_view(p)), &plain, reads, true)?;
     bring_back(&mut result, &view, enhance);
     Some(result)
 }
@@ -342,7 +439,7 @@ fn read_outline_plain(
     version: SymbolVersion,
     region: [[f64; 2]; 4],
     params: &SampleParams,
-    opts: &DecodeOptions,
+    reads: Reads,
     copy: bool,
 ) -> Option<ReadResult> {
     let variants = variants_of(params);
@@ -357,14 +454,15 @@ fn read_outline_plain(
     let candidates = seated(image, detect_candidates_by(image, version, region, params, climb), params);
     // Each read is one of about as many as there are placements and
     // turns of the photo, times the ways of sampling each.
-    let opts = &opts.among(candidates.len() + 3);
-    let reads_of = |found: &Detection| {
+    let all = reads.among(candidates.len() + 3);
+    let placements: Vec<(&Detection, Reads)> = candidates.iter().zip(all.first_then_past()).collect();
+    let reads_of = |&(found, counted): &(&Detection, Reads)| {
         let mut reads = Vec::new();
         if work::cancelled() {
             return reads;
         }
         if let Some(prepared) = prepare(image, found.clone(), params) {
-            read_placement(image, &prepared, &variants, params, opts, &mut |result| {
+            read_placement(image, &prepared, &variants, params, counted, &mut |result| {
                 let settled = result.is_trustworthy();
                 reads.push(result);
                 settled
@@ -372,7 +470,7 @@ fn read_outline_plain(
         }
         reads
     };
-    if work::first_then_in_turn(&candidates, reads_of, |reads| reads.into_iter().any(|result| consider(&mut best, result))) {
+    if work::first_then_in_turn(&placements, reads_of, |reads| reads.into_iter().any(|result| consider(&mut best, result))) {
         return best;
     }
     // Nothing found in the photo as it is: the detector's own ladder has
@@ -393,10 +491,10 @@ fn read_outline_plain(
         let turned_region = rotate_outline_cw(region, quarters, image.width, image.height);
         let Some(found) = detect_candidates_by(&turned, version, turned_region, params, climb).into_iter().next() else { return reads };
         let Some(prepared) = prepare(&turned, seat(&turned, found, params), params) else { return reads };
-        let opts = &opts.among(variants.len());
+        let turned_reads = all.past().among(variants.len());
         work::first_then_in_turn(
             &variants,
-            |&variant| if work::cancelled() { None } else { read_prepared(&turned, &prepared, variant, params, opts) },
+            |&variant| if work::cancelled() { None } else { read_prepared(&turned, &prepared, variant, params, turned_reads) },
             |result| {
                 let Some(mut result) = result else { return false };
                 unturn(&mut result.detection, quarters, image.width, image.height, region);
@@ -471,10 +569,13 @@ pub fn read_detection(image: &Luma, found: Detection, params: &SampleParams, opt
         _ => params.enhance,
     };
     let mut best: Option<ReadResult> = None;
-    if read_found_through(image, found, around, params, opts, through, &mut best) || work::cancelled() {
+    // The placement found, read every way, and then the search about it,
+    // each read one of those of both ([`Reads`]).
+    let reads = Reads::new(opts).one_of(2);
+    if read_found_through(image, found, around, params, reads, through, &mut best) || work::cancelled() {
         return best;
     }
-    if let Some(again) = read_outline(image, version, around, params, opts)
+    if let Some(again) = read_outline_as(image, version, around, params, reads.past())
         && best.as_ref().is_none_or(|held| again.outranks(held))
     {
         best = Some(again);
@@ -491,7 +592,7 @@ fn read_found_through(
     mut found: Detection,
     around: [[f64; 2]; 4],
     params: &SampleParams,
-    opts: &DecodeOptions,
+    reads: Reads,
     enhance: Enhance,
     best: &mut Option<ReadResult>,
 ) -> bool {
@@ -499,7 +600,7 @@ fn read_found_through(
     let variants = variants_of(&plain);
     if enhance.is_none() {
         return prepare(image, seat(image, found, &plain), &plain)
-            .is_some_and(|prepared| read_placement(image, &prepared, &variants, &plain, opts, &mut |result| consider(best, result)));
+            .is_some_and(|prepared| read_placement(image, &prepared, &variants, &plain, reads, &mut |result| consider(best, result)));
     }
     let Some(view) = Enhanced::around(image, around, enhance) else { return false };
     found.corners = found.corners.map(|c| view.to_view(c));
@@ -508,7 +609,7 @@ fn read_found_through(
     }
     let plain = SampleParams { binarizer: plain.binarizer.scaled(view.factor), ..plain };
     prepare(&view.luma, seat(&view.luma, found, &plain), &plain).is_some_and(|prepared| {
-        read_placement(&view.luma, &prepared, &variants, &plain, opts, &mut |mut result| {
+        read_placement(&view.luma, &prepared, &variants, &plain, reads, &mut |mut result| {
             bring_back(&mut result, &view, enhance);
             consider(best, result)
         })
@@ -542,20 +643,25 @@ const DOUBT_MODULES: f64 = 0.35;
 /// when no read has verified a block, the placement with its most
 /// doubtful anchors dropped, one at a time. The later two are read under
 /// the kernel asked for alone, with every threshold rule: what they
-/// settle does not hang on the kernel.
+/// settle does not hang on the kernel. The first sampling goes on as
+/// the read asked for, and every other read is charged as one of all
+/// these that may be made, the best of which is kept ([`Reads`]): the
+/// reads in mirror order and without anchors once went uncounted.
 fn read_placement(
     image: &Luma,
     prepared: &Prepared,
     variants: &[Variant],
     params: &SampleParams,
-    opts: &DecodeOptions,
+    reads: Reads,
     keep: &mut dyn FnMut(ReadResult) -> bool,
 ) -> bool {
-    let opts = &opts.among(variants.len());
+    let few = variants.len().min(params.rules().count());
+    let reads = reads.among(variants.len() + few + DOUBT_LIMIT * few);
     let mut verified = 0;
+    let samplings: Vec<(Variant, Reads)> = variants.iter().copied().zip(reads.first_then_past()).collect();
     let settled = work::first_then_in_turn(
-        variants,
-        |&variant| if work::cancelled() { None } else { read_prepared(image, prepared, variant, params, opts) },
+        &samplings,
+        |&(variant, reads)| if work::cancelled() { None } else { read_prepared(image, prepared, variant, params, reads) },
         |result| {
             result.is_some_and(|result| {
                 verified = verified.max(result.report.blocks_verified());
@@ -570,7 +676,7 @@ fn read_placement(
         return false;
     }
     // The variants lead with the kernel asked for under each rule.
-    let few = &variants[..variants.len().min(params.rules().count())];
+    let few = &variants[..few];
     let found = &prepared.detection;
     if found.version.family() != Family::Rmqr
         && found.info.format.valid == Some(true)
@@ -578,7 +684,7 @@ fn read_placement(
     {
         let behind = Prepared { detection, agreement: prepared.agreement };
         for &variant in few {
-            if let Some(result) = read_prepared(image, &behind, variant, params, opts)
+            if let Some(result) = read_prepared(image, &behind, variant, params, reads.past())
                 && result.report.blocks_verified() > verified
             {
                 verified = result.report.blocks_verified();
@@ -598,7 +704,7 @@ fn read_placement(
         let Some(k) = doubtful_anchor(&doubted.detection) else { break };
         doubted.detection.anchors.remove(k);
         for &variant in few {
-            if let Some(result) = read_prepared(image, &doubted, variant, params, opts) {
+            if let Some(result) = read_prepared(image, &doubted, variant, params, reads.past()) {
                 verified = verified.max(result.report.blocks_verified());
                 if keep(result) {
                     return true;
@@ -722,9 +828,20 @@ fn prepare(image: &Luma, mut found: Detection, params: &SampleParams) -> Option<
 /// under its threshold rule, with the unsure modules kept at their
 /// colour when it says so, and decode what it reads. `None` for a
 /// variant that keeps the unsure modules when the band left none
-/// unknown: the read would be the one already made.
-fn read_prepared(image: &Luma, prepared: &Prepared, variant: Variant, params: &SampleParams, opts: &DecodeOptions) -> Option<ReadResult> {
+/// unknown: the read would be the one already made. The decode as the
+/// version goes on as the read asked for, and those made after it, as
+/// the other QR Code model, with the padding pinned, and refitted to
+/// the decode as many rounds as that takes, the best of which is kept,
+/// are charged as reads after it ([`Reads`]): they once went uncounted.
+/// Those made under the level and mask it settled are charged besides
+/// for what it picked them among, every level and mask of a brute force
+/// or the rivals of the word the format bits read ([`decode_as`]).
+fn read_prepared(image: &Luma, prepared: &Prepared, variant: Variant, params: &SampleParams, reads: Reads) -> Option<ReadResult> {
     let found = &prepared.detection;
+    let models = 1 + usize::from(found.version.other_model().is_some());
+    // Pinned with the padding too, each of these.
+    let reads = reads.one_of(2 * models * (1 + FEEDBACK_ROUNDS));
+    let (opts, retry) = (&reads.first, &reads.again);
     let func = Arc::new(FunctionMap::new(found.version));
     let projection = found.projection()?;
     let Variant { kernel, rule, unsure_kept } = variant;
@@ -754,16 +871,24 @@ fn read_prepared(image: &Luma, prepared: &Prepared, variant: Variant, params: &S
         && let Some(other) = found.version.other_model()
     {
         let other_func = Arc::new(FunctionMap::new(other));
-        if let Some(again) = decode_as(&grid, &other_func, &analyze(&grid, &other_func), opts)
+        if let Some(again) = decode_as(&grid, &other_func, &analyze(&grid, &other_func), retry)
             && again.score > report.score
         {
             report = again;
             reinterpreted = Some(other);
         }
     }
+    // The level and mask the report was decoded under may be the pick of
+    // many, and the decodes it was charged for say how many: every decode
+    // made under them after it, with the padding pinned or refitted, is a
+    // pick of as many, besides a read after the first. Those decodes were
+    // once charged as reads after the first alone, and stood on as much
+    // as five bits more than the brute force they were made under.
+    let decoded_under = if reinterpreted.is_some() { retry.tries } else { opts.tries };
+    let retry = &retry.one_of(report.tries.div_ceil(decoded_under.max(1)));
     let read_as = Arc::new(FunctionMap::new(reinterpreted.unwrap_or(found.version)));
     let (report, pins) = match SymbolLayout::new(read_as, report.ec) {
-        Some(layout) => with_padding(&grid, &layout, report, opts),
+        Some(layout) => with_padding(&grid, &layout, report, retry),
         None => (report, Pins::new()),
     };
     let result = ReadResult {
@@ -780,7 +905,7 @@ fn read_prepared(image: &Luma, prepared: &Prepared, variant: Variant, params: &S
         sharpen_modules: params.sharpen_modules,
         unsure_kept,
     };
-    Some(if result.is_trustworthy() || work::cancelled() { result } else { refit_by_decode(image, result, &sampling, opts) })
+    Some(if result.is_trustworthy() || work::cancelled() { result } else { refit_by_decode(image, result, &sampling, retry) })
 }
 
 /// A decode that is no read, made again with the padding pinned, when
@@ -1087,12 +1212,15 @@ fn decode_as(grid: &ModuleGrid, func: &Arc<FunctionMap>, analysis: &GridAnalysis
 /// reads well and whose blocks are past correcting costs nothing here.
 ///
 /// A rival stands on its blocks alone, the bits having spoken for
-/// another: on blocks verified with [`AIDED_VERIFIED_BITS`] between
-/// them, which leaves out the sixteen of an M1 symbol, whose every mask
-/// would otherwise be a fresh chance in 65536 for noise to pass. As
-/// [`brute_force`] does, each is decoded without doubting first, which
-/// tells the right mask from the rest when any block of it reads nearly
-/// clean, and only one borne out so is decoded again with it.
+/// another: on a block it verifies, every decode charged as one of the
+/// rivals and the word the bits settled ([`DecodeOptions::among`]), so
+/// that each word tried is the fresh chance for noise to pass that it
+/// is. The blocks verified were once held to three codewords' worth
+/// between them, whatever was tried, which left out the sixteen bits of
+/// an M1 symbol's one block. As [`brute_force`] does, each is decoded
+/// without doubting first, which tells the right mask from the rest
+/// when any block of it reads nearly clean, and only one borne out so
+/// is decoded again with it.
 fn rival_decode(grid: &ModuleGrid, func: &Arc<FunctionMap>, format: &FormatAnalysis, opts: &DecodeOptions) -> Option<DecodeReport> {
     let best = format.best()?;
     let mut rivals: Vec<&FormatCandidate> = format
@@ -1103,9 +1231,7 @@ fn rival_decode(grid: &ModuleGrid, func: &Arc<FunctionMap>, format: &FormatAnaly
         .collect();
     rivals.sort_by_key(|c| (c.best_mismatches, c.best_weight));
     rivals.truncate(RIVALS);
-    let borne_out = |report: &DecodeReport| {
-        report.blocks.iter().filter(|b| b.is_verified()).map(|b| b.outcome.confidence_bits()).sum::<u32>() >= AIDED_VERIFIED_BITS
-    };
+    let borne_out = |report: &DecodeReport| report.blocks_verified() > 0;
     let opts = &opts.among(rivals.len() + 1);
     let two_passes = (opts.reliability && grid.has_reliability()) || opts.erase_by_trial;
     let first_pass = DecodeOptions { reliability: opts.reliability && !two_passes, erase_by_trial: false, ..*opts };
@@ -1144,7 +1270,33 @@ fn unturn(found: &mut Detection, quarters: u8, width: usize, height: usize, regi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::rs::tries_charge;
     use crate::imaging::detect::InfoEvidence;
+
+    #[test]
+    fn every_read_but_the_one_asked_for_is_counted_at_every_turn() {
+        // The read asked for goes uncounted at every turn of the search,
+        // and every other read is one of all those of every turn above it,
+        // a bit more for the share the read asked for leaves the rest.
+        let opts = DecodeOptions::default();
+        let asked = Reads::new(&opts).among(5).one_of(3);
+        assert_eq!((asked.first.tries, asked.again.tries), (1, 2 * 5 * 3));
+        // Past it, the first way tried at each turn beneath is counted as
+        // the rest are: it once went uncounted for its turn, as though it
+        // were the read asked for. So, with every sampling of a turned
+        // photo, which were each counted as the only one.
+        let past = Reads::new(&opts).among(5).past().among(4).one_of(3);
+        assert_eq!((past.first.tries, past.again.tries), (2 * 5 * 4 * 3, 2 * 5 * 4 * 3));
+        // The budgets are shared over every turn alike.
+        assert_eq!(past.first.trial_sets, Reads::new(&opts).among(5).among(4).first.trial_sets);
+        // An outline read as one of three ways, as the families are
+        // ([`read_outline_one_of`]): the first read of the way asked for
+        // goes uncounted, and the first of every other way is counted as
+        // the rest are. Each way's first read once went uncounted.
+        let asked = Reads::new(&opts).one_of(3);
+        let other = asked.past();
+        assert_eq!((asked.first.tries, asked.again.tries, other.first.tries), (1, 2 * 3, 2 * 3));
+    }
 
     /// A version 10 symbol lying square to the photo at eight pixels a
     /// module, with a finder or alignment anchor at each of its patterns,
@@ -1251,25 +1403,39 @@ mod tests {
         assert_ne!(doubtful_anchor(&found), Some(finder));
     }
 
-    /// A version 2 symbol holding `text`, eight pixels a module with four
-    /// modules of paper round it, and its corners in the image.
-    fn drawn(text: &str) -> (Luma, [[f64; 2]; 4]) {
-        use crate::symbol::grid::Module;
+    /// A version `v` symbol at `level` holding `text`, as painted.
+    fn symbol_of(v: u8, level: qrcode_generator::qr::ErrorCorrection, text: &str) -> ModuleGrid {
         use qrcode_generator::{Segment, qr};
-        let symbol = qr::Encoder::new(qr::ErrorCorrection::Low)
-            .version(qr::Version::new(2).unwrap())
+        let symbol = qr::Encoder::new(level)
+            .version(qr::Version::new(v).unwrap())
             .boost_error_correction(false)
             .encode_segments(&[Segment::bytes(text)])
             .unwrap();
-        let grid = ModuleGrid::from_bools(symbol.width(), symbol.height(), symbol.modules());
+        ModuleGrid::from_bools(symbol.width(), symbol.height(), symbol.modules())
+    }
+
+    /// A version 2 symbol holding `text`, eight pixels a module with four
+    /// modules of paper round it, and its corners in the image.
+    fn drawn(text: &str) -> (Luma, [[f64; 2]; 4]) {
+        drawn_grid(&symbol_of(2, qrcode_generator::qr::ErrorCorrection::Low, text))
+    }
+
+    /// `grid` drawn as [`drawn`] draws a symbol, an unknown module the
+    /// grey between ink and paper, and its corners in the image.
+    fn drawn_grid(grid: &ModuleGrid) -> (Luma, [[f64; 2]; 4]) {
+        use crate::symbol::grid::Module;
         let (n, px, margin) = (grid.width(), 8usize, 4usize);
         let side = (n + 2 * margin) * px;
         let mut data = vec![0.92f32; side * side];
         for y in 0..side {
             for x in 0..side {
                 let (mx, my) = ((x / px).wrapping_sub(margin), (y / px).wrapping_sub(margin));
-                if mx < n && my < n && grid.get(mx, my) == Module::Dark {
-                    data[y * side + x] = 0.08;
+                if mx < n && my < n {
+                    match grid.get(mx, my) {
+                        Module::Dark => data[y * side + x] = 0.08,
+                        Module::Unknown => data[y * side + x] = 0.5,
+                        _ => {}
+                    }
                 }
             }
         }
@@ -1305,7 +1471,7 @@ mod tests {
         let read = |found: Detection| {
             let prepared = prepare(&image, found, &params).expect("an outline");
             let variant = Variant { kernel: params.kernel, rule: params.rule(), unsure_kept: false };
-            read_prepared(&image, &prepared, variant, &params, &opts).expect("a decode")
+            read_prepared(&image, &prepared, variant, &params, Reads::new(&opts)).expect("a decode")
         };
 
         // The right way up, a placement is left as it is, and reads.
@@ -1359,6 +1525,72 @@ mod tests {
         // lie on it and is read once.
         let offered = seated(&image, vec![upright.clone(), turned], &params);
         assert_eq!(offered, [upright]);
+    }
+
+    #[test]
+    fn a_decode_under_the_format_a_brute_force_picked_is_charged_for_the_pick() {
+        // A version 3-Q symbol with both copies of its format bits
+        // unreadable, and every padding codeword of the second of its two
+        // blocks and four of that block's error correction codewords too:
+        // its level and mask are the pick of a brute force of every one,
+        // which the first block bears out, and the second, with more
+        // codewords unknown than its eighteen of error correction, solves
+        // only with the padding pinned. That decode is made under the
+        // level and mask the brute force picked, and is the pick of as
+        // many as the decode it follows, besides a read after the first.
+        // It was once charged as a read after the first alone, and stood
+        // five bits above the brute force it was made under.
+        use crate::decode::pipeline::formats;
+        use crate::symbol::EcLevel;
+        use crate::symbol::grid::Module;
+        let text = "hi";
+        let version = SymbolVersion::Qr(3);
+        let func = Arc::new(FunctionMap::new(version));
+        let layout = SymbolLayout::new(func.clone(), EcLevel::Q).unwrap();
+        assert_eq!(layout.blocks.len(), 2);
+        let mut grid = symbol_of(3, qrcode_generator::qr::ErrorCorrection::Quartile, text);
+        let unread = |grid: &mut ModuleGrid, at: &[crate::symbol::Pos]| {
+            for at in at {
+                grid.set(at.x as usize, at.y as usize, Module::Unknown);
+            }
+        };
+        for copy in &func.format {
+            unread(&mut grid, &copy.bits);
+        }
+        // The block's data after the first two codewords, "hi" lying in
+        // the stream's first four, is padding.
+        let second = &layout.blocks[1];
+        for &cw in second.codewords[2..second.data_len].iter().chain(&second.codewords[second.data_len..second.data_len + 4]) {
+            unread(&mut grid, layout.codeword_modules(cw));
+        }
+        let (image, square) = drawn_grid(&grid);
+        let n = version.width() as f64;
+        let at_px = |[x, y]: [f64; 2]| [square[0][0] + 8.0 * x, square[0][1] + 8.0 * y];
+        let anchor = |kind: AnchorKind, at: [f64; 2]| Anchor { kind, at, center: at_px(at), partial: false, inferred: false };
+        let found = Detection {
+            corners: square,
+            version,
+            anchors: vec![
+                anchor(AnchorKind::Finder, [3.5, 3.5]),
+                anchor(AnchorKind::Finder, [n - 3.5, 3.5]),
+                anchor(AnchorKind::Finder, [3.5, n - 3.5]),
+                anchor(AnchorKind::Alignment, [n - 6.5, n - 6.5]),
+            ],
+            ..placed()
+        };
+        // Read against one threshold, and unsharpened, a grey module is
+        // unknown whatever lies beside it.
+        let params = SampleParams { threshold: Some(0.5), local: false, sharpen_modules: false, ..SampleParams::default() };
+        let opts = DecodeOptions::default();
+        let prepared = prepare(&image, found, &params).expect("an outline");
+        let variant = Variant { kernel: params.kernel, rule: params.rule(), unsure_kept: false };
+        let read = read_prepared(&image, &prepared, variant, &params, Reads::new(&opts)).expect("a decode");
+        assert!(!read.analysis.format.is_reliable());
+        assert!(read.is_trustworthy() && !read.pins.is_empty(), "{:?}", read.report.blocks);
+        assert_eq!(read.text(), text);
+        let models = 1 + usize::from(version.other_model().is_some());
+        let after = Reads::new(&opts).one_of(2 * models * (1 + FEEDBACK_ROUNDS)).again;
+        assert_eq!(read.report.tries, after.tries * formats(&func));
     }
 
     #[test]
@@ -1437,9 +1669,11 @@ mod tests {
         assert_eq!((report.ec, report.mask, report.blocks_verified()), (ec, mask, 0));
 
         // An M1 symbol's two check codewords are sixteen bits whatever
-        // the mask, and no mask but the one its bits settle is taken on
-        // them: with the bits misread toward another mask's word it is
-        // left unread, as it was.
+        // the mask. With the bits misread toward another mask's word,
+        // its own mask is among the rivals, and its block bears it out
+        // by those sixteen bits less a bit for each doubling of the
+        // words tried, each a chance of noise passing. It was once left
+        // unread, the blocks of a rival held to three codewords' worth.
         use qrcode_generator::micro;
         let m1 = micro::Encoder::new(micro::ErrorCorrection::DetectionOnly)
             .version(micro::Version::M1)
@@ -1465,8 +1699,11 @@ mod tests {
             let analysis = analyze(&grid, &func);
             assert!(analysis.format.is_reliable(), "{fields:?}");
             assert_eq!(analysis.format.best().map(|best| best.fields.mask), Some(fields.mask));
-            assert!(rival_decode(&grid, &func, &analysis.format, &opts).is_none(), "{fields:?}");
-            assert!(!decode_as(&grid, &func, &analysis, &opts).unwrap().is_trustworthy(), "{fields:?}");
+            let rival = rival_decode(&grid, &func, &analysis.format, &opts).unwrap_or_else(|| panic!("{fields:?}"));
+            assert!(rival.is_trustworthy() && rival.text.plain() == "12345" && (rival.ec, rival.mask) == (EcLevel::L, 1), "{fields:?}");
+            let risk = rival.blocks[0].outcome.risk_bits();
+            assert!((16 - tries_charge(RIVALS + 1)..16).contains(&risk), "{fields:?}: {risk}");
+            assert!(decode_as(&grid, &func, &analysis, &opts).unwrap().is_trustworthy(), "{fields:?}");
             others += 1;
         }
         assert_eq!(others, 3);

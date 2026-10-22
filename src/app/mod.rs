@@ -20,7 +20,7 @@ use qr_forensics::decode::list::{LIST_COST, hard_reach, usable_cost};
 use qr_forensics::decode::padding::{Filler, clear_padding_pins, detect_padding, pin_padding_at, recover_padding};
 use qr_forensics::decode::pipeline::{
     Attempt, BlockOutcome, BlockReport, DecodeOptions, Harder, analyze, brute_force_mirrored_whole, brute_force_whole, decode, decode_keeping,
-    decode_trying_harder, orientation_of,
+    decode_trying_harder, formats, orientation_of, verifying_bits,
 };
 use qr_forensics::decode::repair::{quiet_zone, render_rgba, render_svg, repaired_grid};
 use qr_forensics::decode::rs::{TrialReach, trial_reach};
@@ -33,7 +33,7 @@ use qr_forensics::imaging::detect::{
     Anchor, AnchorKind, AnchorSite, Detection, Lead, SEARCH_SIDE, SearchParams, anchor_sites, decodes_as_found,
     detect_candidates, refine_anchors, search_for_families, settle_loose_corners,
 };
-use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline};
+use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline, read_outline_one_of};
 use qr_forensics::imaging::refine::{Refinement, refine_corners, refine_corners_holding};
 use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::enhance::{Enhance, Sharpen};
@@ -506,7 +506,13 @@ pub struct App {
 /// its attempts are returned as well; while `settle` is false the previous
 /// choice is carried over instead, which keeps a brush stroke responsive.
 /// The blocks searched harder are taken from `harder` where it holds for
-/// the level and mask chosen.
+/// the level and mask chosen. Every decode is charged as one of those the
+/// document's grid was picked among ([`Document::picked`]), and for what
+/// each pin it is made under was picked among where the pin reaches
+/// ([`qr_forensics::decode::codewords::Pin::among`]), and the decode
+/// under the level and mask a brute force chose as one of those it
+/// tried ([`decoding_options`]): it once went uncharged for them, and
+/// stood on more than the attempt it was the pick of.
 fn derive(
     doc: &Document,
     previous: Option<&Derived>,
@@ -514,6 +520,7 @@ fn derive(
     harder: Option<&KeptHarder>,
     settle: bool,
 ) -> (Derived, Option<Vec<Attempt>>) {
+    let picked = doc.picked(opts);
     let func = match previous {
         Some(old) if old.func.version == doc.version => old.func.clone(),
         _ => Arc::new(FunctionMap::new(doc.version)),
@@ -535,7 +542,7 @@ fn derive(
             }
             _ => {
                 let pins = doc.pins_ec.map(|level| (level, &doc.pins));
-                let tried = brute_force_whole(&doc.grid, &func, pins, opts);
+                let tried = brute_force_whole(&doc.grid, &func, pins, &picked);
                 let (ec, mask) = tried.first().map_or((levels[0], 0), |a| (a.ec, a.mask));
                 attempts = Some(tried);
                 (ec, mask, true)
@@ -550,9 +557,10 @@ fn derive(
     // other they would land on the wrong codewords.
     let no_pins = Pins::new();
     let pins = if doc.pins_ec == Some(ec) { &doc.pins } else { &no_pins };
+    let decoding = decoding_options(&picked, format_by_brute, &func);
     let no_harder = Harder::default();
-    let harder = harder.filter(|kept| kept.holds(doc.version, ec, mask, opts)).map_or(&no_harder, |kept| &kept.searched);
-    let report = decode_keeping(&doc.grid, &layout, mask, pins, opts, harder);
+    let harder = harder.filter(|kept| kept.holds(doc.version, ec, mask, &decoding)).map_or(&no_harder, |kept| &kept.searched);
+    let report = decode_keeping(&doc.grid, &layout, mask, pins, &decoding, harder);
     let padding = if report.is_complete() { None } else { detect_padding(&layout, &report) };
     // When nothing decodes and the format bits could not say the grid is
     // a mirror image, try its mirror images outright, as ZXing and ZBar
@@ -566,13 +574,22 @@ fn derive(
         && analysis.mirrored.is_none()
         && doc.grid.count(Module::Unknown) < doc.grid.cells().len())
     .then(|| {
-        let best = brute_force_mirrored_whole(&doc.grid, &func, opts).into_iter().next()?;
+        let best = brute_force_mirrored_whole(&doc.grid, &func, &picked).into_iter().next()?;
         let better = best.report.blocks_verified() > report.blocks_verified()
             && (best.report.is_trustworthy() || best.report.blocks_verified() * 2 > best.report.blocks.len());
         better.then_some(best.mirror).flatten()
     })
     .flatten();
     (Derived { func, analysis, ec, mask, layout, report, padding, format_by_brute, mirror_by_decode }, attempts)
+}
+
+/// The options a document is decoded under, from `opts` with the
+/// decodes it was picked among counted already ([`derive`]): counted too
+/// as one of the levels and masks a brute force tried, where that is
+/// what settled the format ([`formats`]), since the decode is the pick
+/// of them.
+fn decoding_options(opts: &DecodeOptions, format_by_brute: bool, func: &FunctionMap) -> DecodeOptions {
+    if format_by_brute { opts.one_of(formats(func)) } else { *opts }
 }
 
 impl App {
@@ -1529,12 +1546,31 @@ impl App {
         let grid = self.doc.grid.clone();
         let layout = self.derived.layout.clone();
         let pins = self.active_pins();
-        let (version, ec, mask, opts) = (self.doc.version, self.derived.ec, self.derived.mask, self.opts);
+        let (version, ec, mask, opts) = (self.doc.version, self.derived.ec, self.derived.mask, self.decoding_options());
         let kept = self.harder.as_ref().filter(|kept| kept.holds(version, ec, mask, &opts)).map(|kept| kept.searched.clone()).unwrap_or_default();
         self.start_job(ctx, JobKind::TryHarder(block), move || {
             let (_, searched) = decode_trying_harder(&grid, &layout, mask, &pins, &opts, &kept, &[block]);
             JobResult::Harder { block, read, kept: KeptHarder { version, ec, mask, opts, searched } }
         });
+    }
+
+    /// The options the document is decoded under as derived: the decode
+    /// options, counted as one of the decodes the document was picked
+    /// among and of those that settled its format ([`decoding_options`]).
+    /// What a decode made beside the derived one, of a block searched
+    /// harder or of pins tried, is made under, so that it is charged as
+    /// the derived one is.
+    fn decoding_options(&self) -> DecodeOptions {
+        decoding_options(&self.doc.picked(&self.opts), self.derived.format_by_brute, &self.derived.func)
+    }
+
+    /// The options the document would be decoded under at `level`: as
+    /// derived at the level in effect ([`Self::decoding_options`]), and at
+    /// another, which only a format set by hand reaches, the decode
+    /// options counted as one of the decodes the document was picked
+    /// among.
+    fn options_at(&self, level: EcLevel) -> DecodeOptions {
+        if level == self.derived.ec { self.decoding_options() } else { self.doc.picked(&self.opts) }
     }
 
     /// What `block` of the layout in effect is read from in the document
@@ -1567,7 +1603,7 @@ impl App {
         // The derived values of the document as it is now: it may have
         // changed while the block was searched.
         self.catch_up();
-        if !kept.holds(self.doc.version, self.derived.ec, self.derived.mask, &self.opts) {
+        if !kept.holds(self.doc.version, self.derived.ec, self.derived.mask, &self.decoding_options()) {
             self.notify(format!(
                 "The version, EC level, mask or decoding options changed while block {n} was being searched, so the \
                  result was dropped. Press Try harder again."
@@ -2160,7 +2196,15 @@ impl App {
         let func = if self.derived.func.version == version { self.derived.func.clone() } else { Arc::new(FunctionMap::new(version)) };
         let mut grid = read.grid;
         func.fill_fixed(&mut grid);
-        self.doc = Document { grid, pins: read.pins, pins_ec, format, ..self.doc.blank_like(version) };
+        // The read is the pick of every read its search made, and the
+        // grid and pins with it: a decode of them is one of as many. A
+        // brute force of the format among them is made again by the
+        // decode of the document where the format bits cannot settle it,
+        // and counted there. The padding pins it took carry what they
+        // were picked among besides, the passes of their recovery.
+        let brute = format == FormatSel::Auto && !analyze(&grid, &func).format.is_reliable();
+        let grid_among = read.report.tries.div_ceil(if brute { formats(&func) } else { 1 }).max(1);
+        self.doc = Document { grid, pins: read.pins, pins_ec, grid_among, format, ..self.doc.blank_like(version) };
         self.view.selected = None;
         self.view.highlight_block = None;
         self.view.table_block = None;
@@ -2638,6 +2682,11 @@ impl App {
                         None => self.doc.grid.set(x, y, module),
                     }
                 }
+                // Sampled whole, the grid is the sampling asked for, and
+                // no longer the pick of a search.
+                if whole && !only_unknown {
+                    self.doc.grid_among = 1;
+                }
                 // Inverting the photo above refreshed what follows from
                 // the document, and cleared the mark `begin_edit` made:
                 // the grid as sampled is what is to be derived from now.
@@ -2782,7 +2831,7 @@ impl App {
                     &self.doc.grid,
                     &self.derived.func,
                     Some((self.derived.ec, &pins)),
-                    &self.opts,
+                    &self.doc.picked(&self.opts),
                 );
                 self.brute = Some(BruteResults { attempts, stale: false });
             }
@@ -2804,7 +2853,7 @@ impl App {
                 if mask == 0 {
                     self.doc.pins.remove(&cw);
                 } else {
-                    self.doc.pins.insert(cw, Pin { mask, value: value & mask, source: PinSource::Manual });
+                    self.doc.pins.insert(cw, Pin::new(mask, value & mask, PinSource::Manual));
                 }
             }
             Action::Unpin(cw) => {
@@ -2835,11 +2884,16 @@ impl App {
                 }
                 let before = self.derived.report.blocks_solved();
                 self.begin_edit();
+                // Pinned by hand over the pins in force, or, where those
+                // were made under another level, in place of them.
                 self.doc.pins = pins;
                 self.doc.pins_ec = Some(self.derived.ec);
                 // Pinned, the start is the decode's to say again.
                 self.view.pad_from = None;
-                let after = decode(&self.doc.grid, &self.derived.layout, self.derived.mask, &self.doc.pins, &self.opts).blocks_solved();
+                // Under the options the document is derived under, so
+                // that the count is the derived decode's.
+                let opts = self.decoding_options();
+                let after = decode(&self.doc.grid, &self.derived.layout, self.derived.mask, &self.doc.pins, &opts).blocks_solved();
                 let total = self.derived.layout.blocks.len();
                 let progress = if after > before {
                     format!("{after} of {total} blocks solved, up from {before}")
@@ -2854,8 +2908,8 @@ impl App {
             }
             Action::ApplyPadding => {
                 let pins = self.active_pins();
-                let recovery =
-                    recover_padding(&self.doc.grid, &self.derived.layout, self.derived.mask, &pins, &self.opts);
+                let opts = self.decoding_options();
+                let recovery = recover_padding(&self.doc.grid, &self.derived.layout, self.derived.mask, &pins, &opts);
                 match recovery {
                     Some(recovery) => {
                         self.begin_edit();
@@ -3069,7 +3123,8 @@ impl App {
     fn pin_a_beginning(&mut self) {
         let pins = self.active_pins();
         let (before, total) = (self.derived.report.blocks_verified(), self.derived.report.blocks.len());
-        let found = try_beginnings(&self.doc.grid, &self.derived.layout, self.derived.mask, &pins, &self.opts, &self.derived.report);
+        let opts = self.decoding_options();
+        let found = try_beginnings(&self.doc.grid, &self.derived.layout, self.derived.mask, &pins, &opts, &self.derived.report);
         let Some(found) = found else {
             self.fail(
                 "None of the common beginnings made a block verify that had not: either the message begins some other \
@@ -3553,9 +3608,11 @@ pub(crate) struct Reach {
     pub trials_within: usize,
 }
 
-/// What [`Reach::of`] depends on: the version, the level, and the
-/// budgets of list decoding and of the trials.
-type ReachKey = (SymbolVersion, EcLevel, usize, usize);
+/// What [`Reach::of`] depends on: the version, the level, the budgets
+/// of list decoding and of the trials, and what a fallback's solution
+/// must show to be verified ([`verifying_bits`]), which the solvers
+/// switched on and the decodes the document was picked among set.
+type ReachKey = (SymbolVersion, EcLevel, usize, usize, u32);
 
 /// Reaches [`App::reach`] keeps, at the most, the oldest forgotten first:
 /// a level for each of a few versions, and the budgets a slider passes
@@ -3563,15 +3620,21 @@ type ReachKey = (SymbolVersion, EcLevel, usize, usize);
 const REACHES_KEPT: usize = 16;
 
 impl App {
-    /// [`Reach::of`] at the decode options' budgets, worked out once for
-    /// each version, level and budgets asked about.
+    /// [`Reach::of`] under the options the document would be decoded
+    /// under at `level` ([`Self::options_at`]), worked out once for each
+    /// version, level, budgets and verification asked about. It was once
+    /// worked out under the decode options alone, uncounted for the
+    /// decodes a grid read from a photo was picked among, and kept while
+    /// a solver was switched on or off, which moves what a fallback's
+    /// solution must show.
     pub(crate) fn reach(&self, version: SymbolVersion, level: EcLevel) -> Option<Reach> {
-        let key = (version, level, self.opts.list_cost, self.opts.trial_sets);
+        let opts = self.options_at(level);
+        let key = (version, level, opts.list_cost, opts.trial_sets, verifying_bits(version, &opts.first_stage(), false));
         let mut reaches = self.reaches.borrow_mut();
         if let Some((_, reach)) = reaches.iter().find(|(k, _)| *k == key) {
             return *reach;
         }
-        let reach = Reach::of(version, level, &self.opts);
+        let reach = Reach::of(version, level, &opts);
         if reaches.len() == REACHES_KEPT {
             reaches.remove(0);
         }
@@ -3585,7 +3648,13 @@ impl Reach {
         let shape = block_shape(version, level)?;
         let ec = shape.ec_per_block;
         let lengths = (shape.data_len(0) + ec, shape.data_len(shape.blocks - 1) + ec);
-        let list = |cost| hard_reach(lengths.0, ec, cost).min(hard_reach(lengths.1, ec, cost));
+        // A block read certain, as one painted by hand is, verified by
+        // what it must show charged for what found it, in the first stage
+        // of the decode, which list decoding is first run in and which
+        // makes the fewest decodes and searches besides it
+        // ([`DecodeOptions::stages`]).
+        let needed = verifying_bits(version, &opts.first_stage(), false);
+        let list = |cost| hard_reach(lengths.0, ec, cost, needed).min(hard_reach(lengths.1, ec, cost, needed));
         let reserved = misdecode_protection(version, level);
         let trials = trial_reach(lengths.1, ec, opts.trial_sets);
         Some(Self {
@@ -3737,6 +3806,10 @@ fn read_inside(
 /// the whole symbol. Of the reads that did not decode, the one asked
 /// about and any other that passed that bar, the one with the most to
 /// show for itself is kept: see [`standing`].
+///
+/// Each family's read is one of the families' ([`read_outline_one_of`]):
+/// the first of `version`'s goes uncounted, as the read asked for, and
+/// every other is charged as one of all the families make.
 pub(crate) fn read_outline_of_any_family(
     luma: &Luma,
     version: SymbolVersion,
@@ -3744,19 +3817,23 @@ pub(crate) fn read_outline_of_any_family(
     params: &SampleParams,
     opts: &DecodeOptions,
 ) -> Option<(ReadResult, Option<Family>)> {
-    let own = read_outline(luma, version, corners, params, opts);
+    let current = version.family();
+    let others: Vec<Family> = Family::SEARCHED.into_iter().filter(|&f| f != current).collect();
+    let ways = 1 + others.len();
+    let own = read_outline_one_of(luma, version, corners, params, opts, ways, true);
     if own.as_ref().is_some_and(ReadResult::is_trustworthy) {
         return own.map(|read| (read, None));
     }
-    let current = version.family();
     let mut best: Option<(ReadResult, Option<Family>)> = own.map(|read| (read, None));
     // The other families side by side, the read asked for having come to
     // nothing, and each taken in the families' order.
-    let others: Vec<Family> = Family::SEARCHED.into_iter().filter(|&f| f != current).collect();
     let mut decoded = None;
     work::in_turn(
         &others,
-        |&family| (family, if work::cancelled() { None } else { read_outline(luma, family_start(family), corners, params, opts) }),
+        |&family| {
+            let read = if work::cancelled() { None } else { read_outline_one_of(luma, family_start(family), corners, params, opts, ways, false) };
+            (family, read)
+        },
         |(family, read)| {
             let Some(read) = read else { return false };
             let vouched = read.is_trustworthy()
@@ -7205,7 +7282,7 @@ mod tests {
         // others, which changes nothing of the decode.
         bench.act(Action::PinBits { cw, mask: 0xF0, value });
         bench.step();
-        assert_eq!(bench.app.doc.pins.get(&cw), Some(&Pin { mask: 0xF0, value: value & 0xF0, source: PinSource::Manual }));
+        assert_eq!(bench.app.doc.pins.get(&cw), Some(&Pin::new(0xF0, value & 0xF0, PinSource::Manual)));
         assert_eq!(bench.app.doc.pins_ec, Some(bench.app.derived.ec));
         assert!(bench.app.derived.report.is_trustworthy());
         // One of them pinned the other way contradicts the only
@@ -7229,6 +7306,52 @@ mod tests {
         // One undo for each.
         bench.act(Action::Undo);
         assert_eq!(bench.app.doc.pins.get(&cw).map(|pin| pin.value), Some((value ^ 0x80) & 0xF0));
+    }
+
+    #[test]
+    fn each_pin_is_charged_for_what_it_was_picked_among_until_it_goes() {
+        let mut bench = Bench::new();
+        bench.act(Action::ClosePhoto);
+        bench.hold(symbol_of("hi"));
+        assert!(bench.app.derived.report.is_trustworthy());
+        let ec = bench.app.derived.ec;
+        let value = |bench: &Bench, cw: usize| bench.app.derived.report.codewords[cw].final_value.expect("a clean symbol");
+        let (first, last) = (bench.app.derived.layout.data_stream[0], bench.app.derived.layout.data_stream[50]);
+        let picked = |bench: &mut Bench| {
+            bench.app.refresh();
+            bench.app.derived.report.pin_tries
+        };
+        // A beginning tried and pinned as text, the pick of a thousand
+        // ways, beside a pin typed by hand, and then cleared: the pin
+        // typed by hand that is left was picked among nothing. It once
+        // kept the beginning's count.
+        let text = Pin { among: 1000, ..Pin::full(value(&bench, first), PinSource::Text) };
+        bench.app.doc.pins = [(first, text), (last, Pin::full(value(&bench, last), PinSource::Manual))].into();
+        bench.app.doc.pins_ec = Some(ec);
+        assert_eq!(picked(&mut bench), 1000);
+        bench.act(Action::ClearTextPins);
+        assert_eq!((bench.app.doc.pins.len(), picked(&mut bench)), (1, 1));
+        // Padding recovered under the beginning was the pick of it too,
+        // and keeps its count with the beginning gone.
+        let padding = Pin { among: 1000 * 6, ..Pin::full(value(&bench, last), PinSource::Padding) };
+        bench.app.doc.pins = [(first, text), (last, padding)].into();
+        bench.act(Action::ClearTextPins);
+        assert_eq!((bench.app.doc.pins.len(), picked(&mut bench)), (1, 6000));
+        // With the padding cleared, a codeword pinned by hand is picked
+        // among nothing. It once took the padding's count.
+        bench.act(Action::ClearPaddingPins);
+        assert!(bench.app.doc.pins.is_empty());
+        bench.act(Action::Pin(first, value(&bench, first)));
+        assert_eq!((bench.app.doc.pins.len(), picked(&mut bench)), (1, 1));
+        // Pins made under another level give way to padding pinned by
+        // hand, which was picked among nothing.
+        let other = *bench.app.derived.func.version.ec_levels().iter().find(|&&level| level != ec).expect("another level");
+        bench.app.doc.pins = [(first, text)].into();
+        bench.app.doc.pins_ec = Some(other);
+        bench.act(Action::PinPaddingAt { first: 4, filler: Filler::Standard });
+        assert_eq!(bench.app.doc.pins_ec, Some(ec));
+        assert!(bench.app.doc.pins.values().all(|pin| pin.among == 1));
+        assert_eq!(picked(&mut bench), 1);
     }
 
     #[test]
@@ -7401,6 +7524,43 @@ mod tests {
     }
 
     #[test]
+    fn the_reach_said_is_charged_as_the_document_is_decoded() {
+        // A version 1 grid at level H, a block of 26 codewords with 17 of
+        // error correction, painted by hand: a solution the curve finds
+        // eleven codewords out, confirmed by twenty-five bits, has the
+        // eleven a fallback's must show in the search of the block as
+        // read, and more.
+        let (version, level) = (SymbolVersion::Qr(1), EcLevel::H);
+        let mut app = App::blank();
+        app.doc = Document { format: FormatSel::Manual { ec: level, mask: 0 }, ..Document::blank(version) };
+        app.refresh();
+        let reach = |app: &App| app.reach(version, level).expect("a level of the version").list;
+        let fresh = |app: &App| Reach::of(version, level, &app.options_at(level)).expect("a level of the version").list;
+        let painted = reach(&app);
+        assert!(painted >= 11, "{painted}");
+        // Read from a photo as the pick of sixty-five thousand decodes: a
+        // fallback's solution must show sixteen bits more, and eleven out
+        // no longer has them. The reach was once said of the grid as
+        // though painted.
+        app.doc.grid_among = 1 << 16;
+        assert_eq!((reach(&app), fresh(&app)), (10, 10));
+        // The solvers that go by reliability find nothing in a block
+        // painted by hand, and switched off they charge a solution nothing
+        // less; nor does the message prior, whose searches follow the
+        // block as read and take none of its share
+        // ([`qr_forensics::decode::pipeline::verifying_bits`]).
+        app.opts = DecodeOptions { doubt_codewords: false, doubt_bits: false, flip_bits: false, belief_propagation: false, ..app.opts };
+        assert_eq!((reach(&app), fresh(&app)), (10, 10));
+        app.opts = DecodeOptions { message_evidence: false, ..app.opts };
+        assert_eq!((reach(&app), fresh(&app)), (10, 10));
+        // The pick of a quarter as many, a solution is charged two bits
+        // less: eleven out is in reach again. The reach was once kept as
+        // it was worked out under what was charged before.
+        app.doc.grid_among = 1 << 14;
+        assert_eq!((reach(&app), fresh(&app)), (11, 11));
+    }
+
+    #[test]
     fn the_notes_on_reach_are_of_the_symbol_in_hand() {
         let mut bench = Bench::new();
         bench.size = egui::vec2(1440.0, 3000.0);
@@ -7414,13 +7574,15 @@ mod tests {
         // past that: the pairs erased by trial reach five within the
         // standard's limit, which plain decoding reaches first by spending
         // the two, and the trials never see such a block. It was once said
-        // that they reach five.
+        // that they reach five. The curve reaches five as plain decoding
+        // does, spending the two as well.
         assert!(painted(&bench, "Corrects up to 4 wrong codewords or 8 unknown."), "{:?}", bench.texts());
         assert!(
             painted(
                 &bench,
-                "No gain at level L: in this symbol's block of 44 codewords, it's guaranteed to correct 4 wrong \
-                 codewords, the same as plain Reed-Solomon."
+                "No gain at level L: in this symbol's block of 44 codewords, it's guaranteed to correct 5 wrong \
+                 codewords, the same as plain Reed-Solomon. Past 4, both use the reserved error-detection codewords, \
+                 so neither is confirmed."
             ),
             "{:?}",
             bench.texts()
