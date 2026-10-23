@@ -33,7 +33,7 @@
 //! the code off it, which reaches further than any trial of small sets.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::LazyLock;
 
@@ -392,61 +392,111 @@ pub const SOFT_COUNT_REACH: u32 = 4096;
 /// were read make the right codeword lie far off, and go unconfirmed;
 /// they never make a wrong one lie near.
 pub fn soft_count_bits(block: &[CwRead], bit_reliability: &[[u8; 8]], redundancy_bits: usize, distance: u32) -> u32 {
+    soft_count_reaching(block, bit_reliability, redundancy_bits, distance, 0).unwrap_or(0)
+}
+
+/// Cost of a bit, in eighths of a bit, that the rough count of
+/// [`soft_count_reaching`] rounds every cost up to a multiple of.
+const ROUGH_COST: usize = 8;
+
+/// Bits taken into a count of sets between each look at whether it has
+/// grown past what the count is asked to come to ([`soft_count_reaching`]).
+const LOOK_EVERY: usize = 16;
+
+/// [`soft_count_bits`] where it comes to `needed` or more, and `None`
+/// where it falls short, as soon as that shows: the sets within reach
+/// only grow as the bits are taken in, so a count already too large to
+/// leave `needed` stays so. The sets are counted first with every cost
+/// rounded up to a multiple of [`ROUGH_COST`], and the reach down: a set
+/// within the rough reach is within the reach, so the rough count is
+/// never the more, a few hundred counts where the reach has thousands,
+/// and a codeword far from the block as read, which noise lies within
+/// reach of many codewords of, is refused on it. Nothing is refused
+/// that the whole count would have offered: what it says is lowered by
+/// a hair against the rounding, a millionth of a bit where the counts
+/// are wrong by a millionth of that. `needed` of nought asks for the
+/// whole count, every time.
+fn soft_count_reaching(block: &[CwRead], bit_reliability: &[[u8; 8]], redundancy_bits: usize, distance: u32, needed: u32) -> Option<u32> {
     if distance > SOFT_COUNT_REACH {
-        return 0;
+        return (needed == 0).then_some(0);
     }
     let reach = distance as usize;
+    let choice = (255f64 / 254.0).log2();
+    let short = |volume: f64| needed > 0 && redundancy_bits as f64 - volume - choice < f64::from(needed) - 1e-6;
+    let costs = || {
+        block
+            .iter()
+            .zip(bit_reliability)
+            .flat_map(|(cw, reliability)| {
+                (0..8).filter(move |&b| cw.known >> b & 1 != 0 && cw.pinned >> b & 1 == 0).map(move |b| bit_cost(reliability[b]) as usize)
+            })
+            .filter(move |&cost| cost <= reach)
+    };
+    if needed > 0 {
+        let rough = sets_within(costs().map(|cost| cost.div_ceil(ROUGH_COST)), reach / ROUGH_COST, &short)?;
+        if short(rough) {
+            return None;
+        }
+    }
+    let volume = sets_within(costs(), reach, &short)?;
+    Some((redundancy_bits as f64 - volume - (255f64 / 254.0).log2()).max(0.0).floor() as u32)
+}
+
+/// The log of how many sets of bits costing `costs` cost `reach` or
+/// less, by dynamic programming over the costs ([`soft_count_bits`]);
+/// `None` once a look at the count, every [`LOOK_EVERY`] bits, finds it
+/// `short`.
+fn sets_within(costs: impl Iterator<Item = usize>, reach: usize, short: &impl Fn(f64) -> bool) -> Option<f64> {
     // ways[d]: how many sets of the bits seen so far cost exactly d,
     // scaled down by 2^scaled whenever they grow large.
     let mut ways = vec![0f64; reach + 1];
     ways[0] = 1.0;
     let mut scaled = 0i64;
-    for (cw, reliability) in block.iter().zip(bit_reliability) {
-        for (b, &reliability) in reliability.iter().enumerate() {
-            if cw.known >> b & 1 == 0 || cw.pinned >> b & 1 != 0 {
-                continue;
+    // No count is larger than this: a bit at most doubles the largest. The
+    // largest itself is looked for only once this passes the scale, and
+    // the counts are scaled exactly where they were when it was looked for
+    // after every bit, without a comparison an addition to hold the
+    // additions back.
+    let mut bound = 1f64;
+    let volume = |ways: &[f64], scaled: i64| ways.iter().sum::<f64>().log2() + scaled as f64;
+    for (taken, cost) in costs.enumerate() {
+        if cost == 0 {
+            // In every set or out of it for nothing: every count
+            // doubles.
+            for w in &mut ways {
+                *w *= 2.0;
             }
-            let cost = bit_cost(reliability) as usize;
-            if cost > reach {
-                continue;
-            }
-            let mut peak = 0f64;
-            if cost == 0 {
-                // In every set or out of it for nothing: every count
-                // doubles.
-                for w in &mut ways {
-                    *w *= 2.0;
-                    peak = peak.max(*w);
+        } else {
+            // `ways[d] += ways[d - cost]` from the top down, which
+            // reads only counts not yet added to: so done a stretch
+            // of `cost` at a time, each stretch from the one below
+            // it, which it does not overlap.
+            let mut end = reach + 1;
+            while end > cost {
+                let start = (end - cost).max(cost);
+                let (below, from) = ways.split_at_mut(start);
+                for (w, &add) in from[..end - start].iter_mut().zip(&below[start - cost..end - cost]) {
+                    *w += add;
                 }
-            } else {
-                // `ways[d] += ways[d - cost]` from the top down, which
-                // reads only counts not yet added to: so done a stretch
-                // of `cost` at a time, each stretch from the one below
-                // it, which it does not overlap. The counts below `cost`
-                // are as they were, and were no larger than the bound the
-                // last time round.
-                let mut end = reach + 1;
-                while end > cost {
-                    let start = (end - cost).max(cost);
-                    let (below, from) = ways.split_at_mut(start);
-                    for (w, &add) in from[..end - start].iter_mut().zip(&below[start - cost..end - cost]) {
-                        *w += add;
-                        peak = peak.max(*w);
-                    }
-                    end = start;
-                }
+                end = start;
             }
-            if peak > 2f64.powi(500) {
+        }
+        bound *= 2.0;
+        if bound > 2f64.powi(500) {
+            bound = ways.iter().copied().fold(0f64, f64::max);
+            if bound > 2f64.powi(500) {
                 for w in &mut ways {
                     *w *= 2f64.powi(-500);
                 }
                 scaled += 500;
+                bound *= 2f64.powi(-500);
             }
         }
+        if taken % LOOK_EVERY == LOOK_EVERY - 1 && short(volume(&ways, scaled)) {
+            return None;
+        }
     }
-    let total: f64 = ways.iter().sum();
-    let volume = total.log2() + scaled as f64;
-    (redundancy_bits as f64 - volume - (255f64 / 254.0).log2()).max(0.0).floor() as u32
+    Some(volume(&ways, scaled))
 }
 
 /// Whether a solver that tries many ways offers a solution it found:
@@ -470,8 +520,17 @@ pub(super) struct Offering<'a> {
     block: &'a [CwRead],
     bit_reliability: &'a [[u8; 8]],
     redundancy_bits: usize,
-    counted: HashMap<Vec<u8>, u32>,
+    counted: HashMap<Vec<u8>, Counted>,
     seen: &'a mut Sightings,
+}
+
+/// The soft count of a codeword an [`Offering`] was asked about: the
+/// whole of it, or that it fell short of a figure, where the count
+/// stopped as soon as it did ([`soft_count_reaching`]).
+#[derive(Clone, Copy)]
+enum Counted {
+    Exactly(u32),
+    ShortOf(u32),
 }
 
 impl<'a> Offering<'a> {
@@ -505,16 +564,18 @@ impl<'a> Offering<'a> {
         if confidence >= VERIFIED_BITS {
             return true;
         }
+        let needed = charge + 1 + VERIFIED_BITS;
         let soft = match self.counted.get(corrected) {
-            Some(&soft) => soft,
-            None => {
+            Some(&Counted::Exactly(soft)) => Some(soft),
+            Some(&Counted::ShortOf(short_of)) if needed >= short_of => None,
+            _ => {
                 let distance = soft_distance(self.block, self.bit_reliability, corrected);
-                let soft = soft_count_bits(self.block, self.bit_reliability, self.redundancy_bits, distance);
-                self.counted.insert(corrected.to_vec(), soft);
+                let soft = soft_count_reaching(self.block, self.bit_reliability, self.redundancy_bits, distance, needed);
+                self.counted.insert(corrected.to_vec(), soft.map_or(Counted::ShortOf(needed), Counted::Exactly));
                 soft
             }
         };
-        soft.saturating_sub(charge + 1) >= VERIFIED_BITS
+        soft.is_some_and(|soft| soft.saturating_sub(charge + 1) >= VERIFIED_BITS)
     }
 }
 
@@ -1864,18 +1925,56 @@ pub fn solve_bit_erasures_doubting(
     // already lack. The known bits are carried only where a flip or a
     // free may be tried: the count as it is solves as well without them,
     // and a system that carries them is several times the size.
+    //
+    // Every count asks for the same equations, the bits not read and the
+    // doubted ones taken as unknown and the rest carried, and differs
+    // only in how many of the doubtful bits are among the unknowns. So
+    // one system is laid for them all, the bits not read first and the
+    // doubtful after them in the order they are doubted
+    // ([`BitSystem::laid`]), and each count's is the one before it
+    // reduced over as many columns more ([`BitSystem::reduce_to`]): a
+    // doubted bit is solved for as what overturns its reading, which
+    // leaves the right-hand side what the block as read makes it at every
+    // count. What a system says of the block is the same whatever order
+    // its unknowns were reduced in, and so is what its rows no unknown
+    // has a pivot in make of the known bits, a basis of the same
+    // equations. Each count's system was once built afresh, a dozen
+    // times a search.
     let carried = trials.flips || trials.free;
-    let systems: RefCell<HashMap<usize, Rc<(BitSystem, Option<ZeroRows>)>>> = RefCell::new(HashMap::new());
-    let system_at = |k: usize, read: &[CwRead]| -> Rc<(BitSystem, Option<ZeroRows>)> {
-        systems
-            .borrow_mut()
-            .entry(k)
-            .or_insert_with(|| {
-                let system = BitSystem::build(read, ec_len, carried);
-                let zero = (carried && system.rank == system.unknown && !system.consistent()).then(|| system.zero_rows());
-                Rc::new((system, zero))
-            })
-            .clone()
+    let laid = std::cell::OnceCell::new();
+    let lay = || {
+        let mut doubted_bits = vec![0u8; n];
+        for &(_, i, b) in &doubtful {
+            doubted_bits[i] |= 1 << b;
+        }
+        let mut columns: Vec<(usize, u8)> =
+            block.iter().enumerate().flat_map(|(i, cw)| (0..8u8).filter(move |b| cw.known >> b & 1 == 0).map(move |b| (i, b))).collect();
+        let unread = columns.len();
+        columns.extend(doubtful.iter().map(|&(_, i, b)| (i, b)));
+        if carried {
+            columns.extend(block.iter().enumerate().flat_map(|(i, cw)| {
+                let carry = cw.known & !cw.pinned & !doubted_bits[i];
+                (0..8u8).filter(move |b| carry >> b & 1 != 0).map(move |b| (i, b))
+            }));
+        }
+        let read_as = doubtful.iter().map(|&(_, i, b)| block[i].value >> b & 1 != 0);
+        let read_as = std::iter::repeat_n(false, unread).chain(read_as).collect();
+        let mut system = BitSystem::laid(block, ec_len, columns, read_as);
+        system.reduce_to(unread);
+        system
+    };
+    let systems: RefCell<BTreeMap<usize, Rc<(BitSystem, Option<ZeroRows>)>>> = RefCell::new(BTreeMap::new());
+    let system_at = |k: usize| -> Rc<(BitSystem, Option<ZeroRows>)> {
+        if let Some(system) = systems.borrow().get(&k) {
+            return system.clone();
+        }
+        let below = systems.borrow().range(..k).next_back().map(|(_, below)| below.0.clone());
+        let mut system = below.unwrap_or_else(|| laid.get_or_init(lay).clone());
+        system.reduce_to(unknown_bits + k);
+        let zero = (carried && system.rank == system.unknown && !system.consistent()).then(|| system.zero_rows());
+        let system = Rc::new((system, zero));
+        systems.borrow_mut().insert(k, system.clone());
+        system
     };
 
     let attempt = |k: usize, trial: Trial| -> Option<Vec<BitDoubt>> {
@@ -1892,17 +1991,17 @@ pub fn solve_bit_erasures_doubting(
             Trial::Plain => {
                 // As [`solve_bit_erasures`] solves the block.
                 unknowns_within_reach(&read, ec_len).ok()?;
-                let solution = system_at(k, &read).0.solve(&read).ok().filter(BitSolution::is_complete)?;
+                let solution = system_at(k).0.solve(&read).ok().filter(BitSolution::is_complete)?;
                 vec![(solution, Vec::new(), vec![0; n], 1)]
             }
             Trial::Flips => {
-                let shared = system_at(k, &read);
+                let shared = system_at(k);
                 let (system, zero) = &*shared;
                 let (tries, found) = system.flipping(zero.as_ref()?, &read, bit_reliability, trials.sets, offering.borrow_mut().seen());
                 found.into_iter().map(|(flipped, solution)| (solution, Vec::new(), flipped, tries)).collect()
             }
             Trial::Free(size) => {
-                let shared = system_at(k, &read);
+                let shared = system_at(k);
                 let (system, zero) = &*shared;
                 let (tries, found) = system.trying(zero.as_ref()?, &read, bit_reliability, size, trials.sets, offering.borrow_mut().seen());
                 found.into_iter().map(|(erased, _, solution)| (solution, erased, vec![0; n], tries)).collect()
@@ -2163,6 +2262,7 @@ pub fn solve_bit_erasures_trying(block: &[CwRead], bit_reliability: &[[u8; 8]], 
 /// bit can afterwards be taken as unknown without building the system
 /// again ([`BitSystem::trying`]): the rows no unknown has a pivot in say
 /// at once whether the block is consistent with that bit free.
+#[derive(Clone)]
 struct BitSystem {
     /// Each column's bit, as (codeword, bit): the unknown bits first,
     /// then the known ones where they are carried.
@@ -2179,12 +2279,14 @@ struct BitSystem {
     /// Row holding each unknown column's pivot, `usize::MAX` for none.
     pivot_row: Vec<usize>,
     rank: usize,
+    /// For each column taken as unknown though it was read, the bit read
+    /// ([`BitSystem::laid`]): what the column is solved for is what
+    /// overturns it. False, or past the end, for a bit not read.
+    read_as: Vec<bool>,
 }
 
 impl BitSystem {
     fn build(block: &[CwRead], ec_len: usize, with_known: bool) -> Self {
-        let n = block.len();
-        let equations = 8 * ec_len;
         let mut columns: Vec<(usize, u8)> = block
             .iter()
             .enumerate()
@@ -2196,6 +2298,20 @@ impl BitSystem {
                 (0..8u8).filter(move |b| cw.known >> b & 1 != 0 && cw.pinned >> b & 1 == 0).map(move |b| (i, b))
             }));
         }
+        let mut system = Self::laid(block, ec_len, columns, Vec::new());
+        system.reduce_to(unknown);
+        system
+    }
+
+    /// The equations of `block` over `columns`, none of them reduced yet
+    /// ([`Self::reduce_to`]), the right-hand side what every bit read
+    /// makes of the syndromes. A column of a bit that was read is solved
+    /// for, once reduced as an unknown, as what overturns its reading,
+    /// `read_as` holding the bit read: the right-hand side, made with it,
+    /// is so whichever of the bits read are taken as unknown.
+    fn laid(block: &[CwRead], ec_len: usize, columns: Vec<(usize, u8)>, read_as: Vec<bool>) -> Self {
+        let n = block.len();
+        let equations = 8 * ec_len;
         let rhs = columns.len();
         let words = rhs / 64 + 1;
         let mut rows = vec![0u64; equations * words];
@@ -2228,33 +2344,44 @@ impl BitSystem {
                 }
             }
         }
-        let mut rank = 0;
-        let mut pivot_row = vec![usize::MAX; unknown];
+        Self { columns, unknown: 0, equations, rows, words, pivot_row: Vec::new(), rank: 0, read_as }
+    }
+
+    /// The system reduced over its first `unknown` columns, those it was
+    /// reduced over already and as many more: the reduction goes a column
+    /// at a time, and leaves the columns before alone.
+    fn reduce_to(&mut self, unknown: usize) {
+        debug_assert!(self.unknown <= unknown && unknown <= self.columns.len());
+        let Self { rows, words, equations, rank, pivot_row, .. } = self;
+        let (words, equations) = (*words, *equations);
         let mut pivot = vec![0u64; words];
-        for (col, pivot_of) in pivot_row.iter_mut().enumerate() {
+        for col in self.unknown..unknown {
             let (word, bit) = (col / 64, 1u64 << (col % 64));
-            let Some(p) = (rank..equations).find(|&r| rows[r * words + word] & bit != 0) else { continue };
-            if p != rank {
+            let Some(p) = (*rank..equations).find(|&r| rows[r * words + word] & bit != 0) else {
+                pivot_row.push(usize::MAX);
+                continue;
+            };
+            if p != *rank {
                 let (head, tail) = rows.split_at_mut(p * words);
-                head[rank * words..(rank + 1) * words].swap_with_slice(&mut tail[..words]);
+                head[*rank * words..(*rank + 1) * words].swap_with_slice(&mut tail[..words]);
             }
             // The pivot row is nought in every column before its own: a
             // column with a pivot was cleared from every other row, and
             // one without is nought in every row from the rank on. So the
             // words before its own add nothing.
-            debug_assert!(rows[rank * words..rank * words + word].iter().all(|&w| w == 0));
-            pivot[word..].copy_from_slice(&rows[rank * words + word..(rank + 1) * words]);
+            debug_assert!(rows[*rank * words..*rank * words + word].iter().all(|&w| w == 0));
+            pivot[word..].copy_from_slice(&rows[*rank * words + word..(*rank + 1) * words]);
             for (r, row) in rows.chunks_exact_mut(words).enumerate() {
-                if r != rank && row[word] & bit != 0 {
+                if r != *rank && row[word] & bit != 0 {
                     for (a, b) in row[word..].iter_mut().zip(&pivot[word..]) {
                         *a ^= b;
                     }
                 }
             }
-            *pivot_of = rank;
-            rank += 1;
+            pivot_row.push(*rank);
+            *rank += 1;
         }
-        Self { columns, unknown, equations, rows, words, pivot_row, rank }
+        self.unknown = unknown;
     }
 
     fn row(&self, r: usize) -> &[u64] {
@@ -2324,7 +2451,8 @@ impl BitSystem {
             }
             solved[i] |= 1 << bit;
             solved_bits += 1;
-            if self.rhs(row) ^ (moved.iter().filter(|&&m| Self::bit(row, m)).count() % 2 == 1) {
+            let read_as = self.read_as.get(col).copied().unwrap_or(false);
+            if self.rhs(row) ^ (moved.iter().filter(|&&m| Self::bit(row, m)).count() % 2 == 1) ^ read_as {
                 corrected[i] |= 1 << bit;
             }
         }
@@ -2342,23 +2470,24 @@ impl BitSystem {
         let (first, end) = (self.unknown, self.columns.len());
         let mut columns = vec![0u64; (end - first) * words];
         let mut residual = vec![0u64; words];
-        for (k, row) in self.rows[self.rank * self.words..].chunks_exact(self.words).enumerate() {
-            let (word, bit) = (k / 64, 1u64 << (k % 64));
+        let zero_rows: Vec<&[u64]> = self.rows[self.rank * self.words..].chunks_exact(self.words).collect();
+        for (k, row) in zero_rows.iter().enumerate() {
             if self.rhs(row) {
-                residual[word] |= bit;
+                residual[k / 64] |= 1 << (k % 64);
             }
-            for (w, &held) in row.iter().enumerate().take(end.div_ceil(64)).skip(first / 64) {
-                let mut held = held;
-                if w == first / 64 {
-                    held &= !0u64 << (first % 64);
+        }
+        // Sixty-four rows by sixty-four columns at a time, turned about the
+        // diagonal: what was a word of a row is then a word of a column.
+        for (word, rows) in zero_rows.chunks(64).enumerate() {
+            for w in first / 64..end.div_ceil(64) {
+                let mut square = [0u64; 64];
+                for (held, row) in square.iter_mut().zip(rows) {
+                    *held = row[w];
                 }
-                if w == end / 64 {
-                    held &= (1u64 << (end % 64)) - 1;
-                }
-                while held != 0 {
-                    let col = 64 * w + held.trailing_zeros() as usize;
-                    columns[(col - first) * words + word] |= bit;
-                    held &= held - 1;
+                transpose_square(&mut square);
+                let (from, to) = ((64 * w).max(first), (64 * w + 64).min(end));
+                for col in from..to {
+                    columns[(col - first) * words + word] = square[col - 64 * w];
                 }
             }
         }
@@ -2391,11 +2520,24 @@ impl BitSystem {
         debug_assert!(self.rank == self.unknown && !self.consistent());
         let n = block.len();
         let zero = self.equations - self.rank;
-        let mut columns_of: Vec<Vec<usize>> = vec![Vec::new(); n];
+        // Each codeword's known columns, in their order, end to end: the
+        // `i`th codeword's from `column_starts[i]` to `column_starts[i + 1]`.
+        let mut column_starts = vec![0usize; n + 1];
         for col in self.unknown..self.columns.len() {
-            columns_of[self.columns[col].0].push(col);
+            column_starts[self.columns[col].0 + 1] += 1;
         }
-        let candidates: Vec<usize> = (0..n).filter(|&i| !columns_of[i].is_empty()).collect();
+        for i in 0..n {
+            column_starts[i + 1] += column_starts[i];
+        }
+        let mut by_codeword = vec![0usize; self.columns.len() - self.unknown];
+        let mut filled = column_starts.clone();
+        for col in self.unknown..self.columns.len() {
+            let i = self.columns[col].0;
+            by_codeword[filled[i]] = col;
+            filled[i] += 1;
+        }
+        let columns_of = |i: usize| &by_codeword[column_starts[i]..column_starts[i + 1]];
+        let candidates: Vec<usize> = (0..n).filter(|&i| !columns_of(i).is_empty()).collect();
         let c = candidates.len();
         let budget = budget.min(TRIAL_SETS_MAX);
         let tries: Option<usize> = (1..=size).map(|s| sets_of(c, s, budget)).sum();
@@ -2407,12 +2549,12 @@ impl BitSystem {
         // end in the order of the candidates.
         let mut starts = Vec::with_capacity(c + 1);
         starts.push(0);
-        let mut vectors = Vec::new();
+        let mut vectors = Vec::with_capacity(by_codeword.len() * over.words);
         for &i in &candidates {
-            for &col in &columns_of[i] {
+            for &col in columns_of(i) {
                 vectors.extend_from_slice(over.column(col - self.unknown));
             }
-            starts.push(starts[starts.len() - 1] + columns_of[i].len());
+            starts.push(starts[starts.len() - 1] + columns_of(i).len());
         }
         let mut found: Vec<(u32, (Vec<usize>, Vec<u8>, BitSolution))> = Vec::new();
         each_freeing(&starts, &vectors, &over.residual, size, |set, combination| {
@@ -2420,7 +2562,7 @@ impl BitSystem {
             let mut changed = vec![0u8; n];
             for (which, &k) in set.iter().enumerate() {
                 let i = candidates[k];
-                for (b, &col) in columns_of[i].iter().enumerate() {
+                for (b, &col) in columns_of(i).iter().enumerate() {
                     if combination >> (8 * which + b) & 1 != 0 {
                         changed[i] |= 1 << self.columns[col].1;
                     }
@@ -2470,7 +2612,9 @@ impl BitSystem {
                 (reliability < CERTAIN).then_some((reliability, col))
             })
             .collect();
-        cols.sort();
+        // By reliability and then by bit, as the columns of a system that
+        // carries its known bits in the block's order are.
+        cols.sort_by_key(|&(reliability, col)| (reliability, self.columns[col]));
         let c = cols.len();
         if c == 0 || zero < SPARE_EQUATIONS + tries_charge(c) as usize {
             return (0, Vec::new());
@@ -2495,17 +2639,23 @@ impl BitSystem {
             // whose fingerprint matches is held to the vector itself.
             let fingerprint = |v: &[u64]| v.iter().enumerate().fold(0u64, |f, (w, &x)| f ^ x.rotate_left((23 * w % 64) as u32));
             let prints: Vec<u64> = vectors.iter().map(|v| fingerprint(v)).collect();
-            let mut by_print: HashMap<u64, Vec<usize>, WordHash> = HashMap::with_capacity_and_hasher(c, WordHash::default());
+            // The bits in order of their fingerprints, those sharing one in
+            // their own order, and where each fingerprint's run of them lies.
+            let mut in_print_order: Vec<usize> = (0..c).collect();
+            in_print_order.sort_unstable_by_key(|&k| (prints[k], k));
+            let mut by_print: HashMap<u64, std::ops::Range<usize>, WordHash> = HashMap::with_capacity_and_hasher(c, WordHash::default());
             // And which fingerprints there are at all, by sixteen bits of
             // them, which the triples ask after hundreds of thousands of
             // times a block and nearly always in vain: most are answered
             // here, without the map.
             let slot = |print: u64| (print.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48) as usize;
             let mut present = vec![0u64; 1 << 10];
-            for (k, &print) in prints.iter().enumerate() {
-                by_print.entry(print).or_default().push(k);
+            for (at, &k) in in_print_order.iter().enumerate() {
+                let print = prints[k];
+                by_print.entry(print).or_insert(at..at).end = at + 1;
                 present[slot(print) / 64] |= 1 << (slot(print) % 64);
             }
+            let sharing = |print: u64| by_print.get(&print).map(|run| &in_print_order[run.clone()]);
             let maybe = |print: u64| present[slot(print) / 64] >> (slot(print) % 64) & 1 != 0;
             let wanting = fingerprint(residual);
             let mut target = vec![0u64; residual.len()];
@@ -2525,7 +2675,7 @@ impl BitSystem {
                 }
             };
             for (k, &v) in vectors.iter().enumerate() {
-                if let Some(others) = by_print.get(&(wanting ^ prints[k])) {
+                if let Some(others) = sharing(wanting ^ prints[k]) {
                     let before = &others[..others.partition_point(|&a| a < k)];
                     if !before.is_empty() {
                         matching(before, &[v], &mut |a| sets.push(vec![a, k]));
@@ -2546,7 +2696,7 @@ impl BitSystem {
                         if !maybe(print) {
                             continue;
                         }
-                        if let Some(others) = by_print.get(&print) {
+                        if let Some(others) = sharing(print) {
                             let after = &others[others.partition_point(|&k| k <= b)..];
                             if !after.is_empty() {
                                 matching(after, &[vectors[a], vectors[b]], &mut |k| sets.push(vec![a, b, k]));
@@ -2586,6 +2736,25 @@ fn transpose_bits(mut x: u64) -> u64 {
     let t = (x ^ (x >> 28)) & 0x0000_0000_F0F0_F0F0;
     x ^= t ^ (t << 28);
     x
+}
+
+/// A sixty-four by sixty-four matrix of bits turned about its diagonal,
+/// in place: bit `c` of word `r` becomes bit `r` of word `c`. The two
+/// off-diagonal halves exchanged, then within each half its quarters, and
+/// so on down to single bits, six exchanges of every pair of words.
+fn transpose_square(square: &mut [u64; 64]) {
+    let (mut j, mut low) = (32, 0x0000_0000_FFFF_FFFFu64);
+    while j != 0 {
+        let mut k = 0;
+        while k < 64 {
+            let t = ((square[k] >> j) ^ square[k + j]) & low;
+            square[k] ^= t << j;
+            square[k + j] ^= t;
+            k = (k + j + 1) & !j;
+        }
+        j >>= 1;
+        low ^= low << j;
+    }
 }
 
 /// A hasher for the fingerprints of the columns of a [`BitSystem`] over
@@ -4435,6 +4604,181 @@ mod tests {
             let located = located_error_bits(len, ec_len / 2);
             let expected = f64::from(blocks) / 2f64.powi(located as i32 + 1);
             assert!(f64::from(solved_at_the_limit) >= expected / 2.0, "{len} codewords, {ec_len} EC: {solved_at_the_limit} at the limit, {expected} expected");
+        }
+    }
+
+
+    /// The count as it was, before the largest count was bounded rather
+    /// than looked for after every bit, and before it could stop short.
+    fn soft_count_bits_reference(block: &[CwRead], bit_reliability: &[[u8; 8]], redundancy_bits: usize, distance: u32) -> u32 {
+        if distance > SOFT_COUNT_REACH {
+            return 0;
+        }
+        let reach = distance as usize;
+        let mut ways = vec![0f64; reach + 1];
+        ways[0] = 1.0;
+        let mut scaled = 0i64;
+        for (cw, reliability) in block.iter().zip(bit_reliability) {
+            for (b, &reliability) in reliability.iter().enumerate() {
+                if cw.known >> b & 1 == 0 || cw.pinned >> b & 1 != 0 {
+                    continue;
+                }
+                let cost = bit_cost(reliability) as usize;
+                if cost > reach {
+                    continue;
+                }
+                let mut peak = 0f64;
+                if cost == 0 {
+                    for w in &mut ways {
+                        *w *= 2.0;
+                        peak = peak.max(*w);
+                    }
+                } else {
+                    let mut end = reach + 1;
+                    while end > cost {
+                        let start = (end - cost).max(cost);
+                        let (below, from) = ways.split_at_mut(start);
+                        for (w, &add) in from[..end - start].iter_mut().zip(&below[start - cost..end - cost]) {
+                            *w += add;
+                            peak = peak.max(*w);
+                        }
+                        end = start;
+                    }
+                }
+                if peak > 2f64.powi(500) {
+                    for w in &mut ways {
+                        *w *= 2f64.powi(-500);
+                    }
+                    scaled += 500;
+                }
+            }
+        }
+        let total: f64 = ways.iter().sum();
+        let volume = total.log2() + scaled as f64;
+        (redundancy_bits as f64 - volume - (255f64 / 254.0).log2()).max(0.0).floor() as u32
+    }
+
+    #[test]
+    fn the_soft_count_is_what_it_was_and_stops_short_only_where_it_falls_short() {
+        let mut rng = Rng(0x50F7);
+        let (mut cases, mut stopped, mut rescaled) = (0, 0, 0);
+        for round in 0..3000 {
+            let n = [4, 10, 26, 60, 150, 255][round % 6];
+            let block: Vec<CwRead> = (0..n)
+                .map(|_| {
+                    let known = if rng.below(10) == 0 { rng.byte() } else { 0xFF };
+                    let pinned = if rng.below(20) == 0 { rng.byte() & known } else { 0 };
+                    CwRead { value: rng.byte() & known, known, pinned }
+                })
+                .collect();
+            // Every kind of reading: on the threshold, faint, solid, certain.
+            let style = rng.below(5);
+            let bits: Vec<[u8; 8]> = (0..n)
+                .map(|_| {
+                    std::array::from_fn(|_| match style {
+                        0 => [0, 0, 0, 3, 200][rng.below(5)],
+                        1 => rng.below(40) as u8,
+                        2 => rng.byte(),
+                        3 => CERTAIN,
+                        _ => if rng.below(3) == 0 { 0 } else { 255 - rng.below(60) as u8 },
+                    })
+                })
+                .collect();
+            let redundancy = rng.below(8 * 68 + 1);
+            let distance = match rng.below(4) {
+                0 => rng.below(64) as u32,
+                1 => rng.below(600) as u32,
+                2 => rng.below(SOFT_COUNT_REACH as usize + 1) as u32,
+                _ => SOFT_COUNT_REACH - rng.below(8) as u32 + rng.below(16) as u32,
+            };
+            let want = soft_count_bits_reference(&block, &bits, redundancy, distance);
+            assert_eq!(soft_count_bits(&block, &bits, redundancy, distance), want, "round {round}");
+            rescaled += usize::from(block.iter().map(|c| (c.known & !c.pinned).count_ones()).sum::<u32>() > 500);
+            for needed in [1, 9, 17, 30, 64, 200] {
+                cases += 1;
+                match soft_count_reaching(&block, &bits, redundancy, distance, needed) {
+                    Some(soft) => assert_eq!(soft, want, "round {round}, needed {needed}"),
+                    None => {
+                        stopped += 1;
+                        assert!(want < needed, "round {round}: stopped short of {needed} where the count is {want}");
+                    }
+                }
+            }
+        }
+        // The test is of something: counts stopped short, and counts large enough to be scaled.
+        assert!(stopped > cases / 10, "{stopped} of {cases}");
+        assert!(rescaled > 100, "{rescaled}");
+    }
+
+    #[test]
+    fn squares_of_bits_are_turned_about_the_diagonal() {
+        let mut rng = Rng(0x7A5E);
+        for _ in 0..200 {
+            let square: [u64; 64] = std::array::from_fn(|_| rng.next());
+            let mut turned = square;
+            transpose_square(&mut turned);
+            for r in 0..64 {
+                for c in 0..64 {
+                    assert_eq!(turned[c] >> r & 1, square[r] >> c & 1);
+                }
+            }
+        }
+    }
+
+    /// The rows no unknown has a pivot in, as they were taken a bit at a
+    /// time before they were taken a square at a time.
+    fn zero_rows_reference(system: &BitSystem) -> ZeroRows {
+        let zero = system.equations - system.rank;
+        let words = zero / 64 + 1;
+        let (first, end) = (system.unknown, system.columns.len());
+        let mut columns = vec![0u64; (end - first) * words];
+        let mut residual = vec![0u64; words];
+        for (k, row) in system.rows[system.rank * system.words..].chunks_exact(system.words).enumerate() {
+            let (word, bit) = (k / 64, 1u64 << (k % 64));
+            if system.rhs(row) {
+                residual[word] |= bit;
+            }
+            for (w, &held) in row.iter().enumerate().take(end.div_ceil(64)).skip(first / 64) {
+                let mut held = held;
+                if w == first / 64 {
+                    held &= !0u64 << (first % 64);
+                }
+                if w == end / 64 {
+                    held &= (1u64 << (end % 64)) - 1;
+                }
+                while held != 0 {
+                    let col = 64 * w + held.trailing_zeros() as usize;
+                    columns[(col - first) * words + word] |= bit;
+                    held &= held - 1;
+                }
+            }
+        }
+        ZeroRows { words, residual, columns }
+    }
+
+    #[test]
+    fn zero_rows_taken_a_square_at_a_time_are_those_taken_a_bit_at_a_time() {
+        let mut rng = Rng(0x2E80);
+        for round in 0..300 {
+            let (data_len, ec_len) = [(9, 17), (19, 7), (44, 30), (118, 30), (20, 68), (3, 2)][round % 6];
+            let block = codeword(&mut rng, data_len, ec_len);
+            let n = block.len();
+            let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+            for _ in 0..rng.below(4 * ec_len) {
+                let i = rng.below(n);
+                read[i].known &= !(1 << rng.below(8));
+                read[i].value &= read[i].known;
+            }
+            for _ in 0..rng.below(4) {
+                read[rng.below(n)].value ^= rng.nonzero();
+            }
+            for _ in 0..rng.below(3) {
+                let i = rng.below(n);
+                read[i].pinned = read[i].known & rng.byte();
+            }
+            let system = BitSystem::build(&read, ec_len, true);
+            let (got, want) = (system.zero_rows(), zero_rows_reference(&system));
+            assert_eq!((got.words, &got.residual, &got.columns), (want.words, &want.residual, &want.columns), "round {round}");
         }
     }
 

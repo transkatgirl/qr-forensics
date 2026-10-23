@@ -290,6 +290,7 @@ impl Curve {
     /// `xpow` and `ypow` are the powers of `x` and `y`. In characteristic
     /// two a binomial coefficient is odd exactly when the lower index's
     /// bits lie within the upper's.
+    #[cfg(test)]
     fn hasse(&self, a: usize, b: usize, xpow: &[u8], ypow: &[u8]) -> u8 {
         let mut total = 0u8;
         // The powers whose bits hold the order's, in turn: the next after
@@ -309,6 +310,26 @@ impl Curve {
             t = (t + 1) | b;
         }
         total
+    }
+
+    /// The Hasse derivatives in `x` alone of each coefficient of the curve
+    /// at the point whose powers are `xpow`, of the orders below `m`, for
+    /// `lists` powers of `y`: entry `t * m + a` is order `a` of the
+    /// coefficient of `y^t`, as [`Self::hasse`] takes them one at a time.
+    fn x_derivatives(&self, m: usize, lists: usize, xpow: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; lists * m];
+        for (t, poly) in self.coef.iter().enumerate() {
+            for a in 0..m {
+                let mut inner = 0u8;
+                let mut d = a;
+                while d < poly.len() {
+                    inner ^= mul(poly[d], xpow[d - a]);
+                    d = (d + 1) | a;
+                }
+                out[t * m + a] = inner;
+            }
+        }
+        out
     }
 
     /// Largest power of `x` among the coefficients.
@@ -406,6 +427,24 @@ impl Curve {
     }
 }
 
+/// The Hasse derivative of order `(a, b)` of a curve whose derivatives in
+/// `x` alone are `derivatives` ([`Curve::x_derivatives`]), at the point
+/// whose powers of `y` are `ypow`: what [`Curve::hasse`] makes of the curve
+/// itself.
+fn y_derivative(derivatives: &[u8], m: usize, a: usize, b: usize, ypow: &[u8]) -> u8 {
+    let lists = derivatives.len() / m;
+    let mut total = 0u8;
+    let mut t = b;
+    while t < lists {
+        let inner = derivatives[t * m + a];
+        if inner != 0 {
+            total ^= mul(inner, ypow[t - b]);
+        }
+        t = (t + 1) | b;
+    }
+    total
+}
+
 /// The degree in `y` the curve is given for `cost` constraints and data
 /// of degree below `w + 1`: the smallest that lets the curve have the
 /// smallest `(1, w)`-weighted degree the constraints allow. A curve of
@@ -488,28 +527,44 @@ fn interpolate(constraints: &[(u8, u8, usize)], w: usize, list_size: usize) -> O
     let mut met = 0usize;
     for &(x, y, m) in constraints {
         let ypow = powers(y, list_size + 1);
-        let mut xpow = powers(x, 1);
+        let degree = degrees.iter().copied().max().unwrap_or(1);
+        let xpow = powers(x, degree + 1);
+        // Each curve's Hasse derivatives in `x` alone at the point, of every
+        // order the point's constraints ask, for each power of `y`: entry
+        // `t * m + a` is the coefficient of `(X - x)^a` in the coefficient
+        // of `y^t`. A constraint's derivative is read off them
+        // ([`Curve::hasse`]), and they are kept as the curves change, which
+        // they do only by adding a multiple of another curve, whose
+        // derivatives add as the curves do, and by `(X - x)`, which raises
+        // each derivative's order by one. Every constraint once took its
+        // derivatives afresh from every coefficient of every curve, and at
+        // a point of multiplicity `m` that was `m(m+1)/2` passes over them
+        // where this is `m`.
+        let mut derivatives: Vec<Vec<u8>> = curves.iter().map(|curve| curve.x_derivatives(m, list_size + 1, &xpow)).collect();
         for a in 0..m {
             for b in 0..m - a {
-                let degree = degrees.iter().copied().max().unwrap_or(1);
-                while xpow.len() <= degree {
-                    xpow.push(mul(*xpow.last().expect("a power"), x));
-                }
-                for (dj, curve) in d.iter_mut().zip(&curves) {
-                    *dj = curve.hasse(a, b, &xpow, &ypow);
+                for (dj, derivative) in d.iter_mut().zip(&derivatives) {
+                    *dj = y_derivative(derivative, m, a, b, &ypow);
                 }
                 let Some(pivot) = (0..=list_size).filter(|&j| d[j] != 0).min_by_key(|&j| leading[j]) else { continue };
                 let pivot_curve = std::mem::take(&mut curves[pivot]);
+                let pivot_derivative = std::mem::take(&mut derivatives[pivot]);
                 for j in 0..=list_size {
                     if j != pivot && d[j] != 0 {
                         let c = div(d[j], d[pivot]);
                         curves[j].add_scaled(&pivot_curve, c);
+                        Scale::new(c).add_into(&mut derivatives[j], &pivot_derivative);
                         leading[j] = curves[j].leading(w);
                         degrees[j] = curves[j].x_degree();
                     }
                 }
                 curves[pivot] = pivot_curve;
                 curves[pivot].times_x_minus(x);
+                derivatives[pivot] = pivot_derivative;
+                for orders in derivatives[pivot].chunks_exact_mut(m) {
+                    orders.copy_within(..m - 1, 1);
+                    orders[0] = 0;
+                }
                 leading[pivot] = curves[pivot].leading(w);
                 degrees[pivot] = curves[pivot].x_degree();
                 met += 1;
@@ -789,6 +844,64 @@ mod tests {
             }
         }
         out
+    }
+
+
+    /// Koetter's interpolation as it was, each derivative taken afresh.
+    fn interpolate_reference(constraints: &[(u8, u8, usize)], w: usize, list_size: usize) -> Option<Curve> {
+        let mut curves: Vec<Curve> = (0..=list_size).map(Curve::monomial).collect();
+        let mut leading: Vec<Option<(usize, usize)>> = curves.iter().map(|c| c.leading(w)).collect();
+        let mut degrees: Vec<usize> = curves.iter().map(Curve::x_degree).collect();
+        let mut d = vec![0u8; list_size + 1];
+        for &(x, y, m) in constraints {
+            let ypow = powers(y, list_size + 1);
+            let mut xpow = powers(x, 1);
+            for a in 0..m {
+                for b in 0..m - a {
+                    let degree = degrees.iter().copied().max().unwrap_or(1);
+                    while xpow.len() <= degree {
+                        xpow.push(mul(*xpow.last().expect("a power"), x));
+                    }
+                    for (dj, curve) in d.iter_mut().zip(&curves) {
+                        *dj = curve.hasse(a, b, &xpow, &ypow);
+                    }
+                    let Some(pivot) = (0..=list_size).filter(|&j| d[j] != 0).min_by_key(|&j| leading[j]) else { continue };
+                    let pivot_curve = std::mem::take(&mut curves[pivot]);
+                    for j in 0..=list_size {
+                        if j != pivot && d[j] != 0 {
+                            let c = div(d[j], d[pivot]);
+                            curves[j].add_scaled(&pivot_curve, c);
+                            leading[j] = curves[j].leading(w);
+                            degrees[j] = curves[j].x_degree();
+                        }
+                    }
+                    curves[pivot] = pivot_curve;
+                    curves[pivot].times_x_minus(x);
+                    leading[pivot] = curves[pivot].leading(w);
+                    degrees[pivot] = curves[pivot].x_degree();
+                }
+            }
+        }
+        curves.into_iter().min_by_key(|c| c.leading(w))
+    }
+
+    #[test]
+    fn derivatives_kept_through_the_interpolation_are_those_taken_afresh() {
+        let mut rng = Rng(0x4A55E);
+        for round in 0..120 {
+            let n = [8usize, 26, 45, 70][round % 4];
+            let k = 1 + rng.below(n / 2);
+            let points = grs_points(n, n - k);
+            let mut constraints = Vec::new();
+            for &(x, _) in &points {
+                for _ in 0..1 + rng.below(2) {
+                    constraints.push((x, rng.byte(), 1 + rng.below(if round % 3 == 0 { 12 } else { 5 })));
+                }
+            }
+            let total: usize = constraints.iter().map(|&(_, _, m)| m * (m + 1) / 2).sum();
+            let (list, _) = list_size(total, k - 1);
+            assert_eq!(interpolate(&constraints, k - 1, list), interpolate_reference(&constraints, k - 1, list), "round {round}");
+        }
     }
 
     #[test]

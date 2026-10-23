@@ -238,6 +238,10 @@ fn adapt(rows: &mut [Vec<u64>], order: &[usize]) {
 /// says of each of its bits from the beliefs of the others, summed into
 /// `ext`.
 fn propagate(rows: &[Vec<u64>], llr: &[f32], ext: &mut [f32]) {
+    // What a bit's belief says through a check is the same in every check
+    // it is in: worked out once a round, where it was once worked out in
+    // every check, half the bits of each.
+    let halves: Vec<f32> = llr.iter().map(|&l| (l * 0.5).tanh()).collect();
     let mut members: Vec<usize> = Vec::new();
     let mut tanh: Vec<f32> = Vec::new();
     let mut prefix: Vec<f32> = Vec::new();
@@ -254,7 +258,7 @@ fn propagate(rows: &[Vec<u64>], llr: &[f32], ext: &mut [f32]) {
             continue;
         }
         tanh.clear();
-        tanh.extend(members.iter().map(|&c| (llr[c] * 0.5).tanh()));
+        tanh.extend(members.iter().map(|&c| halves[c]));
         prefix.clear();
         prefix.push(1.0);
         for &t in &tanh {
