@@ -815,7 +815,7 @@ fn anchors_follow_a_curled_symbol() {
         // Refining the anchors against the photo leaves them on their
         // patterns.
         let module_px = (QUAD[1][0] - QUAD[0][0]) / w as f64;
-        let again = refine_anchors(&image, func, refined.corners, &found.anchors, &params);
+        let again = refine_anchors(&image, func, refined.corners, &found.anchors, found.bloom, &params);
         assert_eq!(again.len(), found.anchors.len());
         for (a, b) in again.iter().zip(&found.anchors) {
             assert!(distance(a.center, b.center) < 0.3 * module_px, "{version}: {:?} moved {:.2} px", a.at, distance(a.center, b.center));
@@ -961,7 +961,7 @@ fn a_displaced_anchor_is_refined_back_onto_its_pattern() {
     // Half a module off, as a hand might drop it.
     anchors[k].center[0] += 0.5 * module_px;
     anchors[k].center[1] -= 0.4 * module_px;
-    let refined = refine_anchors(&image, &func, found.corners, &anchors, &params);
+    let refined = refine_anchors(&image, &func, found.corners, &anchors, found.bloom, &params);
     let want = truth.apply(anchors[k].at[0], anchors[k].at[1]);
     let off = distance(refined[k].center, want) / module_px;
     assert!(off < 0.1, "refined anchor {off:.3} modules off");
@@ -1268,6 +1268,71 @@ fn bloomed_finder_patterns_are_still_found() {
     let module_px = (QUAD[1][0] - QUAD[0][0]) / grid.width() as f64;
     let error = corner_error(found.corners, QUAD) / module_px;
     assert!(error < 0.75, "corners {error:.2} modules off");
+}
+
+#[test]
+fn a_symbol_whose_dark_has_thinned_is_read_expecting_the_bleed() {
+    // Over-exposed as BoofCV's photograph of a version 2 test symbol is
+    // (`brightness/image012.jpg`), whose dark had thinned by a third of a
+    // module at every boundary, and rendered here thinned by three
+    // tenths. The plain template, a third of a module
+    // to one side of a finder, lies right on that side's boundaries,
+    // which reads more crisply than lying a third off all of them, and
+    // fitted every finder there; every other pattern was looked for from
+    // the finders, and the symbol was sampled a third of a module off
+    // throughout, where every light module between two dark ones reads
+    // dark. It read nothing, and zxing-cpp read it outright.
+    let (version, ec) = (SymbolVersion::Qr(2), EcLevel::L);
+    let grid = symbol(version, ec);
+    let text = decode_plain(&grid, &layout(version, ec), 0).text.plain();
+    let image = render_bloomed(&grid, QUAD, (760, 640), 0.6);
+    let params = SampleParams::default();
+    let read = read_outline(&image, version, loosen(QUAD, 1.1, [5.0, -4.0]), &params, &DecodeOptions::default()).expect("bloomed symbol read");
+    assert!(read.is_trustworthy(), "{} of {} blocks verified", read.report.blocks_verified(), read.report.blocks.len());
+    assert_eq!(read.text(), text);
+    assert!(read.detection.bloom > 0.2, "read expecting a bleed of {:.2} modules", read.detection.bloom);
+    let module_px = (QUAD[1][0] - QUAD[0][0]) / grid.width() as f64;
+    let truth = Homography::rect_to_quad(grid.width() as f64, grid.height() as f64, QUAD).unwrap();
+    for anchor in read.detection.anchors.iter().filter(|a| matches!(a.kind, AnchorKind::Finder | AnchorKind::Alignment)) {
+        let off = distance(anchor.center, truth.apply(anchor.at[0], anchor.at[1])) / module_px;
+        assert!(off < 0.1, "{:?} at {:?} placed {off:.2} modules off", anchor.kind, anchor.at);
+    }
+    // The corners with them: moved by as much as the finder beside it, a
+    // corner whose finder the read had fitted again as printed came out
+    // more than half a module off.
+    for (i, corner) in read.detection.corners.iter().enumerate() {
+        let off = distance(*corner, QUAD[i]) / module_px;
+        assert!(off < 0.15, "corner {i} placed {off:.2} modules off");
+    }
+}
+
+#[test]
+fn a_version_1_symbol_whose_dark_has_thinned_is_placed_expecting_the_bleed() {
+    // A version 1 symbol has no alignment pattern: its finders and timing
+    // modules all lie about one corner of it. With the dark thinned by
+    // three tenths of a module, the plane through the centres of those
+    // anchors, with the top-left finder's a fifth of a module out and a
+    // timing module's more, put the top-left corner 0.59 of a module off,
+    // where the refinement held it, and the fourth corner two modules
+    // off; and the fourth corner, placed by the symbol's edge, settled as
+    // printed 0.58 of a module in, where the edge of the ink lies with
+    // the bleed. The finders' own fits place the corners they stand at,
+    // as the detector places them, and the edge is traced expecting the
+    // bleed.
+    let (version, ec) = (SymbolVersion::Qr(1), EcLevel::L);
+    let grid = symbol(version, ec);
+    let text = decode_plain(&grid, &layout(version, ec), 0).text.plain();
+    let image = render_bloomed(&grid, QUAD, (760, 640), 0.6);
+    let params = SampleParams::default();
+    let read = read_outline(&image, version, loosen(QUAD, 1.1, [5.0, -4.0]), &params, &DecodeOptions::default()).expect("bloomed symbol read");
+    assert!(read.is_trustworthy(), "{} of {} blocks verified", read.report.blocks_verified(), read.report.blocks.len());
+    assert_eq!(read.text(), text);
+    assert!(read.detection.bloom > 0.2, "read expecting a bleed of {:.2} modules", read.detection.bloom);
+    let module_px = (QUAD[1][0] - QUAD[0][0]) / grid.width() as f64;
+    for (i, corner) in read.detection.corners.iter().enumerate() {
+        let off = distance(*corner, QUAD[i]) / module_px;
+        assert!(off < 0.2, "corner {i} placed {off:.2} modules off");
+    }
 }
 
 #[test]
@@ -2673,4 +2738,38 @@ fn light_from_a_lamp_beside_a_symbol_leaves_it_placed_on_its_three_finders() {
     let read = read_outline(&image, version, outline, &params, &DecodeOptions::default()).expect("found");
     assert!(read.is_trustworthy(), "{:?} of {} blocks", read.report.blocks_verified(), read.report.blocks.len());
     assert_eq!(read.text(), text);
+}
+
+#[test]
+fn noise_in_a_symbols_frame_is_read_as_its_version_and_never_as_a_message() {
+    // A version 2 symbol's fixed patterns and format word, with random
+    // modules for its data: there is no message in it to read. Version 1
+    // laid over it, two modules smaller a side, reads its codewords from
+    // modules the grid straddles and erases them, and fills them with
+    // nothing left over to check them by: a block "solved" so has no
+    // confirming bit. Read through an outline, that read once outranked
+    // version 2's, which solved nothing either, and came back as the
+    // read, though its fixed patterns fitted 134 of 203 to version 2's
+    // 236 of 236: sixty-five of eighty such symbols were read as version
+    // 1, four of the first six. Between two versions the decode has
+    // confirmed nothing of, the fixed patterns judge.
+    let version = SymbolVersion::Qr(2);
+    let func = FunctionMap::new(version);
+    let (params, opts) = (SampleParams::default(), DecodeOptions::default());
+    let outline = loosen(QUAD, 1.1, [5.0, -4.0]);
+    let mut rng = Rng(0x5eed2);
+    for seed in 0..6 {
+        let mut grid = symbol(version, EcLevel::L);
+        for y in 0..grid.height() {
+            for x in 0..grid.width() {
+                if matches!(func.role(x, y), Role::Data { .. } | Role::Remainder { .. }) {
+                    grid.set(x, y, Module::from_dark(rng.next() & 1 == 1));
+                }
+            }
+        }
+        let image = render(&grid, QUAD, (760, 640), |_, _, v| v);
+        let read = read_outline(&image, version, outline, &params, &opts).expect("the frame is found");
+        assert!(!read.is_trustworthy(), "noise {seed} read as {:?}", read.text());
+        assert_eq!(read.version(), version, "noise {seed} read as version {}", read.version());
+    }
 }

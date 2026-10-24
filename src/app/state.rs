@@ -36,6 +36,18 @@ pub enum AnchorSource {
 pub struct DocAnchor {
     pub anchor: Anchor,
     pub source: AnchorSource,
+    /// How far, in modules, the anchor was moved out from where the photo
+    /// shows it for the bleed its placement expected
+    /// ([`qr_forensics::imaging::detect::Detection::bloom`]): an edge
+    /// point traced against the quiet zone lies as far in as the bleed
+    /// drew the edge of the ink, and a placement made expecting the bleed
+    /// moves it out by as much
+    /// ([`qr_forensics::imaging::detect::bled_outline`]), which a
+    /// placement made again must not do twice. Nought for an anchor where
+    /// the photo shows it, as every anchor placed by hand is, and for
+    /// every kind but an edge point, which alone is moved and not looked
+    /// for again.
+    pub bled: f64,
 }
 
 impl DocAnchor {
@@ -198,12 +210,19 @@ impl Document {
         self.anchors.iter().find(|a| (a.anchor.at[0] - at[0]).abs() < 1e-6 && (a.anchor.at[1] - at[1]).abs() < 1e-6)
     }
 
-    /// Set or replace the anchor at a site. One replaced keeps its place
-    /// among the others, so that nothing which goes by their order, as
-    /// the handles of the Align stage are drawn, sees it move.
+    /// Set or replace the anchor at a site, where the photo shows it
+    /// ([`DocAnchor::bled`]). One replaced keeps its place among the
+    /// others, so that nothing which goes by their order, as the handles
+    /// of the Align stage are drawn, sees it move.
     pub fn set_anchor(&mut self, anchor: Anchor, source: AnchorSource) {
+        self.set_anchor_bled(anchor, source, 0.0);
+    }
+
+    /// [`Self::set_anchor`], for an anchor moved `bled` modules out for a
+    /// bleed ([`DocAnchor::bled`]).
+    pub fn set_anchor_bled(&mut self, anchor: Anchor, source: AnchorSource, bled: f64) {
         let at = anchor.at;
-        let set = DocAnchor { anchor, source };
+        let set = DocAnchor { anchor, source, bled };
         match self.anchors.iter().position(|a| (a.anchor.at[0] - at[0]).abs() < 1e-6 && (a.anchor.at[1] - at[1]).abs() < 1e-6) {
             Some(i) => self.anchors[i] = set,
             None => self.anchors.push(set),

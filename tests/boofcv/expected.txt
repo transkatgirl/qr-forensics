@@ -57,7 +57,7 @@ blurred/image033.jpg 0 read
 blurred/image034.jpg 0 read
 blurred/image035.jpg 0 read
 blurred/image036.jpg 0 found
-blurred/image037.jpg 0 found
+blurred/image037.jpg 0 read
 blurred/image038.jpg 0 read
 blurred/image039.jpg 0 read
 blurred/image040.jpg 0 not found
@@ -197,8 +197,8 @@ brightness/image010.jpg 2 read
 brightness/image011.jpg 0 read
 brightness/image011.jpg 1 read
 brightness/image011.jpg 2 read
-brightness/image012.jpg 0 found
-brightness/image012.jpg 1 found
+brightness/image012.jpg 0 read
+brightness/image012.jpg 1 read
 brightness/image012.jpg 2 not found
 brightness/image013.jpg 0 read
 brightness/image013.jpg 1 read
@@ -298,7 +298,7 @@ curved/image007.jpg 0 read
 curved/image008.jpg 0 read
 curved/image009.jpg 0 read
 curved/image010.jpg 0 read
-curved/image011.jpg 0 found
+curved/image011.jpg 0 read
 curved/image012.jpg 0 read
 curved/image013.jpg 0 found
 curved/image014.jpg 0 read
@@ -306,7 +306,7 @@ curved/image015.jpg 0 read
 curved/image015.jpg 1 read
 curved/image016.jpg 0 read
 curved/image016.jpg 1 read
-curved/image017.jpg 0 found
+curved/image017.jpg 0 read
 curved/image017.jpg 1 read
 curved/image018.jpg 0 read
 curved/image018.jpg 1 read
@@ -318,7 +318,7 @@ curved/image021.jpg 0 found
 curved/image021.jpg 1 read
 curved/image022.jpg 0 read
 curved/image022.jpg 1 read
-curved/image023.jpg 0 found
+curved/image023.jpg 0 read
 curved/image023.jpg 1 read
 curved/image024.jpg 0 found
 curved/image024.jpg 1 read
@@ -370,18 +370,18 @@ damaged/image013.jpg 0 found
 damaged/image014.jpg 0 found
 damaged/image015.jpg 0 read
 damaged/image016.jpg 0 found
-damaged/image017.jpg 0 found
+damaged/image017.jpg 0 read
 damaged/image018.jpg 0 read
 damaged/image019.jpg 0 read
 damaged/image020.jpg 0 read
 damaged/image021.jpg 0 read
-damaged/image022.jpg 0 found
+damaged/image022.jpg 0 read
 damaged/image023.jpg 0 found
 damaged/image024.jpg 0 found
 damaged/image025.jpg 0 read
 damaged/image026.jpg 0 read
-damaged/image027.jpg 0 found
-damaged/image028.jpg 0 found
+damaged/image027.jpg 0 read
+damaged/image028.jpg 0 read
 damaged/image029.jpg 0 read
 damaged/image030.jpg 0 read
 damaged/image031.jpg 0 found

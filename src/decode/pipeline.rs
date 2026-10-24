@@ -714,18 +714,28 @@ impl CodewordReport {
 
 /// Ranking of a decode attempt; larger is better. Field order is the
 /// comparison order.
-/// How attempts at a grid, and reads of a photo, rank against each other:
-/// field by field, the first that differs deciding. A read that is
-/// trustworthy, with every block confirmed and a stream that parses,
-/// outranks all else. Below that the stream comes before the blocks: a
-/// placement whose stream parses, through bits no block confirmed, is
-/// nearer the symbol than one whose every block "verified" while its
-/// stream reads as noise. A wrong placement manages the latter now and
-/// then, where a block spends most of its redundancy on what it erased
-/// and is confirmed by the little left, which noise passes once in so
-/// many blocks, as often as its risk says; BoofCV takes a symbol as read
-/// only when its error correction succeeds and its message parses, and
-/// the order here does the same.
+/// How attempts at a grid rank against each other: field by field, the
+/// first that differs deciding. An attempt that is trustworthy, with
+/// every block confirmed and a stream that parses, outranks all else.
+/// Below that the stream comes before the blocks: of two attempts at one
+/// grid, under two formats or as the two QR Code models, or of two
+/// refits of one read, the one whose stream parses, through bits no
+/// block confirmed, is nearer the symbol than one whose every block
+/// "verified" while its stream reads as noise. A wrong placement manages
+/// the latter now and then, where a block spends most of its redundancy
+/// on what it erased and is confirmed by the little left, which noise
+/// passes once in so many blocks, as often as its risk says; BoofCV
+/// takes a symbol as read only when its error correction succeeds and
+/// its message parses, and the order here does the same.
+///
+/// Reads of a photo, which may be of other placements and other
+/// versions, are ranked otherwise ([`crate::imaging::read::ReadResult`]):
+/// first by whether a block of them is confirmed, those with none by the
+/// fit of their fixed patterns, and only then by this. Between them a
+/// stream that parses through bits no block confirmed shows nothing that
+/// noise does not show as often, since a version laid over a symbol of
+/// another reads one so, and a block confirmed comes first, false
+/// confirmations and all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AttemptScore {
     /// Segments parse to a clean end with no impossible values; a stream

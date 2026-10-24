@@ -775,6 +775,23 @@ pub fn alignment_score(
     Some((scorer.agreement(corners, false)?, scorer.contrast(corners)?))
 }
 
+/// (matching, fixed) modules of a version's fixed patterns read through
+/// `corners` and the map `anchors` bend, as a [`Refinement`] counts them,
+/// with dark and light swapped when `inverted`. `None` when they form no
+/// usable outline.
+pub fn placement_agreement(
+    image: &Luma,
+    func: &FunctionMap,
+    corners: [[f64; 2]; 4],
+    anchors: &[ControlPoint],
+    inverted: bool,
+    params: &SampleParams,
+) -> Option<(usize, usize)> {
+    let scorer = Scorer::new(image, &Template::whole(func), corners, fixed_threshold(params));
+    let map = Projection::new(func.width, func.height, corners, anchors)?;
+    Some((scorer.agreement_known(&map, inverted)?.0, scorer.fixed()))
+}
+
 /// The threshold the sampler would apply to every module alike. A fixed
 /// global threshold is honoured; local thresholds are not meaningful over
 /// fixed modules alone.
@@ -836,8 +853,34 @@ pub fn refine_corners_holding(
     held: &[usize],
     params: &SampleParams,
 ) -> Option<Refinement> {
+    refine_corners_expecting(image, func, corners, anchors, held, 0.0, None, params)
+}
+
+/// [`refine_corners_holding`] expecting every boundary `bloom` modules
+/// into the dark ([`super::detect::Detection::bloom`]), as the anchors of
+/// a photo that has bled are refined ([`super::detect::refine_anchors`]):
+/// fitted as printed, the outline of a symbol whose dark has thinned
+/// settles to one side of it, as a finder pattern does. The corners
+/// settled by the symbol's edge are settled expecting it too: the edge of
+/// the ink a trace finds lies as far in as the bleed, and a QR Code of
+/// version 1, with no alignment pattern, has its fourth corner so. The
+/// symbol is taken to be light on dark when `inverted` says so, and where
+/// it is `None` at whichever polarity reads the more crisply: a bleed is
+/// into the symbol's dark, and one measured at one polarity is the
+/// opposite bleed at the other.
+#[allow(clippy::too_many_arguments)]
+pub fn refine_corners_expecting(
+    image: &Luma,
+    func: &FunctionMap,
+    corners: [[f64; 2]; 4],
+    anchors: &[ControlPoint],
+    held: &[usize],
+    bloom: f64,
+    inverted: Option<bool>,
+    params: &SampleParams,
+) -> Option<Refinement> {
     let warp = Warp::new(func.width, func.height, anchors);
-    let scorer = Scorer::new(image, &Template::whole(func), corners, fixed_threshold(params)).with_spline(warp.spline());
+    let scorer = Scorer::new(image, &Template::whole(func), corners, fixed_threshold(params)).with_spline(warp.spline()).with_bloom(bloom);
     let fixed = scorer.fixed();
     let mut evaluations = 0;
     // Start at half a module: a corner further off than that is misplaced,
@@ -865,16 +908,24 @@ pub fn refine_corners_holding(
     let pinned = super::detect::corners_held_by_controls(func, anchors);
     let still: Vec<usize> = loose.iter().chain(&pinned).copied().collect();
     let moves = holding(&still);
-    // The two polarities descend from the same corners and take nothing
-    // from one another: side by side, on a core to spare.
-    let descents = work::map(&[1.0, -1.0], |&sign| {
+    // The two polarities, where the polarity is not given, descend from
+    // the same corners and take nothing from one another: side by side,
+    // on a core to spare.
+    let polarities: Vec<bool> = inverted.map_or_else(|| vec![false, true], |inverted| vec![inverted]);
+    let descents = work::map(&polarities, |&inverted| {
         let mut evaluations = 0;
-        (scorer.descend_by(corners, &moves, step, &mut evaluations, score(sign)), evaluations)
+        (scorer.descend_by(corners, &moves, step, &mut evaluations, score(if inverted { -1.0 } else { 1.0 })), evaluations)
     });
     evaluations += descents.iter().map(|(_, n)| n).sum::<usize>();
-    let [(normal, _), (flipped, _)] = <[_; 2]>::try_from(descents).ok()?;
-    let (normal, flipped) = (normal?, flipped?);
-    let (inverted, (mut current, _)) = if flipped.1 > normal.1 { (true, flipped) } else { (false, normal) };
+    // Light on dark only where that reads more crisply.
+    let mut crispest: Option<(bool, _, f64)> = None;
+    for (&inverted, (descent, _)) in polarities.iter().zip(descents) {
+        let (placed, contrast) = descent?;
+        if crispest.is_none_or(|(_, _, best)| contrast > best) {
+            crispest = Some((inverted, placed, contrast));
+        }
+    }
+    let (inverted, mut current, _) = crispest?;
     // A corner a finder pattern's own fit placed is let move only the
     // last fraction of a pixel, which the whole outline's contrast does
     // place better on a flat photo: on curled paper the contrast would
@@ -894,7 +945,7 @@ pub fn refine_corners_holding(
         current = corners;
     }
     let sign = if inverted { -1.0 } else { 1.0 };
-    let current = super::detect::settle_loose_corners_with(image, func, current, &anchored, sign, params);
+    let current = super::detect::settle_loose_corners_with(image, func, current, &anchored, sign, bloom, params);
     let after = scorer.agreement_known(&warp.place(current)?, inverted)?.0;
     Some(Refinement { corners: current, before: (before, fixed), after: (after, fixed), evaluations, inverted })
 }

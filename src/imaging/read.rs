@@ -55,6 +55,11 @@
 //!   to go by, tries all four turns and keeps the one that decodes;
 //! - the placement without the anchor that lies farthest from where the
 //!   others put it, when not one block has verified: see below;
+//! - the placement again expecting the bleed its finders show, when no
+//!   other read of it is beyond doubt ([`super::detect::bled_placement`]):
+//!   on an over-exposed photo whose dark has thinned, or a print whose
+//!   ink has spread, the fixed patterns are fitted as printed to one side
+//!   of themselves, by as much as the bleed, and the grid with them;
 //! - the photo turned a quarter at a time, as zxing-cpp's `tryRotate`
 //!   does: the fits walk the photo's axes, and a symbol that sits a
 //!   fraction of a module off at one turn reads at another.
@@ -121,18 +126,18 @@
 use std::sync::Arc;
 
 use super::detect::{
-    Anchor, AnchorKind, Climb, Detection, Retry, detect_candidates_by, outline_around, refine_anchors, seen_from_behind,
-    turned_on_symbol,
+    Anchor, AnchorKind, Climb, Detection, Retry, bled_placement, detect_candidates_by, first_finder_bleed, may_bleed,
+    outline_around, refine_anchors_with, seen_from_behind, turned_on_symbol,
 };
 use super::enhance::{Enhance, Enhanced};
 use super::projection::{ControlPoint, Project, Projection};
-use super::refine::{MOVES, Scorer, Shifted, Template, Warp, descend_by, fixed_threshold, refine_corners_holding};
+use super::refine::{MOVES, Scorer, Shifted, Template, Warp, descend_by, fixed_threshold, refine_corners_expecting};
 use super::sample::{Kernel, Rule, SampleParams, classify, read_modules, sample_modules_noting};
 use super::{Luma, rotate_outline_cw, unrotate_point_cw};
 use crate::decode::bch::{FormatAnalysis, FormatCandidate};
 use crate::decode::codewords::Pins;
 use crate::decode::padding::recover_padding_after;
-use crate::decode::pipeline::{DecodeOptions, DecodeReport, GridAnalysis, analyze, brute_force, decode};
+use crate::decode::pipeline::{AttemptScore, DecodeOptions, DecodeReport, GridAnalysis, analyze, brute_force, decode};
 use crate::decode::repair::known_modules;
 use crate::symbol::function_map::FunctionMap;
 use crate::symbol::{Family, SymbolVersion};
@@ -219,9 +224,71 @@ impl ReadResult {
         !self.pins.is_empty()
     }
 
+    /// Whether this read is the better of two, by where each stands
+    /// ([`Self::standing`]).
     fn outranks(&self, other: &ReadResult) -> bool {
-        self.report.score > other.report.score
+        self.standing() > other.standing()
     }
+
+    /// Where this read stands among others: first what it has to show
+    /// besides its decode ([`standing_of`]), whether a block of it is
+    /// confirmed and, for a read with none, how far its fixed patterns
+    /// read right beyond what chance gives; and then the decode, as the
+    /// module describes. What a decode with not a block confirmed has to
+    /// show is nothing a block of noise does not show as often. A version
+    /// two modules smaller, laid over a symbol, reads its codewords from
+    /// modules the grid straddles, and fills those it erases with nothing
+    /// left over to check them by: a block "solved" so has no confirming
+    /// bit, and any input would have solved. Its stream, read through bits
+    /// no block confirmed, parses as often as a short stream of noise
+    /// does. Of eighty version 2 symbols of random data, each read through
+    /// an outline round it, sixty-five came back as version 1 that way
+    /// with the decode judging, most with a fit of 120 to 140 of 203 fixed
+    /// modules beside version 2's 236 of 236.
+    ///
+    /// One key for every read, and not a rule for each pair of them: with
+    /// the fit judging between reads of two versions and the decode
+    /// between reads of one, three reads can each outrank the next round
+    /// in a ring, and which is kept then hangs on the order they come in.
+    /// A read of version 2 that fits outright gives way to a worse-fitting
+    /// one of version 2 whose stream parses, and that to a read of version
+    /// 1 that fits better than it, though not as well as the first. A
+    /// block confirmed outweighs any fit, as it does where the app ranks
+    /// the reads of each family that did not decode.
+    fn standing(&self) -> (bool, i64, AttemptScore) {
+        let (confirmed, fit) = standing_of(self.report.score.blocks_verified, self.agreement);
+        (confirmed, if confirmed { 0 } else { fit }, self.report.score)
+    }
+}
+
+/// What a read has to show for itself besides its decode, from the
+/// blocks of it that verified and its (matching, fixed) agreement:
+/// whether any block verified, and then how far its fixed modules read
+/// right beyond what chance gives ([`fit_beyond_chance`]), which is how a
+/// read of one version is told from a read of another when neither has a
+/// block confirmed. The blocks are counted as the decode's score counts
+/// them ([`AttemptScore::blocks_verified`]): none where every block
+/// "verified" and not one segment header parsed, the false solve of a
+/// wrong placement. A read ranks its own by it ([`ReadResult::standing`]),
+/// and the app the reads of each family that did not decode.
+pub fn standing_of(blocks_verified: usize, agreement: (usize, usize)) -> (bool, i64) {
+    (blocks_verified > 0, fit_beyond_chance(agreement))
+}
+
+/// How far a placement's (matching, fixed) agreement over its version's
+/// fixed modules reads right beyond what chance gives, for choosing
+/// between placements of different sizes. Chance is no coin toss here:
+/// the placement of a symbol of the wrong family or version has been
+/// pushed to the best fit the outline allows, and over the test
+/// photographs a QR Code laid on a Micro QR symbol reads as many as seven
+/// in ten of its fixed modules right, though never three in four. So a
+/// fixed module that reads wrong is set against two that read right: a
+/// fit of two in three nets nothing, however many fixed modules the
+/// version has, where a small symbol that fits nets nearly all of its
+/// own, and a larger one that fits, damaged as it may be, more than any
+/// part of it read as a symbol of its own.
+fn fit_beyond_chance((matching, fixed): (usize, usize)) -> i64 {
+    3 * matching as i64 - 2 * fixed as i64
 }
 
 /// Read the symbol inside `region`, an outline drawn loosely around it,
@@ -643,10 +710,12 @@ const DOUBT_MODULES: f64 = 0.35;
 /// when no read has verified a block, the placement with its most
 /// doubtful anchors dropped, one at a time. The later two are read under
 /// the kernel asked for alone, with every threshold rule: what they
-/// settle does not hang on the kernel. The first sampling goes on as
-/// the read asked for, and every other read is charged as one of all
-/// these that may be made, the best of which is kept ([`Reads`]): the
-/// reads in mirror order and without anchors once went uncounted.
+/// settle does not hang on the kernel. Last, when no read has settled the
+/// search, the placement again expecting the bleed its finders show,
+/// every way the placement was read. The first sampling goes on as the
+/// read asked for, and every other read is charged as one of all these
+/// that may be made, the best of which is kept ([`Reads`]): the reads in
+/// mirror order and without anchors once went uncounted.
 fn read_placement(
     image: &Luma,
     prepared: &Prepared,
@@ -655,8 +724,21 @@ fn read_placement(
     reads: Reads,
     keep: &mut dyn FnMut(ReadResult) -> bool,
 ) -> bool {
+    let found = &prepared.detection;
     let few = variants.len().min(params.rules().count());
-    let reads = reads.among(variants.len() + few + DOUBT_LIMIT * few);
+    // Whether the placement is read expecting a bleed is known only once
+    // every other read has failed, and every read is counted before the
+    // first is made. Measuring every finder's bleed costs more than a
+    // read that decodes at once, 125 ms against 35 for a version 2 symbol;
+    // but a symbol bleeds only where every finder does ([`symbol_bleed`]),
+    // and one finder took 29. So those reads are counted where the first
+    // finder shows a bleed, and the others are measured only once the
+    // reads are reached ([`bled_placement`]). Counted wherever the
+    // placement had finders enough, they charged every other read of it
+    // more than half a bit, for a bleed few photographs show.
+    let first_bleed = if may_bleed(found) { first_finder_bleed(image, found, params) } else { 0.0 };
+    let bled_ways = if first_bleed != 0.0 { variants.len() } else { 0 };
+    let reads = reads.among(variants.len() + few + DOUBT_LIMIT * few + bled_ways);
     let mut verified = 0;
     let samplings: Vec<(Variant, Reads)> = variants.iter().copied().zip(reads.first_then_past()).collect();
     let settled = work::first_then_in_turn(
@@ -677,7 +759,6 @@ fn read_placement(
     }
     // The variants lead with the kernel asked for under each rule.
     let few = &variants[..few];
-    let found = &prepared.detection;
     if found.version.family() != Family::Rmqr
         && found.info.format.valid == Some(true)
         && let Some(detection) = seen_from_behind(image, found, params)
@@ -712,7 +793,28 @@ fn read_placement(
             }
         }
     }
-    false
+    if bled_ways == 0 || work::cancelled() {
+        return false;
+    }
+    // Last, the placement expecting the bleed its finders show
+    // ([`bled_placement`]), every way a placement is read. Over-exposed, the
+    // dark of BoofCV's photograph of a version 2 symbol had thinned by a
+    // third of a module at every boundary, and the patterns were fitted
+    // a third of a module to one side of themselves, where every light
+    // module between two dark ones read dark: it read nothing, and
+    // zxing-cpp read it outright. It is read so only when no read before
+    // it settled the search, though one may have confirmed a block or
+    // more: the symbol is not placed expecting the bleed as it is found,
+    // since a bleed is measured as one number, and ink that has spread
+    // further on one side of a finder than the other, as on a creased
+    // thermal receipt in the same benchmark, was placed better by the
+    // fit as printed, and its symbol, which read so, no longer did.
+    let Some(bled) = bled_placement(image, found, first_bleed, params).and_then(|bled| prepare(image, bled, params)) else { return false };
+    work::in_turn(
+        variants,
+        |&variant| if work::cancelled() { None } else { read_prepared(image, &bled, variant, params, reads.past()) },
+        |result| result.is_some_and(&mut *keep),
+    )
 }
 
 /// The anchor, no finder's, that lies farthest from where the corners
@@ -811,15 +913,19 @@ struct Prepared {
 
 /// Refine a detection's corners, with the anchors held and the corners a
 /// finder pattern measured kept, and then every anchor against its own
-/// pattern. `None` when the corners form no usable outline. The
-/// detection is taken to lie the right way up on its symbol ([`seat`]).
+/// pattern, each expecting the bleed the detection was placed for
+/// ([`Detection::bloom`]) at the polarity it was measured at
+/// ([`Detection::held_polarity`]). `None` when the corners form no usable
+/// outline. The detection is taken to lie the right way up on its symbol
+/// ([`seat`]).
 fn prepare(image: &Luma, mut found: Detection, params: &SampleParams) -> Option<Prepared> {
     let func = FunctionMap::new(found.version);
     let controls: Vec<ControlPoint> = found.anchors.iter().map(|a| a.control_point()).collect();
-    let refined = refine_corners_holding(image, &func, found.corners, &controls, &found.held_corners(), params);
+    let polarity = found.held_polarity();
+    let refined = refine_corners_expecting(image, &func, found.corners, &controls, &found.held_corners(), found.bloom, polarity, params);
     let agreement = refined.as_ref().map_or(found.agreement, |r| r.after);
     found.corners = refined.map_or(found.corners, |r| r.corners);
-    found.anchors = refine_anchors(image, &func, found.corners, &found.anchors, params);
+    found.anchors = refine_anchors_with(image, &func, found.corners, &found.anchors, found.bloom, polarity, params);
     found.projection()?;
     Some(Prepared { detection: found, agreement })
 }
@@ -992,7 +1098,11 @@ fn feedback_round(image: &Luma, current: &ReadResult, params: &SampleParams, opt
     // The corners, against every known module, with the anchors held.
     let controls: Vec<ControlPoint> = found.anchors.iter().map(|a| a.control_point()).collect();
     let warp = Warp::new(func.width, func.height, &controls);
-    let scorer = Scorer::new(image, &template, found.corners, threshold).with_spline(warp.spline()).with_max_edges(FEEDBACK_MAX_EDGES);
+    // Expecting the bleed the placement was made for, as it was refined
+    // ([`Detection::bloom`]): fitted as printed, the known modules of a
+    // photo that has bled pull the placement back to one side of them.
+    let scorer =
+        Scorer::new(image, &template, found.corners, threshold).with_spline(warp.spline()).with_max_edges(FEEDBACK_MAX_EDGES).with_bloom(found.bloom);
     let module_px = scorer.module_px();
     let mut corners = found.corners;
     let mut evaluations = 0;
@@ -1029,7 +1139,7 @@ fn feedback_round(image: &Luma, current: &ReadResult, params: &SampleParams, opt
         };
         let Some(initial) = placed(anchors[k].center) else { continue };
         let frame = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]].map(|[x, y]| initial.apply(x as f64, y as f64));
-        let local = Scorer::new(image, &window, frame, threshold).with_along(6);
+        let local = Scorer::new(image, &window, frame, threshold).with_along(6).with_bloom(found.bloom);
         let local_px = local.module_px();
         let (dx, dy) = (x0 as f64, y0 as f64);
         let score = |trial: [[f64; 2]; 4]| local.contrast_with(&Shifted { map: &placed(trial[0])?, dx, dy }, sign);
@@ -1329,6 +1439,7 @@ mod tests {
             retry: None,
             turned: 0,
             decodes: None,
+            bloom: 0.0,
         }
     }
 

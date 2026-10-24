@@ -439,10 +439,32 @@ const CURVE_GAIN: f64 = 0.2;
 /// to a few tenths of a module either way, only this far.
 const REFINE_LIMIT: f64 = 1.0;
 const TIMING_REFINE_LIMIT: f64 = 0.15;
+/// How far, in modules, a timing module of a symbol placed again
+/// expecting its bleed ([`bled_placement`]) is looked for from where the
+/// finders and alignment patterns placed so put it: the narrowest window
+/// the detector looks in. [`search_site`] rounds it up to whole
+/// [`SEARCH_STEP`]s, as it does every window, so it reaches nine tenths
+/// of a module either way, still inside the two modules a timing pattern
+/// repeats at.
+const BLED_TIMING_WINDOW: f64 = 0.75;
 /// Boundary moves tried, in modules, for a finder pattern that does not
 /// fit as printed: into the dark for an over-exposed photo, into the light
 /// for an under-exposed one.
 const BLOOMS: [f64; 3] = [0.2, 0.35, -0.2];
+/// How much more crisply a finder must read fitted expecting a bleed than
+/// fitted as printed for the bleed to be taken as the photo's
+/// ([`measured_bleed`]). On BoofCV's over-exposed photograph of a version
+/// 2 symbol, `brightness/image012.jpg`, whose dark had thinned by a third
+/// of a module at every boundary, the fit expecting a third read a
+/// quarter more crisply than the plain one; on a photo that has not bled
+/// the plain fit reads the more crisply, and a bleed it barely gains on
+/// is too slight to move a pattern far.
+const BLOOM_GAIN: f64 = 1.1;
+/// How far either side of the crispest of [`BLOOMS`] a finder's bleed
+/// is measured again, in modules: those lie fifteen hundredths apart and
+/// more. Over renders that had bled 0.15, 0.25 and 0.3 of a module at
+/// every boundary it measured 0.125, 0.275 and 0.275.
+const BLEED_STEP: f64 = 0.075;
 /// Contrast forgone per square module of distance from the predicted
 /// place of a pattern, and how many of the best placements are read
 /// before giving up on a site.
@@ -1022,6 +1044,16 @@ pub struct Detection {
     /// Asked by whoever lists detections for choosing among, which lists
     /// what decodes first; `None` when it was not asked.
     pub decodes: Option<bool>,
+    /// How far, in modules, the symbol's boundaries are taken to lie into
+    /// its dark modules from where its modules have them: on a symbol dark
+    /// on light, the bleed of an over-exposed photo, negative where the ink
+    /// spread; on one light on dark, whose dark modules read light, the
+    /// other way about. Its anchors and corners are refined expecting it
+    /// ([`refine_anchors`], [`super::refine::refine_corners_expecting`]).
+    /// Nought as the symbol is found; where no read of the placement
+    /// settles the search, the read measures it ([`bloom_of`]) and reads
+    /// the symbol again expecting it.
+    pub bloom: f64,
 }
 
 impl Detection {
@@ -1080,6 +1112,16 @@ impl Detection {
         held.sort_unstable();
         held.dedup();
         held
+    }
+
+    /// The polarity the refinement should hold, light on dark when
+    /// `Some(true)`: the detection's own, where it was placed expecting a
+    /// bleed ([`Self::bloom`]), which was measured at that polarity and is
+    /// into the symbol's dark, so that at the other it would be the
+    /// opposite bleed. `None` for a placement made as printed, which the
+    /// refinement places at whichever polarity reads the better.
+    pub fn held_polarity(&self) -> Option<bool> {
+        (self.bloom != 0.0).then_some(self.inverted)
     }
 
     /// A square symbol's placement taken in mirror order: its corners
@@ -1626,6 +1668,7 @@ fn pure_detection(
         retry: None,
         turned: 0,
         decodes: None,
+        bloom: 0.0,
     };
     // A square symbol seen from the back reads as its transpose; the
     // format bits decide, as they do for a fitted symbol.
@@ -4176,10 +4219,11 @@ fn choose_model(anchors: &[Anchor], points: usize) -> Model {
 const SEARCH_SITE_THREADS: usize = 4;
 
 /// Look for a site's pattern within `window` modules of where `predicted`
-/// puts its centre, with the shape of the patch taken from `map`. Returns
-/// the anchor and its correspondences: the four corners of a finder,
-/// whose shape the template pins down, or the centre alone of a smaller
-/// pattern.
+/// puts its centre, with the shape of the patch taken from `map`, expecting
+/// its boundaries `bloom` modules into the dark ([`Detection::bloom`]).
+/// Returns the anchor and its correspondences: the four corners of a
+/// finder, whose shape the template pins down, or the centre alone of a
+/// smaller pattern.
 #[allow(clippy::too_many_arguments)]
 fn search_site(
     image: &Luma,
@@ -4189,6 +4233,7 @@ fn search_site(
     window: f64,
     inverted: bool,
     threshold: Option<f32>,
+    bloom: f64,
 ) -> Option<(Anchor, Vec<Pair>)> {
     let template = site.template(func);
     if template.fixed() < 4 {
@@ -4196,7 +4241,7 @@ fn search_site(
     }
     let rect = site.rect_corners();
     let placed = |dx: f64, dy: f64| rect.map(|[x, y]| map.apply(x + dx, y + dy));
-    let scorer = Scorer::new(image, &template, placed(0.0, 0.0), threshold).with_along(6);
+    let scorer = Scorer::new(image, &template, placed(0.0, 0.0), threshold).with_along(6).with_bloom(bloom);
     let sign = if inverted { -1.0 } else { 1.0 };
     let steps = (window / SEARCH_STEP).ceil() as i32;
     let timing = site.kind == AnchorKind::Timing;
@@ -4226,8 +4271,23 @@ fn search_site(
     let moves: &[[f64; 4]] = if site.kind == AnchorKind::Finder { &MOVES } else { &SHIFT };
     let mut evaluations = 0;
     // The best few placements are each settled and read; the first that
-    // reads as the pattern wins.
-    let mut found = None;
+    // reads as the pattern wins. A finder looked for expecting a bleed
+    // keeps the crispest of them that reads as its pattern instead: it is
+    // looked for through corners fitted as printed, as far off as the
+    // bleed, and its template begins in the shape they give it. Refitted
+    // so, the top-left finder of a version 2 symbol whose dark had
+    // thinned by three tenths of a module, with edge points dropped by
+    // hand on the edge of its ink, was now and then settled from the
+    // first placement squeezed a third of a module across, at a contrast
+    // of 0.68 where it read 0.71 on its pattern. Its fit places the
+    // symbol's corner ([`bled_outline`]): Refine pressed six times over
+    // put that corner from 0.06 of a module off to 0.49, and keeping the
+    // crispest from 0.05 to 0.13. One that reads whole still comes before
+    // one read with a quarter torn ([`judge`]), however crisply that
+    // reads: its corners are the ones a finder's fit places the symbol's
+    // corner by.
+    let crispest = bloom != 0.0 && site.kind == AnchorKind::Finder;
+    let mut found: Option<([[f64; 2]; 4], bool, f64)> = None;
     for (start, _) in placements.iter().copied().take(PLACEMENTS_TRIED) {
         let Some((corners, score)) = scorer.descend(start, sign, moves, scorer.module_px() * SEARCH_STEP, &mut evaluations) else { continue };
         if score <= 0.0 {
@@ -4252,17 +4312,21 @@ fn search_site(
                 pm == pk && pk + tk == template.fixed() && tm + 1 >= tk
             };
             if whole || passable {
-                found = Some((corners, false));
+                found = Some((corners, false, score));
                 break;
             }
             continue;
         }
         if let Some(partial) = accept(&scorer, corners, inverted) {
-            found = Some((corners, partial));
-            break;
+            if found.is_none_or(|(_, torn, best)| (!partial, score) > (!torn, best)) {
+                found = Some((corners, partial, score));
+            }
+            if !crispest {
+                break;
+            }
         }
     }
-    let (corners, partial) = found?;
+    let (corners, partial, _) = found?;
     let patch = Homography::rect_to_quad(site.width as f64, site.height as f64, corners)?;
     let center = patch.apply(site.at[0] - site.x0 as f64, site.at[1] - site.y0 as f64);
     let points = if site.kind == AnchorKind::Finder {
@@ -7481,9 +7545,10 @@ fn solve3(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> Option<[f64; 3]> {
 }
 
 /// Scores placements of one corner's quarter of the symbol: the contrast
-/// of the fixed modules there, where there are any, and how crisply the
-/// data modules read dark or light rather than grey, which a grid off by
-/// part of a module cannot manage.
+/// of the fixed modules there, where there are any, expecting their
+/// boundaries `bloom` modules into the dark ([`Detection::bloom`]), and
+/// how crisply the data modules read dark or light rather than grey,
+/// which a grid off by part of a module cannot manage.
 struct CornerScorer<'a> {
     image: &'a Luma,
     width: f64,
@@ -7495,7 +7560,7 @@ struct CornerScorer<'a> {
 }
 
 impl<'a> CornerScorer<'a> {
-    fn new(image: &'a Luma, func: &FunctionMap, corners: [[f64; 2]; 4], i: usize, threshold: Option<f32>) -> Option<Self> {
+    fn new(image: &'a Luma, func: &FunctionMap, corners: [[f64; 2]; 4], i: usize, threshold: Option<f32>, bloom: f64) -> Option<Self> {
         let (w, h) = (func.width, func.height);
         let (qx0, qx1) = if i == 0 || i == 3 { (0, w.div_ceil(2)) } else { (w / 2, w) };
         let (qy0, qy1) = if i == 0 || i == 1 { (0, h.div_ceil(2)) } else { (h / 2, h) };
@@ -7503,7 +7568,7 @@ impl<'a> CornerScorer<'a> {
         let quarter = [[qx0, qy0], [qx1, qy0], [qx1, qy1], [qx0, qy1]].map(|[x, y]| [x as f64, y as f64]);
         let map = Homography::rect_to_quad(w as f64, h as f64, corners)?;
         let base = quarter.map(|[x, y]| map.apply(x, y));
-        let fixed = (template.fixed() >= 4).then(|| Scorer::new(image, &template, base, threshold).with_along(6));
+        let fixed = (template.fixed() >= 4).then(|| Scorer::new(image, &template, base, threshold).with_along(6).with_bloom(bloom));
         // Every module of the quarter that is not fixed, thinned to a
         // manageable number.
         let mut data: Vec<Pos> = (qy0..qy1)
@@ -7755,7 +7820,9 @@ fn traced_corner(
 /// which on curled paper is not where the edge goes, and on a blurred
 /// photo the anchor itself is read to a few tenths of a module; the
 /// edges, traced over many modules, place the corner better either way.
-/// Returns whether the corner was moved.
+/// Every boundary is expected `bloom` modules into the dark
+/// ([`Detection::bloom`]), as [`settle_corner`] expects it. Returns
+/// whether the corner was moved.
 #[allow(clippy::too_many_arguments)]
 fn settle_traced_corner(
     image: &Luma,
@@ -7766,15 +7833,18 @@ fn settle_traced_corner(
     threshold: Option<f32>,
     starts: &[[f64; 2]],
     fourth: bool,
+    bloom: f64,
 ) -> bool {
     let (w, h) = (func.width as f64, func.height as f64);
+    let [cx, cy] = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]][i];
     // No further than a bend could carry it: beyond that the trace has
     // found other print.
-    let Some(p) = traced_corner(image, func, corners, i, sign, threshold, starts, fourth, MAX_EDGE_SAGITTA) else { return false };
+    let Some(traced) = traced_corner(image, func, corners, i, sign, threshold, starts, fourth, MAX_EDGE_SAGITTA) else { return false };
+    let [dx, dy] = Homography::rect_to_quad(w, h, *corners).map_or([0.0, 0.0], |map| bled_out(&map, w, h, [cx, cy], bloom));
+    let p = [traced[0] + dx, traced[1] + dy];
     corners[i] = p;
     let Some(map) = Homography::rect_to_quad(w, h, *corners) else { return true };
-    let [cx, cy] = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]][i];
-    polish_corner_by_data(image, func, corners, i, sign, threshold);
+    polish_corner_by_data(image, func, corners, i, sign, threshold, bloom);
     if distance(corners[i], p) > POLISH_LIMIT * module_size_at(&map, [cx, cy]) {
         corners[i] = p;
     }
@@ -7786,8 +7856,11 @@ fn settle_traced_corner(
 /// against, and otherwise by the fixed and data modules of the quarter
 /// alone. The edges are traced from the corner as it stands and from each
 /// of `starts`, other places it may be, `fourth` saying whether it is a
-/// QR Code's fourth corner ([`traced_corner`]). Returns whether the edge
-/// was traced on both sides.
+/// QR Code's fourth corner ([`traced_corner`]). Every boundary is
+/// expected `bloom` modules into the dark ([`Detection::bloom`]): the
+/// edge of the ink a trace finds lies as far in from the symbol's edge,
+/// and the quarter's boundaries, fitted as printed, settle to one side of
+/// themselves. Returns whether the edge was traced on both sides.
 #[allow(clippy::too_many_arguments)]
 fn settle_corner(
     image: &Luma,
@@ -7798,13 +7871,16 @@ fn settle_corner(
     threshold: Option<f32>,
     starts: &[[f64; 2]],
     fourth: bool,
+    bloom: f64,
 ) -> bool {
     let (w, h) = (func.width as f64, func.height as f64);
     let Some(map) = Homography::rect_to_quad(w, h, *corners) else { return false };
-    let Some(scorer) = CornerScorer::new(image, func, *corners, i, threshold) else { return false };
+    let Some(scorer) = CornerScorer::new(image, func, *corners, i, threshold, bloom) else { return false };
     let [cx, cy] = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]][i];
 
-    if let Some(p) = traced_corner(image, func, corners, i, sign, threshold, starts, fourth, f64::INFINITY) {
+    if let Some(traced) = traced_corner(image, func, corners, i, sign, threshold, starts, fourth, f64::INFINITY) {
+        let [dx, dy] = bled_out(&map, w, h, [cx, cy], bloom);
+        let p = [traced[0] + dx, traced[1] + dy];
         // Two traced edges fix the corner outright: their crossing is a
         // measurement, where the search below is only a preference. The
         // profiles that found the edges stepped a tenth of a module, and
@@ -7813,15 +7889,22 @@ fn settle_corner(
         // would walk the corner off its edges to where a plane reads the
         // quarter best, so it may take the corner only so far.
         corners[i] = p;
-        polish_corner_by_data(image, func, corners, i, sign, threshold);
+        polish_corner_by_data(image, func, corners, i, sign, threshold, bloom);
         if distance(corners[i], p) > POLISH_LIMIT * module_size_at(&map, [cx, cy]) {
             corners[i] = p;
         }
         return true;
     }
     let (edge_threshold, contrast) = edge_levels(image, func, &map, threshold);
-    let lines: Vec<Line> =
-        edges_at(i, w, h).iter().filter_map(|e| trace_edge(image, &map, e, sign, edge_threshold, contrast).map(|t| t.line)).collect();
+    // Each traced edge moved out across itself by the bleed.
+    let lines: Vec<Line> = edges_at(i, w, h)
+        .iter()
+        .filter_map(|e| {
+            let Line { point: [x, y], dir } = trace_edge(image, &map, e, sign, edge_threshold, contrast)?.line;
+            let (from, to) = (map.apply(e.corner[0], e.corner[1]), map.apply(e.corner[0] - e.inward[0] * bloom, e.corner[1] - e.inward[1] * bloom));
+            Some(Line { point: [x + to[0] - from[0], y + to[1] - from[1]], dir })
+        })
+        .collect();
     let (start, half_width) = match lines.as_slice() {
         [a] => (a.project(corners[i]), CORNER_SEARCH_EDGED),
         _ => (corners[i], if scorer.has_fixed() { CORNER_SEARCH } else { CORNER_SEARCH_CRISP }),
@@ -7882,7 +7965,7 @@ fn settle_corner(
     if best > baseline {
         *corners = best_outline;
     }
-    polish_corner_by_data(image, func, corners, i, sign, threshold);
+    polish_corner_by_data(image, func, corners, i, sign, threshold, bloom);
     false
 }
 
@@ -7907,7 +7990,8 @@ const POLISH_LIMIT: f64 = 0.3;
 /// trace and the crispness search place the corner to within a fraction
 /// of a module; the boundaries, once there are modules to see them
 /// between, place it to a fraction of a pixel. The corner moves only
-/// when the boundaries read sharper for it.
+/// when the boundaries read sharper for it, expecting them `bloom`
+/// modules into the dark ([`Detection::bloom`]).
 fn polish_corner_by_data(
     image: &Luma,
     func: &FunctionMap,
@@ -7915,6 +7999,7 @@ fn polish_corner_by_data(
     i: usize,
     sign: f64,
     threshold: Option<f32>,
+    bloom: f64,
 ) {
     let (w, h) = (func.width, func.height);
     let (qx0, qx1) = if i == 0 || i == 3 { (0, w.div_ceil(2)) } else { (w / 2, w) };
@@ -7950,7 +8035,7 @@ fn polish_corner_by_data(
     }
     let template = Template { width: qx1 - qx0, height: qy1 - qy0, expected };
     let quarter = [[qx0, qy0], [qx1, qy0], [qx1, qy1], [qx0, qy1]].map(|[x, y]| [x as f64, y as f64]);
-    let scorer = Scorer::new(image, &template, quarter.map(|[x, y]| map.apply(x, y)), threshold).with_along(6);
+    let scorer = Scorer::new(image, &template, quarter.map(|[x, y]| map.apply(x, y)), threshold).with_along(6).with_bloom(bloom);
     let score = |outline: [[f64; 2]; 4]| {
         let m = Homography::rect_to_quad(w as f64, h as f64, outline)?;
         let placed = quarter.map(|[x, y]| m.apply(x, y));
@@ -8443,7 +8528,7 @@ fn look_again_for_alignment(
             }
             for ([dx, dy], far) in seeds {
                 let moved = super::refine::Shifted { map: plane, dx, dy };
-                if let Some((anchor, pairs)) = search_site(image, func, site, &moved, window(far), inverted, threshold)
+                if let Some((anchor, pairs)) = search_site(image, func, site, &moved, window(far), inverted, threshold, 0.0)
                     && !anchor.partial
                 {
                     // Only where its neighbours bear it out: a patch of
@@ -8658,9 +8743,9 @@ fn align_assignment(
             Some(grid) if site.kind == AnchorKind::Alignment => carried_offset(grid, &site, &map, &placed),
             _ => None,
         };
-        let mut found = carried.and_then(|[dx, dy]| search_site(image, func, &site, &super::refine::Shifted { map: &map, dx, dy }, window, inverted, threshold));
+        let mut found = carried.and_then(|[dx, dy]| search_site(image, func, &site, &super::refine::Shifted { map: &map, dx, dy }, window, inverted, threshold, 0.0));
         if found.as_ref().is_none_or(|(anchor, _)| anchor.partial) {
-            let plain = search_site(image, func, &site, &local, window, inverted, threshold);
+            let plain = search_site(image, func, &site, &local, window, inverted, threshold, 0.0);
             if found.is_none() || plain.as_ref().is_some_and(|(anchor, _)| !anchor.partial) {
                 found = plain;
             }
@@ -8754,7 +8839,7 @@ fn align_assignment(
     // from the better place.
     for i in (0..4).filter(|i| !measured_corners.contains(i) && !loose.contains(i)) {
         let starts = corner_starts(&placed, &map, &corners, &measured_corners, outline, i);
-        if settle_traced_corner(image, func, &mut corners, i, sign, threshold, &starts, fourth) {
+        if settle_traced_corner(image, func, &mut corners, i, sign, threshold, &starts, fourth, 0.0) {
             edged_corners.push(i);
         }
     }
@@ -8768,7 +8853,7 @@ fn align_assignment(
         for (n, &i) in loose.iter().enumerate() {
             let before = corners;
             let starts = corner_starts(&placed, &map, &corners, &measured_corners, outline, i);
-            let mut edged = settle_corner(image, func, &mut corners, i, sign, threshold, &starts, fourth);
+            let mut edged = settle_corner(image, func, &mut corners, i, sign, threshold, &starts, fourth, 0.0);
             if pass == 0 && !edged && lone_finder && n + 1 == loose.len() {
                 // The edges were not found from where the map put the
                 // corner: the corner opposite the one finder is tried
@@ -8777,7 +8862,7 @@ fn align_assignment(
                 // for the edges to be traced from.
                 let mut again = before;
                 again[i] = std::array::from_fn(|axis| before[(i + 1) % 4][axis] + before[(i + 3) % 4][axis] - before[(i + 2) % 4][axis]);
-                if settle_corner(image, func, &mut again, i, sign, threshold, &[], false) {
+                if settle_corner(image, func, &mut again, i, sign, threshold, &[], false, 0.0) {
                     corners = again;
                     edged = true;
                 }
@@ -8880,6 +8965,7 @@ fn align_assignment(
         retry: None,
         turned: 0,
         decodes: None,
+        bloom: 0.0,
     };
     // A square symbol seen from the back reads as its transpose, which
     // swaps the top-right and bottom-left corners. Its fixed patterns fit
@@ -8933,7 +9019,7 @@ pub fn settle_loose_corners(
         }
     };
     let anchored: Vec<[f64; 2]> = anchors.iter().map(|a| a.at).collect();
-    settle_loose_corners_with(image, func, corners, &anchored, sign, params)
+    settle_loose_corners_with(image, func, corners, &anchored, sign, 0.0, params)
 }
 
 /// The corners of a `func` symbol that nothing holds: neither an anchor at
@@ -8992,13 +9078,16 @@ pub(crate) fn corners_held_by_controls(func: &FunctionMap, controls: &[ControlPo
 }
 
 /// [`settle_loose_corners`] for a symbol of known polarity (`sign` is -1
-/// for light on dark), with the anchors given by their module coordinates.
+/// for light on dark), with the anchors given by their module coordinates,
+/// expecting every boundary `bloom` modules into the dark
+/// ([`Detection::bloom`]).
 pub(crate) fn settle_loose_corners_with(
     image: &Luma,
     func: &FunctionMap,
     corners: [[f64; 2]; 4],
     anchored: &[[f64; 2]],
     sign: f64,
+    bloom: f64,
     params: &SampleParams,
 ) -> [[f64; 2]; 4] {
     let loose = loose_corners(func, anchored);
@@ -9013,74 +9102,465 @@ pub(crate) fn settle_loose_corners_with(
             if work::cancelled() {
                 return corners;
             }
-            settle_corner(image, func, &mut corners, i, sign, threshold, &[], false);
+            settle_corner(image, func, &mut corners, i, sign, threshold, &[], false, bloom);
         }
     }
     corners
 }
 
+/// The bleed a pattern's boundaries show ([`Scorer::with_bloom`]): the
+/// `template` fitted from `from`, where fitted as printed it reads
+/// `plain` contrast, expecting each bleed of [`BLOOMS`], and then a
+/// [`BLEED_STEP`] either side of the crispest. The fit, its contrast and
+/// its bleed, when it reads more than [`BLOOM_GAIN`] times as crisply as
+/// the plain fit; `None` when no bleed does.
+///
+/// A pattern that has bled is fitted off itself by the plain template:
+/// where the dark has thinned by a third of a module, the template a
+/// third of a module to one side lies right on the boundaries of that
+/// side, which reads more crisply than lying a third off every boundary,
+/// and the plain fit settles there. A template that expects the bleed
+/// lies on every boundary at once, and reads more crisply still; one that
+/// expects a bleed the photo does not have reads less crisply than the
+/// plain one.
+fn measured_bleed(
+    image: &Luma,
+    template: &Template,
+    from: [[f64; 2]; 4],
+    plain: f64,
+    sign: f64,
+    threshold: Option<f32>,
+    evaluations: &mut usize,
+) -> Option<([[f64; 2]; 4], f64, f64)> {
+    if plain <= 0.0 {
+        return None;
+    }
+    let fit = |b: f64, evaluations: &mut usize| {
+        let bloomed = Scorer::new(image, template, from, threshold).with_along(8).with_bloom(b);
+        bloomed.descend(from, sign, &MOVES, 0.5 * bloomed.module_px(), evaluations).map(|(corners, score)| (corners, score, b))
+    };
+    let crispest = |best: Option<([[f64; 2]; 4], f64, f64)>, next: Option<([[f64; 2]; 4], f64, f64)>| match (best, next) {
+        (Some(best), Some(next)) if next.1 > best.1 => Some(next),
+        (None, next) => next,
+        (best, _) => best,
+    };
+    let coarse = BLOOMS.into_iter().map(|b| fit(b, evaluations)).fold(None, crispest)?;
+    let fine = [coarse.2 - BLEED_STEP, coarse.2 + BLEED_STEP].into_iter().map(|b| fit(b, evaluations)).fold(Some(coarse), crispest)?;
+    (fine.1 > BLOOM_GAIN * plain).then_some(fine)
+}
+
+/// A symbol's bleed from the bleeds measured of its finders
+/// ([`measured_bleed`]): their middle, when there are two or more and
+/// every one bled the same way, and nought otherwise. A bleed is the
+/// print's and the exposure's, and shows at every finder alike. A finder
+/// blurred, as against bled, can read more crisply expecting a bleed of
+/// either sign, since a blur thins whichever of its rings is narrower
+/// than its neighbours: on BoofCV's photographs of a symbol out of focus
+/// one finder or two of a placement measured a bleed of an eighth of a
+/// module into the light where the others measured none.
+fn symbol_bleed(bleeds: impl IntoIterator<Item = f64>) -> f64 {
+    let mut bleeds: Vec<f64> = bleeds.into_iter().collect();
+    let alike = bleeds.iter().all(|&b| b > 0.0) || bleeds.iter().all(|&b| b < 0.0);
+    if bleeds.len() < 2 || !alike {
+        return 0.0;
+    }
+    bleeds.sort_by(f64::total_cmp);
+    (bleeds[(bleeds.len() - 1) / 2] + bleeds[bleeds.len() / 2]) / 2.0
+}
+
+/// What the finders of a placed symbol are measured through
+/// ([`bloom_of`]): the map its corners and anchors make, and the sign of
+/// its polarity, -1 for light on dark.
+struct BleedFrame {
+    map: Projection,
+    sign: f64,
+    threshold: Option<f32>,
+}
+
+impl BleedFrame {
+    /// For a symbol light on dark when `inverted`, as whoever placed it
+    /// settled. `None` when the corners and anchors make no map.
+    fn new(func: &FunctionMap, corners: [[f64; 2]; 4], anchors: &[Anchor], inverted: bool, params: &SampleParams) -> Option<Self> {
+        let controls: Vec<ControlPoint> = anchors.iter().map(Anchor::control_point).collect();
+        let map = Projection::new(func.width, func.height, corners, &controls)?;
+        Some(Self { map, sign: if inverted { -1.0 } else { 1.0 }, threshold: fixed_threshold(params) })
+    }
+
+    /// The bleed the finder at `anchor` shows: fitted as printed from
+    /// where the map and the anchor put it, and its bleed measured from
+    /// there ([`measured_bleed`]); nought where it shows none.
+    fn finder(&self, image: &Luma, anchor: &Anchor) -> f64 {
+        let (map, sign, threshold) = (&self.map, self.sign, self.threshold);
+        let template = Template::finder_core();
+        let [ax, ay] = map.apply(anchor.at[0], anchor.at[1]);
+        let start = [[-3.5, -3.5], [3.5, -3.5], [3.5, 3.5], [-3.5, 3.5]].map(|[dx, dy]| {
+            let [px, py] = map.apply(anchor.at[0] + dx, anchor.at[1] + dy);
+            [px + anchor.center[0] - ax, py + anchor.center[1] - ay]
+        });
+        let mut evaluations = 0;
+        let plain = Scorer::new(image, &template, start, threshold).with_along(8);
+        plain
+            .descend(start, sign, &MOVES, 0.5 * plain.module_px(), &mut evaluations)
+            .and_then(|(fitted, contrast)| measured_bleed(image, &template, fitted, contrast, sign, threshold, &mut evaluations))
+            .map_or(0.0, |(.., b)| b)
+    }
+}
+
+/// The bleed of a placed symbol ([`Detection::bloom`]), read off its
+/// finder anchors ([`symbol_bleed`]): each finder fitted as printed from
+/// where the anchors and `corners` put it, light on dark when `inverted`
+/// as the placement has it, and its bleed measured from there
+/// ([`measured_bleed`]).
+pub fn bloom_of(image: &Luma, func: &FunctionMap, corners: [[f64; 2]; 4], anchors: &[Anchor], inverted: bool, params: &SampleParams) -> f64 {
+    bloom_given(image, func, corners, anchors, inverted, None, params)
+}
+
+/// [`bloom_of`], with the bleed of the first finder among `anchors`
+/// given as `first` where it has been measured already
+/// ([`first_finder_bleed`]).
+fn bloom_given(
+    image: &Luma,
+    func: &FunctionMap,
+    corners: [[f64; 2]; 4],
+    anchors: &[Anchor],
+    inverted: bool,
+    first: Option<f64>,
+    params: &SampleParams,
+) -> f64 {
+    let Some(frame) = BleedFrame::new(func, corners, anchors, inverted, params) else { return 0.0 };
+    let finders = anchors.iter().filter(|a| a.kind == AnchorKind::Finder).enumerate();
+    symbol_bleed(finders.map(|(k, anchor)| match first {
+        Some(bleed) if k == 0 => bleed,
+        _ => frame.finder(image, anchor),
+    }))
+}
+
+/// The bleed the first finder of `found` shows, as [`bloom_of`] measures
+/// it: nought where it shows none, and then the symbol shows none
+/// either, since a symbol bleeds only where every finder does
+/// ([`symbol_bleed`]). For a read that counts the reads it may make
+/// before it makes the first ([`super::read`]), and would not measure
+/// every finder of a symbol that reads at once.
+pub(crate) fn first_finder_bleed(image: &Luma, found: &Detection, params: &SampleParams) -> f64 {
+    let func = FunctionMap::new(found.version);
+    let Some(first) = found.anchors.iter().find(|a| a.kind == AnchorKind::Finder) else { return 0.0 };
+    BleedFrame::new(&func, found.corners, &found.anchors, found.inverted, params).map_or(0.0, |frame| frame.finder(image, first))
+}
+
+/// Whether [`bled_placement`] may place `found` again at all: a symbol not
+/// yet placed expecting a bleed, with two finders or more to measure one
+/// by ([`symbol_bleed`]).
+pub(crate) fn may_bleed(found: &Detection) -> bool {
+    found.bloom == 0.0 && found.count(AnchorKind::Finder) >= 2
+}
+
+/// How far, in the photo's pixels through `map`, the edge of a `w` × `h`
+/// symbol at `at`, a point of its outline, lies out from the edge of its
+/// ink, on a photo whose boundaries lie `bloom` modules into the dark
+/// ([`Detection::bloom`]): out of the symbol across whichever of its
+/// edges `at` lies on, both at a corner, by the bleed, which drew the
+/// edge of the ink in by as much; in, by the spread of ink.
+fn bled_out(map: &Homography, w: f64, h: f64, [x, y]: [f64; 2], bloom: f64) -> [f64; 2] {
+    let across = |v: f64, end: f64| if v <= 0.0 { -bloom } else if v >= end { bloom } else { 0.0 };
+    let (from, to) = (map.apply(x, y), map.apply(x + across(x, w), y + across(y, h)));
+    [to[0] - from[0], to[1] - from[1]]
+}
+
+/// A placement as a bleed puts it ([`bled_outline`]).
+pub struct BledOutline {
+    pub corners: [[f64; 2]; 4],
+    pub anchors: Vec<Anchor>,
+    /// The corners a finder's own fit placed, as
+    /// [`Detection::measured_corners`].
+    pub measured_corners: Vec<usize>,
+    /// The corners the symbol's edges placed, as
+    /// [`Detection::edged_corners`].
+    pub edged_corners: Vec<usize>,
+}
+
+impl BledOutline {
+    /// The corners a refinement holds where they were placed, as
+    /// [`Detection::held_corners`].
+    pub fn held_corners(&self) -> Vec<usize> {
+        let mut held: Vec<usize> = self.measured_corners.iter().chain(&self.edged_corners).copied().collect();
+        held.sort_unstable();
+        held.dedup();
+        held
+    }
+}
+
+/// A placement fitted as printed, as a bleed of `bloom` modules puts it
+/// ([`Detection::bloom`]), placed afresh as the detector first places a
+/// symbol ([`align_assignment`]): every anchor refined expecting the
+/// bleed ([`refine_anchors`]); each edge point, traced against the quiet
+/// zone, moved out by the bleed, which drew the edge of the ink in by as
+/// much, or in by the spread of ink, less however far `already` says it
+/// was moved so before; the plane fitted through the four
+/// corners of each finder found and the centre of every other anchor
+/// ([`choose_model`]); a corner a finder stands at placed by that
+/// finder's fit, and any other an anchor holds by its two edges, traced
+/// expecting the bleed ([`settle_traced_corner`]); and the rest where the
+/// plane puts them. Every pattern and edge is looked for light on dark
+/// when `inverted`, as the placement has it, the same as the bleed was
+/// measured ([`bloom_of`]). Whoever reads the symbol refines it expecting
+/// the bleed ([`super::refine::refine_corners_expecting`]), holding the
+/// corners a finder or the edges placed ([`BledOutline::held_corners`])
+/// as the detector's are held. `None` when the corners given form no
+/// usable outline, or the anchors no map or no plane.
+///
+/// A corner is placed afresh, and not moved by how it was placed, since
+/// neither the corner nor its placement says how far the bleed put it
+/// off. A corner a finder's fit placed was off as far as that finder
+/// when it was placed, but before a read places its symbol again the
+/// anchors have been refitted as printed: on a photo of a version 2
+/// symbol whose dark had thinned by three tenths of a module, the
+/// top-left corner lay 0.39 of a module off where its finder lay 0.40
+/// off another way, and moved with the finder it came to lie 0.56 off.
+/// A corner Refine placed says nothing of how it was placed at all, and
+/// a refinement leaves the corners the anchors hold where they were
+/// given: of another such symbol, two corners held so stayed four
+/// tenths off. Nor will a plane through the centres of the anchors alone
+/// do, for a symbol with no alignment pattern: a version 1 symbol's
+/// finders and timing modules all lie about one corner of it, and a
+/// perspective through their centres, with the top-left finder's a fifth
+/// of a module out and a timing module's more, put the top-left corner
+/// 0.59 of a module off, which the refinement then held there, and the
+/// far one two modules off. Left free once placed so, the corners the
+/// finders placed were walked off them: on the same symbol the descent
+/// took the bottom-left corner from 0.06 of a module off to 0.18.
+///
+/// `already[k]` is how far, in modules, `anchors[k]` was moved out for a
+/// bleed before, as a placement made expecting one moves its edge points;
+/// an anchor with no entry was not. An edge point is never looked for
+/// again, only moved, and one already moved would be moved out again by
+/// the whole bleed: Refine pressed twice on a version 2 symbol whose
+/// dark had thinned by three tenths of a module, with edge points
+/// dropped by hand on the edge of its ink, kept the fit as printed the
+/// second time, the finders four tenths of a module off, since the
+/// placement through edge points moved twice read worse; and the third
+/// time placed the symbol through them, a quarter of a module out.
+#[allow(clippy::too_many_arguments)]
+pub fn bled_outline(
+    image: &Luma,
+    func: &FunctionMap,
+    corners: [[f64; 2]; 4],
+    anchors: &[Anchor],
+    bloom: f64,
+    inverted: bool,
+    already: &[f64],
+    params: &SampleParams,
+) -> Option<BledOutline> {
+    // Twice over: each pattern is looked for through the map the others
+    // make, and the first time they are where the fit as printed put
+    // them, each as far off as the bleed. The top-left finder of a version
+    // 1 symbol whose dark had thinned by three tenths of a module stopped
+    // a fifth of a module short of its pattern so, and came to within a
+    // fiftieth looked for again.
+    let first: Vec<Anchor> =
+        refine_anchors_paired(image, func, corners, anchors, bloom, Some(inverted), params)?.into_iter().map(|(anchor, _)| anchor).collect();
+    let paired = refine_anchors_paired(image, func, corners, &first, bloom, Some(inverted), params)?;
+    let (w, h) = (func.width as f64, func.height as f64);
+    let printed = Homography::rect_to_quad(w, h, corners)?;
+    let mut bled: Vec<Anchor> = paired.iter().map(|(anchor, _)| *anchor).collect();
+    for (k, anchor) in bled.iter_mut().enumerate().filter(|(_, a)| a.kind == AnchorKind::Edge) {
+        let moved = already.get(k).copied().unwrap_or(0.0);
+        let [dx, dy] = bled_out(&printed, w, h, anchor.at, bloom - moved);
+        anchor.center = [anchor.center[0] + dx, anchor.center[1] + dy];
+    }
+    // An edge point holds the map across the edge alone, and says nothing
+    // of where along it a module lies.
+    let planar: Vec<&(Anchor, Vec<Pair>)> = paired.iter().filter(|(anchor, _)| anchor.kind != AnchorKind::Edge).collect();
+    let pairs: Vec<Pair> = planar.iter().flat_map(|(_, pairs)| pairs.iter().copied()).collect();
+    let model = choose_model(&planar.iter().map(|(anchor, _)| *anchor).collect::<Vec<_>>(), pairs.len());
+    let plane = Homography::fit(model, &pairs)?;
+    let outline = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]];
+    let mut placed = outline.map(|[x, y]| plane.apply(x, y));
+    let mut measured_corners = Vec::new();
+    for (i, corner) in outline.iter().enumerate() {
+        let at_corner = planar
+            .iter()
+            .filter(|(anchor, _)| anchor.kind == AnchorKind::Finder)
+            .flat_map(|(_, pairs)| pairs.iter())
+            .find(|(at, _)| distance(*at, *corner) < 1e-9);
+        if let Some(&(_, px)) = at_corner {
+            placed[i] = px;
+            measured_corners.push(i);
+        }
+    }
+    let (sign, threshold) = (if inverted { -1.0 } else { 1.0 }, fixed_threshold(params));
+    let fourth = matches!(func.version, SymbolVersion::Qr(_) | SymbolVersion::Model1(_)) && measured_corners.len() == 3;
+    let anchored: Vec<[f64; 2]> = bled.iter().map(|a| a.at).collect();
+    let loose = loose_corners(func, &anchored);
+    let mut edged_corners = Vec::new();
+    for i in (0..4).filter(|i| !measured_corners.contains(i) && !loose.contains(i)) {
+        if settle_traced_corner(image, func, &mut placed, i, sign, threshold, &[], fourth, bloom) {
+            edged_corners.push(i);
+        }
+    }
+    Some(BledOutline { corners: placed, anchors: bled, measured_corners, edged_corners })
+}
+
+/// A symbol placed as printed placed again expecting the bleed its finders
+/// show ([`bloom_of`]): its anchors refined expecting it and its corners
+/// placed afresh by them ([`bled_outline`]), and the timing modules looked
+/// for afresh through the map the rest now make, within
+/// [`BLED_TIMING_WINDOW`], with any that breaks the trend of its line
+/// dropped, as the detector drops one ([`timing_line_strays`]). Refined
+/// from where the placement as printed had them, a third of a module off
+/// on a photo whose dark had thinned by a third, not all of them came
+/// back. The corners a finder's fit or the symbol's edges placed expecting
+/// the bleed are held as the detector's are ([`Detection::held_corners`]),
+/// and the read refines the rest expecting it. The bleed of `found`'s
+/// first finder is given as `first`, measured already
+/// ([`first_finder_bleed`]) and not measured again. `None` when it is
+/// nought, the finders show no bleed alike, or they are too few to show
+/// one ([`may_bleed`]).
+pub(crate) fn bled_placement(image: &Luma, found: &Detection, first: f64, params: &SampleParams) -> Option<Detection> {
+    if !may_bleed(found) || first == 0.0 {
+        return None;
+    }
+    let func = FunctionMap::new(found.version);
+    // Light on dark or not as the detection settled it, for the bleed
+    // and every pattern looked for again alike.
+    let bloom = bloom_given(image, &func, found.corners, &found.anchors, found.inverted, Some(first), params);
+    if bloom == 0.0 {
+        return None;
+    }
+    // A placement not yet made expecting a bleed ([`may_bleed`]) has moved
+    // no edge point for one.
+    let BledOutline { corners, mut anchors, measured_corners, edged_corners } =
+        bled_outline(image, &func, found.corners, &found.anchors, bloom, found.inverted, &[], params)?;
+    if anchors.iter().any(|a| a.kind == AnchorKind::Timing) {
+        anchors.retain(|a| a.kind != AnchorKind::Timing);
+        let controls: Vec<ControlPoint> = anchors.iter().map(Anchor::control_point).collect();
+        let map = Projection::new(func.width, func.height, corners, &controls)?;
+        let threshold = fixed_threshold(params);
+        let timing: Vec<Site> = sites(&func).into_iter().filter(|site| site.kind == AnchorKind::Timing).collect();
+        anchors.extend(timing.iter().filter_map(|site| search_site(image, &func, site, &map, BLED_TIMING_WINDOW, found.inverted, threshold, bloom).map(|(anchor, _)| anchor)));
+        // Looked for all at once, through one map, the timing modules
+        // are not checked against each other as the detector's search
+        // checks them, one at a time through the map the rest make; one
+        // off the bend its line-mates trace has read a row of data or a
+        // smudge.
+        let (w, h) = (func.width as f64, func.height as f64);
+        let pairs: Vec<Pair> = anchors.iter().map(|a| (a.at, a.center)).chain([[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]].into_iter().zip(corners)).collect();
+        if let Some(base) = Homography::fit(Model::Projective, &pairs) {
+            let mut strays: Vec<usize> = timing_line_strays(&anchors, &base).into_iter().map(|(i, _)| i).collect();
+            strays.sort_unstable_by(|a, b| b.cmp(a));
+            strays.dedup();
+            for i in strays {
+                anchors.remove(i);
+            }
+        }
+    }
+    Some(Detection { corners, anchors, bloom, measured_corners, edged_corners, ..found.clone() })
+}
+
 /// Move each anchor to where its own pattern reads best in the photo,
 /// through the outline given by `corners` and the other anchors, by at
-/// most [`REFINE_LIMIT`] modules. Anchors whose pattern cannot be found
-/// are returned as they were.
+/// most [`REFINE_LIMIT`] modules, expecting its boundaries `bloom`
+/// modules into the dark ([`Detection::bloom`]). Anchors whose pattern
+/// cannot be found are returned as they were.
 pub fn refine_anchors(
     image: &Luma,
     func: &FunctionMap,
     corners: [[f64; 2]; 4],
     anchors: &[Anchor],
+    bloom: f64,
     params: &SampleParams,
 ) -> Vec<Anchor> {
+    refine_anchors_with(image, func, corners, anchors, bloom, None, params)
+}
+
+/// [`refine_anchors`], each pattern looked for light on dark when
+/// `inverted` says so, and where it is `None` as the fixed patterns read
+/// best through the map: a bleed is into the symbol's dark, and one
+/// measured at one polarity is the opposite bleed at the other
+/// ([`Detection::held_polarity`]).
+pub fn refine_anchors_with(
+    image: &Luma,
+    func: &FunctionMap,
+    corners: [[f64; 2]; 4],
+    anchors: &[Anchor],
+    bloom: f64,
+    inverted: Option<bool>,
+    params: &SampleParams,
+) -> Vec<Anchor> {
+    refine_anchors_paired(image, func, corners, anchors, bloom, inverted, params)
+        .map_or_else(|| anchors.to_vec(), |paired| paired.into_iter().map(|(anchor, _)| anchor).collect())
+}
+
+/// [`refine_anchors`], each anchor with the correspondences it gives a
+/// fit, as [`search_site`] gives them: the four corners of a finder
+/// found, which its template pins down, and the centre alone of any other
+/// pattern, or of an anchor not found or put where the trend of its line
+/// has it. Each pattern is looked for light on dark when `inverted` says
+/// so, and where it is `None` as the fixed patterns read best through the
+/// map. `None` when the corners and anchors make no map.
+fn refine_anchors_paired(
+    image: &Luma,
+    func: &FunctionMap,
+    corners: [[f64; 2]; 4],
+    anchors: &[Anchor],
+    bloom: f64,
+    inverted: Option<bool>,
+    params: &SampleParams,
+) -> Option<Vec<(Anchor, Vec<Pair>)>> {
+    let as_given = |anchor: &Anchor| (*anchor, vec![(anchor.at, anchor.center)]);
     let threshold = fixed_threshold(params);
     let controls: Vec<ControlPoint> = anchors.iter().map(Anchor::control_point).collect();
-    let Some(map) = Projection::new(func.width, func.height, corners, &controls) else { return anchors.to_vec() };
-    let inverted = {
+    let map = Projection::new(func.width, func.height, corners, &controls)?;
+    let inverted = inverted.unwrap_or_else(|| {
         let scorer = Scorer::new(image, &Template::whole(func), corners, threshold);
         let (plain, flipped) = (scorer.agreement_known(&map, false), scorer.agreement_known(&map, true));
         flipped.map(|a| a.0) > plain.map(|a| a.0)
-    };
+    });
     // Each anchor through the map the others make as they were given, so
     // that none waits on another: side by side on the cores to spare.
     let numbered: Vec<(usize, &Anchor)> = anchors.iter().enumerate().collect();
-    let mut refined: Vec<Anchor> = work::map(&numbered, |&(k, anchor)| {
+    let mut refined: Vec<(Anchor, Vec<Pair>)> = work::map(&numbered, |&(k, anchor)| {
         // Called off, an anchor not yet looked for stays where it is.
         if work::cancelled() {
-            return *anchor;
+            return as_given(anchor);
         }
-        let Some(site) = site_of(func, anchor) else { return *anchor };
+        let Some(site) = site_of(func, anchor) else { return as_given(anchor) };
         // Search a small window around where the anchor already is,
         // through the map the other anchors make: the map through
         // this one too passes through wherever it was put, and an
         // anchor dropped by hand half a module off bends it there,
         // which an anchor two modules away then holds against.
         let others: Vec<ControlPoint> = controls.iter().enumerate().filter(|(i, _)| *i != k).map(|(_, c)| *c).collect();
-        let Some(map) = Projection::new(func.width, func.height, corners, &others) else { return *anchor };
+        let Some(map) = Projection::new(func.width, func.height, corners, &others) else { return as_given(anchor) };
         let shifted = |x: f64, y: f64| {
             let [px, py] = map.apply(x, y);
             let [ax, ay] = map.apply(anchor.at[0], anchor.at[1]);
             [px + anchor.center[0] - ax, py + anchor.center[1] - ay]
         };
         let local = ShiftedMap { f: &shifted };
-        let limit = if anchor.kind == AnchorKind::Timing { TIMING_REFINE_LIMIT } else { REFINE_LIMIT };
-        match search_site(image, func, &site, &local, SEARCH_STEP, inverted, threshold) {
-            Some((found, _)) if distance(found.center, anchor.center) <= limit * module_size_at(&map, anchor.at) => found,
-            _ => *anchor,
+        // A timing anchor placed as printed on a photo that has bled lies
+        // as far as the bleed off its pattern besides.
+        let limit = if anchor.kind == AnchorKind::Timing { TIMING_REFINE_LIMIT + bloom.abs() } else { REFINE_LIMIT };
+        match search_site(image, func, &site, &local, SEARCH_STEP, inverted, threshold, bloom) {
+            Some((found, pairs)) if distance(found.center, anchor.center) <= limit * module_size_at(&map, anchor.at) => (found, pairs),
+            _ => as_given(anchor),
         }
     });
     // A timing anchor that still breaks the trend of its line is put
     // where the trend has it: that is what its neighbours say of the
     // paper there, and its own reading has gone astray.
-    let pairs: Vec<Pair> = refined.iter().map(|a| (a.at, a.center)).collect();
+    let anchors: Vec<Anchor> = refined.iter().map(|(anchor, _)| *anchor).collect();
+    let pairs: Vec<Pair> = anchors.iter().map(|a| (a.at, a.center)).collect();
     let corner_pairs: Vec<Pair> = [[0.0, 0.0], [func.width as f64, 0.0], [func.width as f64, func.height as f64], [0.0, func.height as f64]]
         .iter()
         .zip(corners)
         .map(|(at, px)| (*at, px))
         .collect();
     if let Some(base) = Homography::fit(Model::Projective, &pairs.iter().chain(&corner_pairs).copied().collect::<Vec<_>>()) {
-        for (i, position) in timing_line_strays(&refined, &base) {
-            refined[i].center = position;
+        for (i, position) in timing_line_strays(&anchors, &base) {
+            refined[i] = as_given(&Anchor { center: position, ..anchors[i] });
         }
     }
-    refined
+    Some(refined)
 }
 
 /// A map given as a closure.
@@ -10005,6 +10485,7 @@ mod tests {
             retry: None,
             turned: 0,
             decodes: None,
+            bloom: 0.0,
         };
         assert_eq!(found.found_with(), None);
         // The turn alone, the copy alone, and a symbol found turned
@@ -10043,6 +10524,7 @@ mod tests {
             retry: None,
             turned: 0,
             decodes: None,
+            bloom: 0.0,
         };
         let upright = placement(square, 0);
         let turned = placement([square[2], square[3], square[0], square[1]], 2);
@@ -10070,6 +10552,7 @@ mod tests {
             retry: None,
             turned: 0,
             decodes: None,
+            bloom: 0.0,
         };
         assert!(named(SymbolVersion::Micro(4), Some(0)).version_confirmed());
         // Within correction range of the word, as the bits beside most
@@ -10413,6 +10896,7 @@ mod tests {
             retry: None,
             turned: 0,
             decodes: None,
+            bloom: 0.0,
         }
     }
 

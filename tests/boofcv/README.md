@@ -94,17 +94,19 @@ rewritten.
 ## What BoofCV makes of it
 
 BoofCV 1.5.0, as `FactoryFiducial.qrcode(null, GrayU8.class)` configures
-its detector, reads 923 of the 1232 symbols. The search here reads 1190
-as the record stands; 24 more it finds and cannot decode, and 18 it
+its detector, reads 923 of the 1232 symbols. The search here reads 1200
+as the record stands; 14 more it finds and cannot decode, and 18 it
 does not find. When it read 1187, every one of BoofCV's was among them,
-each with the message BoofCV reads. Three of those 1187 are found now
-and not read, `brightness/image012.jpg` 0, `curved/image017.jpg` 0 and
-`curved/image024.jpg` 0: each decodes only with its padding pinned and
-some codewords doubted or filled in, and fell short of the fixed three
-codewords' worth of confirmation such a decode needed then. That fixed
-bar has since been replaced by charging each solution for every search
-that could have found it (`Search` in `src/decode/pipeline.rs`), and
-nobody has rechecked whether BoofCV or this decoder reads the three now.
+each with the message BoofCV reads. Three of those 1187 were later
+found and not read, `brightness/image012.jpg` 0, `curved/image017.jpg` 0
+and `curved/image024.jpg` 0: each decodes only with its padding pinned
+and some codewords doubted or filled in, and fell short of the fixed
+three codewords' worth of confirmation such a decode needed then. That
+fixed bar has since been replaced by charging each solution for every
+search that could have found it (`Search` in `src/decode/pipeline.rs`),
+and this decoder reads the first two again; `curved/image024.jpg` 0 it
+still finds and does not read. Nobody has rechecked whether BoofCV reads
+the three now.
 BoofCV takes a third of a second over a twelve-megapixel photograph
 where this search takes tens of seconds, and where it finds the
 position patterns of a symbol and cannot decode it, it says where:

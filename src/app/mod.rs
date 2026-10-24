@@ -31,10 +31,10 @@ use qr_forensics::imaging::photo::{crop_box, flatten_alpha};
 use qr_forensics::imaging::resize::resize;
 use qr_forensics::imaging::detect::{
     Anchor, AnchorKind, AnchorSite, Detection, Lead, SEARCH_SIDE, SearchParams, anchor_sites, decodes_as_found,
-    detect_candidates, refine_anchors, search_for_families, settle_loose_corners,
+    bled_outline, bloom_of, detect_candidates, refine_anchors, refine_anchors_with, search_for_families, settle_loose_corners,
 };
-use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline, read_outline_one_of};
-use qr_forensics::imaging::refine::{Refinement, refine_corners, refine_corners_holding};
+use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline, read_outline_one_of, standing_of};
+use qr_forensics::imaging::refine::{Refinement, placement_agreement, refine_corners, refine_corners_expecting};
 use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::enhance::{Enhance, Sharpen};
 use qr_forensics::imaging::sample::{
@@ -441,6 +441,9 @@ struct Refined {
     refinement: Refinement,
     before: Vec<Anchor>,
     after: Vec<Anchor>,
+    /// The bleed the symbol was placed expecting ([`Detection::bloom`]):
+    /// nought for a symbol placed as printed.
+    bloom: f64,
 }
 
 pub struct App {
@@ -1468,7 +1471,7 @@ impl App {
                 // placed as it was picked, and the read only told of.
                 result => Prepared {
                     read: result.as_ref().map(read_note),
-                    ..prepare_adoption(&luma, &func, version, found, searched_inverted, &params)
+                    ..prepare_adoption(&luma, &func, version, found, searched_inverted, photo_inverted, &params)
                 },
             };
             JobResult::Adopt(prepared, what, picked)
@@ -1489,27 +1492,37 @@ impl App {
         let func = self.derived.func.clone();
         let (corners, params) = (self.doc.corners, self.view.sample);
         let anchors: Vec<Anchor> = self.doc.anchors.iter().map(|a| a.anchor).collect();
+        let already: Vec<f64> = self.doc.anchors.iter().map(|a| a.bled).collect();
         self.start_job(ctx, JobKind::Refine, move || {
-            let refined = refine_outline(&luma, &func, corners, anchors.clone(), &params);
+            let refined = refine_outline(&luma, &func, corners, anchors.clone(), &already, &params);
             JobResult::Refine { corners, anchors, refined }
         });
     }
 
     /// Take in what Refine worked out: the corners move, and every anchor
-    /// that found its pattern moves onto it.
+    /// that found its pattern moves onto it, an edge point moved out for
+    /// the bleed the symbol was placed expecting remembered as moved so
+    /// ([`DocAnchor::bled`]).
     fn finish_refine(&mut self, refined: Option<Refined>) {
-        let Some(Refined { refinement: refined, before, after }) = refined else {
+        let Some(Refined { refinement: refined, before, after, bloom }) = refined else {
             self.fail("The corners do not form a usable outline.");
             return;
         };
         self.checkpoint();
         self.doc.corners = refined.corners;
-        let mut moved = 0;
+        // An edge point is never looked for, only moved for the bleed, and
+        // is counted apart from the anchors that moved onto a pattern.
+        let (mut moved, mut shifted) = (0, 0);
         for (old, new) in before.iter().zip(&after) {
             if old.center != new.center {
-                moved += 1;
+                if new.kind == AnchorKind::Edge {
+                    shifted += 1;
+                } else {
+                    moved += 1;
+                }
                 let source = self.doc.anchor_at(old.at).map_or(AnchorSource::Detected, |a| a.source);
-                self.doc.set_anchor(*new, source);
+                let bled = if new.kind == AnchorKind::Edge { bloom } else { 0.0 };
+                self.doc.set_anchor_bled(*new, source, bled);
             }
         }
         let (after_count, fixed, before_count) = (refined.after.0, refined.after.1, refined.before.0);
@@ -1524,6 +1537,20 @@ impl App {
         };
         if moved > 0 {
             text.push_str(&format!(" {moved} of {} anchors moved onto their patterns.", after.len()));
+        }
+        if bloom != 0.0 {
+            // The bleed is into the symbol's dark modules, which on a
+            // light-on-dark symbol are the photo's light.
+            let what = if (bloom > 0.0) != refined.inverted { "dark thinned" } else { "ink spread" };
+            let points = match shifted {
+                0 => String::new(),
+                1 => ", 1 edge point moved from the edge of the print to the symbol's".into(),
+                n => format!(", {n} edge points moved from the edge of the print to the symbol's"),
+            };
+            text.push_str(&format!(
+                " The finder patterns show the {what} by {:.2} of a module at every boundary, and the symbol was placed expecting it{points}.",
+                bloom.abs()
+            ));
         }
         if refined.inverted {
             text.push_str(if self.photo.as_ref().is_some_and(|p| p.adjust.invert) {
@@ -2219,7 +2246,7 @@ impl App {
         self.dirty = true;
         self.set_photo_invert(read_inverted ^ found.inverted);
         self.doc.corners = found.corners;
-        self.doc.anchors = found.anchors.iter().map(|&anchor| DocAnchor { anchor, source: AnchorSource::Detected }).collect();
+        self.doc.anchors = doc_anchors(&found);
         self.detection = Some(found);
         // What read this symbol is what Sample would have to use to read
         // it the same again: the kernel and the threshold rule, the
@@ -2298,7 +2325,7 @@ impl App {
         let photo_flipped = self.set_photo_invert(want_inverted);
         self.doc.corners = found.corners;
         self.doc.anchors = if adopt || found.version == self.doc.version {
-            found.anchors.iter().map(|&anchor| DocAnchor { anchor, source: AnchorSource::Detected }).collect()
+            doc_anchors(&found)
         } else {
             Vec::new()
         };
@@ -3846,8 +3873,10 @@ pub(crate) fn read_outline_of_any_family(
                 decoded = Some((read, Some(family)));
                 return true;
             }
+            // Neither decoded: ranked by what each has to show besides its
+            // decode ([`standing_of`]).
             let outranks = |held: &ReadResult| {
-                standing(read.report.blocks_verified(), read.agreement) > standing(held.report.blocks_verified(), held.agreement)
+                standing_of(read.report.score.blocks_verified, read.agreement) > standing_of(held.report.score.blocks_verified, held.agreement)
             };
             if best.as_ref().is_none_or(|(held, _)| outranks(held)) {
                 best = Some((read, Some(family)));
@@ -3856,23 +3885,6 @@ pub(crate) fn read_outline_of_any_family(
         },
     );
     decoded.or(best)
-}
-
-/// What a read that did not decode has to show for itself, for choosing
-/// between two of them, from the blocks of it that verified and its
-/// (matching, fixed) agreement: whether any block verified, and then how
-/// far its fixed modules read right beyond what chance gives. Chance is
-/// no coin toss here: the placement of a symbol of the wrong family has
-/// been pushed to the best fit the outline allows, and over the test
-/// photographs a QR Code laid on a Micro QR symbol reads as many as seven
-/// in ten of its fixed modules right, though never three in four. So a
-/// fixed module that reads wrong is set against two that read right:
-/// a fit of two in three nets nothing, however many fixed modules the
-/// family has, where a small symbol that fits nets nearly all of its
-/// own, and a larger one that fits, damaged as it may be, more than any
-/// part of it read as a symbol of its own.
-fn standing(blocks_verified: usize, (matching, fixed): (usize, usize)) -> (bool, i64) {
-    (blocks_verified > 0, 3 * matching as i64 - 2 * fixed as i64)
 }
 
 /// What a read made of its detection, in brief.
@@ -3920,27 +3932,46 @@ fn prepared_from_read(
 
 /// The slow part of adopting a detection: its corners refined against
 /// the photo with its anchors held, then every anchor against its own
-/// pattern, and the versions ranked on the corners when the version found
-/// would not be adopted outright, so that it can be suggested instead.
-/// `func` is the function map in use, kept when the detection is of its
-/// version, and `version` the document's when the job began.
+/// pattern, each expecting the bleed the detection was placed for
+/// ([`Detection::bloom`]) at the polarity it was measured at
+/// ([`Detection::held_polarity`]), and the versions ranked on the corners
+/// when the version found would not be adopted outright, so that it can
+/// be suggested instead. `func` is the function map in use, kept when the
+/// detection is of its version, and `version` the document's when the
+/// job began. `searched_inverted` is the Invert setting the detection was
+/// found under, which its `inverted` is reckoned from, and
+/// `photo_inverted` the one `luma` is under.
 fn prepare_adoption(
     luma: &Luma,
     func: &Arc<FunctionMap>,
     version: SymbolVersion,
     mut found: Detection,
     searched_inverted: bool,
+    photo_inverted: bool,
     params: &SampleParams,
 ) -> Prepared {
     let func = if func.version == found.version { func.clone() } else { Arc::new(FunctionMap::new(found.version)) };
     let controls: Vec<_> = found.anchors.iter().map(Anchor::control_point).collect();
-    let refined = refine_corners_holding(luma, &func, found.corners, &controls, &found.held_corners(), params);
+    // The polarity held is the detection's against the photo as it was
+    // searched; with Invert photo changed since, the symbol reads the
+    // other way against `luma`, and the bleed held at the polarity found
+    // would be the opposite bleed.
+    let polarity = found.held_polarity().map(|inverted| inverted ^ (searched_inverted != photo_inverted));
+    let refined = refine_corners_expecting(luma, &func, found.corners, &controls, &found.held_corners(), found.bloom, polarity, params);
     let agreement = refined.as_ref().map_or(found.agreement, |r| r.after);
     found.corners = refined.map_or(found.corners, |r| r.corners);
-    found.anchors = refine_anchors(luma, &func, found.corners, &found.anchors, params);
+    found.anchors = refine_anchors_with(luma, &func, found.corners, &found.anchors, found.bloom, polarity, params);
     let guesses = (found.version != version && !adopts_version(&found, version, false))
         .then(|| (version.family(), suggest_versions(luma, found.corners, version.family(), params)));
     Prepared { found, agreement, guesses, searched_inverted, read: None, result: None }
+}
+
+/// The anchors of `found` as the document holds them: detected, its edge
+/// points moved out for the bleed it was placed expecting
+/// ([`Detection::bloom`], [`DocAnchor::bled`]), as a read moves them.
+fn doc_anchors(found: &Detection) -> Vec<DocAnchor> {
+    let bled = |anchor: &Anchor| if anchor.kind == AnchorKind::Edge { found.bloom } else { 0.0 };
+    found.anchors.iter().map(|&anchor| DocAnchor { anchor, source: AnchorSource::Detected, bled: bled(&anchor) }).collect()
 }
 
 /// Whether adopting `found` switches a document at `version` to the
@@ -3968,20 +3999,74 @@ fn new_grid_note(found: &Detection, version: SymbolVersion) -> String {
 
 /// The slow part of Refine: corners nothing holds are settled by the
 /// symbol's edge first, then every corner is refined with the anchors
-/// held, then every anchor against its own pattern. `None` when the
+/// held, then every anchor against its own pattern; and all of it again
+/// expecting the bleed the finders show, where that reads no worse
+/// ([`refined_for_bleed`]), `already[k]` saying how far `anchors[k]` was
+/// moved out for a bleed before ([`DocAnchor::bled`]). `None` when the
 /// corners form no usable outline.
 fn refine_outline(
     luma: &Luma,
     func: &FunctionMap,
     corners: [[f64; 2]; 4],
     anchors: Vec<Anchor>,
+    already: &[f64],
     params: &SampleParams,
 ) -> Option<Refined> {
     let settled = settle_loose_corners(luma, func, corners, &anchors, params);
     let controls: Vec<_> = anchors.iter().map(Anchor::control_point).collect();
     let refinement = refine_corners(luma, func, settled, &controls, params)?;
-    let after = refine_anchors(luma, func, refinement.corners, &anchors, params);
-    Some(Refined { refinement, before: anchors, after })
+    let after = refine_anchors(luma, func, refinement.corners, &anchors, 0.0, params);
+    let printed = Refined { refinement, before: anchors, after, bloom: 0.0 };
+    Some(refined_for_bleed(luma, func, &printed, already, params).unwrap_or(printed))
+}
+
+/// Refine as `printed` refined, again expecting the bleed the finders
+/// show ([`bloom_of`]), as a read places a symbol again expecting it
+/// ([`qr_forensics::imaging::read`]): the anchors refined expecting it,
+/// the edge points moved out by however much of it `already` says they
+/// have yet to be, and the corners placed afresh by the finders, the
+/// symbol's edges and the plane through the anchors ([`bled_outline`]),
+/// the corners refined expecting it from there with those the finders or
+/// the edges placed held ([`refine_corners_expecting`]), and every anchor
+/// once more. Kept unless the fixed patterns read worse for it, each
+/// placement read through the anchors refined on it
+/// ([`placement_agreement`]): a bleed is measured as one number, and ink
+/// that spread further on one side of a finder than the other was placed
+/// better as printed, which is why a read places a symbol expecting one
+/// only when no other read of it is beyond doubt. Where the two read
+/// alike the fixed patterns cannot tell them apart, and the finders,
+/// which read more crisply expecting the bleed, can: as printed, every
+/// anchor lies as far as the bleed off its pattern. `None` when the
+/// finders show no bleed, or the symbol reads worse for it.
+fn refined_for_bleed(luma: &Luma, func: &FunctionMap, printed: &Refined, already: &[f64], params: &SampleParams) -> Option<Refined> {
+    // Light on dark or not as the refinement as printed found it, for the
+    // bleed, every pattern looked for again, and the corners and anchors
+    // refined again alike: the bleed is into the symbol's dark, and
+    // refined at the other polarity it would be the opposite bleed.
+    let (corners, inverted) = (printed.refinement.corners, printed.refinement.inverted);
+    let bloom = bloom_of(luma, func, corners, &printed.before, inverted, params);
+    if bloom == 0.0 {
+        return None;
+    }
+    let bled = bled_outline(luma, func, corners, &printed.before, bloom, inverted, already, params)?;
+    let controls: Vec<_> = bled.anchors.iter().map(Anchor::control_point).collect();
+    let again = refine_corners_expecting(luma, func, bled.corners, &controls, &bled.held_corners(), bloom, Some(inverted), params)?;
+    let after = refine_anchors_with(luma, func, again.corners, &bled.anchors, bloom, Some(inverted), params);
+    // Each placement read as it would be taken in, through the anchors
+    // refined on it. A refinement counts its fixed modules through the
+    // anchors it was given: for the placement as printed those Refine
+    // began from, for this one those already refined expecting the bleed,
+    // and an anchor dropped by hand off its pattern would count against
+    // the first alone.
+    let matching = |corners: [[f64; 2]; 4], anchors: &[Anchor]| {
+        let controls: Vec<_> = anchors.iter().map(Anchor::control_point).collect();
+        placement_agreement(luma, func, corners, &controls, inverted, params).map(|(matching, _)| matching)
+    };
+    if matching(again.corners, &after)? < matching(corners, &printed.after)? {
+        return None;
+    }
+    let refinement = Refinement { before: printed.refinement.before, evaluations: printed.refinement.evaluations + again.evaluations, ..again };
+    Some(Refined { refinement, before: printed.before.clone(), after, bloom })
 }
 
 /// Items as a sentence lists them: "a", "a and b", "a, b and c".
@@ -4371,12 +4456,188 @@ mod tests {
         // when asked about as one: seven in ten of its many fixed modules
         // right, which is more modules than the Micro QR symbol has, and
         // nothing to set against the Micro QR symbol's own clean fit.
-        assert!(standing(0, (78, 78)) > standing(0, (144, 203)));
+        assert!(standing_of(0, (78, 78)) > standing_of(0, (144, 203)));
         // A finder pattern of a damaged QR Code fits well as a Micro QR
         // symbol, and has less to show than the whole it is a corner of.
-        assert!(standing(0, (195, 230)) > standing(0, (77, 82)));
+        assert!(standing_of(0, (195, 230)) > standing_of(0, (77, 82)));
         // A block that verified outweighs any fit.
-        assert!(standing(1, (150, 230)) > standing(0, (85, 85)));
+        assert!(standing_of(1, (150, 230)) > standing_of(0, (85, 85)));
+    }
+
+    /// A version 2 symbol photographed over-exposed, as BoofCV's
+    /// photograph of one is (`brightness/image012.jpg`): its dark thinned
+    /// by a share of a module at every boundary.
+    struct Thinned {
+        luma: Luma,
+        /// Module coordinates onto the photo.
+        truth: qr_forensics::imaging::homography::Homography,
+        module_px: f64,
+    }
+
+    impl Thinned {
+        const VERSION: SymbolVersion = SymbolVersion::Qr(2);
+        /// An outline drawn loosely round the symbol.
+        const AROUND: [[f64; 2]; 4] = [[120.0, 40.0], [690.0, 90.0], [640.0, 595.0], [65.0, 535.0]];
+
+        /// The symbol with its dark thinned by `r` of a module at every
+        /// boundary.
+        fn new(r: f64) -> Self {
+            use qr_forensics::imaging::homography::Homography;
+            use qrcode_generator::{Segment, qr};
+            let symbol = qr::Encoder::new(qr::ErrorCorrection::Low)
+                .version(qr::Version::new(2).unwrap())
+                .boost_error_correction(false)
+                .mask(qr::Mask::new(0).unwrap())
+                .encode_segments(&[Segment::bytes("the dark thinned at every edge")])
+                .unwrap();
+            let grid = ModuleGrid::from_bools(symbol.width(), symbol.height(), symbol.modules());
+            let quad = [[150.5, 70.25], [655.0, 120.5], [610.75, 560.0], [95.25, 500.5]];
+            let (gw, gh) = (grid.width() as f64, grid.height() as f64);
+            let truth = Homography::rect_to_quad(gw, gh, quad).unwrap();
+            let dark_at = |mx: f64, my: f64| mx >= 0.0 && my >= 0.0 && mx < gw && my < gh && grid.get(mx as usize, my as usize) == Module::Dark;
+            let to_grid = truth.inverse().unwrap();
+            let (width, height) = (760, 640);
+            let mut data = Vec::with_capacity(width * height);
+            for py in 0..height {
+                for px in 0..width {
+                    let mut sum = 0.0;
+                    for (sx, sy) in (0..3).flat_map(|sy| (0..3).map(move |sx| (sx, sy))) {
+                        let [mx, my] = to_grid.apply(px as f64 + (sx as f64 + 0.5) / 3.0, py as f64 + (sy as f64 + 0.5) / 3.0);
+                        let dark = [[0.0, 0.0], [r, 0.0], [-r, 0.0], [0.0, r], [0.0, -r], [r, r], [-r, -r], [r, -r], [-r, r]]
+                            .iter()
+                            .all(|[dx, dy]| dark_at(mx + dx, my + dy));
+                        sum += if dark { 0.08f32 } else { 0.92 };
+                    }
+                    data.push(sum / 9.0);
+                }
+            }
+            Self { luma: Luma::new(width, height, data), truth, module_px: (quad[1][0] - quad[0][0]) / gw }
+        }
+
+        /// How far, in modules, `px` lies from where the photo has the
+        /// module point `at`.
+        fn off(&self, at: [f64; 2], [x, y]: [f64; 2]) -> f64 {
+            let [tx, ty] = self.truth.apply(at[0], at[1]);
+            (x - tx).hypot(y - ty) / self.module_px
+        }
+    }
+
+    #[test]
+    fn refine_places_a_symbol_whose_dark_has_thinned_expecting_the_bleed() {
+        // Over-exposed as BoofCV's photograph of a version 2 symbol is
+        // (`brightness/image012.jpg`): the dark thinned by three tenths
+        // of a module at every boundary. Found as printed, a finder may
+        // sit as far off as the bleed to one side of itself, and a corner
+        // traced against the quiet zone lies as far in. Expecting the
+        // bleed, the anchors come back onto their patterns, and the
+        // corners must come with them, or the map, held at the anchors
+        // and stretched to the corners, runs off between the two.
+        let (func, params) = (FunctionMap::new(Thinned::VERSION), SampleParams::default());
+        let (gw, gh) = (func.width as f64, func.height as f64);
+        let refine = |luma: &Luma| {
+            let found = detect_candidates(luma, Thinned::VERSION, Thinned::AROUND, &params).into_iter().next().expect("the symbol is found");
+            refine_outline(luma, &func, found.corners, found.anchors, &[], &params).expect("the corners refine")
+        };
+        let thinned = Thinned::new(0.3);
+        let off = |at, px| thinned.off(at, px);
+        let refined = refine(&thinned.luma);
+        assert!(refined.bloom > 0.2, "placed expecting a bleed of {:.2} modules", refined.bloom);
+        let (after, before) = (refined.refinement.after, refined.refinement.before);
+        assert!(after.0 > before.0, "fixed patterns match {after:?}, from {before:?}");
+        for (at, px) in [[0.0, 0.0], [gw, 0.0], [gw, gh], [0.0, gh]].into_iter().zip(refined.refinement.corners) {
+            assert!(off(at, px) < 0.15, "corner {at:?} placed {:.2} modules off", off(at, px));
+        }
+        for anchor in refined.after.iter().filter(|a| matches!(a.kind, AnchorKind::Finder | AnchorKind::Alignment)) {
+            assert!(off(anchor.at, anchor.center) < 0.1, "{:?} at {:?} placed {:.2} modules off", anchor.kind, anchor.at, off(anchor.at, anchor.center));
+        }
+        // A symbol that has not bled is refined as printed.
+        assert_eq!(refine(&Thinned::new(0.0).luma).bloom, 0.0);
+    }
+
+    #[test]
+    fn a_symbol_whose_dark_has_thinned_stays_placed_as_refine_is_pressed_again() {
+        use qr_forensics::imaging::detect::edge_sites;
+        // The symbol whose dark has thinned by three tenths of a module,
+        // with an edge point dropped by hand on the edge of its ink at
+        // every place the window offers one, Refine pressed again and
+        // again as the window takes each result in. An edge point is
+        // never looked for again, only moved out for the bleed, and once
+        // was moved out by the whole bleed every time: the second time
+        // the placement through edge points moved twice read worse than
+        // the fit as printed, which was kept with the finders four tenths
+        // of a module off, and the third time the edge points came out a
+        // quarter of a module beyond the symbol's edge. And the top-left
+        // finder, refitted through corners fitted as printed, was now and
+        // then settled squeezed, and the corner its fit placed came out as
+        // much as half a module off, with five of the fixed modules wrong.
+        let (func, params) = (FunctionMap::new(Thinned::VERSION), SampleParams::default());
+        let (gw, gh) = (func.width as f64, func.height as f64);
+        let r = 0.3;
+        let thinned = Thinned::new(r);
+        let found = detect_candidates(&thinned.luma, Thinned::VERSION, Thinned::AROUND, &params).into_iter().next().expect("the symbol is found");
+        let mut doc = Document::blank(Thinned::VERSION);
+        doc.corners = found.corners;
+        for &anchor in found.anchors.iter().filter(|a| a.kind != AnchorKind::Edge) {
+            doc.set_anchor(anchor, AnchorSource::Detected);
+        }
+        for site in edge_sites(&func) {
+            let [x, y] = site.at;
+            let inward = |v: f64, end: f64| if v <= 0.0 { r } else if v >= end { -r } else { 0.0 };
+            let center = thinned.truth.apply(x + inward(x, gw), y + inward(y, gh));
+            doc.set_anchor(Anchor { kind: AnchorKind::Edge, at: site.at, center, partial: false, inferred: false }, AnchorSource::Manual);
+        }
+        for press in 1..=6 {
+            let anchors: Vec<Anchor> = doc.anchors.iter().map(|a| a.anchor).collect();
+            let already: Vec<f64> = doc.anchors.iter().map(|a| a.bled).collect();
+            let refined = refine_outline(&thinned.luma, &func, doc.corners, anchors, &already, &params).expect("the corners refine");
+            assert!(refined.bloom > 0.2, "press {press}: placed expecting a bleed of {:.2} modules", refined.bloom);
+            let (matching, fixed) = refined.refinement.after;
+            assert_eq!(matching, fixed, "press {press}: fixed patterns match {matching} of {fixed}");
+            // Taken in as the window takes it in ([`App::finish_refine`]).
+            doc.corners = refined.refinement.corners;
+            for (old, new) in refined.before.iter().zip(&refined.after) {
+                if old.center != new.center {
+                    let source = doc.anchor_at(old.at).map_or(AnchorSource::Detected, |a| a.source);
+                    doc.set_anchor_bled(*new, source, if new.kind == AnchorKind::Edge { refined.bloom } else { 0.0 });
+                }
+            }
+            for anchor in doc.anchors.iter().map(|a| a.anchor).filter(|a| matches!(a.kind, AnchorKind::Edge | AnchorKind::Finder | AnchorKind::Alignment)) {
+                let off = thinned.off(anchor.at, anchor.center);
+                assert!(off < 0.1, "press {press}: {:?} at {:?} placed {off:.2} modules off", anchor.kind, anchor.at);
+            }
+            for (at, px) in [[0.0, 0.0], [gw, 0.0], [gw, gh], [0.0, gh]].into_iter().zip(doc.corners) {
+                let off = thinned.off(at, px);
+                assert!(off < 0.15, "press {press}: corner {at:?} placed {off:.2} modules off");
+            }
+        }
+    }
+
+    #[test]
+    fn a_placement_made_expecting_a_bleed_is_adopted_after_invert_photo_is_changed() {
+        // Placed expecting the bleed with Invert photo off, and adopted
+        // once it is on: the detection says the symbol reads dark on
+        // light, against the photo as it was searched, and the photo is
+        // now the other way about. Refined at the polarity found, every
+        // pattern was looked for the wrong way round, and the bleed with
+        // it.
+        let (func, params) = (Arc::new(FunctionMap::new(Thinned::VERSION)), SampleParams::default());
+        let (gw, gh) = (func.width as f64, func.height as f64);
+        let thinned = Thinned::new(0.3);
+        let read = read_outline(&thinned.luma, Thinned::VERSION, Thinned::AROUND, &params, &DecodeOptions::default()).expect("the symbol is read");
+        let found = read.detection;
+        assert!(found.bloom > 0.2 && !found.inverted, "read expecting a bleed of {:.2} modules, inverted {}", found.bloom, found.inverted);
+        let inverted = Luma::new(thinned.luma.width, thinned.luma.height, thinned.luma.data.iter().map(|v| 1.0 - v).collect());
+        let prepared = prepare_adoption(&inverted, &func, Thinned::VERSION, found, false, true, &params);
+        let (matching, fixed) = prepared.agreement;
+        assert_eq!(matching, fixed, "fixed patterns match {matching} of {fixed}");
+        for anchor in prepared.found.anchors.iter().filter(|a| matches!(a.kind, AnchorKind::Finder | AnchorKind::Alignment)) {
+            let off = thinned.off(anchor.at, anchor.center);
+            assert!(off < 0.1, "{:?} at {:?} placed {off:.2} modules off", anchor.kind, anchor.at);
+        }
+        for (at, px) in [[0.0, 0.0], [gw, 0.0], [gw, gh], [0.0, gh]].into_iter().zip(prepared.found.corners) {
+            let off = thinned.off(at, px);
+            assert!(off < 0.15, "corner {at:?} placed {off:.2} modules off");
+        }
     }
 
     #[test]
@@ -4578,6 +4839,7 @@ mod tests {
             retry: None,
             turned: 0,
             decodes: None,
+            bloom: 0.0,
         }
     }
 
@@ -4701,7 +4963,7 @@ mod tests {
         /// anchor's handle, which is drawn where its anchor is.
         fn locate(&mut self) -> impl Fn([f64; 2]) -> egui::Pos2 + use<> {
             let saved = self.app.doc.anchors.clone();
-            self.app.doc.anchors = vec![DocAnchor { anchor: finder_anchor([75.0, 75.0]), source: AnchorSource::Detected }];
+            self.app.doc.anchors = vec![DocAnchor { anchor: finder_anchor([75.0, 75.0]), source: AnchorSource::Detected, bled: 0.0 }];
             self.step();
             self.step();
             let handles = self.handles(5.5);
@@ -5354,7 +5616,7 @@ mod tests {
         // and are known among the handles only by where they are.
         for x in [6.3, 12.1, 18.4] {
             let anchor = anchor(AnchorKind::Edge, [x, 0.0], [40.0 + 10.0 * x, 36.0]);
-            bench.app.doc.anchors.push(DocAnchor { anchor, source: AnchorSource::Detected });
+            bench.app.doc.anchors.push(DocAnchor { anchor, source: AnchorSource::Detected, bled: 0.0 });
         }
         bench.step();
         bench.step();
