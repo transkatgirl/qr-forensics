@@ -93,6 +93,7 @@
 
 use std::borrow::Cow;
 
+use super::gpu;
 use super::resize::resize;
 use crate::work;
 
@@ -181,7 +182,7 @@ const PART_SIDE: usize = 512;
 /// read as they would in the whole image.
 const PART_MARGIN: usize = 56;
 /// Rounds of the deconvolution.
-const ROUNDS: usize = 25;
+pub(crate) const ROUNDS: usize = 25;
 /// Directions the edges are sorted into, over half a turn.
 const DIRECTIONS: usize = 12;
 /// Fewest edges a direction must have to be fitted on.
@@ -220,7 +221,7 @@ const STEP_SHARE: f32 = 0.5;
 /// blur is read off them: the middle one.
 const NARROWEST: f64 = 0.5;
 /// Lowest light the deconvolution divides by.
-const FLOOR: f32 = 0.01;
+pub(crate) const FLOOR: f32 = 0.01;
 
 /// How far the photo `width` by `height` spreads an edge, measured from
 /// the edges it shows, as the module describes. `None` when it shows too
@@ -567,23 +568,10 @@ fn blurred(data: &[f32], width: usize, height: usize, taps: &[(isize, isize, f32
 
 /// `data`, `width` by `height`, with the blur `spread` undone by
 /// Richardson and Lucy's deconvolution, as the module describes, held
-/// to black and white.
+/// to black and white: on the graphics card ([`super::gpu`]), held to
+/// [`FLOOR`] and above there, fewer rounds where the work is called off.
 pub fn deconvolve(data: &[f32], width: usize, height: usize, spread: &Spread) -> Vec<f32> {
-    let taps = kernel(spread);
-    let observed: Vec<f32> = data.iter().map(|v| v.clamp(FLOOR, 1.0)).collect();
-    let mut estimate = observed.clone();
-    for _ in 0..ROUNDS {
-        if work::cancelled() {
-            break;
-        }
-        let again = blurred(&estimate, width, height, &taps);
-        let ratio: Vec<f32> = observed.iter().zip(&again).map(|(o, a)| o / a.max(FLOOR)).collect();
-        let correction = blurred(&ratio, width, height, &taps);
-        for (e, c) in estimate.iter_mut().zip(&correction) {
-            *e = (*e * c).clamp(FLOOR, 1.0);
-        }
-    }
-    estimate
+    super::gpu::deconvolved(data, width, height, &kernel(spread), ROUNDS, FLOOR)
 }
 
 /// How far a deconvolution reduces an image before it undoes the blur in
@@ -640,6 +628,12 @@ impl Reduction {
     pub fn factor(self) -> f64 {
         self.p as f64 / self.q as f64
     }
+
+    /// The size an image `width` by `height` is carried to before it is
+    /// reduced ([`reduced`]): a whole number of steps of `q` each way.
+    fn carried(self, width: usize, height: usize) -> (usize, usize) {
+        (width.div_ceil(self.q) * self.q, height.div_ceil(self.q) * self.q)
+    }
 }
 
 /// `data`, `width` by `height`, reduced by `reduction` on its grid
@@ -648,7 +642,7 @@ impl Reduction {
 /// by exactly `p` in `q`. With the size it comes to.
 fn reduced(data: &[f32], width: usize, height: usize, reduction: Reduction) -> (Vec<f32>, usize, usize) {
     let Reduction { p, q } = reduction;
-    let (ew, eh) = (width.div_ceil(q) * q, height.div_ceil(q) * q);
+    let (ew, eh) = reduction.carried(width, height);
     let carried: Cow<[f32]> = if (ew, eh) == (width, height) {
         Cow::Borrowed(data)
     } else {
@@ -677,6 +671,24 @@ fn restored(sharp: &[f32], (rw, rh): (usize, usize), reduction: Reduction, (widt
     } else {
         (0..height).flat_map(|y| back[y * ew..y * ew + width].iter().copied()).collect()
     }
+}
+
+/// `data`, `width` by `height`, reduced by `reduction` ([`reduced`]) and
+/// the blur `at_size`, the blur at the reduced size, undone in it: a step
+/// at a time, each handed the graphics card and taken off it in turn. With
+/// the size it comes to.
+fn reduced_deconvolved(data: &[f32], width: usize, height: usize, at_size: &Spread, reduction: Reduction) -> (Vec<f32>, usize, usize) {
+    let (small, rw, rh) = reduced(data, width, height, reduction);
+    (deconvolve(&small, rw, rh, at_size), rw, rh)
+}
+
+/// [`reduced_deconvolved`] of an image on the graphics card, left there:
+/// carried and resized as [`reduced`] carries and resizes it, and
+/// deconvolved as [`deconvolve`] deconvolves it, to the same values.
+fn reduced_deconvolved_on(image: &gpu::Image, at_size: &Spread, reduction: Reduction) -> gpu::Image {
+    let Reduction { p, q } = reduction;
+    let (ew, eh) = reduction.carried(image.width, image.height);
+    image.carried(ew, eh).resized(ew / q * p, eh / q * p).deconvolved(&kernel(at_size), ROUNDS, FLOOR)
 }
 
 /// How many of the deconvolution's kernels a part of an image must reach
@@ -717,12 +729,15 @@ pub fn deblurred(data: &[f32], width: usize, height: usize, most_pixels: usize) 
     if reduction == Reduction::NONE {
         return Some((deconvolve(data, width, height, &spread), width, height, 1.0, spread));
     }
-    let (small, rw, rh) = reduced(data, width, height, reduction);
     let at_size = spread.scaled(reduction.factor());
-    let sharp = deconvolve(&small, rw, rh, &at_size);
-    // As far as the image itself reaches.
+    // As far as the image itself reaches: reduced, undone and cut on the
+    // card, handed it once and taken off it once, where it holds the image
+    // whole; and otherwise a step at a time.
     let (w, h) = ((width * reduction.p).div_ceil(reduction.q), (height * reduction.p).div_ceil(reduction.q));
-    let sharp = (0..h).flat_map(|y| sharp[y * rw..y * rw + w].iter().copied()).collect();
+    let sharp = gpu::through(data, (width, height), reduction.carried(width, height), |image| reduced_deconvolved_on(&image, &at_size, reduction).carried(w, h)).unwrap_or_else(|| {
+        let (sharp, rw, _) = reduced_deconvolved(data, width, height, &at_size, reduction);
+        (0..h).flat_map(|y| sharp[y * rw..y * rw + w].iter().copied()).collect()
+    });
     Some((sharp, w, h, reduction.factor(), at_size))
 }
 
@@ -814,19 +829,65 @@ pub fn undone_by(data: &[f32], width: usize, height: usize, kernel: Option<Sprea
 /// the whole about it as the deconvolution reads ([`reach`]), it comes
 /// out as the whole does there.
 pub fn undone_within(data: &[f32], width: usize, height: usize, kernel: Option<Spread>, strength: f64, whole: usize) -> (Vec<f32>, Option<Spread>) {
-    let Some(spread) = kernel.or_else(|| spread_of(data, width, height)) else { return (data.to_vec(), None) };
+    match undoing(kernel, strength, whole, || spread_of(data, width, height)) {
+        Undoing::Nothing(spread) => (data.to_vec(), spread),
+        Undoing::Undo { spread, undone, reduction: Reduction::NONE } => (deconvolve(data, width, height, &undone), Some(spread)),
+        Undoing::Undo { spread, undone, reduction } => {
+            // Reduced, undone and brought back on the card, handed it once
+            // and taken off it once, where it holds the image whole; and
+            // otherwise a step at a time.
+            let at_size = undone.scaled(reduction.factor());
+            let carried = reduction.carried(width, height);
+            let sharp = gpu::through(data, (width, height), carried, |image| reduced_deconvolved_on(&image, &at_size, reduction).resized_part(carried, (width, height))).unwrap_or_else(|| {
+                let (sharp, rw, rh) = reduced_deconvolved(data, width, height, &at_size, reduction);
+                restored(&sharp, (rw, rh), reduction, (width, height))
+            });
+            (sharp, Some(spread))
+        }
+    }
+}
+
+/// [`undone_within`] of an image on the graphics card, left there: by the
+/// same steps and the same kernels, to the same values ([`gpu::Image`]).
+/// The image is taken off the card only to measure the blur it shows,
+/// where no kernel is `given`.
+pub(crate) fn undone_on(image: &gpu::Image, given: Option<Spread>, strength: f64, whole: usize) -> (gpu::Image, Option<Spread>) {
+    let (width, height) = (image.width, image.height);
+    match undoing(given, strength, whole, || spread_of(&image.read(), width, height)) {
+        Undoing::Nothing(spread) => (image.clone(), spread),
+        Undoing::Undo { spread, undone, reduction: Reduction::NONE } => (image.deconvolved(&kernel(&undone), ROUNDS, FLOOR), Some(spread)),
+        Undoing::Undo { spread, undone, reduction } => {
+            // Brought back as [`restored`] brings it: enlarged to the size
+            // it was carried to, of which only the image's own is made.
+            let sharp = reduced_deconvolved_on(image, &undone.scaled(reduction.factor()), reduction);
+            (sharp.resized_part(reduction.carried(width, height), (width, height)), Some(spread))
+        }
+    }
+}
+
+/// What undoing a blur in an image comes to before any pixel of it is
+/// touched ([`undoing`]).
+enum Undoing {
+    /// Nothing: no blur shown, with too few edges to measure one, or one
+    /// so faint as next to none at the strength asked for; and the blur,
+    /// where there was one.
+    Nothing(Option<Spread>),
+    /// The blur `spread`, `undone` as far as the strength asks, at
+    /// `reduction`.
+    Undo { spread: Spread, undone: Spread, reduction: Reduction },
+}
+
+/// What undoing the blur `given`, or that `measured` gives where none is
+/// given, `strength` times as wide, comes to in an image that is a part of
+/// one of `whole` pixels.
+fn undoing(given: Option<Spread>, strength: f64, whole: usize, measured: impl FnOnce() -> Option<Spread>) -> Undoing {
+    let Some(spread) = given.or_else(measured) else { return Undoing::Nothing(None) };
     let undone = spread.scaled(strength.max(0.0));
     let (widest, _) = undone.extremes();
     if widest <= 0.0 || !widest.is_finite() {
-        return (data.to_vec(), Some(spread));
+        return Undoing::Nothing(Some(spread));
     }
-    let reduction = Reduction::for_blur(widest, whole, MOST_READ_PIXELS, 1.0);
-    if reduction == Reduction::NONE {
-        return (deconvolve(data, width, height, &undone), Some(spread));
-    }
-    let (small, rw, rh) = reduced(data, width, height, reduction);
-    let sharp = deconvolve(&small, rw, rh, &undone.scaled(reduction.factor()));
-    (restored(&sharp, (rw, rh), reduction, (width, height)), Some(spread))
+    Undoing::Undo { spread, undone, reduction: Reduction::for_blur(widest, whole, MOST_READ_PIXELS, 1.0) }
 }
 
 /// `data`, `width` by `height`, deblurred by the blur it shows, at full
@@ -1111,6 +1172,46 @@ mod tests {
         let image = grainy(blurred(&stripes([0.0, 45.0, 90.0]), w, h, &kernel(&Spread::round(2.5))));
         let (widest, narrowest) = measure(&image, w, h).expect("edges enough").extremes();
         assert!(widest < 1.2 * narrowest && (widest - 2.5).abs() < 0.35 * 2.5, "a quarter turn: {widest} by {narrowest}");
+    }
+
+    #[test]
+    fn an_image_on_the_card_is_undone_as_one_handed_it_is() {
+        // Its height no whole number of a reduction's steps.
+        let (w, h, cell) = (150, 143, 8);
+        let data = blurred(&squares(w, cell)[..w * h], w, h, &kernel(&Spread::round(2.6)));
+        let card = gpu::Image::handed(&data, w, h);
+        // Measured, given, given so wide that it is undone reduced, and at a
+        // strength of nought.
+        let wide = Spread { xx: 9.0, xy: 1.0, yy: 6.0 };
+        assert!(Reduction::for_blur(wide.extremes().0, w * h, MOST_READ_PIXELS, 1.0).q > 1);
+        for (given, strength) in [(None, 1.0), (Some(Spread::round(1.5)), 1.0), (Some(wide), 1.0), (Some(Spread::round(2.0)), 0.0)] {
+            let (handed, spread) = undone_within(&data, w, h, given, strength, w * h);
+            let (on, on_spread) = undone_on(&card, given, strength, w * h);
+            assert_eq!(on_spread, spread, "{given:?} at {strength}");
+            assert!(on.read() == handed, "{given:?} at {strength}");
+        }
+        // With no edges to measure a blur off, as it is.
+        let flat = vec![0.6f32; 64 * 64];
+        let (on, spread) = undone_on(&gpu::Image::handed(&flat, 64, 64), None, 1.0, 64 * 64);
+        assert_eq!((on.read(), spread), (flat, None));
+    }
+
+    #[test]
+    fn a_reduction_undone_on_the_card_at_once_is_as_it_is_a_step_at_a_time() {
+        // Its height no whole number of a reduction's steps.
+        let (w, h, cell) = (150, 143, 8);
+        let data = blurred(&squares(w, cell)[..w * h], w, h, &kernel(&Spread::round(2.6)));
+        let at_size = Spread::round(1.4);
+        for reduction in [Reduction { p: 1, q: 2 }, Reduction { p: 2, q: 3 }, Reduction { p: 1, q: 5 }] {
+            let carried = reduction.carried(w, h);
+            let (stepped, rw, rh) = reduced_deconvolved(&data, w, h, &at_size, reduction);
+            // Reduced and undone, as a search's copy is deblurred.
+            let card = gpu::through(&data, (w, h), carried, |image| reduced_deconvolved_on(&image, &at_size, reduction)).expect("on the card");
+            assert!(card == stepped, "{reduction:?}");
+            // And brought back, as the photo's Deblur filter is.
+            let card = gpu::through(&data, (w, h), carried, |image| reduced_deconvolved_on(&image, &at_size, reduction).resized_part(carried, (w, h))).expect("on the card");
+            assert!(card == restored(&stepped, (rw, rh), reduction, (w, h)), "{reduction:?} brought back");
+        }
     }
 
     #[test]

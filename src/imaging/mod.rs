@@ -6,6 +6,7 @@ pub mod binarize;
 pub mod deblur;
 pub mod detect;
 pub mod enhance;
+pub mod gpu;
 pub mod homography;
 pub mod measure;
 pub mod patches;
@@ -21,7 +22,7 @@ pub mod sample;
 use std::fmt;
 use std::ops::Deref;
 use std::panic::RefUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// RGBA bytes held once and shared: a photo as loaded, by the window
 /// that shows it and by the luminance made of it, which keeps it beside
@@ -210,13 +211,10 @@ impl Luma {
 
     /// The image as opaque grey pixels, four bytes to each: what a
     /// photo shown in grey is drawn from, so that what is shown is what
-    /// is read.
+    /// is read ([`greyed`]).
     pub fn to_rgba(&self) -> Vec<u8> {
-        let mut rgba = Vec::with_capacity(self.data.len() * 4);
-        for &value in &self.data {
-            let grey = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
-            rgba.extend_from_slice(&[grey, grey, grey, 255]);
-        }
+        let mut rgba = vec![0u8; self.data.len() * 4];
+        greyed(&self.data, &mut rgba);
         rgba
     }
 
@@ -243,6 +241,27 @@ impl Luma {
         out.deblurred = self.deblurred.map(|spread| (0..quarters % 4).fold(spread, |spread, _| spread.turned_cw()));
         out
     }
+}
+
+/// Pixels greyed as one piece of an image spread over the cores.
+const GREYED_AT_ONCE: usize = 1 << 18;
+
+/// `luma` as opaque grey pixels, four bytes to each, written over `rgba`:
+/// each value held from black to white and rounded to a byte. On the
+/// cores, a piece at a time on those to spare: so, a photo of twelve
+/// megapixels is greyed in well under a millisecond, where handed the
+/// graphics card and taken back it took ten.
+pub(crate) fn greyed(luma: &[f32], rgba: &mut [u8]) {
+    assert_eq!(rgba.len(), luma.len() * 4);
+    let pieces: Vec<Mutex<(&[f32], &mut [u8])>> = luma.chunks(GREYED_AT_ONCE).zip(rgba.chunks_mut(4 * GREYED_AT_ONCE)).map(Mutex::new).collect();
+    crate::work::map(&pieces, |piece| {
+        let mut piece = piece.lock().expect("a piece is greyed once, by one worker");
+        let (values, pixels) = &mut *piece;
+        for (pixel, &value) in pixels.as_chunks_mut::<4>().0.iter_mut().zip(values.iter()) {
+            let grey = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+            *pixel = [grey, grey, grey, 255];
+        }
+    });
 }
 
 /// A point of an image `width` by `height` pixels, in the pixel

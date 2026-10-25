@@ -2660,7 +2660,7 @@ impl App {
         match action {
             Action::OpenImage => {
                 let picked = rfd::FileDialog::new()
-                    .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"])
+                    .add_filter("Images", qr_forensics::imaging::photo::EXTENSIONS)
                     .pick_file();
                 if let Some(path) = picked {
                     self.load_path(ctx, &path);

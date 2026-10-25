@@ -9,17 +9,21 @@
 //! one symbol for the sampling to read off ([`super::enhance`]), in
 //! grey; a read that does not decode still makes itself such copies,
 //! and what it read through one the photo so adjusted shows again.
+//!
+//! Every adjustment is worked on the graphics card ([`super::gpu`]); what
+//! is worked out here is what it is asked to do and where: the weights of
+//! a resize, the box of the photo a part draws on, the curve of the tone.
 
 use std::borrow::Cow;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use super::enhance::{mask_for, unsharp_rgba};
+use super::enhance::{gaussian, mask_for};
 use super::deblur::{self, Spread};
-use super::resize::{Sample, resize};
+use super::gpu::{Lens, Step};
+use super::resize::{Sample, Taps};
 use super::detect::most_shrunk;
-use super::{AsShot, Luma, SharedRgba};
-use crate::work;
+use super::{AsShot, Luma, SharedRgba, gpu};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Channel {
@@ -109,77 +113,18 @@ impl Filter {
     /// The filter over a `width` × `height` luminance image, with a
     /// neighbourhood `radius` pixels either side of each pixel. The
     /// median's cost grows with the square of the radius, so it is held
-    /// to two.
+    /// to two. Worked on the graphics card ([`super::gpu`]), the image's
+    /// edges repeated beyond it.
     pub fn apply(self, data: &[f32], width: usize, height: usize, radius: usize) -> Vec<f32> {
         let radius = radius.max(1);
         match self {
             Filter::None => data.to_vec(),
-            Filter::Median => median(data, width, height, radius.min(2)),
-            Filter::Close => {
-                let darkest = separable(data, width, height, radius, |w| w.iter().copied().fold(f32::INFINITY, f32::min));
-                separable(&darkest, width, height, radius, |w| w.iter().copied().fold(f32::NEG_INFINITY, f32::max))
-            }
+            Filter::Median => super::gpu::median(data, width, height, radius.min(2)),
+            Filter::Close => super::gpu::closed(data, width, height, radius),
             Filter::Deblur => super::deblur::undone(data, width, height),
         }
     }
 }
-
-/// `reduce` over the row window and then the column window around each
-/// pixel, the image's edges repeated beyond it.
-fn separable(data: &[f32], width: usize, height: usize, radius: usize, reduce: impl Fn(&[f32]) -> f32) -> Vec<f32> {
-    let mut rows = vec![0.0f32; width * height];
-    let mut window = Vec::with_capacity(2 * radius + 1);
-    for y in 0..height {
-        let row = &data[y * width..(y + 1) * width];
-        for x in 0..width {
-            window.clear();
-            for dx in -(radius as isize)..=radius as isize {
-                let sx = (x as isize + dx).clamp(0, width as isize - 1) as usize;
-                window.push(row[sx]);
-            }
-            rows[y * width + x] = reduce(&window);
-        }
-    }
-    let mut out = vec![0.0f32; width * height];
-    for y in 0..height {
-        for x in 0..width {
-            window.clear();
-            for dy in -(radius as isize)..=radius as isize {
-                let sy = (y as isize + dy).clamp(0, height as isize - 1) as usize;
-                window.push(rows[sy * width + x]);
-            }
-            out[y * width + x] = reduce(&window);
-        }
-    }
-    out
-}
-
-/// The median of the square neighbourhood around each pixel, the image's
-/// edges repeated beyond it.
-fn median(data: &[f32], width: usize, height: usize, radius: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; width * height];
-    let side = 2 * radius + 1;
-    let mut window = Vec::with_capacity(side * side);
-    for y in 0..height {
-        for x in 0..width {
-            window.clear();
-            for dy in -(radius as isize)..=radius as isize {
-                let sy = (y as isize + dy).clamp(0, height as isize - 1) as usize;
-                for dx in -(radius as isize)..=radius as isize {
-                    let sx = (x as isize + dx).clamp(0, width as isize - 1) as usize;
-                    window.push(data[sy * width + sx]);
-                }
-            }
-            let middle = window.len() / 2;
-            let (_, value, _) = window.select_nth_unstable_by(middle, f32::total_cmp);
-            out[y * width + x] = *value;
-        }
-    }
-    out
-}
-
-/// Pixels toned as one piece of a photo spread over the cores.
-const TONED_AT_ONCE: usize = 1 << 18;
 
 /// The longest a photo's longer side is enlarged to, past the few times
 /// its size any photo may be made ([`Enlarge::ALWAYS`]), and the longest
@@ -437,6 +382,11 @@ pub struct Adjust {
     pub strength: f32,
 }
 
+/// What is shown of a part of the photo and what is read of it, filtered
+/// on the graphics card ([`Adjust::filtered_on`]), with the blur its
+/// Deblur filter undid.
+type Filtered = (Vec<u8>, Vec<f32>, Option<Spread>);
+
 /// How far the Deblur filter's strength goes ([`Adjust::strength`]).
 pub const STRENGTH_RANGE: std::ops::RangeInclusive<f32> = 0.0..=2.0;
 
@@ -681,9 +631,6 @@ pub(crate) struct Shot<'a, T> {
     pub step: [f32; 2],
 }
 
-/// Rows of a part straightened as one piece, spread over the cores.
-const STRAIGHTENED_AT_ONCE: usize = 1 << 18;
-
 /// The part `width` by `height` of a frame beginning at `out_at` in it,
 /// the whole photo `frame` of the frame's pixels across and down, with
 /// the photo's radial distortion `k1` taken out about its centre: each
@@ -694,7 +641,8 @@ const STRAIGHTENED_AT_ONCE: usize = 1 << 18;
 /// where they meet, whatever part of the photo as shot each is read
 /// from: `shot` holds what the part draws on ([`drawn_on`]). A `shot`
 /// that holds nothing is of a part that draws on none of the photo, and
-/// the part is `fill` throughout.
+/// the part is `fill` throughout. Straightened on the graphics card
+/// ([`gpu::straightened`]).
 pub(crate) fn straighten<T: Sample>(shot: &Shot<'_, T>, frame: [f32; 2], k1: f32, out_at: [f32; 2], (width, height): (usize, usize), fill: &[T]) -> Vec<T> {
     let channels = shot.channels;
     assert_eq!(shot.pixels.len(), shot.width * shot.height * channels);
@@ -705,43 +653,10 @@ pub(crate) fn straighten<T: Sample>(shot: &Shot<'_, T>, frame: [f32; 2], k1: f32
     if shot.width == 0 || shot.height == 0 {
         return fill.repeat(width * height);
     }
-    let (w, h) = (frame[0], frame[1]);
-    let (cx, cy) = (w / 2.0, h / 2.0);
-    let norm = (w * w + h * h).sqrt() / 2.0;
-    let at = |x: usize, y: usize| &shot.pixels[(y * shot.width + x) * channels..(y * shot.width + x + 1) * channels];
-    let rows = (STRAIGHTENED_AT_ONCE / width).max(1);
-    let bands: Vec<(usize, usize)> = (0..height).step_by(rows).map(|y| (y, (y + rows).min(height))).collect();
-    work::map(&bands, |&(top, bottom)| {
-        let mut out = Vec::with_capacity((bottom - top) * width * channels);
-        for y in top..bottom {
-            for x in 0..width {
-                let (dx, dy) = (out_at[0] + x as f32 + 0.5 - cx, out_at[1] + y as f32 + 0.5 - cy);
-                let r = (dx * dx + dy * dy).sqrt() / norm;
-                let f = if r > 0.0 { source_radius(r, k1) / r } else { 1.0 };
-                // Source pixel centres sit at half-integers, as in `Luma::sample`.
-                let (sx, sy) = (cx + dx * f - 0.5, cy + dy * f - 0.5);
-                if !(sx >= -0.5 && sy >= -0.5 && sx <= w - 0.5 && sy <= h - 0.5) {
-                    out.extend_from_slice(fill);
-                    continue;
-                }
-                // Where that lies among the pixels held.
-                let (lx, ly) = ((sx - shot.at[0]) / shot.step[0], (sy - shot.at[1]) / shot.step[1]);
-                let x0 = lx.floor().clamp(0.0, shot.width as f32 - 1.0) as usize;
-                let y0 = ly.floor().clamp(0.0, shot.height as f32 - 1.0) as usize;
-                let (x1, y1) = ((x0 + 1).min(shot.width - 1), (y0 + 1).min(shot.height - 1));
-                let tx = (lx - x0 as f32).clamp(0.0, 1.0);
-                let ty = (ly - y0 as f32).clamp(0.0, 1.0);
-                let (p00, p10, p01, p11) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
-                for c in 0..channels {
-                    let top = p00[c].to_f32() * (1.0 - tx) + p10[c].to_f32() * tx;
-                    let bottom = p01[c].to_f32() * (1.0 - tx) + p11[c].to_f32() * tx;
-                    out.push(T::from_f32(top * (1.0 - ty) + bottom * ty));
-                }
-            }
-        }
-        out
-    })
-    .concat()
+    let lens = gpu::Lens { frame, k1, slope: edge_slope(f64::from(k1)) as f32 };
+    let fill: Vec<f32> = fill.iter().map(|value| value.to_f32()).collect();
+    let made = gpu::straightened(T::handed(shot.pixels), (shot.width, shot.height), channels, [shot.at, shot.step], &lens, out_at, (width, height), &fill, T::BYTES);
+    T::taken(made)
 }
 
 /// The box of a frame, `[x0, y0, x1, y1]` in its pixels, that the part
@@ -895,7 +810,7 @@ impl Adjust {
     /// order. An enlargement the part's size does not allow is held to
     /// the most that it does ([`Enlarge::within`]).
     pub fn apply_to(&self, rgba: &[u8], width: usize, height: usize, part: [usize; 4]) -> (Vec<u8>, Luma) {
-        self.applied(rgba, None, width, height, part)
+        self.applied(rgba, None, width, height, part, true)
     }
 
     /// [`Self::apply_to`] of a photo whose bytes are held to be shared,
@@ -904,20 +819,29 @@ impl Adjust {
     /// those same bytes where it is the whole of them, and not a second
     /// copy of a photo of many megapixels.
     pub fn apply_to_shared(&self, rgba: &SharedRgba, width: usize, height: usize, part: [usize; 4]) -> (Vec<u8>, Luma) {
-        self.applied(rgba, Some(rgba), width, height, part)
+        self.applied(rgba, Some(rgba), width, height, part, true)
     }
 
-    /// [`Self::apply_to`], with the bytes held to be shared, if they are.
-    fn applied(&self, rgba: &[u8], shared: Option<&SharedRgba>, width: usize, height: usize, [x, y, w, h]: [usize; 4]) -> (Vec<u8>, Luma) {
+    /// The luminance alone of [`Self::apply_to_shared`], for a photo that
+    /// is read and not shown: what would be shown of it is never taken off
+    /// the graphics card, which is as many bytes again as the luminance.
+    pub fn luma_of_shared(&self, rgba: &SharedRgba, width: usize, height: usize, part: [usize; 4]) -> Luma {
+        self.applied(rgba, Some(rgba), width, height, part, false).1
+    }
+
+    /// [`Self::apply_to`], with the bytes held to be shared, if they are,
+    /// and the RGBA image to display made only where it is `shown`
+    /// ([`Self::made`]).
+    fn applied(&self, rgba: &[u8], shared: Option<&SharedRgba>, width: usize, height: usize, [x, y, w, h]: [usize; 4], shown: bool) -> (Vec<u8>, Luma) {
         assert_eq!(rgba.len(), width * height * 4);
         assert!(x + w <= width && y + h <= height, "the part [{x}, {y}, {w}, {h}] lies within the photo, {width} by {height}");
         if w == 0 || h == 0 {
-            return self.tone(Vec::new(), w, h, 1.0, 0);
+            return self.filtered(Vec::new(), Vec::new(), w, h, 1.0, 0);
         }
         let enlarge = self.enlarge.within(w as u32, h as u32);
         let photo = Loaded { rgba, width, height, at: [0, 0], photo: [width, height], shared };
         let size = enlarge.size(w, h);
-        Adjust { enlarge, ..*self }.made(photo, [x, y, w, h], size, size.0 * size.1, true)
+        Adjust { enlarge, ..*self }.made(photo, [x, y, w, h], size, size.0 * size.1, shown, true)
     }
 
     /// Whether the tone is the photo's own: a copy made of the photo's
@@ -932,11 +856,14 @@ impl Adjust {
     /// and `to_height` give: what the whole photo so adjusted would show
     /// there, at that size. `whole_pixels` is how many pixels that whole
     /// comes to at that size, which the Deblur filter is reduced for as the
-    /// whole is ([`deblur::undone_within`]). With `keep`, the luminance
-    /// keeps the part made at its own size beside it, when it is made a
-    /// whole number of times larger, and the photo as loaded, when it is
-    /// adjusted more than that.
-    pub(crate) fn made(&self, from: Loaded<'_>, [x, y, w, h]: [usize; 4], (to_width, to_height): (usize, usize), whole_pixels: usize, keep: bool) -> (Vec<u8>, Luma) {
+    /// whole is ([`deblur::undone_within`]). The RGBA image to display is
+    /// made where it is `shown`, and is otherwise empty, and never taken off
+    /// the graphics card: a copy made for a read is read and not shown.
+    /// With `keep`, the luminance keeps the part made at its own size
+    /// beside it, when it is made a whole number of times larger, and the
+    /// photo as loaded, when it is adjusted more than that.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn made(&self, from: Loaded<'_>, [x, y, w, h]: [usize; 4], (to_width, to_height): (usize, usize), whole_pixels: usize, shown: bool, keep: bool) -> (Vec<u8>, Luma) {
         let [ax, ay] = from.at;
         let held = [ax, ay, ax + from.width, ay + from.height];
         // Unbent, the part is read where it lies. Bent, it is read from
@@ -952,12 +879,14 @@ impl Adjust {
         };
         let scale = [to_width as f32 / w as f32, to_height as f32 / h as f32];
         let mask = mask_for(self.sharpen);
-        // The part resized and straightened, and what of the photo it
-        // draws on.
-        let (worked, drawn) = if self.k1 == 0.0 {
-            let part = pixels([x, y, x + w, y + h]);
-            let worked = if (to_width, to_height) != (w, h) { Cow::Owned(resize(&part, w, h, 4, to_width, to_height)) } else { part };
-            (worked, [x, y, x + w, y + h])
+        // The chain of steps the part is made by on the card, and what of
+        // the photo it is made from, which is what of it the part draws on.
+        let mut chain = Vec::new();
+        let drawn = if self.k1 == 0.0 {
+            if (to_width, to_height) != (w, h) {
+                chain.push(Step::Resized { across: Taps::new(w, to_width), down: Taps::new(h, to_height) });
+            }
+            [x, y, x + w, y + h]
         } else {
             // In a frame of the pixels the photo is worked on at, the
             // photo as loaded about the part, resized into it, and
@@ -968,7 +897,6 @@ impl Adjust {
             let steps = scale.map(|scale| whole_after(f64::from(scale)));
             let region = aligned(shot_about(frame, self.k1, out_at, (to_width, to_height), scale, from.photo), steps, held);
             let (gw, gh) = (region[2] - region[0], region[3] - region[1]);
-            let shot = pixels(region);
             // A part that draws on none of the photo has nothing to resize,
             // and is white throughout.
             let (rw, rh) = if gw == 0 || gh == 0 {
@@ -976,17 +904,35 @@ impl Adjust {
             } else {
                 (((gw as f32 * scale[0]).round() as usize).max(1), ((gh as f32 * scale[1]).round() as usize).max(1))
             };
-            let resized = if (rw, rh) != (gw, gh) && rw > 0 { Cow::Owned(resize(&shot, gw, gh, 4, rw, rh)) } else { shot };
+            if (rw, rh) != (gw, gh) && rw > 0 {
+                chain.push(Step::Resized { across: Taps::new(gw, rw), down: Taps::new(gh, rh) });
+            }
             let at = [region[0] as f32 * scale[0], region[1] as f32 * scale[1]];
             let step = [gw as f32 * scale[0] / rw.max(1) as f32, gh as f32 * scale[1] / rh.max(1) as f32];
-            let from = Shot { pixels: &resized, width: rw, height: rh, channels: 4, at, step };
-            (Cow::Owned(straighten(&from, frame, self.k1, out_at, (to_width, to_height), &[255; 4])), region)
+            let lens = Lens { frame, k1: self.k1, slope: edge_slope(f64::from(self.k1)) as f32 };
+            chain.push(Step::Straightened { place: [at, step], lens, out_at, size: (to_width, to_height) });
+            region
         };
-        let sharp = match mask {
-            Some((sigma, amount)) => unsharp_rgba(&worked, to_width, to_height, sigma * f64::from(scale[0]).max(1.0), amount),
-            None => worked.into_owned(),
+        if let Some((sigma, amount)) = mask {
+            chain.push(Step::Sharpened { weights: gaussian(sigma * f64::from(scale[0]).max(1.0)), amount });
+        }
+        // Made on the card from the photo to what is shown and read, the
+        // filter and all, where the card holds it whole; and otherwise a
+        // step at a time, and filtered after.
+        let source = gpu::Source { rgba: from.rgba, width: from.width, part: [drawn[0] - ax, drawn[1] - ay, drawn[2] - ax, drawn[3] - ay], shared: from.shared };
+        let table = self.lookup_table();
+        let on_card = gpu::adjusted(&source, &chain, &table, self.pick()).map(|toned| self.filtered_on(toned, scale[0], whole_pixels, shown));
+        let (display, mut luma) = match on_card {
+            Some((display, toned, deblurred)) => {
+                let mut luma = Luma::new(to_width, to_height, toned);
+                luma.deblurred = deblurred;
+                (display, luma)
+            }
+            None => {
+                let (display, toned) = gpu::stepped(&source, &chain, &table, self.pick(), shown);
+                self.filtered(display, toned, to_width, to_height, scale[0], whole_pixels)
+            }
         };
-        let (display, mut luma) = self.tone(sharp, to_width, to_height, scale[0], whole_pixels);
         if !keep {
             return (display, luma);
         }
@@ -999,7 +945,7 @@ impl Adjust {
             // pixel either way of each of them would take out every
             // module that stands alone, and a finder pattern's ring.
             let unfiltered = Adjust { filter: Filter::None, ..*self };
-            luma.unenlarged = Some(Arc::new(unfiltered.made(from, [x, y, w, h], (w, h), w * h, false).1));
+            luma.unenlarged = Some(Arc::new(unfiltered.made(from, [x, y, w, h], (w, h), w * h, false, false).1));
         }
         if !whole || self.k1 != 0.0 || mask.is_some() || self.filter != Filter::None || !self.plain_tone() {
             // As much of the photo as a copy of the part at any size
@@ -1043,36 +989,46 @@ impl Adjust {
         (display, luma)
     }
 
-    /// The tone and the filter, over pixels already straightened,
-    /// resized and sharpened: the RGBA image to display, which is made
-    /// of those pixels where they stand, and the luminance to sample
-    /// from. A photo enlarged is many times the photo, and is not held
-    /// a second time to be toned. The pixels are a part of a whole of
-    /// `whole` pixels at this size, which the Deblur filter is reduced
-    /// for ([`Self::made`]).
-    fn tone(&self, mut rgba: Vec<u8>, width: usize, height: usize, scale: f32, whole: usize) -> (Vec<u8>, Luma) {
-        let table = self.lookup_table();
-        let mut luma = vec![0.0f32; width * height];
-        // A curve for each pixel alone: the pixels are toned a piece at
-        // a time on the cores to spare, each piece with its luminance.
-        let pieces: Vec<Mutex<(&mut [u8], &mut [f32])>> = rgba.chunks_mut(4 * TONED_AT_ONCE).zip(luma.chunks_mut(TONED_AT_ONCE)).map(Mutex::new).collect();
-        work::map(&pieces, |piece| {
-            let mut piece = piece.lock().expect("a piece is toned once, by one worker");
-            let (pixels, values) = &mut *piece;
-            for (pixel, value) in pixels.as_chunks_mut::<4>().0.iter_mut().zip(values.iter_mut()) {
-                let [r, g, b] = [table[pixel[0] as usize], table[pixel[1] as usize], table[pixel[2] as usize]];
-                let shown = match self.channel {
-                    Channel::Color => [r, g, b],
-                    Channel::Red => [r; 3],
-                    Channel::Green => [g; 3],
-                    Channel::Blue => [b; 3],
-                };
-                *pixel = [shown[0], shown[1], shown[2], 255];
-                let [r, g, b] = shown.map(|c| c as f32 / 255.0);
-                *value = 0.299 * r + 0.587 * g + 0.114 * b;
+    /// Which of the photo's colours the tone shows in all three, as the
+    /// card is told ([`gpu::adjusted`]): none for the photo in colour.
+    fn pick(&self) -> Option<usize> {
+        match self.channel {
+            Channel::Color => None,
+            Channel::Red => Some(0),
+            Channel::Green => Some(1),
+            Channel::Blue => Some(2),
+        }
+    }
+
+    /// [`Self::filtered`] on the card, over a part of the photo adjusted
+    /// and toned there ([`gpu::Toned`]), by the same kernels, to the same
+    /// values: what is shown, where it is `shown`, and what is read taken off
+    /// the card after the filter, with the blur the Deblur filter undid.
+    fn filtered_on(&self, toned: gpu::Toned, scale: f32, whole: usize, shown: bool) -> Filtered {
+        let radius = usize::from(self.radius.clamp(1, Filter::MAX_RADIUS));
+        let (filtered, deblurred) = match self.filter {
+            Filter::None => (None, None),
+            Filter::Median => (Some(toned.luma.median(radius.min(2))), None),
+            Filter::Close => (Some(toned.luma.closed(radius)), None),
+            Filter::Deblur => {
+                let kernel = self.kernel.map(|kernel| kernel.scaled(f64::from(scale)));
+                let (sharp, spread) = deblur::undone_on(&toned.luma, kernel, f64::from(self.strength), whole);
+                (Some(sharp), spread)
             }
-        });
-        drop(pieces);
+        };
+        let (display, luma) = toned.taken(filtered, shown);
+        (display, luma, deblurred)
+    }
+
+    /// The filter, over pixels already straightened, resized, sharpened
+    /// and toned, `rgba` as they are shown and `luma` as they are read:
+    /// the RGBA image to display, made of those pixels where they stand,
+    /// and the luminance to sample from. A photo enlarged is many times
+    /// the photo, and is not held a second time to be filtered. The
+    /// pixels are a part of a whole of `whole` pixels at this size, which
+    /// the Deblur filter is reduced for ([`Self::made`]). Pixels not shown
+    /// come empty, and stay so.
+    fn filtered(&self, mut rgba: Vec<u8>, mut luma: Vec<f32>, width: usize, height: usize, scale: f32, whole: usize) -> (Vec<u8>, Luma) {
         let mut deblurred = None;
         if self.filter != Filter::None && width > 0 && height > 0 {
             luma = if self.filter == Filter::Deblur {
@@ -1085,11 +1041,8 @@ impl Adjust {
             } else {
                 self.filter.apply(&luma, width, height, self.radius.clamp(1, Filter::MAX_RADIUS) as usize)
             };
-            for (pixel, &value) in rgba.as_chunks_mut::<4>().0.iter_mut().zip(&luma) {
-                let grey = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
-                pixel[0] = grey;
-                pixel[1] = grey;
-                pixel[2] = grey;
+            if !rgba.is_empty() {
+                super::greyed(&luma, &mut rgba);
             }
         }
         let mut luma = Luma::new(width, height, luma);
@@ -1101,6 +1054,7 @@ impl Adjust {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::imaging::resize::resize;
 
     #[test]
     fn neutral_settings_change_nothing() {
@@ -1909,6 +1863,26 @@ mod tests {
         let part = lens.apply_to_shared(&larger, w, h, [70, 50, 10, 10]).1;
         let shot = part.as_shot.as_ref().expect("a straightened part keeps the photo as loaded about it");
         assert!(!Arc::ptr_eq(&shot.rgba, &larger) && shot.rgba.len() < larger.len(), "{} of {} bytes", shot.rgba.len(), larger.len());
+    }
+
+    #[test]
+    fn a_photo_read_and_not_shown_reads_as_it_does_shown() {
+        // Its luminance alone, with all it keeps beside it: the photo at
+        // its own size where it is enlarged, and as loaded where it is
+        // adjusted more than that; filtered, toned and straightened.
+        let (w, h) = (90, 70);
+        let photo: SharedRgba = Arc::new(pixels(w, h, |x, y| [((x * 37 + y * 11) % 256) as u8, ((x * 13 + y * 29) % 256) as u8, (((x / 3 + y / 2) % 2) * 255) as u8]));
+        for adjust in [
+            Adjust::default(),
+            Adjust { enlarge: Enlarge::times(2), ..Default::default() },
+            Adjust { enlarge: Enlarge::times(2), filter: Filter::Median, contrast: 0.3, ..Default::default() },
+            Adjust { k1: 0.15, sharpen: 1.0, filter: Filter::Close, radius: 2, channel: Channel::Green, ..Default::default() },
+            Adjust { filter: Filter::Deblur, kernel: Some(Spread::round(1.2)), ..Default::default() },
+        ] {
+            for part in [[0, 0, w, h], [10, 5, 50, 40]] {
+                assert!(adjust.luma_of_shared(&photo, w, h, part) == adjust.apply_to_shared(&photo, w, h, part).1, "{adjust:?} of {part:?}");
+            }
+        }
     }
 
     #[test]

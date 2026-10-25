@@ -188,10 +188,11 @@
 //! message's `risk 1 in 2^n`: the parts' chances added up.
 //!
 //! The exit status is 0 when every image gave a trustworthy read, 1 when
-//! one did not, and 2 for a bad command line or an image that would not
-//! load. `--help` prints the usage and exits with 0. When standard output
-//! is closed, as `| head` closes it, the run stops there without
-//! complaint, with the status of the images read so far.
+//! one did not, and 2 for a bad command line, an image that would not
+//! load, or no graphics card to filter on ([`gpu::ready`]). `--help`
+//! prints the usage and exits with 0. When standard output is closed, as
+//! `| head` closes it, the run stops there without complaint, with the
+//! status of the images read so far.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -206,6 +207,7 @@ use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::adjust::Enlarge;
 use qr_forensics::imaging::detect::{Lead, SearchParams, search_for_families};
 use qr_forensics::imaging::enhance::{Enhance, Sharpen};
+use qr_forensics::imaging::gpu;
 use qr_forensics::imaging::measure::ReadMeasures;
 use qr_forensics::imaging::photo;
 use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline, read_placed};
@@ -683,6 +685,12 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
             return 2;
         }
     };
+    // The filters a read makes copies through run on the graphics card,
+    // and with none no image can be read.
+    if let Err(message) = gpu::ready() {
+        warn(&message);
+        return 2;
+    }
     let asked = SampleParams { enhance: options.enhance, ..SampleParams::default() };
     let params = if options.surface { asked.under(Rule::Surface) } else { asked };
     let opts = DecodeOptions { charset: options.charset, derive_pins: true, ..DecodeOptions::default() };

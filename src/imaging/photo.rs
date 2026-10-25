@@ -4,12 +4,13 @@
 //! so that its modules can be seen.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader, ImageResult, RgbaImage};
 
-use super::Luma;
 use super::adjust::Adjust;
+use super::{Luma, SharedRgba};
 
 /// A photo from a file, as a viewer shows it: its format told by its
 /// first bytes, whatever its name says, and turned upright as its EXIF
@@ -26,6 +27,34 @@ pub fn open(path: &Path) -> ImageResult<RgbaImage> {
     image.apply_orientation(orientation);
     Ok(image.into_rgba8())
 }
+
+/// The extensions of the files [`open`] reads, as the Open dialog offers
+/// them: those of every format the `image` crate decodes. Only TGA, which
+/// has no signature to be told by, needs its own name to open.
+pub const EXTENSIONS: &[&str] = &[
+    #[cfg(feature = "avif")]
+    "avif",
+    "bmp",
+    "dds",
+    "exr",
+    "ff",
+    "gif",
+    "hdr",
+    "ico",
+    "jpg",
+    "jpeg",
+    "png",
+    "pbm",
+    "pam",
+    "ppm",
+    "pgm",
+    "pnm",
+    "qoi",
+    "tga",
+    "tif",
+    "tiff",
+    "webp",
+];
 
 /// Lay the photo on white paper wherever it is transparent, leaving it
 /// opaque. An encoder that draws a symbol's dark modules on a transparent
@@ -56,7 +85,13 @@ pub fn luma(mut image: RgbaImage, adjust: &Adjust) -> Luma {
     // Before any resampling, which would otherwise bleed the hidden
     // colour of transparent pixels into the edges of opaque ones.
     flatten_alpha(&mut image);
-    adjust.apply(image.as_raw(), image.width() as usize, image.height() as usize).1
+    let (width, height) = (image.width() as usize, image.height() as usize);
+    // Held to be shared, the bytes are what the luminance keeps of the
+    // photo as loaded, where it keeps any, rather than a copy of them; and
+    // what the graphics card holds of the photo from one copy of it a read
+    // makes to the next.
+    let rgba: SharedRgba = Arc::new(image.into_raw());
+    adjust.luma_of_shared(&rgba, width, height, [0, 0, width, height])
 }
 
 /// [`luma`] of a photo as it is first loaded: under no adjustment but
@@ -92,6 +127,11 @@ pub fn crop_box(outline: [[f64; 2]; 4], width: u32, height: u32) -> Option<[u32;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::io::Cursor;
+
+    use image::{ImageError, ImageFormat};
+
     use super::*;
 
     #[test]
@@ -204,6 +244,43 @@ mod tests {
 
         let _ = std::fs::remove_file(misnamed);
         let _ = std::fs::remove_file(sideways);
+    }
+
+    #[test]
+    fn the_dialog_offers_every_format_the_crate_decodes() {
+        // Given nothing to read, a decoder this build lacks is refused as
+        // unsupported, and one it has fails on the missing bytes instead.
+        let decoded: BTreeSet<&str> = ImageFormat::all()
+            .filter(|&format| {
+                !matches!(ImageReader::with_format(Cursor::new(b""), format).into_decoder(), Err(ImageError::Unsupported(_)))
+            })
+            .flat_map(ImageFormat::extensions_str)
+            .copied()
+            .collect();
+        assert_eq!(EXTENSIONS.iter().copied().collect::<BTreeSet<_>>(), decoded);
+    }
+
+    #[test]
+    fn a_photo_opens_in_every_format_the_crate_also_writes() {
+        // Dark on the left, light on the right, twice as wide as tall.
+        let photo = RgbaImage::from_fn(40, 20, |x, _| if x < 20 { image::Rgba([10, 10, 10, 255]) } else { image::Rgba([240, 240, 240, 255]) });
+        for format in ImageFormat::all().filter(ImageFormat::writing_enabled) {
+            // Each encoder takes its own pixel types.
+            let image = DynamicImage::ImageRgba8(photo.clone());
+            let image = match format {
+                ImageFormat::Jpeg => DynamicImage::ImageRgb8(image.into_rgb8()),
+                ImageFormat::Hdr | ImageFormat::OpenExr => DynamicImage::ImageRgb32F(image.into_rgb32f()),
+                ImageFormat::Farbfeld => DynamicImage::ImageRgba16(image.into_rgba16()),
+                _ => image,
+            };
+            // Under its own name: TGA has no signature to be told by.
+            let path = std::env::temp_dir().join(format!("qr-forensics-format-{}.{}", std::process::id(), format.extensions_str()[0]));
+            image.save_with_format(&path, format).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+            let opened = open(&path).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+            let _ = std::fs::remove_file(&path);
+            assert_eq!(opened.dimensions(), (40, 20), "{format:?}");
+            assert!(opened.get_pixel(5, 10)[0] < 60 && opened.get_pixel(35, 10)[0] > 200, "{format:?}");
+        }
     }
 
     #[test]

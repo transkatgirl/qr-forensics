@@ -28,6 +28,19 @@ fn main() -> eframe::Result {
         println!("qr-forensics {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    // The photo's filters run on the graphics card: with none, the window
+    // says so before it would open, as well as the terminal, if there is
+    // one to read it.
+    if let Err(message) = qr_forensics::imaging::gpu::ready() {
+        eprintln!("{message}");
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("QR Forensics")
+            .set_description(message)
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+        std::process::exit(1);
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("QR Forensics")

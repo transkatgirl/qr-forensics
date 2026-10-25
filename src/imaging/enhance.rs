@@ -65,8 +65,7 @@ use super::adjust::{Adjust, Filter, Loaded, cut, whole_after};
 use super::deblur::{self, Reduction, Spread, deblurred};
 use super::{AsShot, Luma};
 use super::projection::Project;
-use super::resize::Sample;
-use crate::work;
+use super::gpu::{self, Made, Samples};
 
 /// Longest side a copy of the photo made for one look at it may have.
 pub(crate) const MAX_VIEW_SIDE: usize = 4096;
@@ -362,10 +361,23 @@ impl Enhanced {
                 let around = [sx0.saturating_sub(pad), sy0.saturating_sub(pad), (sx1 + pad).min(source.width), (sy1 + pad).min(source.height)];
                 let (aw, ah) = (around[2] - around[0], around[3] - around[1]);
                 let part = Luma::new(aw, ah, cut(&source.data, source.width, 1, around));
-                let part = if factor > 1 { part.resized(aw * factor, ah * factor) } else { part };
-                let sharp = unsharp(&part.data, part.width, part.height, 1, sigma * factor as f64, amount);
                 let (ox, oy) = ((sx0 - around[0]) * factor, (sy0 - around[1]) * factor);
-                Luma::new(vw, vh, cut(&sharp, part.width, 1, [ox, oy, ox + vw, oy + vh]).into_iter().map(|v| v.clamp(0.0, 1.0)).collect())
+                let window = [ox, oy, ox + vw, oy + vh];
+                // On the card, handed it once and taken off it once, where
+                // it holds the part enlarged whole; and otherwise a step at
+                // a time.
+                let (pw, ph) = (aw * factor, ah * factor);
+                let weights = gaussian(sigma * factor as f64);
+                let on_card = gpu::through(&part.data, (aw, ah), (pw, ph), |image| {
+                    let image = if factor > 1 { image.resized(pw, ph) } else { image };
+                    image.sharpened(&weights, amount).held_part(window)
+                });
+                let data = on_card.unwrap_or_else(|| {
+                    let part = if factor > 1 { part.resized(pw, ph) } else { part };
+                    let sharp = unsharp(&part.data, part.width, part.height, 1, sigma * factor as f64, amount);
+                    cut(&sharp, part.width, 1, window).into_iter().map(|v| v.clamp(0.0, 1.0)).collect()
+                });
+                Luma::new(vw, vh, data)
             }
             None => {
                 let part = Luma::new(w, h, cut(&source.data, source.width, 1, window));
@@ -510,7 +522,7 @@ impl Enhanced {
         let around = [down(ox0.saturating_sub(pad), lead), down(oy0.saturating_sub(pad), lead), up(ox1 + pad, pw), up(oy1 + pad, ph)];
         let out = (size(around[2] - around[0]), size(around[3] - around[1]));
         let from = Loaded { rgba: &shot.rgba, width: shot.width, height: shot.height, at: shot.at, photo: shot.photo, shared: Some(&shot.rgba) };
-        let made = adjust.made(from, [px + around[0], py + around[1], around[2] - around[0], around[3] - around[1]], out, whole, false).1;
+        let made = adjust.made(from, [px + around[0], py + around[1], around[2] - around[0], around[3] - around[1]], out, whole, false, false).1;
         let (cx, cy) = (offset(ox0 - around[0]).min(out.0 - 1), offset(oy0 - around[1]).min(out.1 - 1));
         let (vw, vh) = (vw.min(out.0 - cx), vh.min(out.1 - cy));
         let luma = Luma::new(vw, vh, cut(&made.data, made.width, 1, [cx, cy, cx + vw, cy + vh]));
@@ -653,132 +665,36 @@ impl<P: Project> Project for Through<'_, P> {
 
 /// The weights of a Gaussian blur `sigma` pixels wide, out to three
 /// times that either side of the pixel, summing to one.
-fn gaussian(sigma: f64) -> Vec<f32> {
+pub(crate) fn gaussian(sigma: f64) -> Vec<f32> {
     let reach = (3.0 * sigma).ceil().max(1.0) as i64;
     let raw: Vec<f64> = (-reach..=reach).map(|k| (-0.5 * (k as f64 / sigma).powi(2)).exp()).collect();
     let total: f64 = raw.iter().sum();
     raw.iter().map(|w| (w / total) as f32).collect()
 }
 
-/// Rows worked as one piece of an image spread over the cores.
-const BAND: usize = 64;
-
-/// An image `width` by `height`, of `channels` values to a pixel, under
-/// an unsharp mask, as [`Enhanced::window`] lays one on a part of the
-/// photo: every channel sharpened alike and apart from the others, so
-/// that a photo is sharpened in its colours, and past the image the
-/// pixel on its edge standing for those beyond it. `row` fills in the
-/// values of one row of the image, and `emit` adds to the result what a
-/// row of sharpened values comes to, which is not held to black and
-/// white before it is handed over.
-///
-/// The image is worked a band of rows at a time, on the cores to spare,
-/// each band blurring for itself the rows above and below that it draws
-/// on: what is held besides the result is a few rows a core, where the
-/// whole of a large photo as values to sharpen, and again blurred, would
-/// be several times the photo.
-fn unsharp_rows<T: Send + Copy>(
-    (width, height, channels): (usize, usize, usize),
-    (sigma, amount): (f64, f32),
-    row: impl Fn(usize, &mut [f32]) + Sync,
-    emit: impl Fn(&[f32], &mut Vec<T>) + Sync,
-) -> Vec<T> {
-    if width == 0 || height == 0 || channels == 0 {
-        return Vec::new();
-    }
-    let weights = gaussian(sigma);
-    let reach = weights.len() / 2;
-    let stride = width * channels;
-    let bands: Vec<(usize, usize)> = (0..height).step_by(BAND).map(|y| (y, (y + BAND).min(height))).collect();
-    work::map(&bands, |&(y0, y1)| {
-        // The rows the band's blur draws on: its own, and as many
-        // either side as the mask reaches, within the image.
-        let (top, bottom) = (y0.saturating_sub(reach), (y1 - 1 + reach).min(height - 1));
-        let mut values = vec![0.0f32; (bottom - top + 1) * stride];
-        let mut across = vec![0.0f32; values.len()];
-        for ((y, line), sums) in (top..=bottom).zip(values.chunks_exact_mut(stride)).zip(across.chunks_exact_mut(stride)) {
-            row(y, line);
-            // Blurred across, tap by tap, so that the middle of the row,
-            // where no tap falls off it, is one run of sums.
-            for (k, &weight) in weights.iter().enumerate() {
-                let shift = k as isize - reach as isize;
-                // The pixels whose tap lies on the row, and those before
-                // and after them, whose tap is the pixel on its edge.
-                let lo = (-shift).clamp(0, width as isize) as usize;
-                let hi = (width as isize - shift).clamp(lo as isize, width as isize) as usize;
-                for x in 0..lo {
-                    for c in 0..channels {
-                        sums[x * channels + c] += weight * line[c];
-                    }
-                }
-                if hi > lo {
-                    let from = (lo as isize + shift) as usize * channels;
-                    for (sum, &value) in sums[lo * channels..hi * channels].iter_mut().zip(&line[from..]) {
-                        *sum += weight * value;
-                    }
-                }
-                for x in hi..width {
-                    for c in 0..channels {
-                        sums[x * channels + c] += weight * line[(width - 1) * channels + c];
-                    }
-                }
-            }
-        }
-        // And those blurred down, against the pixels themselves.
-        let mut out = Vec::new();
-        let mut sharp = vec![0.0f32; stride];
-        for y in y0..y1 {
-            sharp.fill(0.0);
-            for (k, &weight) in weights.iter().enumerate() {
-                let from = (y + k).saturating_sub(reach).clamp(top, bottom) - top;
-                for (sum, &value) in sharp.iter_mut().zip(&across[from * stride..(from + 1) * stride]) {
-                    *sum += weight * value;
-                }
-            }
-            for (blurred, &value) in sharp.iter_mut().zip(&values[(y - top) * stride..(y - top + 1) * stride]) {
-                *blurred = value + amount * (value - *blurred);
-            }
-            emit(&sharp, &mut out);
-        }
-        out
-    })
-    .concat()
-}
-
 /// A whole image under an unsharp mask `sigma` pixels wide and `amount`
 /// strong: `width` by `height` pixels of `channels` interleaved values
-/// each, every channel sharpened apart from the others. The values are
-/// not held to black and white, which is left to what is made of them.
+/// each, every channel sharpened apart from the others, past the image
+/// the pixel on its edge standing for those beyond it. The values are not
+/// held to black and white, which is left to what is made of them.
+/// Sharpened on the graphics card ([`gpu::unsharp`]).
 pub fn unsharp(data: &[f32], width: usize, height: usize, channels: usize, sigma: f64, amount: f32) -> Vec<f32> {
     assert_eq!(data.len(), width * height * channels);
-    let stride = width * channels;
-    unsharp_rows(
-        (width, height, channels),
-        (sigma, amount),
-        |y, line| line.copy_from_slice(&data[y * stride..(y + 1) * stride]),
-        |sharp, out| out.extend_from_slice(sharp),
-    )
+    match gpu::unsharp(Samples::Values(data), (width, height), [channels; 2], &gaussian(sigma), amount, false) {
+        Made::Values(values) => values,
+        Made::Bytes(_) => unreachable!("the card makes values where it is asked to"),
+    }
 }
 
 /// Opaque pixels, four bytes to each, under an unsharp mask, in their
-/// colours, held to what a byte holds, and made without the whole
-/// photo ever being held as anything wider than its bytes.
+/// colours, held to what a byte holds, and made without the whole photo
+/// ever being held as anything wider than its bytes: the card holds a
+/// piece of it at a time as values.
 pub fn unsharp_rgba(rgba: &[u8], width: usize, height: usize, sigma: f64, amount: f32) -> Vec<u8> {
     assert_eq!(rgba.len(), width * height * 4);
-    unsharp_rows(
-        (width, height, 3),
-        (sigma, amount),
-        |y, line| colours_of_row(rgba, width, y, line),
-        |sharp, out| out.extend(sharp.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [r, g, b, 255.0]).map(u8::from_f32)),
-    )
-}
-
-/// The colours of row `y` of opaque pixels `width` to a row, three
-/// values to a pixel, as the bytes have them.
-fn colours_of_row(rgba: &[u8], width: usize, y: usize, line: &mut [f32]) {
-    let pixels = rgba[y * width * 4..(y + 1) * width * 4].as_chunks::<4>().0;
-    for (colours, pixel) in line.as_chunks_mut::<3>().0.iter_mut().zip(pixels) {
-        *colours = [pixel[0], pixel[1], pixel[2]].map(f32::from);
+    match gpu::unsharp(Samples::Bytes(rgba), (width, height), [4, 3], &gaussian(sigma), amount, true) {
+        Made::Bytes(bytes) => bytes,
+        Made::Values(_) => unreachable!("the card makes bytes where it is asked to"),
     }
 }
 

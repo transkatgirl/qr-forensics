@@ -23,15 +23,14 @@
 //! The values are resized as they are stored, as the rest of the
 //! pipeline weighs them, and not in linear light.
 //!
-//! Each row of the result is made of the source alone, so a large
-//! result is made a band of rows at a time on the cores to spare
-//! ([`crate::work`]), and comes out as it would have on one: a photo
-//! enlarged four times is sixteen times its pixels, made on every
-//! change of its adjustments.
+//! The weights are worked out here, and the resizing on the graphics
+//! card ([`super::gpu::resized`]): a photo enlarged four times is sixteen
+//! times its pixels, made on every change of its adjustments. Each pixel
+//! of the result is made of the source alone, so a result too large for
+//! the card to make at once is made a tile at a time, and comes out as
+//! it would have whole.
 
-use std::sync::Mutex;
-
-use crate::work;
+use super::gpu::{self, Made, Samples};
 
 /// Magic Kernel Sharp 2013 at `x` pixels from its centre.
 pub fn mks2013(x: f64) -> f64 {
@@ -50,17 +49,21 @@ pub fn mks2013(x: f64) -> f64 {
 /// How far the kernel reaches either side of its centre.
 const REACH: f64 = 2.5;
 
-/// Values of the result made as one piece of an image spread over the
-/// cores: a megapixel of one channel or so. A smaller result is made
-/// whole, where it was asked for.
-const SPREAD: usize = 1 << 20;
-
 /// What a pixel holds in each of its channels.
 pub trait Sample: Copy + Send + Sync {
     fn to_f32(self) -> f32;
     /// The value kept within what the channel holds: beside a sharp edge
-    /// the kernel's negative lobes carry it past black or white.
+    /// the kernel's negative lobes carry it past black or white. The card
+    /// keeps a value made there so too.
     fn from_f32(value: f32) -> Self;
+    /// Whether the card makes samples of this kind as bytes, rounded,
+    /// rather than as values.
+    const BYTES: bool;
+    /// The samples, as the card is handed them.
+    fn handed(samples: &[Self]) -> Samples<'_>;
+    /// What the card made, as samples of this kind: what it was asked to
+    /// make by [`Self::BYTES`].
+    fn taken(made: Made) -> Vec<Self>;
 }
 
 impl Sample for u8 {
@@ -70,6 +73,19 @@ impl Sample for u8 {
 
     fn from_f32(value: f32) -> Self {
         value.round().clamp(0.0, 255.0) as u8
+    }
+
+    const BYTES: bool = true;
+
+    fn handed(samples: &[Self]) -> Samples<'_> {
+        Samples::Bytes(samples)
+    }
+
+    fn taken(made: Made) -> Vec<Self> {
+        match made {
+            Made::Bytes(bytes) => bytes,
+            Made::Values(_) => unreachable!("the card makes bytes where it is asked to"),
+        }
     }
 }
 
@@ -82,23 +98,36 @@ impl Sample for f32 {
     fn from_f32(value: f32) -> Self {
         value.clamp(0.0, 1.0)
     }
+
+    const BYTES: bool = false;
+
+    fn handed(samples: &[Self]) -> Samples<'_> {
+        Samples::Values(samples)
+    }
+
+    fn taken(made: Made) -> Vec<Self> {
+        match made {
+            Made::Values(values) => values,
+            Made::Bytes(_) => unreachable!("the card makes values where it is asked to"),
+        }
+    }
 }
 
 /// What each pixel along one side of the result draws on: a run of the
 /// source's pixels along that side, and a weight for each.
-struct Taps {
+pub(crate) struct Taps {
     /// The first source pixel each result pixel draws on.
-    first: Vec<usize>,
+    pub(crate) first: Vec<usize>,
     /// How many it draws on.
-    count: Vec<usize>,
+    pub(crate) count: Vec<usize>,
     /// The weights, `per` to a result pixel, of which it uses its count.
-    weights: Vec<f32>,
-    per: usize,
+    pub(crate) weights: Vec<f32>,
+    pub(crate) per: usize,
 }
 
 impl Taps {
     /// A side of `from` pixels resized to `to`.
-    fn new(from: usize, to: usize) -> Self {
+    pub(crate) fn new(from: usize, to: usize) -> Self {
         let ratio = to as f64 / from as f64;
         // The kernel measures in the pixels of the smaller of the two.
         let scale = ratio.min(1.0);
@@ -127,10 +156,11 @@ impl Taps {
         Self { first, count, weights, per }
     }
 
-    /// The first source pixel result pixel `i` draws on, and the weights
-    /// of it and those after it.
-    fn of(&self, i: usize) -> (usize, &[f32]) {
-        (self.first[i], &self.weights[i * self.per..i * self.per + self.count[i]])
+    /// The source pixels the result pixels `from..to` draw on between
+    /// them: from the first of the first to the last of the last, since
+    /// both move on with the result pixel.
+    pub(crate) fn span(&self, from: usize, to: usize) -> (usize, usize) {
+        (self.first[from], self.first[to - 1] + self.count[to - 1])
     }
 }
 
@@ -151,46 +181,7 @@ pub fn resize_into<I: Sample, O: Sample>(data: &[I], width: usize, height: usize
     assert!((1..=4).contains(&channels), "one to four channels a pixel");
     assert!(width > 0 && height > 0 && to_width > 0 && to_height > 0, "neither image may be empty");
     let (across, down) = (Taps::new(width, to_width), Taps::new(height, to_height));
-    let (stride, to_stride) = (width * channels, to_width * channels);
-    let mut out = vec![O::from_f32(0.0); to_stride * to_height];
-    // Bands of whole rows, each with the row it begins at: every band
-    // is its own part of the result, written where it lies.
-    let rows = (SPREAD / to_stride).max(1);
-    let bands: Vec<Mutex<(usize, &mut [O])>> =
-        out.chunks_mut(rows * to_stride).enumerate().map(|(band, values)| Mutex::new((band * rows, values))).collect();
-    work::map(&bands, |band| {
-        let mut band = band.lock().expect("a band is made once, by one worker");
-        let (top, values) = &mut *band;
-        let mut row = vec![0.0f32; stride];
-        for (y, result) in (*top..).zip(values.chunks_exact_mut(to_stride)) {
-            // The source rows this row draws on, weighed into one row as
-            // wide as the source...
-            row.fill(0.0);
-            let (first, weights) = down.of(y);
-            for (k, &weight) in weights.iter().enumerate() {
-                let source = &data[(first + k) * stride..(first + k + 1) * stride];
-                for (sum, &value) in row.iter_mut().zip(source) {
-                    *sum += weight * value.to_f32();
-                }
-            }
-            // ...and that row resized across.
-            for (x, pixel) in result.chunks_exact_mut(channels).enumerate() {
-                let (first, weights) = across.of(x);
-                let mut sums = [0.0f32; 4];
-                for (k, &weight) in weights.iter().enumerate() {
-                    let source = &row[(first + k) * channels..(first + k + 1) * channels];
-                    for (sum, &value) in sums.iter_mut().zip(source) {
-                        *sum += weight * value;
-                    }
-                }
-                for (value, &sum) in pixel.iter_mut().zip(&sums) {
-                    *value = O::from_f32(sum);
-                }
-            }
-        }
-    });
-    drop(bands);
-    out
+    O::taken(gpu::resized(I::handed(data), (width, height), channels, &across, &down, O::BYTES))
 }
 
 #[cfg(test)]
@@ -278,15 +269,14 @@ mod tests {
 
     #[test]
     fn a_large_result_made_in_bands_is_the_result_made_whole() {
-        // A result of more values than are made as one piece: every row
-        // of it is the row a result of that row alone would be, since a
-        // row is made of the source and nothing else. Rows of the source
-        // repeated make every result row the same, whichever band it
-        // fell in.
+        // A large result: every row of it is the row a result of that row
+        // alone would be, since a row is made of the source and nothing
+        // else. Rows of the source repeated make every result row the
+        // same, wherever it lies. (A result too large for the card to make
+        // whole is made in tiles: see the tests of [`super::gpu`].)
         let (width, to_width, to_height) = (600usize, 1800usize, 2400usize);
         let line: Vec<u8> = (0..width).map(|x| ((x * 37) % 256) as u8).collect();
         let source: Vec<u8> = (0..800).flat_map(|_| line.iter().copied()).collect();
-        assert!(to_width * to_height > 4 * SPREAD);
         let large = resize(&source, width, 800, 1, to_width, to_height);
         let one = resize(&line, width, 1, 1, to_width, 1);
         assert_eq!(large.len(), to_width * to_height);

@@ -23,6 +23,10 @@ It works on:
 ## Building and running
 
 You need a recent stable Rust toolchain (the crate uses the 2024 edition).
+To read AVIF photos you also need libdav1d and pkg-config, for example
+`brew install dav1d pkg-config` or `apt install libdav1d-dev pkg-config`.
+Without them, build with `--no-default-features` and every other format is
+still read.
 
 ```text
 git clone https://github.com/transkatgirl/qr-forensics.git
@@ -31,6 +35,18 @@ cargo run --release
 ```
 
 A release build is recommended: searching a photo for symbols is heavy work.
+
+You also need a graphics card that wgpu can use: Metal on macOS, and
+Vulkan, DirectX 12 or OpenGL elsewhere. Every adjustment in the Photo
+section runs on it (Enlarge, Lens, Sharpen, the tone and Channel, and the
+median, dot-closing and **Deblur** filters), as do the enlarged,
+reduced, sharpened, deblurred and closed copies of the photo the search
+and the reader make. There is no fallback to the processor: without a
+card, QR Forensics says so and exits. A photo too large for one of the
+card's buffers is worked on in tiles, with the same result. The card
+still needs room for the photo and the copies made of it at once: one
+that runs out of memory stops QR Forensics with the graphics driver's
+message.
 
 To open an image at startup, give its path:
 
@@ -59,8 +75,12 @@ photo adjustments are all undoable.
 
 ### 1. Load a photo
 
-Use **Open…**, **Paste**, or drop an image file on the window. PNG, JPEG,
-WebP, GIF, BMP and TIFF are read. Paste takes an image on the clipboard, or
+Use **Open…**, **Paste**, or drop an image file on the window. Every format
+the `image` crate decodes is read: PNG, JPEG, WebP, AVIF, GIF, BMP, TIFF,
+TGA, ICO, QOI, OpenEXR, Radiance HDR, Farbfeld, DDS (DXT1, DXT3 and DXT5)
+and the PNM family (PBM, PGM, PPM, PAM). A file is told by its first bytes,
+whatever its extension says, except TGA, which has no signature and is
+known only by its `.tga` name. Paste takes an image on the clipboard, or
 an image file copied in a file manager. A photo is turned upright by its
 EXIF orientation, and a small one starts enlarged so that its modules can be
 seen.
