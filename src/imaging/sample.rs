@@ -637,12 +637,12 @@ pub struct Classified {
     pub offset: Vec<f32>,
     /// How sure each module's reading is, on the scale the decoder works
     /// in: eight times the bits of likelihood the reading carries, less
-    /// eight, so that a module on its threshold is nought and one read
-    /// beyond doubt 254 ([`Calibration::reliability`]). From the margin
-    /// alone under [`Calibration::DEFAULT`], until the read is
-    /// [calibrated](Self::calibrate) against the modules whose colour
-    /// was known. Nought where the module could not be sampled or its
-    /// neighbourhood had no contrast.
+    /// eight, so that a module on its threshold is nought and one read as
+    /// well as any is [`SAMPLED_MAX`] ([`Calibration::reliability`]).
+    /// From the margin alone under [`Calibration::DEFAULT`], until the
+    /// read is [calibrated](Self::calibrate) against the modules whose
+    /// colour was known. Nought where the module could not be sampled or
+    /// its neighbourhood had no contrast.
     pub reliability: Vec<u8>,
     /// The misread model the reliabilities were calibrated with, once
     /// they were.
@@ -896,6 +896,41 @@ pub const CALIBRATION_MIN_EACH: usize = 12;
 /// modules keeps near the noise of both, one with hundreds speaks for
 /// itself.
 const CALIBRATION_PRIOR: f32 = 16.0;
+/// How many times as many of the data's modules read wrong beyond what
+/// the noise explains as of the fixed patterns' ([`Calibration::gross`]):
+/// two. The fixed patterns are a symbol's edges and corners, and a logo
+/// or a stain over its middle, or a grid a module out where the paper
+/// curls, they show in part or not at all: over BoofCV's benchmark, the
+/// symbols whose fixed patterns read some modules wrong read their data
+/// wrong about twice as often again. Fixed patterns that read clean say
+/// nothing of the data, which is read wrong all the same as often as
+/// any photograph's is ([`MISREAD_FLOOR`]).
+pub const DATA_GROSS: f32 = 2.0;
+/// How much wider the readings of the data spread than those of the
+/// labelled modules the spread is learnt from: a tenth. The fixed
+/// patterns stand mostly among their own colour, and the data does not;
+/// the equaliser takes out what the blur puts into a module from its
+/// neighbours, but not what the grid's error does, a fraction of a
+/// module that reads a fixed pattern's solid block as it is and a data
+/// module partly as its neighbour.
+pub const DATA_SPREAD: f32 = 1.1;
+/// The least chance that a sampled module is read wrong, however far
+/// its reading lies inside its colour: one in two hundred and
+/// fifty-six. A photograph reads some modules wrong that no margin
+/// warns of, under a logo, a stain or a crease, or where the grid has
+/// slipped a module where the paper curls, and none of that shows in
+/// the reading. Over BoofCV's benchmark the modules of confirmed blocks
+/// whose readings alone said they were wrong once in a million times or
+/// less were wrong about four times in a thousand, and the floor fitted,
+/// with [`DATA_SPREAD`], to every module of those blocks was within a
+/// hair of this, which leaves a reading eight bits of likelihood
+/// exactly. Laid on every reliability a calibration gives
+/// ([`Calibration::bits`]).
+pub const MISREAD_FLOOR: f32 = 1.0 / 256.0;
+/// The most a sampled module is believed: the eight bits of likelihood
+/// [`MISREAD_FLOOR`] leaves any reading.
+pub const SAMPLED_MAX: u8 = 56;
+
 /// The most one colour's readings may spread against the other's: glare
 /// that flattens the paper, or ink that reads unevenly, spreads one side
 /// twice the other, and a fit further apart than this is two colours
@@ -937,21 +972,31 @@ pub struct Calibration {
     /// it, toward the colour that spreads the less where they do not.
     pub threshold: f32,
     /// The share of modules read wrong by more than the noise explains:
-    /// specks, stains and tears, against which no margin is proof. What
-    /// caps the belief in any reading.
+    /// specks, stains and tears, against which no margin is proof, as the
+    /// labelled modules show it for the data ([`DATA_GROSS`]). What caps
+    /// the belief in any reading.
     pub gross: f32,
     /// Modules whose colour was known that the fit was made on, and how
     /// many of them read wrong.
     pub labelled: usize,
     pub misread: usize,
+    /// The spread of the readings of the labelled modules dark in the
+    /// photo, and of those light, as they show it themselves: what
+    /// [`Self::dark`] and [`Self::light`] widen for the data
+    /// ([`DATA_SPREAD`]), and what [`Self::gross`] is counted against.
+    pub own_sigma: [f32; 2],
+    /// How many of the labelled modules read wrong by more than twice
+    /// that, of which [`Self::gross`] takes the data to have the more
+    /// ([`DATA_GROSS`]).
+    pub grossly_misread: usize,
 }
 
 impl Calibration {
     /// The model for a photo not yet fitted: the noise a photo of
     /// middling quality shows, alike on both sides, under which the
-    /// reliability runs near enough with the margin as the linear scale
-    /// it replaced did, two hundred and fifty-four at a module of full
-    /// contrast and sixty-one at a quarter of it.
+    /// reliability of a module at a quarter of full contrast is fifty,
+    /// and of one at half of it or more [`SAMPLED_MAX`], as far as any
+    /// reading is believed.
     pub const DEFAULT: Self = Self {
         dark: Spread { mean: -1.0, sigma: 0.29 },
         light: Spread { mean: 1.0, sigma: 0.29 },
@@ -959,6 +1004,8 @@ impl Calibration {
         gross: 0.0,
         labelled: 0,
         misread: 0,
+        own_sigma: [0.29, 0.29],
+        grossly_misread: 0,
     };
 
     /// The model fitted to `labelled`: each module's offset from its
@@ -998,11 +1045,30 @@ impl Calibration {
         }
         // The spreads drawn together about their geometric middle as far
         // as the ratio allows.
-        let middle = (dark.sigma * light.sigma).sqrt();
-        let reach = CALIBRATION_MAX_RATIO.sqrt();
-        dark.sigma = dark.sigma.clamp(middle / reach, middle * reach);
-        light.sigma = light.sigma.clamp(middle / reach, middle * reach);
-        let mut fitted = Self { dark, light, threshold: 0.0, gross: 0.0, labelled: labelled.len(), misread: 0 };
+        let drawn_together = |dark: &mut Spread, light: &mut Spread| {
+            let middle = (dark.sigma * light.sigma).sqrt();
+            let reach = CALIBRATION_MAX_RATIO.sqrt();
+            dark.sigma = dark.sigma.clamp(middle / reach, middle * reach);
+            light.sigma = light.sigma.clamp(middle / reach, middle * reach);
+        };
+        // What the labelled modules spread by themselves, which says how
+        // many of them are wrong by more than their noise explains.
+        let (mut own_dark, mut own_light) = (dark, light);
+        drawn_together(&mut own_dark, &mut own_light);
+        // The data spreads wider than what the spread was learnt from.
+        dark.sigma = (dark.sigma * DATA_SPREAD).min(CALIBRATION_MAX_SIGMA);
+        light.sigma = (light.sigma * DATA_SPREAD).min(CALIBRATION_MAX_SIGMA);
+        drawn_together(&mut dark, &mut light);
+        let mut fitted = Self {
+            dark,
+            light,
+            threshold: 0.0,
+            gross: 0.0,
+            labelled: labelled.len(),
+            misread: 0,
+            own_sigma: [own_dark.sigma, own_light.sigma],
+            grossly_misread: 0,
+        };
         // Two colours, one spread far wider than the other and both near
         // the threshold, can leave the wider so likely everywhere that a
         // reading at the narrower one's own middle is called the wider
@@ -1030,15 +1096,21 @@ impl Calibration {
             }
             (low + high) / 2.0
         };
-        let (threshold, dark, light) = (fitted.threshold, fitted.dark, fitted.light);
+        // Wrong by more than the noise explains: further across the
+        // threshold than twice the spread the labelled modules show, not
+        // the wider spread the data is taken to have, which would count
+        // fewer of them before [`DATA_GROSS`] makes the data's share of
+        // them.
+        let threshold = fitted.threshold;
         fitted.misread = labelled.iter().filter(|&&(offset, is_dark)| (offset < threshold) != is_dark).count();
         let gross = labelled
             .iter()
             .filter(|&&(offset, is_dark)| {
-                if is_dark { offset > threshold + 2.0 * dark.sigma } else { offset < threshold - 2.0 * light.sigma }
+                if is_dark { offset > threshold + 2.0 * own_dark.sigma } else { offset < threshold - 2.0 * own_light.sigma }
             })
             .count();
-        fitted.gross = gross as f32 / labelled.len() as f32;
+        fitted.grossly_misread = gross;
+        fitted.gross = (DATA_GROSS * gross as f32 / labelled.len() as f32).min(0.5);
         Some(fitted)
     }
 
@@ -1079,22 +1151,29 @@ impl Calibration {
 
     /// The bits of likelihood that a module read `offset` from its
     /// rule's threshold is the colour the side of [`Self::threshold`] it
-    /// lies on says: minus the log of the odds it was misread, from the
-    /// odds of the two colours there ([`Self::log_odds`]); and besides
-    /// that a share `gross` of modules are wrong whatever their reading.
+    /// lies on says: minus the log of the chance it was misread, from the
+    /// odds of the two colours there ([`Self::log_odds`]); besides that a
+    /// share `gross` of modules wrong whatever their reading; and besides
+    /// both, a coin's toss for the share any photograph reads by chance,
+    /// twice [`MISREAD_FLOOR`], either colour as likely. So never more
+    /// than the eight bits the floor leaves, and a coin's toss on the
+    /// threshold of a photo with no gross misreads, where the floor laid
+    /// on the chance itself would have the module likelier wrong than
+    /// right.
     pub fn bits(&self, offset: f32) -> f32 {
         let odds = self.log_odds(offset).abs().min(87.0);
         let wrong = self.gross + (1.0 - self.gross) / (1.0 + odds.exp());
-        -wrong.max(f32::MIN_POSITIVE).log2()
+        -(MISREAD_FLOOR + (1.0 - 2.0 * MISREAD_FLOOR) * wrong).log2()
     }
 
     /// Reliability for a module read `offset` from its rule's threshold:
     /// eight times the bits of likelihood less eight, so that a module on
     /// the threshold, read right as often as not, is nought, and a module
-    /// whose reading is beyond doubt reaches the cap of 254, one short of
-    /// [`CERTAIN`], which is for modules painted by hand.
+    /// read as far inside its colour as can be reaches [`SAMPLED_MAX`],
+    /// the most any reading is believed ([`MISREAD_FLOOR`]). [`CERTAIN`]
+    /// is for modules painted by hand.
     pub fn reliability(&self, offset: f32) -> u8 {
-        ((self.bits(offset) - 1.0) * 8.0).round().clamp(0.0, (CERTAIN - 1) as f32) as u8
+        ((self.bits(offset) - 1.0) * 8.0).round().clamp(0.0, f32::from(SAMPLED_MAX)) as u8
     }
 }
 
@@ -1897,22 +1976,22 @@ mod tests {
         assert_eq!(out.decided, classify(&sampled, &SampleParams { band: 0.0, ..global }).modules);
         // Groups mean 0.285 and 0.725: a margin of 0.03 is about a seventh
         // of the half-contrast of 0.22, a margin of 0.05 about a quarter.
-        assert_eq!(out.reliability[0], 254);
+        assert_eq!(out.reliability[0], SAMPLED_MAX);
         assert!(
-            (30..40).contains(&out.reliability[1]),
+            (25..35).contains(&out.reliability[1]),
             "{:?}",
             out.reliability
         );
-        assert_eq!(out.reliability[2], 254);
+        assert_eq!(out.reliability[2], SAMPLED_MAX);
         assert_eq!(out.reliability[3], 0);
         assert!(
-            (52..64).contains(&out.reliability[4]),
+            (42..52).contains(&out.reliability[4]),
             "{:?}",
             out.reliability
         );
         let grid = out.to_grid(5, 1);
         assert!(grid.has_reliability());
-        assert_eq!(grid.reliability(0, 0), 254);
+        assert_eq!(grid.reliability(0, 0), SAMPLED_MAX);
         assert_eq!(grid.reliability(3, 0), 0);
         let strict = classify(
             &sampled,
@@ -1981,10 +2060,13 @@ mod tests {
         assert_eq!(out.reliability[4 * w + 4], 0);
         assert!(out.flat >= 1, "{}", out.flat);
         // Reliability is relative to the local contrast, so a module in the
-        // dim left half is about as sure as one in the bright right half.
+        // dim left half is as sure as one in the bright right half, as
+        // sure as any reading is. The reliability tops out at a margin of
+        // a half, so the margins say how near the two are.
         let (left, right) = (out.reliability[w + 1], out.reliability[w + 7]);
-        assert!(left > 230 && right > 230, "{left} {right}");
-        assert!(left.abs_diff(right) < 12, "{left} {right}");
+        assert_eq!((left, right), (SAMPLED_MAX, SAMPLED_MAX));
+        let (left, right) = (out.margin[w + 1], out.margin[w + 7]);
+        assert!(left > 0.85 && right > 0.85 && (left - right).abs() < 0.05, "{left} {right}");
     }
 
     #[test]
@@ -2025,11 +2107,14 @@ mod tests {
         };
         assert_eq!(wrong(&surface), 0);
         // The contrast goes with the threshold: a module at the dark end
-        // is read nearly as surely as one at the light end, where under
-        // one contrast for the whole symbol it would be all but unsure.
+        // is read as surely as one at the light end, where under one
+        // contrast for the whole symbol it would be all but unsure.
         let out = classify(&sampled, &surface);
         let (first, last) = (out.reliability[w + 1], out.reliability[(h - 2) * w + w - 2]);
-        assert!(first > 150 && last > 150, "{first} {last}");
+        assert_eq!((first, last), (SAMPLED_MAX, SAMPLED_MAX));
+        // Which a margin of a half reaches: the margins say how surely.
+        let (first, last) = (out.margin[w + 1], out.margin[(h - 2) * w + w - 2]);
+        assert!(first > 0.6 && last > 0.6, "{first} {last}");
         // A threshold given, or the neighbourhood rule, is as it was.
         let given = SampleParams {
             threshold: Some(0.3),
@@ -2368,13 +2453,16 @@ mod tests {
             assert!((0.12..0.26).contains(&side.sigma), "{calibration:?}");
         }
         assert!(calibration.threshold.abs() < 0.1, "{calibration:?}");
-        assert!((calibration.gross - misread as f32 / labelled as f32).abs() < 1e-6, "{calibration:?}");
+        // The specks are read wrong beyond what the noise explains, and
+        // the data is taken to have twice their share.
+        assert!((calibration.gross - DATA_GROSS * misread as f32 / labelled as f32).abs() < 1e-6, "{calibration:?}");
         // Under the fit, a module's reliability grows with its distance
         // from the threshold on either side, never beyond what the gross
         // misreads allow, and the specks among the fixed patterns cap
-        // every module's reliability at the bits the gross rate is worth.
+        // every module's reliability at the bits the gross rate is worth,
+        // with the floor of what any photograph misreads laid on it.
         let cap = calibration.reliability(10.0);
-        let bits = -(calibration.gross).log2();
+        let bits = -(MISREAD_FLOOR + (1.0 - 2.0 * MISREAD_FLOOR) * calibration.gross).log2();
         assert_eq!(cap, ((bits - 1.0) * 8.0).round() as u8, "{calibration:?}");
         assert_eq!(calibration.reliability(-10.0), cap);
         assert!(classified.reliability.iter().all(|&r| r <= cap));
@@ -2397,8 +2485,13 @@ mod tests {
         };
         assert!(clean.reliability(0.3) > Calibration::DEFAULT.reliability(0.3));
         assert!(Calibration::DEFAULT.reliability(0.3) > calibration.reliability(0.3));
-        assert_eq!((Calibration::DEFAULT.reliability(0.0), Calibration::DEFAULT.reliability(1.0)), (0, 254));
-        assert_eq!((Calibration::DEFAULT.reliability(0.25), Calibration::DEFAULT.reliability(-0.25)), (61, 61));
+        assert_eq!((Calibration::DEFAULT.reliability(0.0), Calibration::DEFAULT.reliability(1.0)), (0, SAMPLED_MAX));
+        assert_eq!(Calibration::DEFAULT.reliability(0.5), SAMPLED_MAX);
+        assert_eq!((Calibration::DEFAULT.reliability(0.25), Calibration::DEFAULT.reliability(-0.25)), (50, 50));
+        // However far inside its colour a reading lies, the floor holds
+        // it to eight bits.
+        assert_eq!(reliability_bits(SAMPLED_MAX), 8.0);
+        assert!((Calibration::DEFAULT.bits(10.0) - 8.0).abs() < 1e-3, "{}", Calibration::DEFAULT.bits(10.0));
         // The scale read back: a coin's toss on the threshold, and a bit
         // more for every eight, which is how often such a reading is
         // misread.
@@ -2419,6 +2512,8 @@ mod tests {
         assert!((fit.dark.mean + calibration.light.mean).abs() < 1e-3 && (fit.dark.sigma - calibration.light.sigma).abs() < 1e-3, "{fit:?} vs {calibration:?}");
         assert!((fit.light.mean + calibration.dark.mean).abs() < 1e-3 && (fit.light.sigma - calibration.dark.sigma).abs() < 1e-3, "{fit:?} vs {calibration:?}");
         assert!((fit.gross - calibration.gross).abs() < 1e-6, "{fit:?} vs {calibration:?}");
+        assert!((fit.own_sigma[0] - calibration.own_sigma[1]).abs() < 1e-3 && (fit.own_sigma[1] - calibration.own_sigma[0]).abs() < 1e-3, "{fit:?} vs {calibration:?}");
+        assert_eq!(fit.grossly_misread, calibration.grossly_misread);
         assert!(inverted.calibrate(&expected, false).is_none(), "read the wrong way round, the fixed patterns are not where they should be");
         // Too few labelled modules, and nothing is fitted.
         let few: Vec<Option<bool>> = expected.iter().enumerate().map(|(i, &e)| e.filter(|_| i < 40)).collect();
@@ -2470,7 +2565,7 @@ mod tests {
         let mut toward: Vec<f32> = lopsided.iter().map(|&(o, d)| if d { -o } else { o }).collect();
         let typical = median(&mut toward);
         assert_eq!(fit.dark.mean, -typical, "{fit:?}");
-        assert!(fit.dark.sigma <= spread_about(&toward, typical) * 1.0001, "{fit:?}");
+        assert!(fit.dark.sigma <= spread_about(&toward, typical) * DATA_SPREAD * 1.0001, "{fit:?}");
         // Spreads further apart than the ratio allows are drawn together.
         let far: Vec<(f32, bool)> =
             (0..400).map(|i| if i % 2 == 0 { (-0.8 + 0.6 * normal.next(), true) } else { (0.9 + 0.06 * normal.next(), false) }).collect();
@@ -2482,8 +2577,45 @@ mod tests {
         let mut toward: Vec<f32> = labelled.iter().map(|&(o, d)| if d { -o } else { o }).collect();
         let typical = median(&mut toward);
         assert_eq!((alike.dark.mean, alike.light.mean, alike.threshold), (-typical, typical, 0.0));
-        assert_eq!((alike.dark.sigma, alike.light.sigma), (spread_about(&toward, typical), spread_about(&toward, typical)));
+        // Each the spread of both, widened as the data spreads wider.
+        let spread = (spread_about(&toward, typical) * DATA_SPREAD).min(CALIBRATION_MAX_SIGMA);
+        assert_eq!((alike.dark.sigma, alike.light.sigma), (spread, spread));
         assert_eq!(alike.log_odds(0.3), -alike.log_odds(-0.3));
+    }
+
+    #[test]
+    fn gross_misreads_are_counted_against_the_labelled_modules_own_spread() {
+        // Both colours read alike, with a few of each read across the
+        // threshold by just over twice the noise: wrong by more than the
+        // labelled modules' own noise explains, though not by more than
+        // twice the spread the data is taken to have, a tenth wider.
+        let mut normal = Normal(0x6055);
+        let clean: Vec<(f32, bool)> =
+            (0..2000).map(|i| if i % 2 == 0 { (-1.0 + 0.15 * normal.next(), true) } else { (1.0 + 0.15 * normal.next(), false) }).collect();
+        let specked = |at: f32| -> Vec<(f32, bool)> {
+            let mut labelled = clean.clone();
+            for (i, module) in labelled.iter_mut().enumerate().take(80) {
+                *module = if i % 2 == 0 { (at, true) } else { (-at, false) };
+            }
+            labelled
+        };
+        // The noise with the specks among the modules, which, past the
+        // middle of the spread, widen it alike wherever they lie.
+        let noise = Calibration::fit(&specked(1.0), false).expect("fits").dark.sigma / DATA_SPREAD;
+        let labelled = specked(2.1 * noise);
+        let fit = Calibration::fit(&labelled, false).expect("fits");
+        let mut toward: Vec<f32> = labelled.iter().map(|&(o, d)| if d { -o } else { o }).collect();
+        let typical = median(&mut toward);
+        let own = spread_about(&toward, typical);
+        assert_eq!(fit.dark.sigma, own * DATA_SPREAD, "{fit:?}");
+        let beyond = |sigma: f32| {
+            labelled.iter().filter(|&&(offset, dark)| if dark { offset > fit.threshold + 2.0 * sigma } else { offset < fit.threshold - 2.0 * sigma }).count()
+        };
+        assert_eq!((beyond(own), beyond(fit.dark.sigma)), (80, 0), "{fit:?}");
+        assert_eq!(fit.gross, DATA_GROSS * 80.0 / labelled.len() as f32);
+        // What the labelled modules show of themselves is kept beside what
+        // the data is taken to have, to be said as theirs.
+        assert_eq!((fit.own_sigma, fit.grossly_misread), ([own; 2], 80), "{fit:?}");
     }
 
     #[test]

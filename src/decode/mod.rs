@@ -9,6 +9,7 @@ pub mod codewords;
 pub mod evidence;
 pub mod gf256;
 pub mod known;
+pub mod likeness;
 pub mod list;
 pub mod padding;
 pub mod pipeline;

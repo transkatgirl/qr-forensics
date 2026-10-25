@@ -8,7 +8,7 @@ use qr_forensics::decode::codewords::PinSource;
 use qr_forensics::decode::pipeline::CwStatus;
 use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::binarize::binarize;
-use qr_forensics::imaging::sample::{misread_odds, reliability_bits};
+use qr_forensics::imaging::sample::{SAMPLED_MAX, misread_odds, reliability_bits};
 use qr_forensics::imaging::detect::{Anchor, AnchorKind, anchor_sites, edge_sites};
 use qr_forensics::imaging::projection::{CORNER_CLEARANCE, Project, Projection};
 use qr_forensics::symbol::function_map::Role;
@@ -47,11 +47,11 @@ const ANCHOR_HIT: f32 = 9.0;
 const CORNER_HIT: f32 = 13.0;
 /// Radius of a corner handle's ring, in screen points.
 const CORNER_RING: f32 = 9.0;
-/// Reliability (0..=254, eight times the bits of likelihood a module's
-/// reading carries, less eight) at which the heatmap's tint has faded
-/// out: a module read with sixteen bits of likelihood behind it, one
-/// misread in sixty-five thousand, is not in doubt.
-const RELIABILITY_FADE: u8 = 120;
+/// Reliability (eight times the bits of likelihood a module's reading
+/// carries, less eight) at which the heatmap's tint has faded out: the
+/// most any sampled module is believed, eight bits of likelihood, one
+/// misread in two hundred and fifty-six.
+const RELIABILITY_FADE: u8 = SAMPLED_MAX;
 
 /// One misread in so many, said roundly: "1/200", "1/65.5 thousand",
 /// "1/4.3 billion".
@@ -142,16 +142,17 @@ fn toolbar(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                 });
                 if app.view.overlay == Overlay::Reliability {
                     ui.weak(format!(
-                        "Red: painted below certain, or sampled with little to believe the reading by, fading out at {:.0} bits of likelihood \
-                         ({} misread); other painted modules untinted",
+                        "Red: less reliable modules, sampled or painted, fading out at {:.0} bits",
                         reliability_bits(RELIABILITY_FADE),
-                        one_in(misread_odds(RELIABILITY_FADE))
                     ))
-                    .on_hover_text(
-                        "How far each sampled module's reading is to be believed, on the scale the Sampling section calibrates \
-                         against the fixed patterns: the bits of likelihood the reading carries, and so how many such readings \
-                         are misread. The decoder doubts the least believed modules first.",
-                    );
+                    .on_hover_text(format!(
+                        "How much each sampled module's reading can be trusted, in bits of likelihood, calibrated on the \
+                         fixed patterns (see Sampling). The decoder doubts the least reliable modules first. No reading \
+                         is trusted past {:.0} bits ({} misread), since logos, stains and creases cause misreads that \
+                         look clear.",
+                        reliability_bits(SAMPLED_MAX),
+                        one_in(misread_odds(SAMPLED_MAX))
+                    ));
                 } else if app.view.overlay == Overlay::Photo && app.preview.is_none() {
                     ui.weak("Load a photo and place the corners to compare the grid with it");
                 } else if app.view.overlay == Overlay::Photo
@@ -453,8 +454,11 @@ fn align_stage(
             handles.extend(edge_sites(&derived.func).into_iter().filter(|s| doc.anchor_at(s.at).is_some() || !near_traced(s.at)).map(|s| (s.kind, s.at)));
             let placed: Vec<[f64; 2]> = handles.iter().map(|h| h.1).collect();
             handles.extend(traced.iter().filter(|&&at| !placed.contains(&at)).map(|&at| (AnchorKind::Edge, at)));
-            // The custom anchors, each of which is a handle of its own.
-            handles.extend(doc.anchors.iter().filter(|a| a.anchor.kind == AnchorKind::Custom).map(|a| (AnchorKind::Custom, a.anchor.at)));
+            // The custom anchors and the data patches a read placed, each
+            // of which is a handle of its own.
+            handles.extend(
+                doc.anchors.iter().filter(|a| matches!(a.anchor.kind, AnchorKind::Custom | AnchorKind::Data)).map(|a| (a.anchor.kind, a.anchor.at)),
+            );
             for (kind, at) in handles {
                 let existing = doc.anchor_at(at).copied();
                 let position = match &existing {
@@ -493,14 +497,14 @@ fn align_stage(
                     AnchorKind::Alignment => ALIGNMENT,
                     AnchorKind::Timing => TIMING,
                     AnchorKind::Edge => EDGE,
-                    AnchorKind::Custom => CUSTOM,
+                    AnchorKind::Custom | AnchorKind::Data => CUSTOM,
                 };
                 let hovered = handle.hovered() || handle.dragged();
                 // Timing sites are many, a dozen or more on a large
                 // symbol, and each marks a single module: their handles
                 // are drawn smaller so the patterns stay visible between
                 // them, though they take the same hit area.
-                let base = if matches!(kind, AnchorKind::Timing | AnchorKind::Edge | AnchorKind::Custom) { 4.0 } else { 5.5 };
+                let base = if matches!(kind, AnchorKind::Timing | AnchorKind::Edge | AnchorKind::Custom | AnchorKind::Data) { 4.0 } else { 5.5 };
                 let radius = if hovered { base + 1.5 } else { base };
                 painter.circle_stroke(center, radius, Line::new(3.0, Color32::from_black_alpha(140)));
                 match existing {
@@ -529,6 +533,10 @@ fn align_stage(
                     }
                     Some(a) if a.source == AnchorSource::Manual => "placed by hand; drag to move, right-click to drop",
                     Some(_) if kind == AnchorKind::Edge => "traced along the symbol's edge in the photo; drag to move, right-click to drop",
+                    Some(_) if kind == AnchorKind::Data => {
+                        "placed by a read where data modules read sharpest, or where the decoded modules match the photo; \
+                         drag to move, right-click to drop"
+                    }
                     Some(_) => "found in the photo; drag to move, right-click to drop",
                     None if kind == AnchorKind::Edge => {
                         "not set; drag to where the edge really runs and the grid bows through it, for a symbol on a bottle or \

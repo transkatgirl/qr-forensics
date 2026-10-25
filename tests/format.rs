@@ -5,7 +5,7 @@ mod common;
 
 use common::*;
 use qr_forensics::decode::bch::{analyze_format, analyze_version};
-use qr_forensics::decode::pipeline::{DecodeOptions, analyze, brute_force};
+use qr_forensics::decode::pipeline::{DecodeOptions, LIKENESS_FLOOR, analyze, brute_force, brute_force_mirrored};
 use qr_forensics::symbol::function_map::InfoCopy;
 use qr_forensics::symbol::grid::{Mirror, Module, ModuleGrid};
 use qr_forensics::symbol::{EcLevel, Family, SymbolVersion};
@@ -532,5 +532,68 @@ fn halves_of_two_damaged_version_copies_assemble_into_a_clean_word() {
         }
         let analysis = analyze_version(&grid, &layout.func).unwrap();
         assert!(analysis.mismatches >= 4 && !analysis.is_reliable(), "version {v}");
+    }
+}
+
+/// A sentence of text in a version 10 symbol at level M under `mask`,
+/// both copies of its format bits gone, and one module in twelve of its
+/// codewords read the other colour, more than any block corrects: no
+/// block verifies under any level and mask. With the symbol's layout.
+fn text_past_correcting(mask: u8) -> (qr_forensics::symbol::layout::SymbolLayout, ModuleGrid) {
+    let (version, ec) = (SymbolVersion::Qr(10), EcLevel::M);
+    let layout = layout(version, ec);
+    let sentence = "the quick brown fox jumps over the lazy dog, and a photograph of it was taken from across the street. ";
+    let text: String = sentence.repeat(4).chars().take(byte_capacity(&layout, 2)).collect();
+    let mut grid = encode(version, ec, Some(mask), &[Segment::bytes(&text)]).unwrap();
+    for copy in &layout.func.format {
+        wipe(&mut grid, copy);
+    }
+    let mut rng = Rng(11 + u64::from(mask));
+    for cw in 0..layout.codewords.len() {
+        for pos in layout.codeword_modules(cw) {
+            if rng.below(12) == 0 {
+                let (x, y) = (pos.x as usize, pos.y as usize);
+                grid.set(x, y, grid.get(x, y).inverted());
+            }
+        }
+    }
+    (layout, grid)
+}
+
+#[test]
+fn with_the_format_bits_gone_and_no_block_confirmed_the_text_tells_the_format() {
+    // The attempts at a symbol no block of which verifies were once
+    // ranked by the unconfirmed solutions noise yields, and then by the
+    // format bits, which say nothing. Under the right level and mask
+    // the data reads as text, misread as it is; under the others it is
+    // noise, or the text scrambled by the difference of two masks.
+    let ec = EcLevel::M;
+    for mask in [0, 3, 5] {
+        let (layout, grid) = text_past_correcting(mask);
+        let attempts = brute_force(&grid, &layout.func, None, &DecodeOptions::default());
+        assert!(attempts.iter().all(|a| a.report.blocks_verified() == 0), "mask {mask}: a block verified");
+        assert_eq!((attempts[0].ec, attempts[0].mask), (ec, mask), "mask {mask}: {:?}", attempts.iter().take(3).map(|a| (a.ec, a.mask, a.likeness_bits)).collect::<Vec<_>>());
+        assert!(attempts[0].likeness_bits >= LIKENESS_FLOOR, "mask {mask}: {}", attempts[0].likeness_bits);
+    }
+}
+
+#[test]
+fn seen_from_behind_with_the_format_bits_gone_the_text_tells_the_format() {
+    // The same symbol seen from the back: its mirror images' attempts are
+    // ranked together as those of one grid are, by the data and the
+    // format bits where no block is confirmed, and not by the
+    // unconfirmed solutions noise yields, as they once were.
+    let ec = EcLevel::M;
+    for mask in [0, 3, 5] {
+        let (layout, grid) = text_past_correcting(mask);
+        let attempts = brute_force_mirrored(&grid.mirrored(Mirror::Transpose), &layout.func, &DecodeOptions::default());
+        assert!(attempts.iter().all(|a| a.report.blocks_verified() == 0), "mask {mask}: a block verified");
+        let best = &attempts[0];
+        assert_eq!(
+            (best.ec, best.mask, best.mirror),
+            (ec, mask, Some(Mirror::Transpose)),
+            "mask {mask}: {:?}",
+            attempts.iter().take(3).map(|a| (a.ec, a.mask, a.likeness_bits)).collect::<Vec<_>>()
+        );
     }
 }

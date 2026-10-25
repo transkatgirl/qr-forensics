@@ -1,9 +1,6 @@
 ; family: qr
-; status: known-failure
-; failure: 0 V34, 1 of 37 blocks solved
-; failure: 90 V34, 1 of 37 blocks solved
-; failure: 180 V34, 1 of 37 blocks solved
-; failure: 270 V34, 1 of 37 blocks solved
+; status: pass
+; rotations: 0 90 180 270
 -22.116712737083418 -5.403967499732971
 358.20547659397124 -30.10020716190337
 378.2406572580337 402.94346368312836

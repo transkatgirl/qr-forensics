@@ -91,6 +91,17 @@ A photo over 4096 pixels on its longer side is searched in a reduced copy.
 If that misses a small symbol, draw the outline round it and press Find in
 outline, or press **Crop to outline** and search again.
 
+If nothing else decodes, the search tries again on a deblurred copy of
+the photo, for symbols that are out of focus or motion-blurred. If only
+that copy decodes, the Photo filter is set to **Deblur** so the canvas
+shows what was read.
+
+Every read also anchors the grid to small patches of data modules where
+they read sharpest. This keeps the grid on track between the alignment
+patterns of a large symbol on curled paper. A read that doesn't decode
+with these anchors is retried without them. They show as small handles,
+like custom anchors.
+
 Also under Alignment: **Other placements** lists the runner-up fits inside
 the outline, **Suggest version** ranks every version on the current corners,
 and **Refine** nudges corners and anchors to sub-pixel accuracy once they
@@ -116,12 +127,34 @@ When detection fails or lands slightly off, place the grid yourself.
   from each module, the bare grid lines, and the photo binarised as the
   finder search sees it. Hold **H** to see the photo with nothing over it.
 
-The **Photo** section adjusts what is read: colour channel, brightness,
-contrast, sharpening (or, with **Sharpen** set below nought, a Gaussian
-blur of the photo in its colours), enlargement, radial lens correction
-(with an **Estimate** from the corners and anchors), a median, dot-closing
-or blur filter, and **Invert photo** for light symbols on a dark
-background.
+The **Photo** section adjusts what is read. Its controls are listed in
+the order they are applied:
+
+1. **Enlarge**.
+2. **Lens**: radial lens correction, applied to the enlarged pixels, with
+   an **Estimate** from the corners and anchors.
+3. **Sharpen**: an unsharp mask, sized in the photo's own pixels however
+   far it's enlarged (or in the reduced pixels, if it's reduced). Below 0
+   it becomes a Gaussian blur up to 4 px wide, for grain and halftone
+   screens.
+4. **Invert photo**, for light symbols on a dark background.
+5. **Contrast**, **Brightness** and **Channel**.
+6. **Filter**, run last on the enlarged photo: median, dot-closing, or
+   **Deblur**.
+
+**Deblur** measures the blur's width and direction from edges in the
+photo and deconvolves it, for a photo that is out of focus or shaken.
+It measures over the whole photo (on a photo over 1.5 megapixels, the
+parts of it with the most edges, at full resolution), or only inside
+the outline if you press **Measure in outline**. The kernel is drawn
+under the filter. The direction of a shake is measured from edges
+that run every way, such as print around the symbol; the symbol's own
+modules only have edges two ways, so a shake slanting across them is
+measured as a rounder blur along them. If the edges all run within less
+than a quarter turn of each other, as on a barcode or ruled paper, they
+say nothing about the blur along them, and it's taken to be round.
+**Strength** scales it: 1 undoes the blur as measured, lower undoes
+less, and higher undoes more but adds ringing around edges.
 
 ### 4. Sample the modules
 
@@ -144,17 +177,22 @@ Sampling reads a colour for each module off the photo.
   learnt, the modules are sharpened by a guess at the blur. The section
   says which was done. Off, the modules are taken as they read, which
   suits a clean print with specks in it.
-- How far each module's reading is to be believed is learnt from the
-  photo itself: the fixed patterns say how far a dark module and a
-  light one read right lie from the threshold, how much the readings of
-  each colour spread, and how many are wrong by more than that spread
-  explains, as specks and stains are. Where one colour spreads wider,
-  as ink read unevenly does against clean paper, a reading near the
-  threshold is likelier that colour, and the threshold moves toward the
-  other. The colours are told apart so only once the blur is undone or
-  found slight, since a blur greys the fixed patterns' thin light rings
-  and leaves their solid dark blocks as they were. The section reports
-  the fit, and the decoder doubts the least reliable modules first by it.
+- Each module's reliability is learnt from the photo itself. The fixed
+  patterns, whose colours are known, show how far correctly read dark
+  and light modules sit from the threshold, how widely each colour's
+  readings spread, and how many readings are wrong by more than that
+  spread explains (specks and stains). However clear a reading is, it's
+  taken to be wrong at least once in 256 times (8 bits). That's roughly
+  how often readings that looked like 1 in a million were wrong on
+  BoofCV's benchmark photos: a logo, a stain, a crease or a grid
+  slipping on curled paper can make a reading wrong without making it
+  faint. If one colour spreads wider, as unevenly read ink does against
+  clean paper, a reading near the threshold is more likely that colour,
+  so the threshold moves toward the other. That only happens once the
+  blur is undone or found to be slight, because blur greys the fixed
+  patterns' thin light rings but leaves their solid dark blocks alone.
+  The section reports the fit, and the decoder doubts the least reliable
+  modules first.
 - **Kernel** chooses how a module's luminance is taken: the average over its
   middle, its centre point alone, or a vote of five points.
 
@@ -207,7 +245,7 @@ Overlays colour the grid by what the decoder knows:
 | Module roles | Finder, timing, alignment, format and version modules, each in its own colour |
 | RS blocks | Which Reed-Solomon block each module belongs to, with unsolved blocks marked red |
 | Corrections | Each module as error correction has it: green rim where it was unknown, red where it was painted otherwise |
-| Reliability | Red where a module's reading is least to be believed: sampled close to its threshold, on a photo whose fixed patterns read poorly, or painted below certain. The status bar says to how many bits a sampled module's reading is believed, and how many such readings are misread |
+| Reliability | Red where a module is least reliable: sampled near its threshold, on a photo whose fixed patterns read poorly, or painted below certain. The tint fades out at 8 bits, the cap for a sampled module |
 | Mask pattern | Where the mask in effect swaps dark and light |
 | Unmasked data | The data bits themselves, with the mask taken off |
 | Codeword status | Green: corrected or filled in. Amber: read but unconfirmed. Red: unknown. Violet rim: doubted to solve the block |
@@ -236,7 +274,11 @@ Overlays colour the grid by what the decoder knows:
   the two copies, so it shows whether the damage is within what the
   format code corrects. The format bits settle on a word only if it's
   at least 256 times likelier than the runner-up, the same bar a block
-  must clear. Choose the level and mask from the format bits or by hand.
+  must clear. When no block verifies under any word, the data is also
+  considered: under the right level and mask it tends to look like text
+  or padding rather than noise, and how much it does is weighed along
+  with the format bits. Choose the level and mask from the format bits
+  or by hand.
   Below the level in effect, a line gives its capacity: how many wrong
   or unknown codewords each block can correct, and how many more list
   decoding and erasing by trial add when they're on. Hover it for

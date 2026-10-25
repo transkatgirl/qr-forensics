@@ -163,7 +163,12 @@ const LLR_CLAMP: f32 = 32.0;
 
 /// The log of the odds that a module read at `reliability` was read
 /// right: the scale of [`crate::imaging::sample::reliability_bits`]
-/// read back, a bit of likelihood more for every eight.
+/// read back, a bit of likelihood more for every eight. What belief
+/// propagation starts each bit from, which the sampler holds short of
+/// eight bits however far inside its colour the reading lies
+/// ([`crate::imaging::sample::MISREAD_FLOOR`]), so that the checks can
+/// move a bit read well and wrongly, as one under a logo or a stain is.
+/// [`reliability_at`] turns it back.
 pub(super) fn log_odds(reliability: u8) -> f32 {
     if reliability == CERTAIN {
         return LLR_FIXED;

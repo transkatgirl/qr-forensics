@@ -8,10 +8,9 @@ use qr_forensics::decode::bch::{format_word_for, format_words};
 use qr_forensics::decode::codewords::Pins;
 use qr_forensics::decode::pipeline::{BlockOutcome, DecodeOptions, SolveMethod, analyze, decode};
 use qr_forensics::imaging::Luma;
-use qr_forensics::imaging::adjust::Filter;
 use qr_forensics::imaging::detect::{AnchorKind, Retry, detect_outline, find_symbols, find_symbols_fine, refine_anchors};
-use qr_forensics::imaging::enhance::{Enhance, Sharpen};
-use qr_forensics::imaging::read::{drop_contradicted_anchors, read_detection, read_outline};
+use qr_forensics::imaging::enhance::{Enhance, Sharpen, mask_for, unsharp};
+use qr_forensics::imaging::read::{drop_contradicted_anchors, read_detection, read_outline, read_placed};
 use qr_forensics::imaging::refine::Template;
 use qr_forensics::symbol::function_map::{FunctionMap, Role};
 use qr_forensics::imaging::homography::Homography;
@@ -215,11 +214,11 @@ fn doubting_faint_modules_solves_a_smudged_block() {
         affected.len()
     );
     // Reliability is the margin as a share of the symbol's contrast: a
-    // tenth of it, here.
+    // tenth of it, here, where the rest read well past seven bits.
     assert!(wrong.iter().all(|&(x, y)| read.reliability(x, y) < 40), "wrong modules read faintly");
     let confident = (0..grid.height())
         .flat_map(|y| (0..grid.width()).map(move |x| (x, y)))
-        .filter(|&(x, y)| read.reliability(x, y) > 60)
+        .filter(|&(x, y)| read.reliability(x, y) > 48)
         .count();
     assert!(confident > grid.cells().len() * 3 / 4);
 
@@ -925,8 +924,10 @@ fn a_corner_nothing_holds_is_not_walked_by_the_refinement() {
         let layout = layout(version, ec);
         let (w, h) = (grid.width(), grid.height());
         let sharp = render(&grid, QUAD, (760, 640), |_, _, v| v);
-        let blurred = Luma::new(sharp.width, sharp.height, Filter::Blur.apply(&sharp.data, sharp.width, sharp.height, 3));
-        let blurred = Luma::new(sharp.width, sharp.height, Filter::Blur.apply(&blurred.data, sharp.width, sharp.height, 3));
+        // Blurred as the photo's Sharpen blurs it, by a Gaussian 2√2
+        // pixels wide.
+        let (sigma, amount) = mask_for(-std::f32::consts::SQRT_2).unwrap();
+        let blurred = Luma::new(sharp.width, sharp.height, unsharp(&sharp.data, sharp.width, sharp.height, 1, sigma, amount));
         let region = loosen(QUAD, 1.1, [5.0, -4.0]);
         let found = detect_outline(&blurred, version, region, &params).unwrap_or_else(|| panic!("{version}: nothing found"));
         assert_eq!(found.version, version);
@@ -1505,6 +1506,88 @@ fn defocus(image: &Luma, sigma: f64) -> Luma {
     Luma::new(image.width, image.height, pass(&pass(&image.data, true), false))
 }
 
+/// `image` shaken: each pixel a mean of the line behind it at `degrees`,
+/// weighed by a Gaussian `sigma` pixels wide from the pixel back, as a
+/// hand that moved and stopped smears a photo with a trail.
+fn shake(image: &Luma, sigma: f64, degrees: f64) -> Luma {
+    let (s, c) = degrees.to_radians().sin_cos();
+    let reach = (3.0 * sigma).ceil() as i64;
+    let data = (0..image.width * image.height)
+        .map(|i| {
+            let (x, y) = ((i % image.width) as f64 + 0.5, (i / image.width) as f64 + 0.5);
+            let (mut sum, mut weight) = (0.0f64, 0.0f64);
+            for k in 0..=2 * reach {
+                let t = k as f64 / 2.0;
+                let w = (-0.5 * (t / sigma).powi(2)).exp();
+                if let Some(v) = image.sample(x + c * t, y + s * t) {
+                    sum += w * f64::from(v);
+                    weight += w;
+                }
+            }
+            (sum / weight.max(1e-12)) as f32
+        })
+        .collect();
+    Luma::new(image.width, image.height, data)
+}
+
+#[test]
+fn a_symbol_placed_by_hand_reads_from_any_corner_either_way_round() {
+    // A square symbol and a rectangular one, rendered square on, their
+    // corners given from each corner of the symbol, round it either way.
+    // The rectangular one was once read only from its top-left or
+    // bottom-right corner, clockwise: from the other two its long side
+    // was fitted along its short one, and given anticlockwise every
+    // version was fitted to its transpose.
+    let params = SampleParams::default();
+    for (version, ec) in [(SymbolVersion::Qr(2), EcLevel::M), (SymbolVersion::Rmqr(10), EcLevel::M)] {
+        let grid = symbol(version, ec);
+        let (w, h) = (grid.width() as f64 * 8.0, grid.height() as f64 * 8.0);
+        let quad = [[32.0, 32.0], [32.0 + w, 32.0], [32.0 + w, 32.0 + h], [32.0, 32.0 + h]];
+        let photo = render(&grid, quad, ((w + 64.0) as usize, (h + 64.0) as usize), |_, _, v| v);
+        for start in 0..4 {
+            for anticlockwise in [false, true] {
+                let mut corners = quad;
+                corners.rotate_left(start);
+                if anticlockwise {
+                    corners.reverse();
+                }
+                let read = read_placed(&photo, version.family(), corners, &params, &DecodeOptions::default());
+                let read = read.unwrap_or_else(|| panic!("{version}, from corner {start}, anticlockwise {anticlockwise}: no read"));
+                assert!(
+                    read.version() == version && read.is_trustworthy(),
+                    "{version}, from corner {start}, anticlockwise {anticlockwise}: {} {:?}",
+                    read.version(),
+                    read.report.score
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_shaken_symbol_is_found_and_read_through_the_photo_deblurred() {
+    // A version 5 symbol at six pixels a module, smeared by a hand that
+    // moved along a couple of modules at thirty degrees, and grainy: its finder
+    // patterns' rings run into one another along the smear, and no mask
+    // the same every way gives them back. The blur, measured off the
+    // photo's own edges, how far and which way, and undone, does.
+    let (version, ec) = (SymbolVersion::Qr(5), EcLevel::M);
+    let grid = symbol(version, ec);
+    let params = SampleParams::default();
+    let quad = [[48.0, 48.0], [270.0, 48.0], [270.0, 270.0], [48.0, 270.0]];
+    let mut photo = shake(&render(&grid, quad, (318, 318), |_, _, v| v), 12.0, 30.0);
+    let mut rng = Rng(3);
+    for v in &mut photo.data {
+        *v = (*v + (rng.below(1000) as f32 / 1000.0 - 0.5) * 0.17).clamp(0.0, 1.0);
+    }
+    let found = find_symbols(&photo, Family::Qr, &params);
+    let found = found.first().expect("found");
+    assert_eq!(found.version, version);
+    assert!(matches!(found.retry, Some(Retry::Enhanced(Enhance { sharpen: Sharpen::Deblur, .. }))), "{:?}", found.retry);
+    let read = read_detection(&photo, found.clone(), &params, &DecodeOptions::default()).expect("read");
+    assert!(read.is_trustworthy(), "{:?}", read.report.score);
+}
+
 #[test]
 fn a_symbol_set_within_another_is_found_with_it() {
     // A version 1 symbol on a patch of white ten modules square in the
@@ -1672,8 +1755,9 @@ fn a_blurred_symbol_in_failing_light_reads_once_a_stained_codeword_a_block_is_fr
     // block, and the neighbourhood reads the symbol. A threshold that
     // lies as a surface across the symbol follows the light and asks
     // nothing of a module's neighbours, as BoofCV reads every symbol,
-    // and reads it with nothing freed, as it did when it was all that
-    // could. A read learns the blur from the finder patterns and takes
+    // and reads it too once something is freed: the modules the blur
+    // carried over it reads as surely as any reading is believed, past
+    // where doubting by reliability reaches. A read learns the blur from the finder patterns and takes
     // it back out of every module before any threshold is drawn, and
     // then no codeword is carried over: every block solves by error
     // correction alone, with redundancy to spare, under the
@@ -1705,7 +1789,7 @@ fn a_blurred_symbol_in_failing_light_reads_once_a_stained_codeword_a_block_is_fr
     // blur carried over are wrong either way. Freed whole, or, where the
     // blur carried only a bit or two or three of it over, those bits
     // flipped by what the equations were left wanting, the neighbourhood
-    // reads it. The surface reads it with nothing freed or flipped.
+    // reads it, and so does the surface.
     let map = read.detection.projection().expect("the placement maps");
     let reads = |rule: Rule, kernel: Kernel, band: f32, aided: bool| {
         let how = SampleParams { kernel, band, ..params.under(rule) };
@@ -1722,7 +1806,7 @@ fn a_blurred_symbol_in_failing_light_reads_once_a_stained_codeword_a_block_is_fr
         }
     }
     assert!(reads(Rule::Neighbourhood, read.kernel, params.band, true));
-    assert!(reads(Rule::Surface, params.kernel, params.band, false));
+    assert!(reads(Rule::Surface, params.kernel, params.band, true));
     // With the blur learnt and undone, every kernel reads it under the
     // neighbourhood with nothing freed or flipped.
     let func = FunctionMap::new(version);

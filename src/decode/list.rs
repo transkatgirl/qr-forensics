@@ -52,7 +52,7 @@ use super::rs::{
     CwRead, Offering, RsSolution, Sightings, doubted_agreement, list_solution_balance, list_solution_bits, nearest, preferring_the_standard,
     settle, soft_distance,
 };
-use crate::symbol::grid::CERTAIN;
+use crate::symbol::grid::{CERTAIN, misread_chance};
 use crate::work;
 
 /// Constraints the interpolation is given by default, counting a point
@@ -93,14 +93,6 @@ const UNKNOWN_BITS_MAX: usize = 3;
 /// smallest blocks, reaches a codeword further on a few of them, at ten
 /// times the time and more.
 const LIST_SIZE_MAX: usize = 32;
-
-/// How likely a module read at `reliability` is to have been misread:
-/// the scale of [`crate::imaging::sample::reliability_bits`] read back, a
-/// coin's toss at nought and a bit of likelihood more for every eight,
-/// and never for a module painted by hand ([`CERTAIN`]).
-pub(super) fn misread(reliability: u8) -> f64 {
-    if reliability == CERTAIN { 0.0 } else { (-(f64::from(reliability) / 8.0 + 1.0)).exp2() }
-}
 
 /// The place the code evaluates each codeword of a block of `n` with `r`
 /// EC codewords at, and what it multiplies the value there by: codeword
@@ -150,7 +142,7 @@ fn points(block: &[CwRead], bit_reliability: &[[u8; 8]]) -> Vec<Point> {
             continue;
         }
         let misread_of = |b: usize| {
-            if cw.known >> b & 1 != 0 && cw.pinned >> b & 1 == 0 { misread(bit_reliability[i][b]) } else { 0.0 }
+            if cw.known >> b & 1 != 0 && cw.pinned >> b & 1 == 0 { misread_chance(bit_reliability[i][b]) } else { 0.0 }
         };
         let mut faint: Vec<(u8, usize)> = (0..8usize)
             .filter(|&b| cw.known >> b & 1 != 0 && cw.pinned >> b & 1 == 0 && bit_reliability[i][b] < CERTAIN)

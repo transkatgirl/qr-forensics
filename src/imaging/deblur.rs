@@ -1,0 +1,1163 @@
+//! Undoing a blur measured off the photo itself: how far, and which way,
+//! the photo spreads an edge, taken from the edges it shows, and a
+//! deconvolution by that spread.
+//!
+//! The sharpening a read tries when a symbol does not decode
+//! ([`super::enhance`]) is an unsharp mask of a fixed width, a pixel or
+//! two, the same every way: it puts back what a lens takes from modules
+//! a pixel or two across, and nothing of what a photo out of focus by
+//! ten pixels takes from modules of seventeen, nor of what a hand that
+//! moved takes along the way it moved. In BoofCV's benchmark the
+//! photographs of the `blurred` set are both: some out of focus, and
+//! some shaken, their strokes smeared one way and their edges doubled.
+//! Their symbols read through the corners marked for them, and the
+//! search did not find them: a finder pattern's rings run into its
+//! stone, and no threshold reads 1:1:3:1:1 across it.
+//!
+//! The blur is measured as it is in a photograph of a symbol, from the
+//! edges: across an edge the light changes from ink to paper over a
+//! width the blur sets, and that width along the edge's normal is the
+//! blur's spread that way. At each pixel where the change is steepest
+//! along its own direction, the step in light either side of it over
+//! the steepness is the edge's width, which for a Gaussian blur of
+//! spread `σ` comes to `σ√(2π)`, and does not depend on how dark the
+//! ink or how light the paper. Edges that lie close together, as the
+//! modules of a symbol blurred by half a module and more do, read
+//! narrower than the blur: a band of ink a spread or two wide never
+//! reaches its full dark, and its step falls further than its
+//! steepness, to some nine tenths of what an edge alone gives. So the
+//! middle width of each direction's edges is taken, and a blur reads a
+//! little under what it is, which undoes a little less than it might,
+//! where reading it over would ring. A hand that moved spreads the edges across its
+//! path more than those along it, and the widths of the edges of each
+//! direction are fitted by the spread a Gaussian of any shape gives
+//! them, turned and stretched as the photo was: one number each way
+//! for a lens out of focus, and a long narrow one for a shake.
+//!
+//! How a shake is turned is told by edges that run every way, as print
+//! and text about a symbol do. A symbol's own modules have their edges
+//! along two ways only, and a shake slanting across both widens them as
+//! a shorter, rounder blur along them would, which is what is measured
+//! where they are all there is: a shake three pixels long laid thirty
+//! degrees off the edges of a field of squares came to a spread two and
+//! a quarter long and one wide, turned eighteen degrees off them. Fitted
+//! at each direction's own mean rather than its middle, it turned
+//! twenty-one, and a round blur over squares a lens had bent a little,
+//! whose corners read narrower one way, came to one and a half long
+//! against one wide; so the edges are fitted at the middle of their
+//! direction, which holds a round blur round. Edges that all run within
+//! a fan narrower than a quarter turn, as a barcode's or ruled paper's
+//! do, say nothing of how far the blur spreads along them, and a shape
+//! fitted to them is a guess there; the blur is then taken the same
+//! every way ([`LEAST_FAN`]).
+//!
+//! The deconvolution is Richardson and Lucy's: the estimate of the
+//! sharp photo is blurred by the spread measured, the photo is divided
+//! by that, and the quotient, blurred again, multiplies the estimate,
+//! twenty-five times over. It keeps light positive and a flat tone
+//! flat, and sharpens where the photo has edges to sharpen, where an
+//! inverse filter raises the noise everywhere. A shake is not a
+//! Gaussian, and one fitted to it undoes the most of it that one can:
+//! enough to give a finder pattern back its rings.
+//!
+//! A blur many pixels wide would take a kernel of hundreds of pixels to
+//! undo where it lies. The photo is reduced first, until the blur is no
+//! more than [`MOST_SPREAD`] pixels, and the blur measured is carried to
+//! the size it comes to: a symbol of seventeen pixels a module blurred
+//! by eight is a symbol of five blurred by two and a half. It is not
+//! measured again there. Magic Kernel Sharp adds next to nothing to the
+//! width of an edge it reduces, and a measure at the smaller size reads
+//! the edges, nearer together there, narrower than they are, and reads
+//! nothing at all where the modules come to a pixel or two: a photo of
+//! twelve megapixels reduced to the most a deconvolution works on put
+//! modules of six pixels at two, and its blur of three pixels went
+//! unread. The reduction is by a ratio of small whole numbers
+//! ([`Reduction`]), laid on the image from its first pixel, so that a
+//! part of the image that begins a whole number of the ratio's steps in
+//! is reduced, deblurred and enlarged back as the whole is there.
+//!
+//! A copy the search looks through is reduced besides until it is no
+//! more than [`MOST_PIXELS`], as a photo is searched in a reduced copy.
+//! The photo's Deblur filter, and a copy a read is made through, are
+//! reduced only past [`MOST_READ_PIXELS`], which no copy a read makes
+//! comes to: the filter set from a read shows what the read read.
+//!
+//! A photo larger than [`MOST_PIXELS`] is measured in parts at its own
+//! size, those with the most edges in them, and not in a copy reduced
+//! to that: reduced, the same modules of six pixels came to two, and no
+//! edge of them said how far the blur spread. Nor is it measured whole:
+//! the steepest change and the contrast an edge is judged against are
+//! the image's, and where a symbol is a small part of a photograph of
+//! grainy paper, the grain sets both, and its edges, the narrowest of
+//! all, are most of those measured.
+
+use std::borrow::Cow;
+
+use super::resize::resize;
+use crate::work;
+
+/// The spread of the light from a point in a photo, as a Gaussian of any
+/// shape: its covariance, in square pixels, across (`xx`), down (`yy`)
+/// and between the two (`xy`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Spread {
+    pub xx: f64,
+    pub xy: f64,
+    pub yy: f64,
+}
+
+impl Spread {
+    /// The spread the same every way, `sigma` pixels.
+    pub fn round(sigma: f64) -> Self {
+        Self { xx: sigma * sigma, xy: 0.0, yy: sigma * sigma }
+    }
+
+    /// The spread along its widest way and its narrowest, in pixels: the
+    /// square roots of the covariance's two eigenvalues.
+    pub fn extremes(&self) -> (f64, f64) {
+        let mean = (self.xx + self.yy) / 2.0;
+        let half = (((self.xx - self.yy) / 2.0).powi(2) + self.xy * self.xy).sqrt();
+        ((mean + half).max(0.0).sqrt(), (mean - half).max(0.0).sqrt())
+    }
+
+    /// The spread in a copy of the photo `times` its size.
+    pub fn scaled(&self, times: f64) -> Self {
+        let t2 = times * times;
+        Self { xx: self.xx * t2, xy: self.xy * t2, yy: self.yy * t2 }
+    }
+
+    /// The spread in a copy of the photo `across` times its width and
+    /// `down` times its height: [`Self::scaled`], each way by its own.
+    pub fn stretched(&self, [across, down]: [f64; 2]) -> Self {
+        Self { xx: self.xx * across * across, xy: self.xy * across * down, yy: self.yy * down * down }
+    }
+
+    /// The way the spread is widest, in degrees from across towards down,
+    /// from -90 to 90; nought for a spread the same every way.
+    pub fn angle(&self) -> f64 {
+        (0.5 * (2.0 * self.xy).atan2(self.xx - self.yy)).to_degrees()
+    }
+
+    /// The spread in the photo turned a quarter clockwise: across is
+    /// down, and down across the other way.
+    pub fn turned_cw(&self) -> Self {
+        Self { xx: self.yy, xy: -self.xy, yy: self.xx }
+    }
+}
+
+/// Least spread, in pixels, along the blur's widest way, worth undoing:
+/// a lens and a sensor spread a sharp edge over a pixel or so, and the
+/// unsharp masks of [`super::enhance`] take that back.
+pub const LEAST_SPREAD: f64 = 1.2;
+/// Most spread, in pixels, the deconvolution works with: a blur wider
+/// is undone in a copy reduced until it is no wider. Three times this
+/// either way is the reach of the kernel.
+pub const MOST_SPREAD: f64 = 2.0;
+/// Most pixels a copy the search looks through is deconvolved at: a
+/// larger one is reduced to this first, as a photo is searched in a
+/// reduced copy. And the most of a larger image measured, in parts
+/// ([`spread_of`]).
+pub const MOST_PIXELS: usize = 1_500_000;
+/// Most pixels the photo's Deblur filter is deconvolved at, and a copy a
+/// read is made through: a larger one is reduced to this first. As many
+/// as the largest copy a read makes, [`super::enhance::MAX_VIEW_SIDE`]
+/// each way, so that a read that decoded only through a copy deblurred,
+/// and set the filter to what it undid, has the photo show what it read,
+/// and Sample read it so. A photograph of twelve megapixels, deconvolved
+/// at [`MOST_PIXELS`] as a search's copy is, put modules of three pixels
+/// at one, and read a hundred modules of a symbol wrong that the copy
+/// had read right; at its own size its filter costs half a second.
+pub const MOST_READ_PIXELS: usize = super::enhance::MAX_VIEW_SIDE * super::enhance::MAX_VIEW_SIDE;
+/// The share of a module, at least, the blur must spread an edge by,
+/// along its widest way, for undoing it to be worth a look: a fifth.
+/// Under that, a threshold or a mask of a pixel or two reads the
+/// modules, and the finder patterns keep their rings.
+pub const WORTH_UNDOING: f64 = 0.2;
+/// Side, in pixels, of the parts a larger image is measured in.
+const PART_SIDE: usize = 512;
+/// Pixels about a part measured that its edges are read with, past the
+/// part: the smoothing's reach and the gradient's pixel, and the
+/// furthest a step is read across an edge, so that the edges of a part
+/// read as they would in the whole image.
+const PART_MARGIN: usize = 56;
+/// Rounds of the deconvolution.
+const ROUNDS: usize = 25;
+/// Directions the edges are sorted into, over half a turn.
+const DIRECTIONS: usize = 12;
+/// Fewest edges a direction must have to be fitted on.
+const LEAST_EDGES: usize = 24;
+/// Least reach of the directions a blur's shape is fitted on, in
+/// [`DIRECTIONS`]: from the first of them to the last round the half
+/// turn, the widest gap between them left out. A quarter turn, as two
+/// edges at right angles reach. Over a narrower fan the shape is a guess
+/// along the edges, where none was measured: three directions within
+/// thirty degrees, each reading a tenth off, may put a round blur at
+/// twice its width one way, where over a quarter turn they hold it
+/// within about a fifth.
+const LEAST_FAN: usize = DIRECTIONS / 2;
+/// The spread, in pixels, of the Gaussian the photo is smoothed by before
+/// its edges are measured: a photograph's grain changes the light by a
+/// few hundredths from pixel to pixel, as steeply as an edge out of
+/// focus does over several, and unsmoothed the grain beside an edge is
+/// taken for the edge's own steepness. What it adds to every edge's
+/// spread is taken off again.
+const SMOOTHING: f64 = 1.0;
+/// The variance, in square pixels, of the spread the measure itself
+/// gives an edge drawn sharp: the smoothing's, and the gradient's over
+/// three pixels, by which a step between two pixels reads two wide.
+/// Taken from what is measured of symbols rendered sharp.
+const OWN_VARIANCE: f64 = SMOOTHING * SMOOTHING + 0.64;
+/// The share of the steepest change in the window that an edge must
+/// come to, to be measured: fainter changes are grain.
+const EDGE_SHARE: f32 = 0.15;
+/// The share of the window's contrast, from its darkest to its lightest
+/// few pixels, that the step across an edge must come to: grain on the
+/// paper changes steeply over a pixel and by a few hundredths, and read
+/// as an edge it is the narrowest of all, where an edge between ink and
+/// paper steps by most of the contrast.
+const STEP_SHARE: f32 = 0.5;
+/// The share of each direction's edges, narrowest first, at which the
+/// blur is read off them: the middle one.
+const NARROWEST: f64 = 0.5;
+/// Lowest light the deconvolution divides by.
+const FLOOR: f32 = 0.01;
+
+/// How far the photo `width` by `height` spreads an edge, measured from
+/// the edges it shows, as the module describes. `None` when it shows too
+/// few edges to say ([`LEAST_EDGES`]), or no spread at all, none so wide
+/// as the narrowest kernel undone ([`KERNEL_LEAST`]): so a photo drawn
+/// sharp to the pixel, and one of a single grey, whose rounding leaves
+/// differences of a few millionths between its pixels that the gradient
+/// takes for edges of no width.
+pub fn measure(data: &[f32], width: usize, height: usize) -> Option<Spread> {
+    if width < 8 || height < 8 {
+        return None;
+    }
+    measured_over(data, width, height, &[[0, 0, width, height]])
+}
+
+/// A part of an image as [`measured_over`] reads its edges: the image
+/// smoothed and its gradient each way, over the part and the margin
+/// about it ([`PART_MARGIN`]) within the image.
+struct PartRead {
+    /// The box `[x0, y0, x1, y1]` of the image the pixels are of.
+    held: [usize; 4],
+    /// The part, within it, that the edges are taken in.
+    part: [usize; 4],
+    smoothed: Vec<f32>,
+    gx: Vec<f32>,
+    gy: Vec<f32>,
+}
+
+impl PartRead {
+    fn new(data: &[f32], width: usize, height: usize, part @ [x0, y0, x1, y1]: [usize; 4]) -> Self {
+        let held = [x0.saturating_sub(PART_MARGIN), y0.saturating_sub(PART_MARGIN), (x1 + PART_MARGIN).min(width), (y1 + PART_MARGIN).min(height)];
+        let (w, h) = (held[2] - held[0], held[3] - held[1]);
+        let pixels: Cow<[f32]> = if held == [0, 0, width, height] {
+            Cow::Borrowed(data)
+        } else {
+            Cow::Owned((held[1]..held[3]).flat_map(|y| data[y * width + held[0]..y * width + held[2]].iter().copied()).collect())
+        };
+        let smoothed = blurred(&pixels, w, h, &kernel(&Spread::round(SMOOTHING)));
+        let at = |x: usize, y: usize| smoothed[y * w + x];
+        // The gradient over three pixels each way, a Sobel's, a pixel apart.
+        let mut gx = vec![0.0f32; w * h];
+        let mut gy = vec![0.0f32; w * h];
+        for y in 1..h.saturating_sub(1) {
+            for x in 1..w.saturating_sub(1) {
+                let i = y * w + x;
+                gx[i] = (at(x + 1, y - 1) + 2.0 * at(x + 1, y) + at(x + 1, y + 1) - at(x - 1, y - 1) - 2.0 * at(x - 1, y) - at(x - 1, y + 1)) / 8.0;
+                gy[i] = (at(x - 1, y + 1) + 2.0 * at(x, y + 1) + at(x + 1, y + 1) - at(x - 1, y - 1) - 2.0 * at(x, y - 1) - at(x + 1, y - 1)) / 8.0;
+            }
+        }
+        Self { held, part, smoothed, gx, gy }
+    }
+
+    fn width(&self) -> usize {
+        self.held[2] - self.held[0]
+    }
+
+    /// The index among the pixels held of the image's pixel `(x, y)`.
+    fn index(&self, x: usize, y: usize) -> usize {
+        (y - self.held[1]) * self.width() + x - self.held[0]
+    }
+
+    fn steepness(&self, i: usize) -> f32 {
+        (self.gx[i] * self.gx[i] + self.gy[i] * self.gy[i]).sqrt()
+    }
+
+    /// The indices of the part's own pixels among those held.
+    fn part_pixels(&self) -> impl Iterator<Item = usize> + '_ {
+        let [x0, y0, x1, y1] = self.part;
+        (y0..y1).flat_map(move |y| (x0..x1).map(move |x| self.index(x, y)))
+    }
+
+    /// The light smoothed at `(x, y)` in the image's pixels, bilinear,
+    /// held within the pixels held: within the image, where they reach
+    /// its edges, and elsewhere further than any step is read.
+    fn light(&self, x: f64, y: f64) -> f32 {
+        let (w, h) = (self.width(), self.held[3] - self.held[1]);
+        let (fx, fy) = ((x - 0.5 - self.held[0] as f64).clamp(0.0, (w - 1) as f64), (y - 0.5 - self.held[1] as f64).clamp(0.0, (h - 1) as f64));
+        let (x0, y0) = (fx.floor() as usize, fy.floor() as usize);
+        let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+        let (tx, ty) = ((fx - x0 as f64) as f32, (fy - y0 as f64) as f32);
+        let at = |x: usize, y: usize| self.smoothed[y * w + x];
+        let top = at(x0, y0) * (1.0 - tx) + at(x1, y0) * tx;
+        let bottom = at(x0, y1) * (1.0 - tx) + at(x1, y1) * tx;
+        top * (1.0 - ty) + bottom * ty
+    }
+}
+
+/// How far the image `width` by `height` spreads an edge, as the module
+/// describes, from the edges in `parts` of it, boxes `[x0, y0, x1, y1]`
+/// of its pixels: the whole of it, or the parts of a large image
+/// [`spread_of`] picks, each read with the pixels about it as the whole
+/// image would read them, and the steepest change and the contrast that
+/// an edge is judged against taken over them all.
+fn measured_over(data: &[f32], width: usize, height: usize, parts: &[[usize; 4]]) -> Option<Spread> {
+    let reads: Vec<PartRead> = work::map(parts, |&part| PartRead::new(data, width, height, part));
+    let mut all: Vec<f32> = reads.iter().flat_map(|read| read.part_pixels().map(|i| read.steepness(i))).filter(|&g| g > 0.0).collect();
+    if all.len() < LEAST_EDGES {
+        return None;
+    }
+    let top = (all.len() * 99 / 100).min(all.len() - 1);
+    let steepest = *all.select_nth_unstable_by(top, f32::total_cmp).1;
+    let floor = EDGE_SHARE * steepest;
+    let mut sorted: Vec<f32> = reads.iter().flat_map(|read| read.part_pixels().map(|i| read.smoothed[i])).collect();
+    let (low, high) = (sorted.len() / 50, sorted.len() * 49 / 50);
+    let darkest = *sorted.select_nth_unstable_by(low, f32::total_cmp).1;
+    let lightest = *sorted.select_nth_unstable_by(high, f32::total_cmp).1;
+    let least_step = STEP_SHARE * (lightest - darkest);
+    // Each edge's width and the direction across it, measured with the
+    // step read `reach` pixels either side, the parts in their order.
+    let widths = |reach: f64| -> Vec<(f64, f64)> {
+        work::map(&reads, |read| {
+            let mut out = Vec::new();
+            let margin = 2;
+            let [x0, y0, x1, y1] = read.part;
+            for y in y0.max(margin)..y1.min(height - margin) {
+                for x in x0.max(margin)..x1.min(width - margin) {
+                    let i = read.index(x, y);
+                    let g = read.steepness(i);
+                    if g < floor {
+                        continue;
+                    }
+                    let (ux, uy) = (f64::from(read.gx[i] / g), f64::from(read.gy[i] / g));
+                    // Steepest along its own direction: the edge's middle.
+                    let (sx, sy) = ((ux.round() as isize), (uy.round() as isize));
+                    let ahead = read.steepness(read.index((x as isize + sx) as usize, (y as isize + sy) as usize));
+                    let behind = read.steepness(read.index((x as isize - sx) as usize, (y as isize - sy) as usize));
+                    if g < ahead || g < behind {
+                        continue;
+                    }
+                    let (cx, cy) = (x as f64 + 0.5, y as f64 + 0.5);
+                    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+                    let steps = reach.ceil() as i64;
+                    for k in -steps..=steps {
+                        let t = k as f64 * reach / steps.max(1) as f64;
+                        let v = read.light(cx + ux * t, cy + uy * t);
+                        lo = lo.min(v);
+                        hi = hi.max(v);
+                    }
+                    if hi - lo < least_step {
+                        continue;
+                    }
+                    let direction = uy.atan2(ux).rem_euclid(std::f64::consts::PI);
+                    out.push((f64::from((hi - lo) / g), direction));
+                }
+            }
+            out
+        })
+        .concat()
+    };
+    // A first look with a reach of a few pixels says how wide the edges
+    // are; the next reads each step over as far as such an edge reaches,
+    // and again while that moves the reach.
+    let mut reach = 8.0;
+    let mut measured = widths(reach);
+    for _ in 0..2 {
+        let typical = narrowest_share(measured.iter().map(|w| w.0).collect(), 0.5)?;
+        let wider = (1.3 * typical).clamp(4.0, 48.0);
+        if (wider - reach).abs() < 1.0 {
+            break;
+        }
+        reach = wider;
+        measured = widths(reach);
+    }
+    if measured.len() < LEAST_EDGES {
+        return None;
+    }
+    // The narrowest of each direction's edges, as a variance of the blur.
+    let mut bins: Vec<Vec<f64>> = vec![Vec::new(); DIRECTIONS];
+    for &(w, direction) in &measured {
+        let bin = ((direction / std::f64::consts::PI * DIRECTIONS as f64) as usize).min(DIRECTIONS - 1);
+        bins[bin].push(w);
+    }
+    let rows: Vec<(usize, [f64; 3], f64, f64)> = bins
+        .into_iter()
+        .enumerate()
+        .filter(|(_, widths)| widths.len() >= LEAST_EDGES)
+        .filter_map(|(bin, widths)| {
+            let count = widths.len() as f64;
+            let w = narrowest_share(widths, NARROWEST)?;
+            let theta = (bin as f64 + 0.5) * std::f64::consts::PI / DIRECTIONS as f64;
+            let (c, s) = (theta.cos(), theta.sin());
+            // The spread along the edge's normal, less the measure's own.
+            let variance = (w * w / (2.0 * std::f64::consts::PI) - OWN_VARIANCE).max(0.0);
+            Some((bin, [c * c, 2.0 * c * s, s * s], variance, count))
+        })
+        .collect();
+    // How far round the half turn the directions reach ([`LEAST_FAN`]):
+    // all of it but the widest gap between two of them, the gap from the
+    // last back round to the first among them.
+    let gaps = rows.windows(2).map(|pair| pair[1].0 - pair[0].0);
+    let round_again = rows.first().zip(rows.last()).map(|(first, last)| DIRECTIONS + first.0 - last.0);
+    let fan = gaps.chain(round_again).max().map_or(0, |widest| DIRECTIONS - widest);
+    let some = |spread: Spread| (spread.extremes().0 >= KERNEL_LEAST).then_some(spread);
+    if rows.len() < 3 || fan < LEAST_FAN {
+        // Too few directions, or too narrow a fan of them, to tell a
+        // shape: the same every way.
+        let all: Vec<f64> = measured.iter().map(|w| w.0).collect();
+        let w = narrowest_share(all, NARROWEST)?;
+        let variance = w * w / (2.0 * std::f64::consts::PI) - OWN_VARIANCE;
+        return (variance > 0.0).then(|| Spread::round(variance.sqrt())).and_then(some);
+    }
+    // Least squares, each direction weighed by its edges.
+    let mut a = [[0.0f64; 3]; 3];
+    let mut b = [0.0f64; 3];
+    for (_, row, value, weight) in &rows {
+        for i in 0..3 {
+            for j in 0..3 {
+                a[i][j] += weight * row[i] * row[j];
+            }
+            b[i] += weight * row[i] * value;
+        }
+    }
+    let [xx, xy, yy] = solve3(a, b)?;
+    // A covariance is never less than nought either way.
+    let spread = Spread { xx, xy, yy };
+    let mean = (xx + yy) / 2.0;
+    let half = (((xx - yy) / 2.0).powi(2) + xy * xy).sqrt();
+    let (big, small) = ((mean + half).max(0.0), (mean - half).max(0.0));
+    if big <= 0.0 {
+        return None;
+    }
+    // The eigenvalues held at nought and above, the axes kept.
+    let angle = 0.5 * (2.0 * spread.xy).atan2(spread.xx - spread.yy);
+    let (c, s) = (angle.cos(), angle.sin());
+    some(Spread { xx: big * c * c + small * s * s, xy: (big - small) * c * s, yy: big * s * s + small * c * c })
+}
+
+/// The value below which `share` of `values` lie; `None` for none.
+fn narrowest_share(mut values: Vec<f64>, share: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let k = ((values.len() as f64 * share) as usize).min(values.len() - 1);
+    Some(*values.select_nth_unstable_by(k, f64::total_cmp).1)
+}
+
+/// Three equations in three unknowns, by elimination; `None` where they
+/// do not settle them.
+fn solve3(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> Option<[f64; 3]> {
+    for col in 0..3 {
+        let pivot = (col..3).max_by(|&i, &j| a[i][col].abs().total_cmp(&a[j][col].abs()))?;
+        if a[pivot][col].abs() < 1e-12 {
+            return None;
+        }
+        a.swap(col, pivot);
+        b.swap(col, pivot);
+        for row in 0..3 {
+            if row != col {
+                let f = a[row][col] / a[col][col];
+                let pivot_row = a[col];
+                for (value, pivot) in a[row].iter_mut().zip(pivot_row) {
+                    *value -= f * pivot;
+                }
+                b[row] -= f * b[col];
+            }
+        }
+    }
+    Some([b[0] / a[0][0], b[1] / a[1][1], b[2] / a[2][2]])
+}
+
+/// Least spread, in pixels, of a kernel along each of its axes: held
+/// away from flat, so that it can be inverted.
+pub const KERNEL_LEAST: f64 = 0.3;
+/// Least spread, in pixels, of a kernel across its narrowest way, where
+/// it is no less along its widest: a Gaussian narrower than half a pixel
+/// is not one on the pixels' grid. Laid at a slant and sampled at whole
+/// pixels, its taps fall as the grid falls across it, and spread along
+/// it further or less far than it does: a shake at forty-five degrees,
+/// flat across, was once a line of taps two and a half times as long as
+/// the shake, where laid along either axis it was right.
+pub const KERNEL_LEAST_ACROSS: f64 = 0.5;
+
+/// The kernel of `spread`: its taps as (dx, dy, weight), the weights
+/// summing to one, out to three spreads along its widest way and
+/// leaving out those too faint to count. Each axis is held to
+/// [`KERNEL_LEAST`] and the narrowest to [`KERNEL_LEAST_ACROSS`], or to
+/// the widest where that is less, so that the taps spread as `spread`
+/// does whichever way it lies, and a spread that is next to nothing
+/// either way is next to a single tap.
+pub fn kernel(spread: &Spread) -> Vec<(isize, isize, f32)> {
+    let (widest, narrowest) = spread.extremes();
+    let big = widest.max(KERNEL_LEAST).powi(2);
+    let small = narrowest.max(KERNEL_LEAST).powi(2).max(KERNEL_LEAST_ACROSS.powi(2).min(big));
+    // The axes held, turned back the way the spread lies.
+    let (s, c) = spread.angle().to_radians().sin_cos();
+    let (xx, xy, yy) = (big * c * c + small * s * s, (big - small) * c * s, big * s * s + small * c * c);
+    let det = xx * yy - xy * xy;
+    let (ixx, iyy, ixy) = (yy / det, xx / det, -xy / det);
+    let reach = (3.0 * big.sqrt()).ceil() as isize;
+    let mut taps = Vec::new();
+    for dy in -reach..=reach {
+        for dx in -reach..=reach {
+            let (fx, fy) = (dx as f64, dy as f64);
+            let w = (-0.5 * (ixx * fx * fx + 2.0 * ixy * fx * fy + iyy * fy * fy)).exp();
+            if w > 1e-3 {
+                taps.push((dx, dy, w as f32));
+            }
+        }
+    }
+    let total: f32 = taps.iter().map(|t| t.2).sum();
+    for tap in &mut taps {
+        tap.2 /= total;
+    }
+    taps
+}
+
+/// Rows worked as one piece on the cores to spare.
+const BAND: usize = 32;
+
+/// `data` blurred by `taps`, the pixel on the image's edge standing for
+/// those beyond it.
+fn blurred(data: &[f32], width: usize, height: usize, taps: &[(isize, isize, f32)]) -> Vec<f32> {
+    let bands: Vec<(usize, usize)> = (0..height).step_by(BAND).map(|y| (y, (y + BAND).min(height))).collect();
+    let (w, h) = (width as isize, height as isize);
+    work::map(&bands, |&(y0, y1)| {
+        let mut out = vec![0.0f32; (y1 - y0) * width];
+        for y in y0..y1 {
+            let row = &mut out[(y - y0) * width..(y - y0 + 1) * width];
+            for &(dx, dy, weight) in taps {
+                let sy = (y as isize + dy).clamp(0, h - 1) as usize;
+                let source = &data[sy * width..(sy + 1) * width];
+                // The pixels whose tap lies on the row, and those before
+                // and after them, whose tap is the pixel on its edge.
+                let lo = (-dx).clamp(0, w) as usize;
+                let hi = (w - dx).clamp(lo as isize, w) as usize;
+                for value in &mut row[..lo] {
+                    *value += weight * source[0];
+                }
+                if hi > lo {
+                    let from = (lo as isize + dx) as usize;
+                    for (value, &v) in row[lo..hi].iter_mut().zip(&source[from..]) {
+                        *value += weight * v;
+                    }
+                }
+                for value in &mut row[hi..] {
+                    *value += weight * source[width - 1];
+                }
+            }
+        }
+        out
+    })
+    .concat()
+}
+
+/// `data`, `width` by `height`, with the blur `spread` undone by
+/// Richardson and Lucy's deconvolution, as the module describes, held
+/// to black and white.
+pub fn deconvolve(data: &[f32], width: usize, height: usize, spread: &Spread) -> Vec<f32> {
+    let taps = kernel(spread);
+    let observed: Vec<f32> = data.iter().map(|v| v.clamp(FLOOR, 1.0)).collect();
+    let mut estimate = observed.clone();
+    for _ in 0..ROUNDS {
+        if work::cancelled() {
+            break;
+        }
+        let again = blurred(&estimate, width, height, &taps);
+        let ratio: Vec<f32> = observed.iter().zip(&again).map(|(o, a)| o / a.max(FLOOR)).collect();
+        let correction = blurred(&ratio, width, height, &taps);
+        for (e, c) in estimate.iter_mut().zip(&correction) {
+            *e = (*e * c).clamp(FLOOR, 1.0);
+        }
+    }
+    estimate
+}
+
+/// How far a deconvolution reduces an image before it undoes the blur in
+/// it: to `p` of its pixels for every `q` of the image's, each way, on
+/// a grid laid from the image's first pixel. A whole number of the
+/// image's pixels to a whole number of the copy's, so that a part of the
+/// image beginning a whole number of steps of `q` in is reduced among
+/// the pixels the whole is ([`super::resize`] centres each pixel of the
+/// copy where it centres it in the whole), and comes back as the whole
+/// does there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reduction {
+    pub p: usize,
+    pub q: usize,
+}
+
+/// Most of an image's pixels a step of a reduction spans, short of a
+/// reduction further than one in so many ([`Reduction::for_blur`]).
+const MOST_STEP: usize = 8;
+
+impl Reduction {
+    /// No reduction: the blur is undone where it lies.
+    pub const NONE: Reduction = Reduction { p: 1, q: 1 };
+
+    /// The reduction a blur spreading `widest` pixels along its widest
+    /// way is undone at, in an image of `pixels`, or a part of one so
+    /// large: as far as brings the blur to [`MOST_SPREAD`] pixels and the
+    /// image to `most_pixels` ([`MOST_PIXELS`] for a copy the search
+    /// looks through, [`MOST_READ_PIXELS`] otherwise), and to `most`
+    /// times the image's own size, and no further than the largest ratio
+    /// short of that whose step is no more than [`MOST_STEP`] pixels, or
+    /// one in as many as it takes.
+    pub fn for_blur(widest: f64, pixels: usize, most_pixels: usize, most: f64) -> Self {
+        let times = (MOST_SPREAD / widest).min((most_pixels as f64 / pixels.max(1) as f64).sqrt()).min(most);
+        if times.is_nan() || times >= 1.0 {
+            return Self::NONE;
+        }
+        if times * (MOST_STEP as f64) < 1.0 {
+            return Self { p: 1, q: (1.0 / times).ceil() as usize };
+        }
+        // Of every ratio at or short of `times`, the largest, in its least
+        // terms: a larger step is taken only for a larger ratio.
+        let mut best = Self { p: 1, q: MOST_STEP };
+        for q in 1..=MOST_STEP {
+            let p = (times * q as f64 + 1e-9).floor() as usize;
+            if p >= 1 && p * best.q > best.p * q {
+                best = Self { p, q };
+            }
+        }
+        best
+    }
+
+    /// The copy's pixels to one of the image's.
+    pub fn factor(self) -> f64 {
+        self.p as f64 / self.q as f64
+    }
+}
+
+/// `data`, `width` by `height`, reduced by `reduction` on its grid
+/// ([`Reduction`]): carried past its far edges by the pixels on them to a
+/// whole number of steps, as the resizing reads past an edge, and resized
+/// by exactly `p` in `q`. With the size it comes to.
+fn reduced(data: &[f32], width: usize, height: usize, reduction: Reduction) -> (Vec<f32>, usize, usize) {
+    let Reduction { p, q } = reduction;
+    let (ew, eh) = (width.div_ceil(q) * q, height.div_ceil(q) * q);
+    let carried: Cow<[f32]> = if (ew, eh) == (width, height) {
+        Cow::Borrowed(data)
+    } else {
+        Cow::Owned(
+            (0..eh)
+                .flat_map(|y| {
+                    let row = &data[y.min(height - 1) * width..(y.min(height - 1) + 1) * width];
+                    row.iter().copied().chain(std::iter::repeat_n(row[width - 1], ew - width))
+                })
+                .collect(),
+        )
+    };
+    let (rw, rh) = (ew / q * p, eh / q * p);
+    (resize(&carried, ew, eh, 1, rw, rh), rw, rh)
+}
+
+/// `sharp`, `rw` by `rh`, the image `width` by `height` reduced by
+/// `reduction` ([`reduced`]), enlarged back by exactly `q` in `p` and
+/// cut to the image's size.
+fn restored(sharp: &[f32], (rw, rh): (usize, usize), reduction: Reduction, (width, height): (usize, usize)) -> Vec<f32> {
+    let Reduction { p, q } = reduction;
+    let (ew, eh) = (rw / p * q, rh / p * q);
+    let back = resize(sharp, rw, rh, 1, ew, eh);
+    if ew == width {
+        back[..width * height].to_vec()
+    } else {
+        (0..height).flat_map(|y| back[y * ew..y * ew + width].iter().copied()).collect()
+    }
+}
+
+/// How many of the deconvolution's kernels a part of an image must reach
+/// past where it is wanted for it to come out there as it does in the
+/// whole image, to well within a grey level: what lies further affects
+/// it by less than that over the deconvolution's rounds, where the
+/// rounds themselves reach a kernel further each time.
+const DECONVOLVED_REACH: f64 = 4.0;
+/// And the reduced pixels besides that the reduction and the enlargement
+/// back draw on past a pixel: half the kernel of [`super::resize`], and
+/// one over.
+const RESIZED_REACH: f64 = 4.0;
+
+/// How far past a part of an image, in the image's pixels, the
+/// deconvolution of the image by `spread` at `strength` under `reduction`
+/// reads it for the part to come out as it does in the whole
+/// ([`DECONVOLVED_REACH`]).
+pub fn reach(spread: &Spread, strength: f64, reduction: Reduction) -> f64 {
+    let (widest, _) = spread.scaled(strength.max(0.0) * reduction.factor()).extremes();
+    let kernel = (3.0 * widest.max(KERNEL_LEAST)).ceil();
+    (DECONVOLVED_REACH * kernel + RESIZED_REACH) / reduction.factor()
+}
+
+/// The image `width` by `height`, deblurred: its blur measured, and, when
+/// it is worth undoing ([`LEAST_SPREAD`]), undone at a size that holds it
+/// to [`MOST_SPREAD`] pixels and the copy to `most_pixels`, but never
+/// larger than the image's own size ([`Reduction`]). The copy, covering
+/// what the image covers, with how many times the image's size it is,
+/// and the blur measured carried to that size; `None` where the image
+/// shows no blur worth undoing, or too few edges to measure one.
+pub fn deblurred(data: &[f32], width: usize, height: usize, most_pixels: usize) -> Option<(Vec<f32>, usize, usize, f64, Spread)> {
+    let spread = spread_of(data, width, height)?;
+    let (widest, _) = spread.extremes();
+    if widest < LEAST_SPREAD {
+        return None;
+    }
+    let reduction = Reduction::for_blur(widest, width * height, most_pixels, 1.0);
+    if reduction == Reduction::NONE {
+        return Some((deconvolve(data, width, height, &spread), width, height, 1.0, spread));
+    }
+    let (small, rw, rh) = reduced(data, width, height, reduction);
+    let at_size = spread.scaled(reduction.factor());
+    let sharp = deconvolve(&small, rw, rh, &at_size);
+    // As far as the image itself reaches.
+    let (w, h) = ((width * reduction.p).div_ceil(reduction.q), (height * reduction.p).div_ceil(reduction.q));
+    let sharp = (0..h).flat_map(|y| sharp[y * rw..y * rw + w].iter().copied()).collect();
+    Some((sharp, w, h, reduction.factor(), at_size))
+}
+
+/// How far the image `width` by `height` spreads an edge, in its own
+/// pixels ([`measure`]): measured whole, or, for an image of more than
+/// [`MOST_PIXELS`], over the parts of it that show the most edges
+/// ([`busiest_parts`]), at its own size. `None` where it shows no blur,
+/// or too few edges to say.
+pub fn spread_of(data: &[f32], width: usize, height: usize) -> Option<Spread> {
+    if width * height <= MOST_PIXELS {
+        return measure(data, width, height);
+    }
+    if width < 8 || height < 8 {
+        return None;
+    }
+    measured_over(data, width, height, &busiest_parts(data, width, height))
+}
+
+/// The parts of the image `width` by `height`, squares [`PART_SIDE`]
+/// pixels a side on a grid from its corner, that change the most across
+/// their edges, the busiest first, as many as come to [`MOST_PIXELS`]:
+/// the symbols and the print about them, where a photograph is mostly
+/// paper, desk and wall. A part is judged by how far its light changes
+/// over two pixels each way at every other pixel of every other row,
+/// added up over the changes as steep as an edge must be to be measured
+/// ([`EDGE_SHARE`] of the steepest), which grain does not reach. However
+/// far an edge is blurred, the light changes across it by the same in
+/// all, so a blur that spreads it wide does not hide it.
+fn busiest_parts(data: &[f32], width: usize, height: usize) -> Vec<[usize; 4]> {
+    let across = width.div_ceil(PART_SIDE);
+    let rows: Vec<usize> = (0..height.saturating_sub(2)).step_by(2).collect();
+    let changes: Vec<Vec<f32>> = work::map(&rows, |&y| {
+        (0..width.saturating_sub(2))
+            .step_by(2)
+            .map(|x| {
+                let here = data[y * width + x];
+                (data[y * width + x + 2] - here).abs() + (data[(y + 2) * width + x] - here).abs()
+            })
+            .collect()
+    });
+    let mut all: Vec<f32> = changes.iter().flatten().copied().filter(|&change| change > 0.0).collect();
+    if all.is_empty() {
+        return Vec::new();
+    }
+    let top = (all.len() * 99 / 100).min(all.len() - 1);
+    let floor = EDGE_SHARE * *all.select_nth_unstable_by(top, f32::total_cmp).1;
+    let mut busy = vec![0.0f64; across * height.div_ceil(PART_SIDE)];
+    for (&y, row) in rows.iter().zip(&changes) {
+        for (k, &change) in row.iter().enumerate() {
+            if change >= floor {
+                busy[y / PART_SIDE * across + 2 * k / PART_SIDE] += f64::from(change);
+            }
+        }
+    }
+    let mut order: Vec<usize> = (0..busy.len()).filter(|&i| busy[i] > 0.0).collect();
+    order.sort_by(|&a, &b| busy[b].total_cmp(&busy[a]).then(a.cmp(&b)));
+    let mut parts = Vec::new();
+    let mut pixels = 0;
+    for i in order {
+        if pixels >= MOST_PIXELS {
+            break;
+        }
+        let (x0, y0) = (i % across * PART_SIDE, i / across * PART_SIDE);
+        let part = [x0, y0, (x0 + PART_SIDE).min(width), (y0 + PART_SIDE).min(height)];
+        pixels += (part[2] - part[0]) * (part[3] - part[1]);
+        parts.push(part);
+    }
+    parts
+}
+
+/// `data`, `width` by `height`, deblurred and at its own size, as the
+/// photo's Deblur filter shows it ([`super::adjust::Filter::Deblur`]):
+/// by `kernel`, where one is given, or by the blur the image shows,
+/// measured over the whole of it, either spread `strength` times as
+/// wide, however little that is, since the filter was asked for; at a
+/// size that holds it to [`MOST_SPREAD`] pixels and the copy to
+/// [`MOST_READ_PIXELS`] ([`Reduction`]), and enlarged back. With the deblurred
+/// image, the spread before its strength: `None`, and the image as it
+/// is, where it shows no blur, or too few edges to measure one; and the
+/// image as it is at a strength of nought.
+pub fn undone_by(data: &[f32], width: usize, height: usize, kernel: Option<Spread>, strength: f64) -> (Vec<f32>, Option<Spread>) {
+    undone_within(data, width, height, kernel, strength, width * height)
+}
+
+/// [`undone_by`] of an image that is a part of one of `whole` pixels, as
+/// the whole is deblurred: reduced as far as the whole is, on the grid
+/// the whole is reduced on where the part begins a whole number of the
+/// reduction's steps into it ([`Reduction`]), so that, given as much of
+/// the whole about it as the deconvolution reads ([`reach`]), it comes
+/// out as the whole does there.
+pub fn undone_within(data: &[f32], width: usize, height: usize, kernel: Option<Spread>, strength: f64, whole: usize) -> (Vec<f32>, Option<Spread>) {
+    let Some(spread) = kernel.or_else(|| spread_of(data, width, height)) else { return (data.to_vec(), None) };
+    let undone = spread.scaled(strength.max(0.0));
+    let (widest, _) = undone.extremes();
+    if widest <= 0.0 || !widest.is_finite() {
+        return (data.to_vec(), Some(spread));
+    }
+    let reduction = Reduction::for_blur(widest, whole, MOST_READ_PIXELS, 1.0);
+    if reduction == Reduction::NONE {
+        return (deconvolve(data, width, height, &undone), Some(spread));
+    }
+    let (small, rw, rh) = reduced(data, width, height, reduction);
+    let sharp = deconvolve(&small, rw, rh, &undone.scaled(reduction.factor()));
+    (restored(&sharp, (rw, rh), reduction, (width, height)), Some(spread))
+}
+
+/// `data`, `width` by `height`, deblurred by the blur it shows, at full
+/// strength ([`undone_by`]).
+pub fn undone(data: &[f32], width: usize, height: usize) -> Vec<f32> {
+    undone_by(data, width, height, None, 1.0).0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A field of squares `cell` pixels a side, dark and light by a fixed
+    /// pattern, `size` pixels a side: edges every way.
+    fn squares(size: usize, cell: usize) -> Vec<f32> {
+        (0..size * size)
+            .map(|i| {
+                let (x, y) = (i % size / cell, i / size / cell);
+                if (x * 7 + y * 13 + x * y) % 3 == 0 { 0.1 } else { 0.9 }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_blur_is_measured_as_it_was_laid() {
+        let (size, cell) = (240, 8);
+        let sharp = squares(size, cell);
+        assert_eq!(measure(&sharp, size, size), None, "a sharp field shows no spread");
+        for sigma in [2.0, 3.0] {
+            let blurred_image = blurred(&sharp, size, size, &kernel(&Spread::round(sigma)));
+            let (widest, narrowest) = measure(&blurred_image, size, size).unwrap().extremes();
+            assert!((widest - sigma).abs() < 0.35 * sigma && (narrowest - sigma).abs() < 0.35 * sigma, "{sigma}: {widest} by {narrowest}");
+        }
+        // A shake across: wide that way, and narrow down.
+        let shaken = blurred(&sharp, size, size, &kernel(&Spread { xx: 9.0, xy: 0.0, yy: 0.36 }));
+        let spread = measure(&shaken, size, size).unwrap();
+        assert!(spread.xx > 4.0 * spread.yy, "{spread:?}");
+    }
+
+    #[test]
+    fn undoing_a_blur_brings_the_edges_back() {
+        let (size, cell) = (160, 8);
+        let sharp = squares(size, cell);
+        let spread = Spread::round(2.5);
+        let blurred_image = blurred(&sharp, size, size, &kernel(&spread));
+        let restored = deconvolve(&blurred_image, size, size, &spread);
+        // How far the middle of each square reads from grey, and how many
+        // read the wrong side of it: what a scan for finder patterns and
+        // a sampler of modules each ask of a photo.
+        let middles = |image: &[f32]| -> (f32, usize) {
+            let (mut far, mut wrong) = (0.0, 0);
+            for cy in 0..size / cell {
+                for cx in 0..size / cell {
+                    let i = (cy * cell + cell / 2) * size + cx * cell + cell / 2;
+                    far += (image[i] - 0.5).abs();
+                    wrong += usize::from((image[i] < 0.5) != (sharp[i] < 0.5));
+                }
+            }
+            (far / ((size / cell) * (size / cell)) as f32, wrong)
+        };
+        let (blurred_far, blurred_wrong) = middles(&blurred_image);
+        let (restored_far, restored_wrong) = middles(&restored);
+        assert!(restored_far > 1.3 * blurred_far, "{restored_far} against {blurred_far}");
+        assert!(restored_wrong <= blurred_wrong, "{restored_wrong} against {blurred_wrong}");
+        // Flat light stays flat.
+        let flat = vec![0.6f32; 64 * 64];
+        assert!(deconvolve(&flat, 64, 64, &spread).iter().all(|v| (v - 0.6).abs() < 1e-4));
+    }
+
+    #[test]
+    fn the_filter_undoes_what_it_is_given_as_far_as_it_is_asked() {
+        let (size, cell) = (96, 8);
+        let sharp = squares(size, cell);
+        // Blurred by less than a read thinks worth undoing: the filter,
+        // asked for, undoes it all the same, by the blur it measures,
+        // which it gives back.
+        let little = blurred(&sharp, size, size, &kernel(&Spread::round(0.8)));
+        assert!(deblurred(&little, size, size, MOST_READ_PIXELS).is_none(), "a read leaves it");
+        let (undone, measured) = undone_by(&little, size, size, None, 1.0);
+        let measured = measured.expect("edges enough to measure");
+        assert!(measured.extremes().0 < LEAST_SPREAD, "{:?}", measured.extremes());
+        assert_eq!(undone, deconvolve(&little, size, size, &measured));
+        assert_eq!(super::undone(&little, size, size), undone);
+        // A kernel given is undone in place of what the image shows, and
+        // given back as it was; so many times as wide as the strength
+        // asks; and at a strength of nought, not at all.
+        let spread = Spread::round(2.0);
+        let wide = blurred(&sharp, size, size, &kernel(&spread));
+        let given = Spread { xx: 1.2, xy: 0.3, yy: 0.8 };
+        assert!(given.scaled(1.5).extremes().0 <= MOST_SPREAD, "undone at the image's own size");
+        assert_eq!(undone_by(&wide, size, size, Some(given), 1.0), (deconvolve(&wide, size, size, &given), Some(given)));
+        assert_eq!(undone_by(&wide, size, size, Some(given), 1.5).0, deconvolve(&wide, size, size, &given.scaled(1.5)));
+        assert_eq!(undone_by(&wide, size, size, Some(given), 0.0), (wide.clone(), Some(given)));
+        // The further, the sharper the squares' middles read.
+        let far = |image: &[f32]| {
+            let middles: Vec<f32> = (0..size / cell).flat_map(|cy| (0..size / cell).map(move |cx| (cy * cell + cell / 2) * size + cx * cell + cell / 2)).map(|i| (image[i] - 0.5).abs()).collect();
+            middles.iter().sum::<f32>() / middles.len() as f32
+        };
+        let fars: Vec<f32> = [0.0, 0.5, 1.0].iter().map(|&strength| far(&undone_by(&wide, size, size, Some(spread), strength).0)).collect();
+        assert!(fars.windows(2).all(|pair| pair[0] < pair[1]), "{fars:?}");
+        // With no edges to measure a blur off, the image as it is: of a
+        // single grey, however its rounding leaves its pixels, a few
+        // millionths apart, which the gradient reads as edges of no width.
+        for grey in [0.6f32, 128.0 / 255.0, 0.5] {
+            let flat = vec![grey; 64 * 64];
+            assert_eq!(measure(&flat, 64, 64), None, "{grey}");
+            assert_eq!(undone_by(&flat, 64, 64, None, 1.0), (flat.clone(), None), "{grey}");
+        }
+    }
+
+    #[test]
+    fn a_kernel_spreads_as_asked_whichever_way_it_lies() {
+        // What the taps themselves spread by, along their widest way and
+        // their narrowest.
+        let spread_of_taps = |taps: &[(isize, isize, f32)]| {
+            let (mut xx, mut xy, mut yy) = (0.0, 0.0, 0.0);
+            for &(dx, dy, weight) in taps {
+                let (x, y, weight) = (dx as f64, dy as f64, f64::from(weight));
+                xx += weight * x * x;
+                xy += weight * x * y;
+                yy += weight * y * y;
+            }
+            Spread { xx, xy, yy }.extremes()
+        };
+        // Round, long and thin, and flat across, every way round: as wide
+        // as asked along the widest way, and across it as asked or half a
+        // pixel, whichever is the more.
+        for sigma in [1.0, 2.0, 3.0] {
+            for across in [0.0, 0.2, 0.8, sigma] {
+                for degrees in (0..180).step_by(15) {
+                    let (s, c) = f64::from(degrees).to_radians().sin_cos();
+                    let (big, small) = (sigma * sigma, across * across);
+                    let spread = Spread { xx: big * c * c + small * s * s, xy: (big - small) * c * s, yy: big * s * s + small * c * c };
+                    let (widest, narrowest) = spread_of_taps(&kernel(&spread));
+                    let want = across.max(KERNEL_LEAST_ACROSS);
+                    assert!((widest / sigma - 1.0).abs() < 0.03, "{sigma} by {across} at {degrees}°: {widest} along");
+                    assert!((narrowest / want - 1.0).abs() < 0.1, "{sigma} by {across} at {degrees}°: {narrowest} across");
+                }
+            }
+        }
+        // Next to nothing either way is next to a single tap, round or a
+        // shake undone at next to no strength, so that the filter's
+        // strength runs smoothly up from nought.
+        let (s, c) = 30f64.to_radians().sin_cos();
+        let shake = Spread { xx: 9.0 * c * c, xy: 9.0 * c * s, yy: 9.0 * s * s };
+        for little in [Spread::round(0.05), shake.scaled(0.02)] {
+            let middle = kernel(&little).iter().find(|tap| (tap.0, tap.1) == (0, 0)).map_or(0.0, |tap| tap.2);
+            assert!(middle > 0.95, "{little:?}: {middle} in the middle");
+        }
+    }
+
+    #[test]
+    fn a_spread_turns_and_says_which_way_it_is_widest() {
+        let shake = Spread { xx: 4.0, xy: 0.0, yy: 1.0 };
+        assert_eq!(shake.angle(), 0.0);
+        assert_eq!(shake.turned_cw(), Spread { xx: 1.0, xy: 0.0, yy: 4.0 });
+        assert!((shake.turned_cw().angle().abs() - 90.0).abs() < 1e-9);
+        let leaning = Spread { xx: 2.5, xy: 1.5, yy: 2.5 };
+        assert!((leaning.angle() - 45.0).abs() < 1e-9 && (leaning.turned_cw().angle() + 45.0).abs() < 1e-9);
+        assert_eq!(leaning.turned_cw().turned_cw().turned_cw().turned_cw(), leaning);
+        assert_eq!(Spread::round(2.0).angle(), 0.0);
+    }
+
+    #[test]
+    fn a_large_image_is_measured_at_its_own_size() {
+        // A page of grainy paper, larger than is measured whole, with a
+        // patch of squares six pixels a side blurred by three. Reduced to
+        // the pixels a measure takes, the squares come to two pixels and
+        // their blur to one, and the measure reads next to nothing; the
+        // parts of the page with the most edges, measured at its own
+        // size, read the blur as the patch alone does.
+        let (w, h) = (2600, 2400);
+        assert!(w * h > MOST_PIXELS);
+        let (pw, ph, cell) = (900, 700, 6);
+        let squares: Vec<f32> = (0..pw * ph)
+            .map(|i| {
+                let (x, y) = (i % pw / cell, i / pw / cell);
+                if (x * 7 + y * 13 + x * y) % 3 == 0 { 0.1 } else { 0.9 }
+            })
+            .collect();
+        let patch = blurred(&squares, pw, ph, &kernel(&Spread::round(3.0)));
+        let mut grain = 0x9E37_79B9u64;
+        let mut page: Vec<f32> = (0..w * h)
+            .map(|_| {
+                grain ^= grain << 13;
+                grain ^= grain >> 7;
+                grain ^= grain << 17;
+                0.85 + ((grain % 1000) as f32 / 1000.0 - 0.5) * 0.03
+            })
+            .collect();
+        let (px, py) = (1500, 1100);
+        for y in 0..ph {
+            page[(py + y) * w + px..(py + y) * w + px + pw].copy_from_slice(&patch[y * pw..(y + 1) * pw]);
+        }
+        let alone = measure(&patch, pw, ph).expect("the patch shows its blur").extremes().0;
+        let widest = spread_of(&page, w, h).expect("the page shows the patch's blur").extremes().0;
+        assert!((widest - alone).abs() < 0.1 * alone, "{widest} against {alone} for the patch alone");
+        let times = (MOST_PIXELS as f64 / (w * h) as f64).sqrt();
+        let (rw, rh) = ((w as f64 * times).round() as usize, (h as f64 * times).round() as usize);
+        let reduced = measure(&resize(&page, w, h, 1, rw, rh), rw, rh);
+        assert!(reduced.is_none_or(|spread| spread.extremes().0 / times < 0.5 * alone), "{reduced:?} reduced");
+    }
+
+    #[test]
+    fn a_small_patch_on_grainy_paper_is_measured_in_parts() {
+        // A field of squares two hundred pixels a side, blurred by three,
+        // on a page of grainy paper under six megapixels, which was once
+        // measured whole: the grain set the steepest change and the
+        // contrast an edge is judged against, its edges were most of
+        // those measured, and the page showed no blur. Measured over its
+        // busiest parts, it shows the field's.
+        let (w, h, side) = (2400, 2400, 200);
+        assert!(w * h > MOST_PIXELS);
+        let field = blurred(&squares(side, 8), side, side, &kernel(&Spread::round(3.0)));
+        let mut grain = 12345u64;
+        let mut page: Vec<f32> = (0..w * h)
+            .map(|_| {
+                grain = grain.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                0.9 + ((grain >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * 0.03
+            })
+            .collect();
+        for y in 0..side {
+            page[(500 + y) * w + 500..(500 + y) * w + 500 + side].copy_from_slice(&field[y * side..(y + 1) * side]);
+        }
+        let alone = measure(&field, side, side).expect("the field shows its blur").extremes().0;
+        assert!(measure(&page, w, h).is_none(), "measured whole, the grain hides it");
+        let widest = spread_of(&page, w, h).expect("the page shows the field's blur").extremes().0;
+        assert!((widest - alone).abs() < 0.1 * alone, "{widest} against {alone} for the field alone");
+    }
+
+    #[test]
+    fn a_few_edges_say_nothing() {
+        // A dot of ink four pixels a side, blurred, on clean paper: a
+        // score of edges round it, fewer than a direction must have to be
+        // fitted on, which once gave a spread all the same.
+        let (size, side) = (40, 4);
+        let dot: Vec<f32> = (0..size * size).map(|i| if (18..18 + side).contains(&(i % size)) && (18..18 + side).contains(&(i / size)) { 0.1 } else { 0.9 }).collect();
+        assert_eq!(measure(&blurred(&dot, size, size, &kernel(&Spread::round(1.5))), size, size), None);
+    }
+
+    #[test]
+    fn edges_within_a_narrow_fan_of_directions_say_nothing_of_the_shape() {
+        // Three fields of stripes side by side, a barcode or ruled paper,
+        // their edges at three directions within thirty degrees, blurred
+        // the same every way and a little grainy. Fitted on those
+        // directions alone, the shape was a guess along the stripes,
+        // where no edge was measured: a blur of two and a half pixels
+        // came to two and a half across them and to nothing along them,
+        // and with the stripes closer together, to three and a half
+        // along them. Over a fan so narrow the blur is taken the same
+        // every way; over one reaching a quarter turn its shape is
+        // fitted, and a round blur comes out round.
+        let (w, h) = (600, 200);
+        let stripes = |normals: [f64; 3]| -> Vec<f32> {
+            (0..w * h)
+                .map(|i| {
+                    let (x, y) = ((i % w) as f64, (i / w) as f64);
+                    let (s, c) = normals[i % w / 200].to_radians().sin_cos();
+                    // Four samples across the pixel, so that a stripe at a
+                    // slant is not drawn in steps; twenty pixels of ink and
+                    // twenty of paper, so that each edge reads alone.
+                    let ink = (0..4).filter(|k| ((c * x + s * y + (*k as f64 - 1.5) * 0.25) / 40.0).rem_euclid(1.0) < 0.5).count();
+                    (0.9 - 0.2 * ink as f64) as f32
+                })
+                .collect()
+        };
+        let mut grain = 99u64;
+        let mut grainy = |image: Vec<f32>| -> Vec<f32> {
+            image
+                .into_iter()
+                .map(|v| {
+                    grain = grain.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    v + ((grain >> 40) % 1000) as f32 / 1000.0 * 0.01 - 0.005
+                })
+                .collect()
+        };
+        for normals in [[5.0, 20.0, 35.0], [2.0, 10.0, 20.0]] {
+            let image = grainy(blurred(&stripes(normals), w, h, &kernel(&Spread::round(2.5))));
+            let (widest, narrowest) = measure(&image, w, h).expect("edges enough").extremes();
+            assert!(widest == narrowest && (widest - 2.5).abs() < 0.35 * 2.5, "{normals:?}: {widest} by {narrowest}");
+        }
+        let image = grainy(blurred(&stripes([0.0, 45.0, 90.0]), w, h, &kernel(&Spread::round(2.5))));
+        let (widest, narrowest) = measure(&image, w, h).expect("edges enough").extremes();
+        assert!(widest < 1.2 * narrowest && (widest - 2.5).abs() < 0.35 * 2.5, "a quarter turn: {widest} by {narrowest}");
+    }
+
+    #[test]
+    fn a_part_of_an_image_is_undone_as_the_whole_is_there() {
+        // The largest ratio with a step of eight pixels or fewer that
+        // brings the blur to two pixels and the image to the most a
+        // deconvolution works on, or one in so many.
+        let few = 100_000;
+        let for_blur = |widest: f64, pixels: usize, most: f64| Reduction::for_blur(widest, pixels, MOST_PIXELS, most);
+        assert_eq!(for_blur(1.5, few, 1.0), Reduction::NONE);
+        assert_eq!(for_blur(2.4, few, 1.0), Reduction { p: 5, q: 6 });
+        assert_eq!(for_blur(3.0, few, 1.0), Reduction { p: 2, q: 3 });
+        assert_eq!(for_blur(3.5, few, 1.0), Reduction { p: 4, q: 7 });
+        assert_eq!(for_blur(16.0, few, 1.0), Reduction { p: 1, q: 8 });
+        assert_eq!(for_blur(50.0, few, 1.0), Reduction { p: 1, q: 25 });
+        assert_eq!(for_blur(1.0, 4 * MOST_PIXELS, 1.0), Reduction { p: 1, q: 2 });
+        assert_eq!(for_blur(3.0, few, 0.5), Reduction { p: 1, q: 2 });
+        // A photograph of twelve megapixels, reduced for a search's copy and
+        // not for the filter or a read's.
+        assert_eq!(for_blur(1.0, 12_000_000, 1.0), Reduction { p: 1, q: 3 });
+        assert_eq!(Reduction::for_blur(1.0, 12_000_000, MOST_READ_PIXELS, 1.0), Reduction::NONE);
+        // A part of a blurred image that begins a whole number of the
+        // reduction's steps into it, with as much of the image about it as
+        // the deconvolution reads, comes out as the whole does there; one
+        // that begins a pixel off the grid differs by most of a hundredth
+        // of the contrast.
+        let (size, cell) = (240, 8);
+        let image = blurred(&squares(size, cell), size, size, &kernel(&Spread::round(3.0)));
+        let spread = Spread { xx: 9.0, xy: 1.0, yy: 6.0 };
+        let reduction = Reduction::for_blur(spread.extremes().0, size * size, MOST_READ_PIXELS, 1.0);
+        assert!(reduction.q > 1, "{reduction:?}");
+        let whole = undone_by(&image, size, size, Some(spread), 1.0).0;
+        let pad = reach(&spread, 1.0, reduction).ceil() as usize;
+        let wanted = [100, 90, 180, 170];
+        let differs = |x0: usize, y0: usize| {
+            let part = [x0, y0, (wanted[2] + pad).min(size), (wanted[3] + pad).min(size)];
+            let (w, h) = (part[2] - part[0], part[3] - part[1]);
+            let pixels: Vec<f32> = (part[1]..part[3]).flat_map(|y| image[y * size + part[0]..y * size + part[2]].iter().copied()).collect();
+            let undone = undone_within(&pixels, w, h, Some(spread), 1.0, size * size).0;
+            (wanted[1]..wanted[3])
+                .flat_map(|y| (wanted[0]..wanted[2]).map(move |x| (x, y)))
+                .map(|(x, y)| (undone[(y - part[1]) * w + x - part[0]] - whole[y * size + x]).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let on_grid = |v: usize| (v - pad) / reduction.q * reduction.q;
+        let (x0, y0) = (on_grid(wanted[0]), on_grid(wanted[1]));
+        assert!(differs(x0, y0) < 1e-4, "{} on the grid", differs(x0, y0));
+        assert!(differs(x0 - 1, y0) > 3e-3, "{} off it", differs(x0 - 1, y0));
+    }
+}

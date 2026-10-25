@@ -91,24 +91,52 @@ QR_BOOFCV_DIR=path/to/qrcodes QR_BOOFCV_BOOTSTRAP=1 cargo test --release --test 
 With `QR_BOOFCV_ONLY` as well, only the lines of the sets searched are
 rewritten.
 
+## Measuring more than the record
+
+The record only says how far the search got with each symbol, so once
+nearly every symbol reads, a change that reads them all better looks
+like no change. Besides the table, the test prints how long each set
+took to search (photos are searched a few at a time) and the slowest
+photos. Three more variables add more measurements:
+
+- `QR_BOOFCV_METRICS` has the reader print figures for each read
+  (`qr-forensics decode --metrics`), and the test totals them per set:
+  misread and unknown modules in confirmed blocks, per thousand; how
+  much of its error correction each read's worst block used; and, over
+  all reads, how many modules were read at each whole number of bits of
+  reliability, how many of them were wrong, and how many that
+  reliability predicted.
+- `QR_BOOFCV_ORACLE` re-reads every symbol the search missed through its
+  hand-marked corners, without searching (`--placed`). A symbol that
+  reads this way was lost by the search; one that doesn't was lost in
+  the reading.
+- `QR_BOOFCV_REPORT` names a tab-separated file to write a line per
+  symbol to: the photo, the symbol's index, its outcome, its outcome
+  through its marks, the seconds its photo took, and its read's figures.
+  Compare reports from before and after a change side by side.
+
+`QR_BOOFCV_READER` runs another reader binary instead of the one this
+crate builds, so the same test can measure a build from another
+revision. A reader that doesn't support `--metrics` or `--placed` is run
+without them.
+
+```text
+QR_BOOFCV_DIR=path/to/qrcodes QR_BOOFCV_METRICS=1 QR_BOOFCV_ORACLE=1 QR_BOOFCV_REPORT=after.tsv cargo test --release --test boofcv -- --nocapture
+```
+
 ## What BoofCV makes of it
 
-BoofCV 1.5.0, as `FactoryFiducial.qrcode(null, GrayU8.class)` configures
-its detector, reads 923 of the 1232 symbols. The search here reads 1200
-as the record stands; 14 more it finds and cannot decode, and 18 it
-does not find. When it read 1187, every one of BoofCV's was among them,
-each with the message BoofCV reads. Three of those 1187 were later
-found and not read, `brightness/image012.jpg` 0, `curved/image017.jpg` 0
-and `curved/image024.jpg` 0: each decodes only with its padding pinned
-and some codewords doubted or filled in, and fell short of the fixed
-three codewords' worth of confirmation such a decode needed then. That
-fixed bar has since been replaced by charging each solution for every
-search that could have found it (`Search` in `src/decode/pipeline.rs`),
-and this decoder reads the first two again; `curved/image024.jpg` 0 it
-still finds and does not read. Nobody has rechecked whether BoofCV reads
-the three now.
-BoofCV takes a third of a second over a twelve-megapixel photograph
-where this search takes tens of seconds, and where it finds the
-position patterns of a symbol and cannot decode it, it says where:
-several of the choices in
-`src/imaging/detect.rs` are answers to one or the other.
+BoofCV 1.5.0, with its detector configured by
+`FactoryFiducial.qrcode(null, GrayU8.class)`, reads 923 of the 1232
+symbols. As the record stands, the search here reads 1210, finds 11 more
+that it can't decode, and doesn't find 11.
+
+Read through their hand-marked corners (`QR_BOOFCV_ORACLE`), 8 of the
+11 not found read and the other 3 are found, but none of the 11 found
+and not decoded reads. So every symbol still within reach is being lost
+in the search.
+
+BoofCV takes a third of a second on a twelve-megapixel photo where this
+search takes tens of seconds, and when it finds a symbol's position
+patterns but can't decode it, it says where. Several of the choices in
+`src/imaging/detect.rs` respond to one or the other.

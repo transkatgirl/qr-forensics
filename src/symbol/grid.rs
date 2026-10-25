@@ -36,6 +36,18 @@ impl Module {
 /// it, and so do those painted as a guess.
 pub const CERTAIN: u8 = 255;
 
+/// How likely a module at `reliability` is to have been read wrong: one
+/// in two to the bits of likelihood it stands for
+/// ([`crate::imaging::sample::reliability_bits`]), a coin's toss at
+/// nought and half as likely for every eight more. For a sampled module
+/// never below the share any photograph reads wrong whatever the
+/// reading, which the sampler lays on every reliability it gives
+/// ([`crate::imaging::sample::MISREAD_FLOOR`]); nought for a module
+/// [`CERTAIN`].
+pub fn misread_chance(reliability: u8) -> f64 {
+    if reliability == CERTAIN { 0.0 } else { (-(f64::from(reliability) / 8.0 + 1.0)).exp2() }
+}
+
 /// A reflection of the grid: what a symbol looks like seen from the back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Mirror {

@@ -41,7 +41,12 @@
 //! enlarge <n>                 the photo's Enlarge: n times its own size,
 //!                             0.25, 0.5 or a whole number, as far as its
 //!                             size allows; the outline goes with it
-//! sharpen <amount>            the photo's Sharpen, from -1 (blurred) to 1
+//! sharpen <amount>            the photo's Sharpen, from -2 (blurred) to 2
+//! filter none|median|close|deblur
+//!                             the photo's Filter
+//! deblur outline|whole        measure the blur the Deblur filter undoes
+//!                             inside the outline, or over the whole photo
+//! strength <amount>           the Deblur filter's Strength, from 0 to 2
 //! grey on|off                 show the photo in greyscale, or in colour
 //! invert photo|grid           toggle the photo's inversion, or swap dark
 //!                             and light in the grid
@@ -96,7 +101,8 @@ use std::path::PathBuf;
 use eframe::egui;
 use qr_forensics::decode::padding::Filler;
 use qr_forensics::decode::pipeline::DecodeOptions;
-use qr_forensics::imaging::adjust::{Adjust, Enlarge};
+use qr_forensics::imaging::adjust::{Adjust, Enlarge, Filter, STRENGTH_RANGE};
+use qr_forensics::imaging::enhance::SHARPEN_RANGE;
 use qr_forensics::symbol::grid::{CERTAIN, Module};
 use qr_forensics::symbol::tables::Mode;
 use qr_forensics::symbol::{EcLevel, SymbolVersion};
@@ -240,7 +246,32 @@ impl App {
             "sharpen" => {
                 assert!(self.photo.is_some(), "selftest: sharpen needs a photo");
                 self.checkpoint();
-                actions.push(Action::SetAdjust(Adjust { sharpen: (number(0) as f32).clamp(-1.0, 1.0), ..self.doc.adjust }));
+                actions.push(Action::SetAdjust(Adjust { sharpen: (number(0) as f32).clamp(*SHARPEN_RANGE.start(), *SHARPEN_RANGE.end()), ..self.doc.adjust }));
+            }
+            "filter" => {
+                assert!(self.photo.is_some(), "selftest: filter needs a photo");
+                let filter = match word(0) {
+                    "none" => Filter::None,
+                    "median" => Filter::Median,
+                    "close" => Filter::Close,
+                    "deblur" => Filter::Deblur,
+                    other => panic!("selftest: no filter {other:?} in `{step}`"),
+                };
+                self.checkpoint();
+                actions.push(Action::SetAdjust(Adjust { filter, ..self.doc.adjust }));
+            }
+            "deblur" => match word(0) {
+                "outline" => actions.push(Action::MeasureDeblur),
+                "whole" => {
+                    self.checkpoint();
+                    actions.push(Action::SetAdjust(Adjust { kernel: None, ..self.doc.adjust }));
+                }
+                other => panic!("selftest: deblur outline|whole, not {other:?}, in `{step}`"),
+            },
+            "strength" => {
+                assert!(self.photo.is_some(), "selftest: strength needs a photo");
+                self.checkpoint();
+                actions.push(Action::SetAdjust(Adjust { strength: (number(0) as f32).clamp(*STRENGTH_RANGE.start(), *STRENGTH_RANGE.end()), ..self.doc.adjust }));
             }
             "grey" => self.view.greyscale = word(0) == "on",
             "refine" => actions.push(Action::RefineCorners),

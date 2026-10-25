@@ -5,17 +5,22 @@ use qr_forensics::decode::abp::{ABP_ROUNDS_LEAST, ABP_ROUNDS_MAX, round_tries};
 use qr_forensics::decode::list::{LIST_COST, LIST_COST_MAX, LIST_COST_MIN};
 use qr_forensics::decode::pipeline::DecodeOptions;
 use qr_forensics::decode::rs::{CHASE_MAX_BITS, TRIAL_SETS_MAX, TRIAL_SETS_MIN, tries_charge};
-use qr_forensics::imaging::adjust::{Adjust, Channel, Enlarge, Filter, K1_RANGE, LENS_MIN_PAIRS, MAX_ENLARGED_SIDE};
+use qr_forensics::imaging::adjust::{Adjust, Channel, Enlarge, Filter, K1_RANGE, LENS_MIN_PAIRS, MAX_ENLARGED_SIDE, STRENGTH_RANGE};
+use qr_forensics::imaging::deblur::{self, Spread};
 use qr_forensics::imaging::binarize::{BinarizeParams, WINDOW_RADII};
 use qr_forensics::imaging::detect::{AnchorKind, Detection, anchor_sites};
-use qr_forensics::imaging::sample::{BLUR_MIN_GAIN, Kernel, POOR_SEPARABILITY, SHARPEN_BELOW_PX, misread_odds, reliability_bits};
+use qr_forensics::imaging::enhance::SHARPEN_RANGE;
+use qr_forensics::imaging::sample::{
+    BLUR_MIN_GAIN, DATA_GROSS, DATA_SPREAD, Kernel, MISREAD_FLOOR, POOR_SEPARABILITY, SAMPLED_MAX, SHARPEN_BELOW_PX, misread_odds,
+    reliability_bits,
+};
 use qr_forensics::symbol::function_map::looks_inverted;
 use qr_forensics::symbol::grid::{CERTAIN, Module};
 use qr_forensics::symbol::{EcLevel, Family, SymbolVersion};
 
 use super::canvas::one_in;
 use super::state::*;
-use super::{Action, App, JobKind, Reach, Transform, count_run, count_word, grouped, wrong_codewords};
+use super::{Action, App, JobKind, Reach, Transform, count_run, count_word, grouped, list_phrase, wrong_codewords};
 
 /// Why a button is disabled while a job runs.
 const BUSY_HINT: &str = "Wait for the step under way to finish";
@@ -105,6 +110,41 @@ fn symbol_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     ui.weak("Changing the version starts a new grid (undoable).");
 }
 
+/// The blur the Deblur filter undoes, before its strength: the kernel
+/// the deconvolution divides by, drawn tap by tap, the heavier the
+/// lighter, and how wide it is, which way, and where it was measured:
+/// over the whole photo, or, `fixed`, set by Measure in outline or by a
+/// read, which may have fixed the whole photo's blur as it then was.
+fn kernel_view(ui: &mut egui::Ui, spread: Option<Spread>, fixed: bool) {
+    let Some(spread) = spread else {
+        ui.weak("No blur found: the photo is sharp or has too few edges to measure, so it's left as is.");
+        return;
+    };
+    ui.horizontal_top(|ui| {
+        let taps = deblur::kernel(&spread);
+        let reach = taps.iter().map(|&(dx, dy, _)| dx.abs().max(dy.abs())).max().unwrap_or(0);
+        let heaviest = taps.iter().map(|tap| tap.2).fold(f32::MIN_POSITIVE, f32::max);
+        let side = 64.0;
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
+        let cell = side / (2 * reach + 1) as f32;
+        for &(dx, dy, weight) in &taps {
+            let at = rect.min + egui::vec2((dx + reach) as f32 * cell, (dy + reach) as f32 * cell);
+            let grey = (255.0 * (weight / heaviest).sqrt()).round() as u8;
+            painter.rect_filled(egui::Rect::from_min_size(at, egui::vec2(cell, cell)), 0.0, egui::Color32::from_gray(grey));
+        }
+        let (widest, narrowest) = spread.extremes();
+        response.on_hover_text(format!(
+            "The blur kernel being undone, before Strength: a Gaussian, σ {widest:.2} px on its widest axis and \
+             {narrowest:.2} px on its narrowest, with {} taps out to 3σ. Brighter cells weigh more.",
+            taps.len()
+        ));
+        let from = if fixed { "set by Measure in outline or a read" } else { "measured over the whole photo" };
+        ui.weak(format!("σ {widest:.1} × {narrowest:.1} px at {:.0}°,\n{from}", spread.angle()));
+    });
+}
+
 fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     ui.heading("Photo");
     ui.horizontal(|ui| {
@@ -135,6 +175,7 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     ui.weak(about);
     let (width, height) = (photo.width, photo.height);
     let cropped = photo.crop.is_some();
+    let deblurred = photo.luma.deblurred;
     // What the photo starts with, which Reset goes back to: no
     // adjustment but the enlargement a small photo is given.
     let fresh = Adjust::for_photo(photo.original.width(), photo.original.height());
@@ -175,35 +216,10 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
             gesture = pointer_down;
         }
     };
+    // The adjustments in the order the photo is put through them
+    // ([`Adjust::apply`]): its size and shape, its sharpness, the one
+    // curve of its tone, and what is read of it.
     egui::Grid::new("adjust").num_columns(2).show(ui, |ui| {
-        ui.label("Channel");
-        let mut changed = false;
-        egui::ComboBox::from_id_salt("channel").selected_text(adjust.channel.label()).show_ui(ui, |ui| {
-            for channel in Channel::ALL {
-                changed |= ui.selectable_value(&mut adjust.channel, channel, channel.label()).changed();
-            }
-        });
-        note(changed);
-        ui.end_row();
-        ui.label("Brightness");
-        note(ui.add(egui::Slider::new(&mut adjust.brightness, -1.0..=1.0)).changed());
-        ui.end_row();
-        ui.label("Contrast");
-        note(ui.add(egui::Slider::new(&mut adjust.contrast, -1.0..=1.0)).changed());
-        ui.end_row();
-        ui.label("Sharpen");
-        let sharpen = ui.add(egui::Slider::new(&mut adjust.sharpen, -1.0..=1.0)).on_hover_text(
-            "Sharpens the photo with an unsharp mask, in its colours: for a symbol out of focus, or modules a pixel or two \
-             across that the lens has run together, which read as grey as their neighbours. The mask is wider and \
-             stronger the further this is set, a pixel wide at 0.5 and two at 1. Below nought it blurs the photo \
-             instead, with the same Gaussian, in its colours and before the tone: for grain, the dots of a halftone \
-             screen, or the halos a camera's own sharpening leaves along edges. The blur is a part of the way at \
-             first, the whole of it and a pixel wide at -0.5, and two pixels wide at -1. Find in outline tries the \
-             photo sharpened and enlarged of itself when it does not decode as it is, and sets this and Enlarge to \
-             what decoded.",
-        );
-        note(sharpen.changed());
-        ui.end_row();
         ui.label("Enlarge");
         // The slider goes from step to step of those on offer for this
         // photo: each twice the last, with what the photo started at,
@@ -248,15 +264,16 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                 .fixed_decimals(3)
                 .clamping(egui::SliderClamping::Edits);
             // A lens bends the photo about its centre, which a crop has
-            // lost: the term is set on the whole photo, and applied
-            // before the cut.
+            // lost: the term is set on the whole photo, and a part cut
+            // under it is straightened as the whole is there.
             const CROPPED_HINT: &str = "A lens bends the photo about its centre, which a cropped photo has lost: show the \
                                         whole photo to set it, and crop again";
             let lens = ui
                 .add_enabled(!cropped, slider)
                 .on_hover_text(
-                    "Takes radial lens distortion out of the photo. Negative straightens edges that bow outwards \
-                     (barrel), positive edges that bow inwards (pincushion).",
+                    "Corrects radial lens distortion around the photo's centre. Negative straightens edges that bow \
+                     outwards (barrel), positive straightens edges that bow inwards (pincushion). Applied after \
+                     Enlarge.",
                 )
                 .on_disabled_hover_text(CROPPED_HINT);
             note(lens.changed());
@@ -278,6 +295,35 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
             }
         });
         ui.end_row();
+        ui.label("Sharpen");
+        let sharpen = ui.add(egui::Slider::new(&mut adjust.sharpen, SHARPEN_RANGE)).on_hover_text(
+            "An unsharp mask, applied in colour after Enlarge and Lens, for a symbol out of focus or modules a pixel \
+             or two across that have blurred together. It's 1 px wide at 0.5, 2 px at 1 and 4 px at 2, in the \
+             photo's original pixels however far it's enlarged (or in the reduced pixels, if it's reduced). Below 0 \
+             it blurs instead, to smooth out grain, halftone dots or in-camera sharpening halos: the blur fades in \
+             down to -0.5 (1 px), then widens to 2 px at -1 and 4 px at -2. When a read fails, Find in outline \
+             tries sharpened and enlarged copies, and sets this and Enlarge to whatever decoded.",
+        );
+        note(sharpen.changed());
+        ui.end_row();
+        ui.label("");
+        note(ui.checkbox(&mut adjust.invert, "Invert photo").on_hover_text("For light symbols on a dark background").changed());
+        ui.end_row();
+        ui.label("Contrast");
+        note(ui.add(egui::Slider::new(&mut adjust.contrast, -1.0..=1.0)).changed());
+        ui.end_row();
+        ui.label("Brightness");
+        note(ui.add(egui::Slider::new(&mut adjust.brightness, -1.0..=1.0)).changed());
+        ui.end_row();
+        ui.label("Channel");
+        let mut changed = false;
+        egui::ComboBox::from_id_salt("channel").selected_text(adjust.channel.label()).show_ui(ui, |ui| {
+            for channel in Channel::ALL {
+                changed |= ui.selectable_value(&mut adjust.channel, channel, channel.label()).changed();
+            }
+        });
+        note(changed);
+        ui.end_row();
         ui.label("Filter");
         let mut changed = false;
         egui::ComboBox::from_id_salt("filter").selected_text(adjust.filter.label()).show_ui(ui, |ui| {
@@ -287,23 +333,52 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         });
         note(changed);
         ui.end_row();
-        if adjust.filter != Filter::None {
+        if adjust.filter == Filter::Deblur {
+            ui.label("Kernel");
+            ui.horizontal_wrapped(|ui| {
+                let measure = ui.button("Measure in outline").on_hover_text(
+                    "Measure the blur inside the outline only (after the adjustments above) and undo that instead of \
+                     the whole photo's blur. Use it when only the symbol is out of focus, or when the rest of the photo \
+                     throws off the measurement. It's rescaled if Enlarge changes.",
+                );
+                if measure.clicked() {
+                    actions.push(Action::MeasureDeblur);
+                }
+                let whole = ui
+                    .add_enabled(adjust.kernel.is_some(), egui::Button::new("Use whole photo"))
+                    .on_hover_text("Go back to undoing the blur measured over the whole photo")
+                    .on_disabled_hover_text("Already undoing the whole photo's blur");
+                if whole.clicked() {
+                    adjust.kernel = None;
+                    note(true);
+                }
+            });
+            ui.end_row();
+            ui.label("");
+            kernel_view(ui, deblurred, adjust.kernel.is_some());
+            ui.end_row();
+            ui.label("Strength");
+            let strength = ui.add(egui::Slider::new(&mut adjust.strength, STRENGTH_RANGE)).on_hover_text(
+                "Scales the kernel's width. 1 undoes the blur as measured (the measurement runs slightly low), \
+                 higher undoes more but adds ringing at edges, and 0 leaves the photo unchanged.",
+            );
+            note(strength.changed());
+            ui.end_row();
+        }
+        if adjust.filter.has_radius() {
             ui.label("Radius");
             let radius = ui.add(egui::DragValue::new(&mut adjust.radius).range(1..=Filter::MAX_RADIUS).suffix(" px")).on_hover_text(
-                "Half-width of the filter's neighbourhood, in photo pixels. With a filter on, the photo is shown \
-                 as the filtered grey that sampling reads.",
+                "Half-width of the filter's neighbourhood, in enlarged pixels (the filter runs last). With a filter \
+                 on, the photo is shown in the filtered grey that sampling reads.",
             );
             note(radius.changed());
             ui.end_row();
         }
     });
-    ui.horizontal_wrapped(|ui| {
-        note(ui.checkbox(&mut adjust.invert, "Invert photo").on_hover_text("For light symbols on a dark background").changed());
-        if ui.add_enabled(adjust != fresh, egui::Button::new("Reset adjustments")).clicked() {
-            adjust = fresh;
-            note(true);
-        }
-    });
+    if ui.add_enabled(adjust != fresh, egui::Button::new("Reset adjustments")).clicked() {
+        adjust = fresh;
+        note(true);
+    }
     // A way of looking, like the binarised view: not an adjustment, and
     // not undone or reset with them.
     ui.checkbox(&mut app.view.greyscale, "Show in greyscale").on_hover_text(
@@ -467,22 +542,31 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
     }
     {
         let sites = anchor_sites(&app.derived.func).len();
-        // Custom anchors stand on no site, and are counted apart.
-        let custom = app.doc.anchors.iter().filter(|a| a.anchor.kind == AnchorKind::Custom).count();
-        let sited = app.doc.anchors.len() - custom;
-        let detected = app.doc.anchors.iter().filter(|a| a.source == AnchorSource::Detected).count();
+        // Edge points, data patches and custom anchors stand on no site,
+        // and are counted apart.
+        let of_kind = |kind: AnchorKind| app.doc.anchors.iter().filter(|a| a.anchor.kind == kind).count();
+        let (edge, data, custom) = (of_kind(AnchorKind::Edge), of_kind(AnchorKind::Data), of_kind(AnchorKind::Custom));
+        let on_site = |a: &&DocAnchor| !matches!(a.anchor.kind, AnchorKind::Edge | AnchorKind::Data | AnchorKind::Custom);
+        let sited = app.doc.anchors.iter().filter(on_site).count();
+        let detected = app.doc.anchors.iter().filter(on_site).filter(|a| a.source == AnchorSource::Detected).count();
         let manual = sited - detected;
         let partial = app.doc.anchors.iter().filter(|a| a.anchor.partial).count();
         let mut text = format!("Anchors: {sited} of {sites} sites set ({detected} found, {manual} by hand)");
         if partial > 0 {
             text.push_str(&format!(", {partial} partly damaged"));
         }
-        if custom > 0 {
-            text.push_str(&format!(", and {custom} custom"));
+        let apart: Vec<String> = [(edge, "edge point", "edge points"), (data, "data patch", "data patches"), (custom, "custom", "custom")]
+            .into_iter()
+            .filter(|&(count, ..)| count > 0)
+            .map(|(count, one, many)| format!("{count} {}", if count == 1 { one } else { many }))
+            .collect();
+        if !apart.is_empty() {
+            text.push_str(&format!(", and {}", list_phrase(&apart)));
         }
         ui.label(text).on_hover_text(
-            "A site is a finder pattern, an alignment pattern, the rMQR sub-pattern or a module of a timing pattern; a \
-             custom anchor is one set by hand on any other module",
+            "A site is a finder pattern, an alignment pattern, the rMQR sub-pattern or a timing module. Edge points \
+             bow the grid's edges to follow the symbol's, data patches are placed by a read where data modules read \
+             sharpest or match the decode, and custom anchors are set by hand on any other module",
         );
         ui.horizontal(|ui| {
             ui.checkbox(&mut app.view.use_anchors, "Bend the grid through the anchors")
@@ -912,21 +996,30 @@ fn sampling_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
             ui.weak(format!(
                 "Reliability calibrated on {} fixed modules: noise {:.2} of the contrast on the dark side and {:.2} on \
                  the light, {} of them read wrong",
-                calibration.labelled, calibration.dark.sigma, calibration.light.sigma, calibration.misread
+                calibration.labelled, calibration.own_sigma[0], calibration.own_sigma[1], calibration.misread
             ))
             .on_hover_text(format!(
-                "How far a module's reading is to be believed is learnt from the fixed patterns, whose colours are known: \
-                 a module read right lies about {:.2} of half the contrast from its threshold on the dark side and {:.2} \
-                 on the light, the readings of each colour spread about that by {:.2} and {:.2}, and {:.1}% of them are \
-                 wrong by more than that spread explains, which no margin is proof against. Where one colour spreads \
-                 wider, a reading near the threshold is likelier that colour, and the threshold moves toward the other: \
-                 here by {:+.2}. The decoder doubts the least reliable modules first, and weighs what a solution \
-                 overturns by it.",
+                "Reliability is calibrated on the fixed patterns, whose colours are known. Correctly read modules sit \
+                 about {:.2} (dark) and {:.2} (light) of half the contrast from the threshold, spread by {:.2} and \
+                 {:.2}; {:.1}% are wrong by more than that spread explains, however far from the threshold they read. \
+                 A logo, a stain or a grid slipping on curled paper barely touches the fixed patterns, so for the data \
+                 the spread is widened {:.0}%, to {:.2} and {:.2}, and the share of such misreads is multiplied by {}, \
+                 to {:.1}%. Every reading is assumed wrong at least {} of the time, so none is trusted past {:.0} bits. \
+                 When one colour spreads wider, a borderline reading is more likely that colour, so the threshold moves \
+                 toward the other: here by {:+.2}. The decoder doubts the least reliable modules first, and weighs each \
+                 solution by the reliability of what it overturns.",
                 -calibration.dark.mean,
                 calibration.light.mean,
+                calibration.own_sigma[0],
+                calibration.own_sigma[1],
+                100.0 * calibration.grossly_misread as f32 / calibration.labelled.max(1) as f32,
+                100.0 * (DATA_SPREAD - 1.0),
                 calibration.dark.sigma,
                 calibration.light.sigma,
+                DATA_GROSS,
                 100.0 * calibration.gross,
+                one_in(1.0 / f64::from(MISREAD_FLOOR)),
+                reliability_bits(SAMPLED_MAX),
                 calibration.threshold
             ));
         }

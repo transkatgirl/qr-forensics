@@ -9,11 +9,12 @@
 //! is, by its size and its layers, a sharpening interpolator: a few
 //! thousand weights that see seven or eight pixels of the crop at once
 //! and add what they make of them to the crop enlarged pixel for pixel.
-//! The same is done here with no network. The photo is sharpened by an
-//! unsharp mask, which puts back a share of what a blur of a pixel or
-//! two would take from it, and then enlarged with Magic Kernel Sharp
-//! 2013 ([`super::resize`]), which lays the grey of each edge where the
-//! edge runs between the pixels rather than on the pixels' own grid.
+//! The same is done here with no network. The photo is enlarged with
+//! Magic Kernel Sharp 2013 ([`super::resize`]), which lays the grey of
+//! each edge where the edge runs between the pixels rather than on the
+//! pixels' own grid, and then sharpened by an unsharp mask, which puts
+//! back a share of what a blur of a pixel or two of the photo's own
+//! would take from it.
 //!
 //! Over photographs made of symbols at one to one and a half pixels a
 //! module, half of them blurred by seven tenths of a pixel, a search
@@ -32,28 +33,37 @@
 //! a half. The light mask reads the smallest modules best and the
 //! strong one the most blurred, so a read tries both.
 //!
-//! The mask is laid on the photo before it is enlarged, at the photo's
-//! own size, where a pixel or two is three taps or seven: laid on the
-//! enlargement it would be that many times as wide and as dear, and
-//! the two come to the same picture, since a blur of the pixels and the
-//! same blur of what is drawn between them differ only in what the
-//! enlargement cannot hold. The mask reads the photo past the edges of
-//! the part that is enlarged, so that a symbol reads the same through
-//! whatever part was cut about it.
+//! The mask is laid on the photo after it is enlarged, as many times as
+//! wide as the enlargement, as the photo's own Enlarge and Sharpen lay
+//! it. Laid before, at the photo's own size, where a pixel or two is
+//! three taps or seven, it would be that many times as narrow and as
+//! cheap, and the two come to much the same picture, since a blur of the
+//! pixels and the same blur of what is drawn between them differ only in
+//! what the enlargement cannot hold: the reads above were counted with
+//! the mask laid so. The enlargement and the mask read the photo past the
+//! edges of the part, so that a symbol reads the same through whatever
+//! part was cut about it.
 //!
-//! A photo enlarged already ([`super::adjust::Enlarge`]) is sharpened
-//! and enlarged from the pixels it had ([`Luma::unenlarged`]), in one
-//! step, and comes out in the pixels it has now.
+//! A photo enlarged already ([`super::adjust::Enlarge`]) is enlarged and
+//! sharpened from the pixels it had ([`Luma::unenlarged`]), in one step,
+//! and comes out in the pixels it has now. A photo adjusted more than
+//! that, straightened, sharpened, toned, filtered or reduced, is made
+//! again for the copy from the photo as loaded ([`Luma::as_shot`]), by
+//! its own adjustments in their order with the copy's Enlarge and
+//! Sharpen in place of its own: the copy is the photo a read that
+//! decoded through it sets, pixel for pixel.
 //!
 //! The copies are a read's own, made about one symbol when the photo as
-//! it lies does not decode. The same mask and the same kernel are an
-//! adjustment of the whole photo besides, in colour
-//! ([`super::adjust::Adjust::sharpen`] and its `enlarge`), and what a
-//! read saw through a copy the photo so adjusted shows again.
+//! it lies does not decode. The same kernel and the same mask, laid in
+//! the same order, are an adjustment of the whole photo besides, in
+//! colour ([`super::adjust::Adjust::sharpen`] and its `enlarge`), and
+//! what a read saw through a copy the photo so adjusted shows again.
 
 use std::fmt;
 
-use super::Luma;
+use super::adjust::{Adjust, Filter, Loaded, cut, whole_after};
+use super::deblur::{self, Reduction, Spread, deblurred};
+use super::{AsShot, Luma};
 use super::projection::Project;
 use super::resize::Sample;
 use crate::work;
@@ -71,15 +81,23 @@ pub enum Sharpen {
     Light,
     /// For a symbol out of focus, blurred by half a module and more.
     Strong,
+    /// The blur the photo shows measured off its own edges, how far and
+    /// which way, and undone ([`super::deblur`]): for a photo out of
+    /// focus by more than a mask of a pixel or two reaches, or shaken.
+    /// No mask, and nothing to set: what is undone is what the copy
+    /// shows once it is enlarged, as the photo's Deblur filter undoes
+    /// what the photo shows once it is, so that a copy made so of the
+    /// same pixels is the same copy.
+    Deblur,
 }
 
 impl Sharpen {
     /// Where this lies between no sharpening, 0.0, and the most, 1.0:
     /// what the photo's Sharpen adjustment is set to for the same mask
-    /// ([`mask_for`]).
+    /// ([`mask_for`]). A deblurring lays no mask, and is nought.
     pub fn amount(self) -> f32 {
         match self {
-            Sharpen::Off => 0.0,
+            Sharpen::Off | Sharpen::Deblur => 0.0,
             Sharpen::Light => 0.5,
             Sharpen::Strong => 1.0,
         }
@@ -93,28 +111,36 @@ impl Sharpen {
     }
 }
 
+/// How far the photo's Sharpen adjustment goes ([`mask_for`]): from the
+/// widest blur below nought to the widest and strongest mask above it.
+pub const SHARPEN_RANGE: std::ops::RangeInclusive<f32> = -2.0..=2.0;
+
 /// The unsharp mask a sharpening of `amount` lays, from 0.0 for none to
-/// 1.0 for the most: the width of its blur, as the standard deviation
+/// 2.0 for the most: the width of its blur, as the standard deviation
 /// of a Gaussian in pixels, and how many times over what the blur takes
-/// is added back. Half way is the light mask, a pixel wide and one and
-/// a half times over, and 1.0 the strong one, two pixels wide and two
-/// and a half times over; between them, and below the light one down
-/// to a mask half a pixel wide that adds nothing back, the two run
-/// straight.
+/// is added back. At 0.5 is the light mask, a pixel wide and one and a
+/// half times over, and at 1.0 the strong one, two pixels wide and two
+/// and a half times over, the two a read tries; between them and on
+/// past the strong one, to a mask four pixels wide and four and a half
+/// times over at 2.0, and below the light one down to a mask half a
+/// pixel wide that adds nothing back, the two run straight.
 ///
 /// Below nought the mask blurs the photo instead, with the same
-/// Gaussian, as far as -1.0: what the blur takes is taken, so many
+/// Gaussian, as far as -2.0: what the blur takes is taken, so many
 /// times over as the second number is below nought, and at -1.0 and
 /// beyond the whole of it, which leaves the photo as the blur alone.
 /// The blur is as wide as the mask the same way up: half a pixel just
 /// below nought, where a part of it is taken, a pixel at -0.5, where
-/// the whole of it is, and two pixels at -1.0. `None` for neither.
+/// the whole of it is, two pixels at -1.0, and four at -2.0, for grain
+/// and halftone screens coarser than a blur two pixels wide runs
+/// together. `None` for neither. What lies past [`SHARPEN_RANGE`] is
+/// held to its ends.
 pub fn mask_for(amount: f32) -> Option<(f64, f32)> {
     if amount.is_nan() || amount == 0.0 {
         return None;
     }
     let blur = amount < 0.0;
-    let how_far = amount.abs().min(1.0);
+    let how_far = amount.clamp(*SHARPEN_RANGE.start(), *SHARPEN_RANGE.end()).abs();
     Some(if how_far <= 0.5 {
         let t = how_far / 0.5;
         (0.5 + 0.5 * f64::from(t), if blur { -t } else { 1.5 * t })
@@ -161,10 +187,23 @@ impl Enhance {
     /// lightly and then strongly. A large outline is sharpened at its
     /// size.
     pub fn rungs(region: [[f64; 2]; 4]) -> [Enhance; 2] {
+        let enlarge = Self::enlarge_for(region);
+        [Sharpen::Light, Sharpen::Strong].map(|sharpen| Enhance { enlarge, sharpen })
+    }
+
+    /// The photo about `region` enlarged as [`Self::rungs`] enlarges it,
+    /// and then deblurred, at the smaller size the blur leaves it where it
+    /// leaves it smaller ([`Enhanced::window`]).
+    pub fn deblurred(region: [[f64; 2]; 4]) -> Enhance {
+        Enhance { enlarge: Self::enlarge_for(region), sharpen: Sharpen::Deblur }
+    }
+
+    /// The whole factor that brings the outline's shorter side to
+    /// [`READ_SIDE`] pixels or so, held to [`Self::MAX_ENLARGE`].
+    fn enlarge_for(region: [[f64; 2]; 4]) -> u8 {
         let side = |a: usize, b: usize| (region[a][0] - region[b][0]).hypot(region[a][1] - region[b][1]);
         let shorter = side(0, 1).min(side(3, 2)).min(side(0, 3)).min(side(1, 2));
-        let enlarge = if shorter > 0.0 && shorter.is_finite() { (READ_SIDE / shorter).ceil().clamp(1.0, f64::from(Self::MAX_ENLARGE)) as u8 } else { 1 };
-        [Sharpen::Light, Sharpen::Strong].map(|sharpen| Enhance { enlarge, sharpen })
+        if shorter > 0.0 && shorter.is_finite() { (READ_SIDE / shorter).ceil().clamp(1.0, f64::from(Self::MAX_ENLARGE)) as u8 } else { 1 }
     }
 }
 
@@ -174,6 +213,7 @@ impl fmt::Display for Enhance {
             Sharpen::Off => None,
             Sharpen::Light => Some("sharpened lightly"),
             Sharpen::Strong => Some("sharpened strongly"),
+            Sharpen::Deblur => Some("deblurred"),
         };
         match (self.enlarge > 1, sharpened) {
             (true, Some(sharpened)) => write!(f, "enlarged {} times and {sharpened}", self.enlarge),
@@ -191,8 +231,12 @@ pub struct Enhanced {
     pub luma: Luma,
     /// The photo pixel at the copy's origin.
     pub origin: [f64; 2],
-    /// Pixels of the copy to a pixel of the photo.
-    pub factor: f64,
+    /// Pixels of the copy to a pixel of the photo, across and down: the
+    /// same both ways, but for a copy made again from the photo as loaded
+    /// ([`Luma::as_shot`]) where the photo is reduced, whose sides each
+    /// come to the nearest whole pixel ([`super::adjust::Enlarge::size`])
+    /// and so are reduced a little more or less than each other.
+    pub factor: [f64; 2],
 }
 
 /// How far beyond an outline the copy made for it reaches, as a share of
@@ -202,16 +246,91 @@ const MARGIN: f64 = 0.15;
 /// enlargement draws on beyond a pixel, so that what is read inside the
 /// outline does not depend on where the copy was cut.
 const MARGIN_PX: f64 = 5.0;
+/// How far past a pixel of the photo's own the enlargement draws on,
+/// with one more for where the taps of a mask widened with it fall
+/// between them: what of the photo past a part to be sharpened after it
+/// is enlarged is enlarged with it.
+const DRAWN_ON_PX: usize = 4;
+
+/// What of an image a copy made again from the photo as loaded is fitted
+/// to: the image's size, and the blur its Deblur filter undid
+/// ([`Luma::deblurred`]); of the image as it lay when it was made, before
+/// any turn since ([`AsShot::turned`]).
+#[derive(Clone, Copy)]
+struct Frame {
+    width: usize,
+    height: usize,
+    deblurred: Option<Spread>,
+}
+
+impl Frame {
+    /// The image turned a quarter clockwise.
+    fn turned_cw(self) -> Self {
+        Frame { width: self.height, height: self.width, deblurred: self.deblurred.map(|spread| spread.turned_cw()) }
+    }
+}
+
+/// The window `[x0, y0, x1, y1]` of an image `height` pixels down, far
+/// sides exclusive, where it lies in the image turned a quarter
+/// clockwise.
+fn turned_window([x0, y0, x1, y1]: [usize; 4], height: usize) -> [usize; 4] {
+    [height.saturating_sub(y1), x0, height.saturating_sub(y0), x1]
+}
+
+/// The greatest number that divides both `a` and `b`.
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a.max(1) } else { gcd(b, a % b) }
+}
 
 impl Enhanced {
     /// The window `[x0, y0, x1, y1]` of the photo, far sides exclusive,
-    /// as `enhance` makes it; `None` when the window is empty, or the
-    /// copy would be too large to hold. The copy may begin a little
+    /// as `enhance` makes it for a read; `None` when the window is empty,
+    /// or the copy would be too large to hold. The copy may begin a little
     /// before the window: at a whole pixel of a small photo's own.
-    pub fn window(image: &Luma, [x0, y0, x1, y1]: [usize; 4], enhance: Enhance) -> Option<Self> {
+    /// Deblurred, it is deconvolved as the photo's Deblur filter is,
+    /// reduced only past [`deblur::MOST_READ_PIXELS`], so that the filter
+    /// a read that decoded through it sets shows the photo as the read
+    /// saw it.
+    pub fn window(image: &Luma, window: [usize; 4], enhance: Enhance) -> Option<Self> {
+        Self::window_within(image, window, enhance, deblur::MOST_READ_PIXELS)
+    }
+
+    /// [`Self::window`] as the search looks through it: deblurred, it is
+    /// reduced past [`deblur::MOST_PIXELS`], as a photo is searched in a
+    /// reduced copy. What the search finds there is read through a copy
+    /// made for a read.
+    pub fn searched(image: &Luma, window: [usize; 4], enhance: Enhance) -> Option<Self> {
+        Self::window_within(image, window, enhance, deblur::MOST_PIXELS)
+    }
+
+    /// [`Self::window`], deblurred at no more than `most_pixels`.
+    fn window_within(image: &Luma, [x0, y0, x1, y1]: [usize; 4], enhance: Enhance, most_pixels: usize) -> Option<Self> {
         let (x1, y1) = (x1.min(image.width), y1.min(image.height));
         if x1 <= x0 || y1 <= y0 {
             return None;
+        }
+        let enlarge = usize::from(enhance.enlarge.clamp(1, Enhance::MAX_ENLARGE));
+        let deblur = enhance.sharpen == Sharpen::Deblur;
+        // A photo adjusted more than enlarged is made again from the
+        // photo as loaded, under its own adjustments with the copy's in
+        // place of theirs, as a read that decodes only so sets them:
+        // enlarged so many times further, sharpened by the copy's mask in
+        // place of the photo's, and deblurred in place of its filter.
+        if let Some(shot) = image.as_shot.as_deref() {
+            if enhance.is_none() {
+                return Some(Self { luma: Luma::new(x1 - x0, y1 - y0, cut(&image.data, image.width, 1, [x0, y0, x1, y1])), origin: [x0 as f64, y0 as f64], factor: [1.0; 2] });
+            }
+            let mask = enhance.sharpen.mask();
+            let to = shot.adjust.enlarge.by(enlarge as u8);
+            return Self::upright(image, shot, [x0, y0, x1, y1], |frame, window| {
+                let copy = Self::remade(frame, shot, window, to.factor(), deblur && enlarge == 1, |adjust| Adjust {
+                    enlarge: to,
+                    sharpen: if mask.is_some() { enhance.sharpen.amount() } else { adjust.sharpen },
+                    filter: if deblur { Filter::None } else { adjust.filter },
+                    ..adjust
+                })?;
+                if deblur { Self::deblurred(copy.luma.data, (copy.luma.width, copy.luma.height), copy.origin, copy.factor, most_pixels) } else { Some(copy) }
+            });
         }
         // The pixels the photo had, each `times` of those it has now.
         let (source, times) = match image.unenlarged.as_deref() {
@@ -223,18 +342,239 @@ impl Enhanced {
         let (sx0, sy0) = (x0 / times, y0 / times);
         let (sx1, sy1) = (x1.div_ceil(times).min(source.width), y1.div_ceil(times).min(source.height));
         let (w, h) = (sx1 - sx0, sy1 - sy0);
-        let enlarge = usize::from(enhance.enlarge.clamp(1, Enhance::MAX_ENLARGE));
         let (vw, vh) = (w * times * enlarge, h * times * enlarge);
+        let origin = [(sx0 * times) as f64, (sy0 * times) as f64];
+        let factor = times * enlarge;
         if vw.max(vh) > MAX_VIEW_SIDE {
+            // The photo too large to copy at its size may yet be
+            // deblurred, at the smaller size the blur leaves it.
+            return if deblur && factor == 1 { Self::deblurred(cut(&image.data, image.width, 1, [sx0, sy0, sx1, sy1]), (w, h), origin, [1.0; 2], most_pixels) } else { None };
+        }
+        let window = [sx0, sy0, sx1, sy1];
+        let luma = match enhance.sharpen.mask() {
+            // Enlarged and then sharpened, by a mask as many times as
+            // wide, as the photo's Enlarge and Sharpen make the whole
+            // photo: with as much of the photo about the window as the
+            // mask reaches into, and as the enlargement draws on past
+            // that, so that the window comes out as it does there.
+            Some((sigma, amount)) => {
+                let pad = (3.0 * sigma).ceil() as usize + DRAWN_ON_PX;
+                let around = [sx0.saturating_sub(pad), sy0.saturating_sub(pad), (sx1 + pad).min(source.width), (sy1 + pad).min(source.height)];
+                let (aw, ah) = (around[2] - around[0], around[3] - around[1]);
+                let part = Luma::new(aw, ah, cut(&source.data, source.width, 1, around));
+                let part = if factor > 1 { part.resized(aw * factor, ah * factor) } else { part };
+                let sharp = unsharp(&part.data, part.width, part.height, 1, sigma * factor as f64, amount);
+                let (ox, oy) = ((sx0 - around[0]) * factor, (sy0 - around[1]) * factor);
+                Luma::new(vw, vh, cut(&sharp, part.width, 1, [ox, oy, ox + vw, oy + vh]).into_iter().map(|v| v.clamp(0.0, 1.0)).collect())
+            }
+            None => {
+                let part = Luma::new(w, h, cut(&source.data, source.width, 1, window));
+                if (vw, vh) == (w, h) { part } else { part.resized(vw, vh) }
+            }
+        };
+        // Deblurred last, as the photo's Deblur filter deblurs the photo
+        // after it is enlarged.
+        if deblur {
+            return Self::deblurred(luma.data, (vw, vh), origin, [enlarge as f64; 2], most_pixels);
+        }
+        Some(Self { luma, origin, factor: [enlarge as f64; 2] })
+    }
+
+    /// `make` of the window `window` of an image adjusted more than
+    /// enlarged, made again from the photo as loaded (`shot`): as the
+    /// image lay when it was made, the window where it lay then, and
+    /// turned after as the image has been since ([`AsShot::turned`]).
+    fn upright(image: &Luma, shot: &AsShot, window: [usize; 4], make: impl FnOnce(Frame, [usize; 4]) -> Option<Self>) -> Option<Self> {
+        let turns = shot.turned % 4;
+        let mut frame = Frame { width: image.width, height: image.height, deblurred: image.deblurred };
+        let mut window = window;
+        // Turned on to a whole turn, the image lies as it was made.
+        for _ in 0..(4 - turns) % 4 {
+            window = turned_window(window, frame.height);
+            frame = frame.turned_cw();
+        }
+        let mut copy = make(frame, window)?;
+        for _ in 0..turns {
+            copy = copy.turned_cw(frame.height);
+            frame = frame.turned_cw();
+        }
+        Some(copy)
+    }
+
+    /// The copy turned a quarter clockwise with the image it is of,
+    /// `height` pixels down: its pixels turned, and placed where they lie
+    /// in the image turned.
+    fn turned_cw(self, height: usize) -> Self {
+        let below = self.origin[1] + self.luma.height as f64 / self.factor[1];
+        Self { luma: self.luma.rotated_cw(1), origin: [height as f64 - below, self.origin[0]], factor: [self.factor[1], self.factor[0]] }
+    }
+
+    /// The window `[x0, y0, x1, y1]` of an image, made again from the
+    /// photo as loaded ([`Luma::as_shot`]) under the image's adjustments
+    /// as `change` changes them, `to` of its pixels to one of the
+    /// photo's own, as a read that decoded through it sets Enlarge: by every
+    /// step of [`Adjust::apply_to`] in its turn, over the window and as
+    /// much of the part about it as the mask and the filter reach into
+    /// and the enlargement draws on past that, so that the window comes
+    /// out as the whole photo so adjusted shows it, pixel for pixel. The
+    /// copy is cut at whole steps of the photo's own pixels that come to
+    /// whole ones of the copy's ([`whole_after`]): a third of the photo's
+    /// size every three, an eighth every eight. It may begin a little
+    /// before the window, and where a step is more than a pixel, end a
+    /// little short of the part's far edges, as a copy shrunk so many
+    /// times leaves out what is left over there. `None` where the copy
+    /// would be too large to hold, but where `unbounded` asks for it at
+    /// any size. Of the image as it lay when it was made, before any turn
+    /// since ([`Self::upright`]).
+    ///
+    /// A Deblur filter with no kernel set undoes the blur the image's own
+    /// filter measured over the whole of it ([`Luma::deblurred`]), carried
+    /// to the photo's own pixels, and not one measured again over the
+    /// window alone, which may differ from it; where that measured none,
+    /// and left the image as it was, the copy is left so too. Deblurred,
+    /// the copy is reduced as the whole is, on its grid ([`Reduction`]),
+    /// and begins where a step of that grid does; and since every pixel
+    /// of a deconvolution draws a little on every other, the copy comes
+    /// out as the whole does to well within a grey level, where it reads
+    /// as far about the window as the deconvolution does ([`deblur::reach`]).
+    fn remade(image: Frame, shot: &AsShot, [x0, y0, x1, y1]: [usize; 4], to: f64, unbounded: bool, change: impl FnOnce(Adjust) -> Adjust) -> Option<Self> {
+        // The image's pixels to one of the photo's own, across and down:
+        // what its enlargement makes of them, but where it reduces the
+        // photo, whose sides each come to the nearest whole pixel
+        // ([`super::adjust::Enlarge::size`]), each a little more or less
+        // than it says. The copy is made on the photo's own grid and
+        // placed in the image by the image's: placed by the enlargement,
+        // a copy of a photo 1,203 pixels across at half its size lay half
+        // a pixel off near the far side.
+        let [px, py, pw, ph] = shot.part;
+        let at = [image.width as f64 / pw.max(1) as f64, image.height as f64 / ph.max(1) as f64];
+        let adjust = change(shot.adjust);
+        let adjust = match (adjust.filter, adjust.kernel, image.deblurred) {
+            (Filter::Deblur, None, Some(spread)) => Adjust { kernel: Some(spread.stretched(at.map(|at| 1.0 / at))), ..adjust },
+            (Filter::Deblur, None, None) => Adjust { filter: Filter::None, ..adjust },
+            _ => adjust,
+        };
+        let offset = |own: usize| (own as f64 * to).round() as usize;
+        let size = |own: usize| offset(own).max(1);
+        // The fewest of the photo's own pixels that come to whole ones of
+        // the copy's: the copy's sides are cut at whole numbers of them,
+        // its far sides within the part.
+        let step = whole_after(to);
+        let down = |v: usize, by: usize| v / by * by;
+        let up = |v: usize, limit: usize| v.div_ceil(step).saturating_mul(step).min(limit / step * step);
+        // The whole the copy is a part of, at the copy's size; the
+        // reduction its Deblur filter undoes the blur at there, and how
+        // far about the window, in the photo's own pixels, the
+        // deconvolution reads.
+        let whole = size(pw) * size(ph);
+        let deblurring = match (adjust.filter, adjust.kernel) {
+            (Filter::Deblur, Some(kernel)) => {
+                let strength = f64::from(adjust.strength);
+                let at_copy = kernel.scaled(to);
+                let reduction = Reduction::for_blur(at_copy.scaled(strength.max(0.0)).extremes().0, whole, deblur::MOST_READ_PIXELS, 1.0);
+                Some((reduction, deblur::reach(&at_copy, strength, reduction) / to))
+            }
+            _ => None,
+        };
+        // Where the copy may begin: at a whole step, and, deblurred, where
+        // a whole step of the reduction's grid begins among the copy's
+        // pixels, so that it is reduced among the pixels the whole is.
+        let lead = deblurring.map_or(step, |(reduction, _)| step * (reduction.q / gcd(offset(step), reduction.q)));
+        let (ox0, oy0) = (down((x0 as f64 / at[0]).floor() as usize, step), down((y0 as f64 / at[1]).floor() as usize, step));
+        let (ox1, oy1) = (up((x1 as f64 / at[0]).ceil() as usize, pw), up((y1 as f64 / at[1]).ceil() as usize, ph));
+        if ox1 <= ox0 || oy1 <= oy0 || image.width == 0 {
             return None;
         }
-        let part = match enhance.sharpen.mask() {
-            Some((sigma, amount)) => unsharp_window(source, [sx0, sy0, sx1, sy1], sigma, amount),
-            None => (sy0..sy1).flat_map(|y| source.data[y * source.width + sx0..y * source.width + sx1].iter().copied()).collect(),
+        let (vw, vh) = (size(ox1 - ox0), size(oy1 - oy0));
+        if !unbounded && vw.max(vh) > MAX_VIEW_SIDE {
+            return None;
+        }
+        // In the photo's own pixels: the mask is as wide in them as
+        // Sharpen says, or in those a reduction leaves, as the kernel
+        // draws on beyond a pixel, and the filter's neighbourhood is in
+        // the copy's, or as far as its deconvolution reads. A closing
+        // takes the lightest of the darkest about each pixel, and so
+        // draws on twice its neighbourhood: padded by it once, a copy
+        // shrunk under Close dots at three pixels read up to a grey level
+        // off along its edges.
+        let reduced = (1.0 / to).max(1.0);
+        let mask = mask_for(adjust.sharpen).map_or(0.0, |(sigma, _)| 3.0 * sigma * reduced);
+        let radius = f64::from(adjust.radius.clamp(1, Filter::MAX_RADIUS)) / to;
+        let filter = match adjust.filter {
+            Filter::None => 0.0,
+            Filter::Deblur => deblurring.map_or(0.0, |(_, reach)| reach),
+            Filter::Median => radius,
+            Filter::Close => 2.0 * radius,
         };
-        let part = Luma::new(w, h, part);
-        let luma = if (vw, vh) == (w, h) { Luma::new(w, h, part.data.iter().map(|v| v.clamp(0.0, 1.0)).collect()) } else { part.resized(vw, vh) };
-        Some(Self { luma, origin: [(sx0 * times) as f64, (sy0 * times) as f64], factor: enlarge as f64 })
+        let pad = (mask + filter + DRAWN_ON_PX as f64 * reduced).ceil() as usize;
+        let around = [down(ox0.saturating_sub(pad), lead), down(oy0.saturating_sub(pad), lead), up(ox1 + pad, pw), up(oy1 + pad, ph)];
+        let out = (size(around[2] - around[0]), size(around[3] - around[1]));
+        let from = Loaded { rgba: &shot.rgba, width: shot.width, height: shot.height, at: shot.at, photo: shot.photo, shared: Some(&shot.rgba) };
+        let made = adjust.made(from, [px + around[0], py + around[1], around[2] - around[0], around[3] - around[1]], out, whole, false).1;
+        let (cx, cy) = (offset(ox0 - around[0]).min(out.0 - 1), offset(oy0 - around[1]).min(out.1 - 1));
+        let (vw, vh) = (vw.min(out.0 - cx), vh.min(out.1 - cy));
+        let luma = Luma::new(vw, vh, cut(&made.data, made.width, 1, [cx, cy, cx + vw, cy + vh]));
+        Some(Self { luma, origin: [ox0 as f64 * at[0], oy0 as f64 * at[1]], factor: [to / at[0], to / at[1]] })
+    }
+
+    /// The window `[x0, y0, x1, y1]` of an image as its own adjustments
+    /// make it but for its filter, at any size: what the blur its Deblur
+    /// filter undoes is measured off ([`super::deblur::spread_of`]),
+    /// which the filter itself would take away. `None` for a window off
+    /// the image.
+    pub fn unfiltered(image: &Luma, [x0, y0, x1, y1]: [usize; 4]) -> Option<Self> {
+        let (x1, y1) = (x1.min(image.width), y1.min(image.height));
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        match image.as_shot.as_deref() {
+            Some(shot) if shot.adjust.filter != Filter::None => Self::upright(image, shot, [x0, y0, x1, y1], |frame, window| {
+                Self::remade(frame, shot, window, shot.adjust.enlarge.factor(), true, |adjust| Adjust { filter: Filter::None, ..adjust })
+            }),
+            _ => Some(Self { luma: Luma::new(x1 - x0, y1 - y0, cut(&image.data, image.width, 1, [x0, y0, x1, y1])), origin: [x0 as f64, y0 as f64], factor: [1.0; 2] }),
+        }
+    }
+
+    /// The window `[x0, y0, x1, y1]` of an image adjusted more than
+    /// enlarged, shrunk `factor` times as its own adjustments would make
+    /// it at that size, resized first and filtered last; `None` for an
+    /// image adjusted no more than that, which is shrunk as it is. At any
+    /// size, as an image is shrunk as it is: the copy is smaller than the
+    /// image, and a search shrinks a large photo to look at it at all.
+    pub fn shrunk(image: &Luma, window: [usize; 4], factor: u8) -> Option<Self> {
+        let shot = image.as_shot.as_deref()?;
+        let to = shot.adjust.enlarge.factor() / f64::from(factor.max(1));
+        Self::upright(image, shot, window, |frame, window| Self::remade(frame, shot, window, to, true, |adjust| adjust))
+    }
+
+    /// The window `[x0, y0, x1, y1]` of an image adjusted more than
+    /// enlarged, closed over gaps of `radius` pixels as its own
+    /// adjustments make it with Close dots for its filter, in place of
+    /// its own; `None` for an image adjusted no more than that, which is
+    /// closed as it is. At any size, as an image is closed as it is: the
+    /// copy is no larger than the window of the image it stands for.
+    pub fn closed(image: &Luma, window: [usize; 4], radius: u8) -> Option<Self> {
+        let shot = image.as_shot.as_deref()?;
+        Self::upright(image, shot, window, |frame, window| {
+            Self::remade(frame, shot, window, shot.adjust.enlarge.factor(), true, |adjust| Adjust { filter: Filter::Close, radius, ..adjust })
+        })
+    }
+
+    /// A copy `width` by `height`, beginning at `origin` in the photo and
+    /// `factor` of its pixels to one of the photo's across and down, deblurred
+    /// ([`deblurred`]), at no more than `most_pixels`: as the photo's
+    /// Deblur filter deblurs the photo, but at the size the blur was
+    /// undone at, where that is smaller, since a blur many pixels wide
+    /// leaves nothing that the pixels it was undone in do not hold. `None`
+    /// where the copy shows no blur worth undoing, or no edges to say.
+    /// The copy says what blur it undid, in its own pixels
+    /// ([`Luma::deblurred`]), for the photo's Deblur filter to undo the
+    /// same.
+    fn deblurred(data: Vec<f32>, (width, height): (usize, usize), origin: [f64; 2], factor: [f64; 2], most_pixels: usize) -> Option<Self> {
+        let (sharp, w, h, scale, spread) = deblurred(&data, width, height, most_pixels)?;
+        let mut luma = Luma::new(w, h, sharp);
+        luma.deblurred = Some(spread);
+        Some(Self { luma, origin, factor: factor.map(|factor| factor * scale) })
     }
 
     /// The photo about `outline`, with a margin, as `enhance` makes it.
@@ -244,7 +584,8 @@ impl Enhanced {
 
     /// The window of the photo a copy about `outline` is made of: the
     /// upright box about the outline with a margin, within the photo.
-    /// `None` for an outline that is no outline.
+    /// `None` for an outline that is no outline, or whose box holds none
+    /// of the photo.
     pub fn window_about(image: &Luma, outline: [[f64; 2]; 4]) -> Option<[usize; 4]> {
         let (x0, x1) = outline.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, p| (a.0.min(p[0]), a.1.max(p[0])));
         let (y0, y1) = outline.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, p| (a.0.min(p[1]), a.1.max(p[1])));
@@ -253,12 +594,13 @@ impl Enhanced {
         }
         let times = image.unenlarged.as_ref().map_or(1, |own| image.width / own.width.max(1)).max(1) as f64;
         let (mx, my) = (MARGIN * (x1 - x0) + MARGIN_PX * times, MARGIN * (y1 - y0) + MARGIN_PX * times);
-        Some([
-            (x0 - mx).floor().max(0.0) as usize,
-            (y0 - my).floor().max(0.0) as usize,
+        let window = [
+            (x0 - mx).floor().clamp(0.0, image.width as f64) as usize,
+            (y0 - my).floor().clamp(0.0, image.height as f64) as usize,
             (x1 + mx).ceil().clamp(0.0, image.width as f64) as usize,
             (y1 + my).ceil().clamp(0.0, image.height as f64) as usize,
-        ])
+        ];
+        (window[0] < window[2] && window[1] < window[3]).then_some(window)
     }
 
     /// The box of the photo the copy covers: its near corner and its
@@ -267,14 +609,20 @@ impl Enhanced {
         [self.origin, self.to_photo([self.luma.width as f64, self.luma.height as f64])]
     }
 
+    /// Pixels of the copy to a pixel of the photo as a length, whichever
+    /// way it runs, as a reading's reach does: the mean of the two ways.
+    pub fn mean_factor(&self) -> f64 {
+        (self.factor[0] + self.factor[1]) / 2.0
+    }
+
     /// Where a point of the photo lies in the copy.
     pub fn to_view(&self, p: [f64; 2]) -> [f64; 2] {
-        [(p[0] - self.origin[0]) * self.factor, (p[1] - self.origin[1]) * self.factor]
+        [(p[0] - self.origin[0]) * self.factor[0], (p[1] - self.origin[1]) * self.factor[1]]
     }
 
     /// Where a point of the copy lies in the photo.
     pub fn to_photo(&self, p: [f64; 2]) -> [f64; 2] {
-        [self.origin[0] + p[0] / self.factor, self.origin[1] + p[1] / self.factor]
+        [self.origin[0] + p[0] / self.factor[0], self.origin[1] + p[1] / self.factor[1]]
     }
 
     /// A map from modules to the photo, as a map from modules to the
@@ -288,51 +636,19 @@ impl Enhanced {
 pub struct Through<'a, P: Project> {
     map: &'a P,
     origin: [f64; 2],
-    factor: f64,
+    factor: [f64; 2],
 }
 
 impl<P: Project> Project for Through<'_, P> {
     fn base(&self, x: f64, y: f64) -> [f64; 2] {
         let [px, py] = self.map.base(x, y);
-        [(px - self.origin[0]) * self.factor, (py - self.origin[1]) * self.factor]
+        [(px - self.origin[0]) * self.factor[0], (py - self.origin[1]) * self.factor[1]]
     }
 
     fn displacement(&self, x: f64, y: f64) -> [f64; 2] {
         let [dx, dy] = self.map.displacement(x, y);
-        [dx * self.factor, dy * self.factor]
+        [dx * self.factor[0], dy * self.factor[1]]
     }
-}
-
-/// The window `[x0, y0, x1, y1]` of `source` under an unsharp mask: each
-/// pixel moved away from a Gaussian blur of the image, `sigma` pixels
-/// wide, by `amount` times its difference from it. The blur reads the
-/// image past the window, and past the image the pixel on its edge. The
-/// values are not held to black and white: the enlargement that follows
-/// is the better for the overshoot, and holds its own result to them.
-fn unsharp_window(source: &Luma, [x0, y0, x1, y1]: [usize; 4], sigma: f64, amount: f32) -> Vec<f32> {
-    let weights = gaussian(sigma);
-    let reach = (weights.len() / 2) as i64;
-    let (w, h) = (x1 - x0, y1 - y0);
-    let (last_x, last_y) = (source.width as i64 - 1, source.height as i64 - 1);
-    // Every row the window's blur draws on, blurred across.
-    let (top, bottom) = ((y0 as i64 - reach).max(0), (y1 as i64 - 1 + reach).min(last_y));
-    let mut across = Vec::with_capacity((bottom - top + 1) as usize * w);
-    for y in top..=bottom {
-        let line = &source.data[y as usize * source.width..(y as usize + 1) * source.width];
-        for x in x0 as i64..x1 as i64 {
-            across.push((-reach..=reach).zip(&weights).map(|(k, weight)| weight * line[(x + k).clamp(0, last_x) as usize]).sum::<f32>());
-        }
-    }
-    // And those blurred down, against the pixels themselves.
-    let mut out = Vec::with_capacity(w * h);
-    for y in y0 as i64..y1 as i64 {
-        for x in 0..w {
-            let blurred: f32 = (-reach..=reach).zip(&weights).map(|(k, weight)| weight * across[((y + k).clamp(0, last_y) - top) as usize * w + x]).sum();
-            let value = source.data[y as usize * source.width + x0 + x];
-            out.push(value + amount * (value - blurred));
-        }
-    }
-    out
 }
 
 /// The weights of a Gaussian blur `sigma` pixels wide, out to three
@@ -361,7 +677,7 @@ const BAND: usize = 64;
 /// on: what is held besides the result is a few rows a core, where the
 /// whole of a large photo as values to sharpen, and again blurred, would
 /// be several times the photo.
-fn unsharp_rows<T: Send>(
+fn unsharp_rows<T: Send + Copy>(
     (width, height, channels): (usize, usize, usize),
     (sigma, amount): (f64, f32),
     row: impl Fn(usize, &mut [f32]) + Sync,
@@ -426,16 +742,13 @@ fn unsharp_rows<T: Send>(
         }
         out
     })
-    .into_iter()
-    .flatten()
-    .collect()
+    .concat()
 }
 
 /// A whole image under an unsharp mask `sigma` pixels wide and `amount`
 /// strong: `width` by `height` pixels of `channels` interleaved values
 /// each, every channel sharpened apart from the others. The values are
-/// not held to black and white: the enlargement that follows is the
-/// better for the overshoot, and holds its own result to them.
+/// not held to black and white, which is left to what is made of them.
 pub fn unsharp(data: &[f32], width: usize, height: usize, channels: usize, sigma: f64, amount: f32) -> Vec<f32> {
     assert_eq!(data.len(), width * height * channels);
     let stride = width * channels;
@@ -448,23 +761,8 @@ pub fn unsharp(data: &[f32], width: usize, height: usize, channels: usize, sigma
 }
 
 /// Opaque pixels, four bytes to each, under an unsharp mask, in their
-/// colours, as the values the bytes come to: four to a pixel, from 0.0
-/// to 255.0 and past either where the mask overshoots, the fourth the
-/// opacity as it was. What a photo is enlarged from, sharpened.
-pub fn unsharp_values(rgba: &[u8], width: usize, height: usize, sigma: f64, amount: f32) -> Vec<f32> {
-    assert_eq!(rgba.len(), width * height * 4);
-    unsharp_rows(
-        (width, height, 3),
-        (sigma, amount),
-        |y, line| colours_of_row(rgba, width, y, line),
-        |sharp, out| out.extend(sharp.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [r, g, b, 255.0])),
-    )
-}
-
-/// Opaque pixels, four bytes to each, under an unsharp mask, in their
-/// colours: [`unsharp_values`] held to what a byte holds, and made
-/// without the whole photo ever being held as anything wider than its
-/// bytes.
+/// colours, held to what a byte holds, and made without the whole
+/// photo ever being held as anything wider than its bytes.
 pub fn unsharp_rgba(rgba: &[u8], width: usize, height: usize, sigma: f64, amount: f32) -> Vec<u8> {
     assert_eq!(rgba.len(), width * height * 4);
     unsharp_rows(
@@ -495,6 +793,38 @@ mod tests {
         Luma::new(width, height, (0..width * height).map(|i| value(i % width, i / width)).collect())
     }
 
+    /// The window `[x0, y0, x1, y1]` of `source` under an unsharp mask,
+    /// pixel by pixel: each moved away from a Gaussian blur of the image,
+    /// `sigma` pixels wide, by `amount` times its difference from it, the
+    /// blur reading the image past the window, and past the image the
+    /// pixel on its edge. The plain way of what [`unsharp`] does a band
+    /// at a time, which it is held to.
+    fn unsharp_window(source: &Luma, [x0, y0, x1, y1]: [usize; 4], sigma: f64, amount: f32) -> Vec<f32> {
+        let weights = gaussian(sigma);
+        let reach = (weights.len() / 2) as i64;
+        let (w, h) = (x1 - x0, y1 - y0);
+        let (last_x, last_y) = (source.width as i64 - 1, source.height as i64 - 1);
+        // Every row the window's blur draws on, blurred across.
+        let (top, bottom) = ((y0 as i64 - reach).max(0), (y1 as i64 - 1 + reach).min(last_y));
+        let mut across = Vec::with_capacity((bottom - top + 1) as usize * w);
+        for y in top..=bottom {
+            let line = &source.data[y as usize * source.width..(y as usize + 1) * source.width];
+            for x in x0 as i64..x1 as i64 {
+                across.push((-reach..=reach).zip(&weights).map(|(k, weight)| weight * line[(x + k).clamp(0, last_x) as usize]).sum::<f32>());
+            }
+        }
+        // And those blurred down, against the pixels themselves.
+        let mut out = Vec::with_capacity(w * h);
+        for y in y0 as i64..y1 as i64 {
+            for x in 0..w {
+                let blurred: f32 = (-reach..=reach).zip(&weights).map(|(k, weight)| weight * across[((y + k).clamp(0, last_y) - top) as usize * w + x]).sum();
+                let value = source.data[y as usize * source.width + x0 + x];
+                out.push(value + amount * (value - blurred));
+            }
+        }
+        out
+    }
+
     /// A soft edge down the middle of a photo: ink left, paper right,
     /// two grey pixels between.
     fn soft_edge(width: usize, height: usize) -> Luma {
@@ -513,7 +843,7 @@ mod tests {
         assert!(!Enhance { enlarge: 1, sharpen: Sharpen::Light }.is_none());
         let photo = image(30, 20, |x, y| ((x * 7 + y * 13) % 11) as f32 / 10.0);
         let view = Enhanced::window(&photo, [4, 3, 19, 15], Enhance::NONE).unwrap();
-        assert_eq!((view.luma.width, view.luma.height, view.origin, view.factor), (15, 12, [4.0, 3.0], 1.0));
+        assert_eq!((view.luma.width, view.luma.height, view.origin, view.factor), (15, 12, [4.0, 3.0], [1.0; 2]));
         assert_eq!(view.luma.data[0], photo.data[3 * 30 + 4]);
         assert_eq!(view.luma.data[11 * 15 + 14], photo.data[14 * 30 + 18]);
         assert!(Enhanced::window(&photo, [4, 3, 4, 15], Enhance::NONE).is_none());
@@ -544,32 +874,38 @@ mod tests {
         assert_eq!((Sharpen::Off.amount(), Sharpen::Light.amount(), Sharpen::Strong.amount()), (0.0, 0.5, 1.0));
         assert_eq!(mask_for(0.5), Some((1.0, 1.5)));
         assert_eq!(mask_for(1.0), Some((2.0, 2.5)));
-        assert_eq!(mask_for(7.0), mask_for(1.0));
+        assert_eq!(mask_for(2.0), Some((4.0, 4.5)));
+        assert_eq!(*SHARPEN_RANGE.end(), 2.0);
+        assert_eq!(mask_for(7.0), mask_for(2.0));
+        assert_eq!(mask_for(f32::INFINITY), mask_for(2.0));
         assert_eq!((Sharpen::Off.mask(), Sharpen::Light.mask(), Sharpen::Strong.mask()), (None, mask_for(0.5), mask_for(1.0)));
-        // Between them each is wider and stronger than the last, and
-        // the least of them adds next to nothing back.
-        let masks: Vec<(f64, f32)> = (1..=20).map(|step| mask_for(step as f32 / 20.0).unwrap()).collect();
+        // Between them, and on past the strong one, each is wider and
+        // stronger than the last, and the least of them adds next to
+        // nothing back.
+        let masks: Vec<(f64, f32)> = (1..=40).map(|step| mask_for(step as f32 / 20.0).unwrap()).collect();
         assert!(masks.windows(2).all(|pair| pair[0].0 < pair[1].0 && pair[0].1 < pair[1].1), "{masks:?}");
         assert!(masks[0].0 > 0.5 && masks[0].1 < 0.2, "{:?}", masks[0]);
     }
 
     #[test]
     fn below_nought_the_mask_blurs_as_wide_as_it_sharpens_above() {
-        // The whole blur, a pixel wide half way down and two at the end,
-        // as the masks are wide the same way up.
+        // The whole blur, a pixel wide at -0.5, two at -1.0 and four at
+        // the end, as the masks are wide the same way up.
         assert_eq!(mask_for(-0.5), Some((1.0, -1.0)));
         assert_eq!(mask_for(-1.0), Some((2.0, -1.0)));
-        assert_eq!(mask_for(-7.0), mask_for(-1.0));
-        assert_eq!(mask_for(f32::NEG_INFINITY), mask_for(-1.0));
-        for step in 1..=20 {
+        assert_eq!(mask_for(-2.0), Some((4.0, -1.0)));
+        assert_eq!(*SHARPEN_RANGE.start(), -2.0);
+        assert_eq!(mask_for(-7.0), mask_for(-2.0));
+        assert_eq!(mask_for(f32::NEG_INFINITY), mask_for(-2.0));
+        for step in 1..=40 {
             let amount = step as f32 / 20.0;
             assert_eq!(mask_for(-amount).unwrap().0, mask_for(amount).unwrap().0, "{amount}");
         }
-        // Over the first half a greater part of the blur is taken each
-        // step, and next to none at first, so that the photo changes
-        // smoothly through nought; over the second the whole of it,
-        // wider each step.
-        let blurs: Vec<(f64, f32)> = (1..=20).map(|step| mask_for(-(step as f32) / 20.0).unwrap()).collect();
+        // Over the first quarter a greater part of the blur is taken
+        // each step, and next to none at first, so that the photo
+        // changes smoothly through nought; over the rest the whole of
+        // it, wider each step.
+        let blurs: Vec<(f64, f32)> = (1..=40).map(|step| mask_for(-(step as f32) / 20.0).unwrap()).collect();
         assert!(blurs.windows(2).all(|pair| pair[0].0 < pair[1].0 && pair[0].1 >= pair[1].1), "{blurs:?}");
         assert!(blurs[0].1 > -0.2 && blurs[0].1 < 0.0, "{:?}", blurs[0]);
         assert!(blurs[9..].iter().all(|&(_, taken)| taken == -1.0), "{blurs:?}");
@@ -619,18 +955,17 @@ mod tests {
         assert!((sharp[5 * 40 + 3] - 0.1).abs() < 1e-5 && (sharp[5 * 40 + 36] - 0.9).abs() < 1e-5);
         assert!(sharp.iter().any(|&v| v < 0.0) && sharp.iter().any(|&v| v > 1.0), "not held to black and white");
         assert!(unsharp(&[], 0, 0, 3, 1.0, 1.5).is_empty());
-        // Opaque pixels are sharpened in their colours, the same whether
-        // they come back as values or as bytes, on an image of more
+        // Opaque pixels are sharpened in their colours, as each channel
+        // is alone, and held to what a byte holds, on an image of more
         // rows than are worked at once as on one of fewer.
         for (width, height) in [(37, 150), (9, 4)] {
             let rgba: Vec<u8> = (0..width * height).flat_map(|i| [(i * 37 % 256) as u8, (i * 11 % 256) as u8, ((i / width) * 29 % 256) as u8, 255]).collect();
             let colours: Vec<f32> = rgba.as_chunks::<4>().0.iter().flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]).map(f32::from).collect();
             let alone = unsharp(&colours, width, height, 3, 2.0, 2.5);
-            let sharp = unsharp_values(&rgba, width, height, 2.0, 2.5);
-            assert_eq!(sharp, alone.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [r, g, b, 255.0]).collect::<Vec<f32>>());
-            assert!(sharp.iter().any(|&v| v < 0.0) && sharp.iter().any(|&v| v > 255.0), "not held to what a byte holds");
+            assert!(alone.iter().any(|&v| v < 0.0) && alone.iter().any(|&v| v > 255.0), "past what a byte holds");
             let bytes = unsharp_rgba(&rgba, width, height, 2.0, 2.5);
-            assert_eq!(bytes, sharp.iter().map(|&v| v.round().clamp(0.0, 255.0) as u8).collect::<Vec<u8>>());
+            let held = alone.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [r, g, b, 255.0]).map(|v: f32| v.round().clamp(0.0, 255.0) as u8);
+            assert_eq!(bytes, held.collect::<Vec<u8>>());
             assert!(bytes.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255) && bytes != rgba);
         }
     }
@@ -664,7 +999,7 @@ mod tests {
         let enhance = Enhance { enlarge: 2, sharpen: Sharpen::Light };
         let view = Enhanced::window(&loaded, [9, 6, 70, 42], enhance).unwrap();
         // Begun at a whole pixel of its own, and twice the loaded size.
-        assert_eq!((view.origin, view.factor), ([8.0, 4.0], 2.0));
+        assert_eq!((view.origin, view.factor), ([8.0, 4.0], [2.0; 2]));
         assert_eq!((view.luma.width, view.luma.height), ((18 - 2) * 8, (11 - 1) * 8));
         // A point of the loaded photo lies where it should in the copy.
         assert_eq!(view.to_view([40.0, 24.0]), [64.0, 40.0]);
@@ -673,7 +1008,7 @@ mod tests {
         // pixels, which were enlarged unsharpened.
         let same = Enhanced::window(&loaded, [8, 4, 72, 44], Enhance { enlarge: 1, sharpen: Sharpen::Light }).unwrap();
         let direct = Enhanced::window(&own, [2, 1, 18, 11], Enhance { enlarge: 4, sharpen: Sharpen::Light }).unwrap();
-        assert_eq!((same.luma.width, same.luma.height, same.origin, same.factor), (64, 40, [8.0, 4.0], 1.0));
+        assert_eq!((same.luma.width, same.luma.height, same.origin, same.factor), (64, 40, [8.0, 4.0], [1.0; 2]));
         assert_eq!(same.luma, direct.luma);
         assert!(same.luma.data.iter().zip(&loaded.data[4 * 80 + 8..]).any(|(a, b)| (a - b).abs() > 0.02));
     }
@@ -694,6 +1029,11 @@ mod tests {
         assert_eq!(view.covers(), [[46.0, 26.0], [134.0, 114.0]]);
         assert_eq!(Enhanced::window_about(&photo, outline), Some([46, 26, 134, 114]));
         assert!(Enhanced::around(&photo, [[f64::NAN, 0.0]; 4], Enhance::NONE).is_none());
+        // An outline whose box lies wholly off the photo, past either far
+        // side, has no window.
+        for off in [[[400.0, 50.0], [500.0, 50.0], [500.0, 100.0], [400.0, 100.0]], [[50.0, 300.0], [100.0, 300.0], [100.0, 350.0], [50.0, 350.0]]] {
+            assert_eq!(Enhanced::window_about(&photo, off), None, "{off:?}");
+        }
     }
 
     #[test]

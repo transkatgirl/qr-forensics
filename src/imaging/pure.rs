@@ -357,6 +357,33 @@ mod tests {
     }
 
     #[test]
+    fn a_render_enlarged_under_a_filter_is_read_off_its_own_pixels_unfiltered() {
+        use crate::imaging::adjust::{Adjust, Enlarge, Filter};
+        // A version 2 symbol at two pixels a module, small enough to be
+        // enlarged as it is loaded. A median or a closing a pixel either
+        // way is a quarter of a module of the photo enlarged, and three
+        // modules of its own pixels, where it would take out the finder
+        // patterns' rings.
+        let version = SymbolVersion::Qr(2);
+        let own = render(version, 2, 2, 0, false);
+        let rgba: Vec<u8> = own.data.iter().flat_map(|&v| [(v * 255.0).round() as u8; 3].into_iter().chain([255])).collect();
+        let enlarge = Enlarge::for_photo(own.width as u32, own.height as u32);
+        assert!(enlarge > Enlarge::NONE);
+        for filter in [Filter::None, Filter::Median, Filter::Close] {
+            let luma = Adjust { enlarge, filter, radius: 1, ..Default::default() }.apply(&rgba, own.width, own.height).1;
+            let (width, height) = (luma.width as f64, luma.height as f64);
+            let found = find(&luma, Family::Qr, [[0.0, 0.0], [width, 0.0], [width, height], [0.0, height]]);
+            assert_eq!(found.map(|found| found.version), Some(version), "{filter:?}");
+            // Its own pixels filtered, as they once were kept, do not read.
+            if filter != Filter::None {
+                let filtered = Adjust { filter, radius: 1, ..Default::default() }.apply(&rgba, own.width, own.height).1;
+                let (width, height) = (own.width as f64, own.height as f64);
+                assert!(find(&filtered, Family::Qr, [[0.0, 0.0], [width, 0.0], [width, height], [0.0, height]]).is_none(), "{filter:?}");
+            }
+        }
+    }
+
+    #[test]
     fn a_finder_with_no_sub_pattern_opposite_is_no_rmqr_symbol() {
         // R7x43 at a pixel a module, its bottom-right corner module, the
         // first of the sub-pattern's diagonal, painted light: the runs

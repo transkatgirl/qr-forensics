@@ -28,10 +28,9 @@
 //! block was read ([`super::rs::soft_count_bits`]).
 
 use super::codewords::codeword_bit_mask;
-use super::list::misread;
 use super::pipeline::{BlockReport, CodewordReport};
 use super::rs::CwRead;
-use crate::symbol::grid::CERTAIN;
+use crate::symbol::grid::{CERTAIN, misread_chance};
 use crate::symbol::layout::SymbolLayout;
 
 /// The share of the modules beside a misread one taken as misread
@@ -123,7 +122,7 @@ impl Clustering {
             let tally = &mut tallies[usize::from(beside[at] >= 2)];
             tally.modules += 1;
             tally.misread += usize::from(misread_here);
-            tally.expected += misread(reliability);
+            tally.expected += misread_chance(reliability);
         }
         let one = gross_of(tallies[0]);
         let gross = [one, gross_of(tallies[1]).max(one)];
@@ -163,7 +162,7 @@ fn gross_of(tally: Tally) -> f64 {
 /// The reliability, on the sampler's scale, of a module read at
 /// `reliability` that is also misread outright one time in `1 / gross`.
 fn doubted(reliability: u8, gross: f64) -> u8 {
-    let wrong = gross + (1.0 - gross) * misread(reliability);
+    let wrong = gross + (1.0 - gross) * misread_chance(reliability);
     ((-wrong.log2() - 1.0) * 8.0).round().clamp(0.0, f64::from(CERTAIN - 1)) as u8
 }
 

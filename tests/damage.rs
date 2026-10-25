@@ -1320,9 +1320,10 @@ fn errors_located_in_one_block_make_the_modules_beside_them_doubtful_in_another(
     // Without the trials of erasures or the algebra, which reach one
     // past the code on their own, nor the message's evidence, which
     // doubts the misread modules that are high bits of the lowercase
-    // text and lets the chase reach the block alone: what the located
-    // errors add is the point here.
-    let opts = DecodeOptions { erase_by_trial: false, list_decode: false, ..unguided() };
+    // text and lets the chase reach the block alone, nor belief
+    // propagation, which lets the checks move the solid misreads as
+    // well: what the located errors add is the point here.
+    let opts = DecodeOptions { erase_by_trial: false, list_decode: false, belief_propagation: false, ..unguided() };
     let mut alone = clean.clone();
     paint(&mut alone, false);
     let report = decode(&alone, &layout, mask, &Pins::new(), &opts);
@@ -1643,10 +1644,11 @@ fn how_far_misreads_spread_is_learnt_from_the_blocks_that_verify() {
     let (layout, clean, _) = sample(version, ec, mask, &mut Rng(0x57A1));
     let failing = layout.blocks.len() - 1;
     let in_verified = |x: usize, y: usize| layout.module_codeword(x, y).is_some_and(|(cw, _)| (layout.codewords[cw].block as usize) < failing);
-    // Without the trials, the curve or the message's evidence, which
-    // reach the failing block on their own: the point is what the other
-    // blocks teach.
-    let opts = DecodeOptions { erase_by_trial: false, list_decode: false, message_evidence: false, ..DecodeOptions::default() };
+    // Without the trials, the curve, the message's evidence or belief
+    // propagation, which reach the failing block on their own: the point
+    // is what the other blocks teach.
+    let opts =
+        DecodeOptions { erase_by_trial: false, list_decode: false, message_evidence: false, belief_propagation: false, ..DecodeOptions::default() };
 
     // Two stains of two by two modules, in the verified blocks alone.
     let (width, height) = (layout.func.width, layout.func.height);

@@ -74,6 +74,33 @@
 //!   nor a threshold rule nor a turn mends that; the copy does, and
 //!   what was read through it says so ([`ReadResult::enhance`]), so
 //!   that it can be read the same again.
+//! - the photo about the outline deblurred ([`super::deblur`]): the blur
+//!   it shows measured off its own edges, how far and which way, and
+//!   undone, when it spreads an edge by a fifth of a module or more,
+//!   whatever the modules' size. The masks of the copy above reach a
+//!   pixel or two, and are tried only for small modules; a photograph
+//!   out of focus by eight pixels blurs modules of seventeen by half of
+//!   one, and one shaken smears them along the way the hand moved.
+//!
+//! Every placement is read anchored besides on patches of its data
+//! ([`super::patches`]), the first as much as any retry: far from every
+//! fixed pattern, the grid is moved a little each way to where the data
+//! modules about each point of a lattice read most crisply, once the
+//! corners and the patterns' anchors are refined. On a large symbol on
+//! curled paper the cells between the fixed patterns read a fraction of a
+//! module off, which no pattern says. The patches were once placed only
+//! when every other read had failed, as the last retry of all; placed on
+//! every read, they read one more symbol of BoofCV's benchmark, which
+//! had been found and not read, and lost none. What the reads make of
+//! their modules moved both ways: on curled paper fewer read wrong, and
+//! on a few large symbols, which the patterns place well enough, more,
+//! the patches of damaged data settling for a read the search had made
+//! before with fewer modules wrong. On a photo blurred or dim enough that
+//! its data reads crisply nowhere, the patches are placed by noise, and
+//! two symbols of the benchmark that read through the corners marked for
+//! them did not read through their patches; so a placement whose patched
+//! reads settle nothing is read without its patches too, before any
+//! other retry ([`read_placement`]).
 //!
 //! Before any of those, a decode that solved some blocks but not all is
 //! turned back on the placement. Every module of a verified block is now
@@ -86,7 +113,11 @@
 //! anchor the known modules contradict, fitted to a stain or to data
 //! that happened to look like its pattern, is dropped: the modules about
 //! it are read through the map with it and through the map without it,
-//! and when they read better without it the anchor misleads. BoofCV,
+//! and when they read better without it the anchor misleads. Where no
+//! anchor is, the known modules place new ones: the blocks that verified
+//! lie all over the symbol, interleaved, and a patch of their modules a
+//! few modules across says where the grid runs there as an alignment
+//! pattern would. BoofCV,
 //! when a symbol's bits fail to correct, refits its grid-to-pixel
 //! transform without the located pattern of largest residual and reads
 //! the bits again, up to six reads in all; the residual against a plane
@@ -123,24 +154,29 @@
 //! version 10 symbol that holds a short address leaves no block that
 //! error correction alone can solve, and all five solve this way.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::detect::{
     Anchor, AnchorKind, Climb, Detection, Retry, bled_placement, detect_candidates_by, first_finder_bleed, may_bleed,
-    outline_around, refine_anchors_with, seen_from_behind, turned_on_symbol,
+    clockwise, outline_around, placed_by_hand, refine_anchors_with, seen_from_behind, turned_on_symbol,
 };
-use super::enhance::{Enhance, Enhanced};
+use super::deblur::Spread;
+use super::enhance::{Enhance, Enhanced, Sharpen};
+use super::patches::with_patches;
 use super::projection::{ControlPoint, Project, Projection};
 use super::refine::{MOVES, Scorer, Shifted, Template, Warp, descend_by, fixed_threshold, refine_corners_expecting};
-use super::sample::{Kernel, Rule, SampleParams, classify, read_modules, sample_modules_noting};
+use super::sample::{Kernel, Rule, SampleParams, classify, read_modules, sample_modules_noting, suggest_versions};
 use super::{Luma, rotate_outline_cw, unrotate_point_cw};
 use crate::decode::bch::{FormatAnalysis, FormatCandidate};
 use crate::decode::codewords::Pins;
 use crate::decode::padding::recover_padding_after;
-use crate::decode::pipeline::{AttemptScore, DecodeOptions, DecodeReport, GridAnalysis, analyze, brute_force, decode};
+use crate::decode::likeness::{likeness_bits, stream_as_read};
+use crate::decode::pipeline::{
+    AttemptScore, DecodeOptions, DecodeReport, GridAnalysis, LIKENESS_FLOOR, analyze, brute_force, brute_force_preferring, decode,
+};
 use crate::decode::repair::known_modules;
 use crate::symbol::function_map::FunctionMap;
-use crate::symbol::{Family, SymbolVersion};
+use crate::symbol::{EcLevel, Family, SymbolVersion};
 use crate::symbol::grid::ModuleGrid;
 use crate::symbol::layout::SymbolLayout;
 use crate::work;
@@ -178,6 +214,13 @@ pub struct ReadResult {
     /// and sampled through the same ([`super::sample::sample_modules_as`])
     /// gives this grid again.
     pub enhance: Enhance,
+    /// The blur the copy undid, when it was deblurred
+    /// ([`Sharpen::Deblur`]): in the pixels of the photo the read was
+    /// made in, and what the photo's Deblur filter undoes to show the
+    /// copy again ([`super::adjust::Adjust::kernel`]). Measured over the
+    /// copy, about the symbol, it may differ from the blur the whole
+    /// photo shows.
+    pub deblurred: Option<Spread>,
     /// Whether the modules were sharpened against their neighbours as
     /// they were read ([`SampleParams::sharpen_modules`]), as was asked
     /// for: with the kernel and the rule, what a sampling must be made
@@ -406,7 +449,7 @@ fn read_outline_as(image: &Luma, version: SymbolVersion, region: [[f64; 2]; 4], 
     // the photo as it is, and the rungs, each once. The way asked for was
     // once counted again where it is a rung.
     let mut ways = vec![asked];
-    for way in std::iter::once(Enhance::NONE).chain(Enhance::rungs(region)) {
+    for way in std::iter::once(Enhance::NONE).chain(Enhance::rungs(region)).chain([Enhance::deblurred(region)]) {
         if !ways.contains(&way) {
             ways.push(way);
         }
@@ -425,6 +468,9 @@ fn read_outline_as(image: &Luma, version: SymbolVersion, region: [[f64; 2]; 4], 
     }
     if worth_enhancing(image, best.as_ref()) {
         rungs.extend(Enhance::rungs(region));
+    }
+    if worth_deblurring(image, region, best.as_ref()) {
+        rungs.push(Enhance::deblurred(region));
     }
     rungs.retain(|rung| *rung != asked);
     work::in_turn(
@@ -459,6 +505,41 @@ fn worth_enhancing(image: &Luma, best: Option<&ReadResult>) -> bool {
     across.min(down) / times < ENHANCE_BELOW_PX
 }
 
+/// Whether a read of `region` that did not decode is worth making again
+/// through the photo deblurred ([`Enhance::deblurred`]): the photo about
+/// it spreads an edge by more than [`super::deblur::LEAST_SPREAD`]
+/// pixels and by a fifth of a module or more
+/// ([`super::deblur::WORTH_UNDOING`]), the modules as `best`
+/// places them, or, with nothing found, as a symbol of twenty-five
+/// across the outline would have them. Unlike the masks, this does not
+/// wait on the modules being small: a photograph out of focus by eight
+/// pixels blurs modules of seventeen by half of one, and its finder
+/// patterns' rings run into their stones whatever their size. The blur
+/// is measured as the copy deblurred measures it
+/// ([`super::deblur::spread_of`]): over a window of more than
+/// [`super::deblur::MOST_PIXELS`], in the parts of it with the most
+/// edges, where measured whole the grain of the paper about a symbol
+/// sets what an edge is judged against.
+fn worth_deblurring(image: &Luma, region: [[f64; 2]; 4], best: Option<&ReadResult>) -> bool {
+    let Some([x0, y0, x1, y1]) = Enhanced::window_about(image, region) else { return false };
+    let (w, h) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+    let part: Vec<f32> = (y0..y1).flat_map(|y| image.data[y * image.width + x0..y * image.width + x1].iter().copied()).collect();
+    let Some(spread) = super::deblur::spread_of(&part, w, h) else { return false };
+    let (widest, _) = spread.extremes();
+    let module = match best {
+        Some(read) => {
+            let (c, version) = (read.detection.corners, read.detection.version);
+            ((distance(c[0], c[1]) + distance(c[3], c[2])) / 2.0 / version.width().max(1) as f64)
+                .min((distance(c[0], c[3]) + distance(c[1], c[2])) / 2.0 / version.height().max(1) as f64)
+        }
+        None => distance(region[0], region[1]).min(distance(region[0], region[3])) / 25.0,
+    };
+    // Under a fifth of a module the masks of the other rungs reach what
+    // there is, where the modules are small enough for them, and a symbol
+    // of large modules so little blurred that does not decode is damaged.
+    widest >= super::deblur::LEAST_SPREAD && widest >= super::deblur::WORTH_UNDOING * module
+}
+
 /// [`read_outline`] through the photo as `enhance` makes it, and no
 /// other way: as it is, or in a copy of it about the outline, enlarged
 /// and sharpened, with what is read there brought back to the photo's
@@ -480,7 +561,7 @@ fn read_outline_through(
     let view = Enhanced::around(image, region, enhance)?;
     // A reading set for the scan reaches as far across the copy as it
     // was set to reach across the photo.
-    let plain = SampleParams { binarizer: plain.binarizer.scaled(view.factor), ..plain };
+    let plain = SampleParams { binarizer: plain.binarizer.scaled(view.mean_factor()), ..plain };
     let mut result = read_outline_plain(&view.luma, version, region.map(|p| view.to_view(p)), &plain, reads, true)?;
     bring_back(&mut result, &view, enhance);
     Some(result)
@@ -496,6 +577,7 @@ fn bring_back(result: &mut ReadResult, view: &Enhanced, enhance: Enhance) {
     }
     found.retry = Some(Retry::Enhanced(enhance));
     result.enhance = enhance;
+    result.deblurred = view.luma.deblurred.map(|spread| spread.stretched(view.factor.map(|factor| 1.0 / factor)));
 }
 
 /// [`read_outline`] of the pixels given, as they are. `copy` says that
@@ -558,18 +640,32 @@ fn read_outline_plain(
         let turned_region = rotate_outline_cw(region, quarters, image.width, image.height);
         let Some(found) = detect_candidates_by(&turned, version, turned_region, params, climb).into_iter().next() else { return reads };
         let Some(prepared) = prepare(&turned, seat(&turned, found, params), params) else { return reads };
-        let turned_reads = all.past().among(variants.len());
-        work::first_then_in_turn(
+        // Read as a placement in the photo as it is is read, and, short of
+        // a read that settles the search, without its patches of data the
+        // ways that lead with the kernel asked for ([`read_placement`]).
+        let patched = prepared.detection.anchors.len() != prepared.plain.anchors.len();
+        let few = &variants[..variants.len().min(params.rules().count())];
+        let turned_reads = all.past().among(variants.len() + usize::from(patched) * few.len());
+        let mut keep = |result: Option<ReadResult>| {
+            let Some(mut result) = result else { return false };
+            unturn(&mut result.detection, quarters, image.width, image.height, region);
+            let settled = result.is_trustworthy();
+            reads.push(result);
+            settled
+        };
+        let settled = work::first_then_in_turn(
             &variants,
             |&variant| if work::cancelled() { None } else { read_prepared(&turned, &prepared, variant, params, turned_reads) },
-            |result| {
-                let Some(mut result) = result else { return false };
-                unturn(&mut result.detection, quarters, image.width, image.height, region);
-                let settled = result.is_trustworthy();
-                reads.push(result);
-                settled
-            },
+            &mut keep,
         );
+        if patched && !settled && !work::cancelled() {
+            let without = Prepared::new(prepared.plain.clone(), prepared.agreement);
+            for &variant in few {
+                if keep(read_prepared(&turned, &without, variant, params, turned_reads)) {
+                    break;
+                }
+            }
+        }
         reads
     };
     // Side by side, as far as the photo's size leaves room for turned
@@ -636,8 +732,8 @@ pub fn read_detection(image: &Luma, found: Detection, params: &SampleParams, opt
         _ => params.enhance,
     };
     let mut best: Option<ReadResult> = None;
-    // The placement found, read every way, and then the search about it,
-    // each read one of those of both ([`Reads`]).
+    // The placement found, read every way, then the search about it, each
+    // read one of those of both ([`Reads`]).
     let reads = Reads::new(opts).one_of(2);
     if read_found_through(image, found, around, params, reads, through, &mut best) || work::cancelled() {
         return best;
@@ -646,6 +742,73 @@ pub fn read_detection(image: &Luma, found: Detection, params: &SampleParams, opt
         && best.as_ref().is_none_or(|held| again.outranks(held))
     {
         best = Some(again);
+    }
+    best
+}
+
+/// Placements by hand a read tries: the versions and turns of the
+/// corners that fit best ([`suggest_versions`]). A version a module or
+/// two off its symbol's reads half its fixed modules right, as does the
+/// right version a quarter turn out, and the symbol's own, the right way
+/// up, is among the first three wherever the corners lie within a
+/// module of it.
+const PLACED_VERSIONS: usize = 3;
+
+/// Read a symbol through its own four corners, given as a hand places
+/// them in the Align stage, with no search: at each of the versions and
+/// turns of the corners that fit best, the placement refined, sampled
+/// every way, decoded and refitted as a placement the search found is
+/// ([`read_found_through`]), and read again through the photo enlarged
+/// and sharpened when its modules are small, as an outline is. Where it
+/// does not decode it is not looked for afresh, as a placement the
+/// search found is: what it reads is what the corners give. `None` when
+/// the corners make no outline at any version.
+///
+/// The corners may start at any corner of the symbol and run round it
+/// either way: they are put clockwise first, as the symbol's own run,
+/// so that every version is fitted to the symbol seen from the front and
+/// not to its transpose, which for a rectangular symbol lays its long
+/// side along its short one. A placement a turn out is seated on its
+/// symbol when its fixed patterns read so ([`seat`]), but not when a blur
+/// leaves them reading no better turned: a symbol smeared by a hand that
+/// moved, placed from its top-right corner, was read as it lay and solved
+/// nothing, and read through the same corners from its top-left at once.
+/// So every turn of the corners is fitted, a rectangular symbol's
+/// quarter turns among them, which start the corners on a short side,
+/// and the turns are ranked with the versions.
+///
+/// Through the corners a benchmark marks by hand, this tells a symbol the
+/// search lost from one its reading lost ([`super::detect::placed_by_hand`]).
+pub fn read_placed(image: &Luma, family: Family, corners: [[f64; 2]; 4], params: &SampleParams, opts: &DecodeOptions) -> Option<ReadResult> {
+    let corners = clockwise(corners);
+    let mut fits: Vec<(f32, SymbolVersion, [[f64; 2]; 4])> = Vec::new();
+    for turn in 0..4 {
+        let mut turned = corners;
+        turned.rotate_left(turn);
+        fits.extend(suggest_versions(image, turned, family, params).into_iter().map(|guess| (guess.score(), guess.version, turned)));
+    }
+    fits.sort_by(|a, b| b.0.total_cmp(&a.0));
+    fits.truncate(PLACED_VERSIONS);
+    let around = outline_around(corners, AROUND_FOUND);
+    let ways: Vec<Enhance> = std::iter::once(params.enhance)
+        .chain(Enhance::rungs(around).into_iter().chain([Enhance::deblurred(around)]).filter(|&rung| rung != params.enhance))
+        .collect();
+    // Every way at every fit.
+    let reads = Reads::new(opts).one_of(fits.len() * ways.len());
+    let mut best: Option<ReadResult> = None;
+    let mut counted = reads.first_then_past();
+    for (_, version, corners) in fits {
+        let Some(found) = placed_by_hand(image, version, corners, params) else { continue };
+        for (k, &way) in ways.iter().enumerate() {
+            let reads = counted.next().expect("the reads go on");
+            let worth = if way.sharpen == Sharpen::Deblur { worth_deblurring(image, around, best.as_ref()) } else { worth_enhancing(image, best.as_ref()) };
+            if work::cancelled() || (k > 0 && !worth) {
+                continue;
+            }
+            if read_found_through(image, found.clone(), around, params, reads, way, &mut best) {
+                return best;
+            }
+        }
     }
     best
 }
@@ -669,12 +832,22 @@ fn read_found_through(
         return prepare(image, seat(image, found, &plain), &plain)
             .is_some_and(|prepared| read_placement(image, &prepared, &variants, &plain, reads, &mut |result| consider(best, result)));
     }
-    let Some(view) = Enhanced::around(image, around, enhance) else { return false };
+    let Some(view) = Enhanced::around(image, around, enhance) else {
+        // Deblurred where the photo about the symbol shows no blur worth
+        // undoing, the copy is the photo enlarged as `enhance` says and
+        // no more, as the photo's Deblur filter leaves a photo it measures
+        // no blur in: read through that. A search that found the symbol
+        // in the photo deblurred measured the blur over the whole of it,
+        // which about the symbol may be sharp; the placement was once not
+        // read at all there, and the symbol looked for again about it.
+        return enhance.sharpen == Sharpen::Deblur
+            && read_found_through(image, found, around, params, reads, Enhance { sharpen: Sharpen::Off, ..enhance }, best);
+    };
     found.corners = found.corners.map(|c| view.to_view(c));
     for anchor in &mut found.anchors {
         anchor.center = view.to_view(anchor.center);
     }
-    let plain = SampleParams { binarizer: plain.binarizer.scaled(view.factor), ..plain };
+    let plain = SampleParams { binarizer: plain.binarizer.scaled(view.mean_factor()), ..plain };
     prepare(&view.luma, seat(&view.luma, found, &plain), &plain).is_some_and(|prepared| {
         read_placement(&view.luma, &prepared, &variants, &plain, reads, &mut |mut result| {
             bring_back(&mut result, &view, enhance);
@@ -703,16 +876,20 @@ const DOUBT_MODULES: f64 = 0.35;
 
 /// Read one placement every way a read tries, handing each read to
 /// `keep`, which says whether it settles the search; true when one did.
-/// The kernels and threshold rules in `variants` first; then, for a
+/// The kernels and threshold rules in `variants` first, through the
+/// placement anchored on patches of its data; then, where patches were
+/// placed, the placement without them; then, for a
 /// square symbol whose format bits read as a word, which the detector
 /// therefore never tried the other way round, the placement in mirror
 /// order, kept when it verifies more blocks than any read so far; then,
 /// when no read has verified a block, the placement with its most
-/// doubtful anchors dropped, one at a time. The later two are read under
+/// doubtful anchors dropped, one at a time, and its patches of data
+/// placed again through the map without each. Those three are read under
 /// the kernel asked for alone, with every threshold rule: what they
-/// settle does not hang on the kernel. Last, when no read has settled the
+/// settle does not hang on the kernel. Then, when no read has settled the
 /// search, the placement again expecting the bleed its finders show,
-/// every way the placement was read. The first sampling goes on as the
+/// every way the placement was read, and without its patches of data the
+/// ways it was read without them. The first sampling goes on as the
 /// read asked for, and every other read is charged as one of all these
 /// that may be made, the best of which is kept ([`Reads`]): the reads in
 /// mirror order and without anchors once went uncounted.
@@ -724,7 +901,7 @@ fn read_placement(
     reads: Reads,
     keep: &mut dyn FnMut(ReadResult) -> bool,
 ) -> bool {
-    let found = &prepared.detection;
+    let (found, plain) = (&prepared.detection, &prepared.plain);
     let few = variants.len().min(params.rules().count());
     // Whether the placement is read expecting a bleed is known only once
     // every other read has failed, and every read is counted before the
@@ -736,9 +913,16 @@ fn read_placement(
     // reads are reached ([`bled_placement`]). Counted wherever the
     // placement had finders enough, they charged every other read of it
     // more than half a bit, for a bleed few photographs show.
-    let first_bleed = if may_bleed(found) { first_finder_bleed(image, found, params) } else { 0.0 };
-    let bled_ways = if first_bleed != 0.0 { variants.len() } else { 0 };
-    let reads = reads.among(variants.len() + few + DOUBT_LIMIT * few + bled_ways);
+    let first_bleed = if may_bleed(plain) { first_finder_bleed(image, plain, params) } else { 0.0 };
+    let patched = found.anchors.len() != plain.anchors.len();
+    // The placement expecting the bleed has its patches of data placed
+    // afresh, and whether any are is known only once it is made: its
+    // reads without them are counted whether or not this placement's
+    // were, as reads that may be made. Counted as this one's were, they
+    // went uncounted where its patches placed none and the bled one's
+    // placed some.
+    let bled_ways = if first_bleed != 0.0 { variants.len() + few } else { 0 };
+    let reads = reads.among(variants.len() + usize::from(patched) * few + few + DOUBT_LIMIT * few + bled_ways);
     let mut verified = 0;
     let samplings: Vec<(Variant, Reads)> = variants.iter().copied().zip(reads.first_then_past()).collect();
     let settled = work::first_then_in_turn(
@@ -759,11 +943,28 @@ fn read_placement(
     }
     // The variants lead with the kernel asked for under each rule.
     let few = &variants[..few];
+    // The placement without its patches of data, which on a photo blurred
+    // or dim enough that its data reads crisply nowhere are placed by
+    // what noise there is, and bend the grid off modules the patterns
+    // placed right: a version 7 symbol blurred by most of a module, and
+    // a dim version 1, each read through the corners marked for it by
+    // hand as the patterns placed it, and through its patches not at all.
+    if patched {
+        let without = Prepared::new(plain.clone(), prepared.agreement);
+        for &variant in few {
+            if let Some(result) = read_prepared(image, &without, variant, params, reads.past()) {
+                verified = verified.max(result.report.blocks_verified());
+                if keep(result) {
+                    return true;
+                }
+            }
+        }
+    }
     if found.version.family() != Family::Rmqr
         && found.info.format.valid == Some(true)
         && let Some(detection) = seen_from_behind(image, found, params)
     {
-        let behind = Prepared { detection, agreement: prepared.agreement };
+        let behind = Prepared::new(detection, prepared.agreement);
         for &variant in few {
             if let Some(result) = read_prepared(image, &behind, variant, params, reads.past())
                 && result.report.blocks_verified() > verified
@@ -775,26 +976,27 @@ fn read_placement(
             }
         }
     }
-    let mut doubted = Prepared { detection: found.clone(), agreement: prepared.agreement };
+    // The anchors doubted are the patterns', and the patches of data,
+    // which were placed through the map a doubtful anchor bent, are placed
+    // again through the map without it.
+    let mut doubted = plain.clone();
     for _ in 0..DOUBT_LIMIT {
         // A block that verified knows which anchors mislead, and the
         // refit to it has already dropped them.
         if verified > 0 || work::cancelled() {
             break;
         }
-        let Some(k) = doubtful_anchor(&doubted.detection) else { break };
-        doubted.detection.anchors.remove(k);
+        let Some(k) = doubtful_anchor(&doubted) else { break };
+        doubted.anchors.remove(k);
+        let without = Prepared::patched(image, doubted.clone(), prepared.agreement);
         for &variant in few {
-            if let Some(result) = read_prepared(image, &doubted, variant, params, reads.past()) {
+            if let Some(result) = read_prepared(image, &without, variant, params, reads.past()) {
                 verified = verified.max(result.report.blocks_verified());
                 if keep(result) {
                     return true;
                 }
             }
         }
-    }
-    if bled_ways == 0 || work::cancelled() {
-        return false;
     }
     // Last, the placement expecting the bleed its finders show
     // ([`bled_placement`]), every way a placement is read. Over-exposed, the
@@ -809,12 +1011,26 @@ fn read_placement(
     // further on one side of a finder than the other, as on a creased
     // thermal receipt in the same benchmark, was placed better by the
     // fit as printed, and its symbol, which read so, no longer did.
-    let Some(bled) = bled_placement(image, found, first_bleed, params).and_then(|bled| prepare(image, bled, params)) else { return false };
-    work::in_turn(
+    if bled_ways == 0 || work::cancelled() {
+        return false;
+    }
+    let Some(bled) = bled_placement(image, plain, first_bleed, params).and_then(|bled| prepare(image, bled, params)) else { return false };
+    // The first way alone before the rest, as the placement was read, so
+    // that the levels and masks it ranks for them do not hang on which of
+    // them came first ([`decode_as_ranked`]).
+    if work::first_then_in_turn(
         variants,
         |&variant| if work::cancelled() { None } else { read_prepared(image, &bled, variant, params, reads.past()) },
         |result| result.is_some_and(&mut *keep),
-    )
+    ) {
+        return true;
+    }
+    // And without its patches of data, as the placement was read.
+    if bled.detection.anchors.len() == bled.plain.anchors.len() || work::cancelled() {
+        return false;
+    }
+    let without = Prepared::new(bled.plain.clone(), bled.agreement);
+    few.iter().any(|&variant| read_prepared(image, &without, variant, params, reads.past()).is_some_and(&mut *keep))
 }
 
 /// The anchor, no finder's, that lies farthest from where the corners
@@ -905,17 +1121,45 @@ fn seated(image: &Luma, candidates: Vec<Detection>, params: &SampleParams) -> Ve
 }
 
 /// A detection with its corners and anchors refined against the photo,
-/// ready to sample.
+/// and anchored besides on patches of its data, ready to sample.
 struct Prepared {
+    /// The detection sampled: `plain` with the anchors the patches of its
+    /// data place ([`with_patches`]).
     detection: Detection,
+    /// The detection as refined, anchored on its patterns and edges and on
+    /// no patch of data: what the anchors doubted are taken from, and the
+    /// bleed is measured through ([`read_placement`]).
+    plain: Detection,
     agreement: (usize, usize),
+    /// The levels and masks that ranked best when the first grid sampled
+    /// through it was brute forced, for the grids sampled after it
+    /// ([`decode_as_ranked`]). Empty until a grid of it is.
+    formats: OnceLock<Vec<(EcLevel, u8)>>,
+}
+
+impl Prepared {
+    /// `detection` as it is, its patches of data placed already or none
+    /// to be placed.
+    fn new(detection: Detection, agreement: (usize, usize)) -> Self {
+        Self { plain: detection.clone(), detection, agreement, formats: OnceLock::new() }
+    }
+
+    /// `plain` anchored besides on patches of its data, far from every
+    /// anchor it has ([`with_patches`]), or as it is where no patch places
+    /// one.
+    fn patched(image: &Luma, plain: Detection, agreement: (usize, usize)) -> Self {
+        let detection = with_patches(image, &plain).unwrap_or_else(|| plain.clone());
+        Self { detection, plain, agreement, formats: OnceLock::new() }
+    }
 }
 
 /// Refine a detection's corners, with the anchors held and the corners a
 /// finder pattern measured kept, and then every anchor against its own
 /// pattern, each expecting the bleed the detection was placed for
 /// ([`Detection::bloom`]) at the polarity it was measured at
-/// ([`Detection::held_polarity`]). `None` when the corners form no usable
+/// ([`Detection::held_polarity`]); and last anchor it besides on patches
+/// of its data far from every anchor, through the map the refined ones
+/// make ([`with_patches`]). `None` when the corners form no usable
 /// outline. The detection is taken to lie the right way up on its symbol
 /// ([`seat`]).
 fn prepare(image: &Luma, mut found: Detection, params: &SampleParams) -> Option<Prepared> {
@@ -927,7 +1171,7 @@ fn prepare(image: &Luma, mut found: Detection, params: &SampleParams) -> Option<
     found.corners = refined.map_or(found.corners, |r| r.corners);
     found.anchors = refine_anchors_with(image, &func, found.corners, &found.anchors, found.bloom, polarity, params);
     found.projection()?;
-    Some(Prepared { detection: found, agreement })
+    Some(Prepared::patched(image, found, agreement))
 }
 
 /// Sample a prepared detection with the variant's kernel, classify it
@@ -966,7 +1210,10 @@ fn read_prepared(image: &Luma, prepared: &Prepared, variant: Variant, params: &S
         grid = grid.inverted();
     }
     let analysis = analyze(&grid, &func);
-    let mut report = decode_as(&grid, &func, &analysis, opts)?;
+    // Only the first way of sampling a placement, which is read alone
+    // before the others, ranks the levels and masks for them.
+    let first = variants_of(params).first() == Some(&variant);
+    let mut report = decode_as_ranked(&grid, &func, &analysis, opts, &prepared.formats, first)?;
     // The format bits may spell a word of the other QR Code model where
     // none of this one is near: a Model 1 symbol found as Model 2, or the
     // reverse. The two lay their data out differently, so the grid is read
@@ -1008,6 +1255,7 @@ fn read_prepared(image: &Luma, prepared: &Prepared, variant: Variant, params: &S
         pins,
         reinterpreted,
         enhance: Enhance::NONE,
+        deblurred: None,
         sharpen_modules: params.sharpen_modules,
         unsure_kept,
     };
@@ -1127,7 +1375,10 @@ fn feedback_round(image: &Luma, current: &ReadResult, params: &SampleParams, opt
         // half its window off the symbol: the known modules do not
         // place it better. An anchor set by hand where no pattern is stays
         // where it was set.
-        if matches!(anchors[k].kind, AnchorKind::Edge | AnchorKind::Custom) {
+        // A patch of data was placed by the data already, and there are
+        // many of them: each refit here solves the map afresh for every
+        // place tried, and a hundred patches made a round take minutes.
+        if matches!(anchors[k].kind, AnchorKind::Edge | AnchorKind::Custom | AnchorKind::Data) {
             continue;
         }
         let Some((window, [x0, y0, x1, y1])) = window_of(&template, anchors[k].at) else { continue };
@@ -1151,6 +1402,41 @@ fn feedback_round(image: &Luma, current: &ReadResult, params: &SampleParams, opt
         {
             anchors[k].center = moved[0];
         }
+    }
+
+    // Anchors where none is, on patches of the known modules: the blocks
+    // that verified lie all over the symbol, interleaved, and the cells
+    // between the fixed patterns, which the corners and the spline alone
+    // placed, have their modules among the known ones as much as any.
+    // Each is fitted as the anchors above were, but as a move of the
+    // window through the one map the anchors make, which is not solved
+    // afresh for every place tried, and kept where the known modules
+    // about it read better for the move and it moved less than
+    // [`FEEDBACK_TRAVEL`].
+    let points = feedback_points(&func, &anchors);
+    let controls: Vec<ControlPoint> = anchors.iter().map(|a| a.control_point()).collect();
+    if let Some(map) = (!points.is_empty()).then(|| Projection::new(func.width, func.height, corners, &controls)).flatten() {
+        let patched: Vec<Anchor> = work::map(&points, |&at| {
+            let (window, [x0, y0, x1, y1]) = window_of(&template, at).filter(|(window, _)| window.fixed() >= FEEDBACK_LEAST_KNOWN)?;
+            let frame = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]].map(|[x, y]| map.apply(x as f64, y as f64));
+            let local = Scorer::new(image, &window, frame, threshold).with_along(6).with_bloom(found.bloom);
+            let local_px = local.module_px();
+            let (dx, dy) = (x0 as f64, y0 as f64);
+            let score = |trial: [[f64; 2]; 4]| local.contrast_with(&Shifted { map: &Moved { map: &map, by: trial[0] }, dx, dy }, sign);
+            let start = score([[0.0, 0.0]; 4])?;
+            let mut evaluations = 0;
+            let (moved, best) = descend_by([[0.0, 0.0]; 4], &[[1.0, 0.0, 0.0, 0.0]], local_px * 0.25, &mut evaluations, score)?;
+            let [mx, my] = moved[0];
+            let travel = mx.hypot(my);
+            (best > start && travel <= FEEDBACK_TRAVEL * local_px).then(|| {
+                let [px, py] = map.apply(at[0], at[1]);
+                Anchor { kind: AnchorKind::Data, at, center: [px + mx, py + my], partial: false, inferred: false }
+            })
+        })
+        .into_iter()
+        .flatten()
+        .collect();
+        anchors.extend(patched);
     }
 
     // Then the anchors the known modules contradict are dropped.
@@ -1190,9 +1476,52 @@ fn feedback_round(image: &Luma, current: &ReadResult, params: &SampleParams, opt
         pins,
         reinterpreted: current.reinterpreted,
         enhance: current.enhance,
+        deblurred: current.deblurred,
         sharpen_modules: current.sharpen_modules,
         unsure_kept: current.unsure_kept,
     })
+}
+
+/// A map moved by `by` pixels in the photo.
+struct Moved<'a, P: Project> {
+    map: &'a P,
+    by: [f64; 2],
+}
+
+impl<P: Project> Project for Moved<'_, P> {
+    fn base(&self, x: f64, y: f64) -> [f64; 2] {
+        let [px, py] = self.map.base(x, y);
+        [px + self.by[0], py + self.by[1]]
+    }
+
+    fn displacement(&self, x: f64, y: f64) -> [f64; 2] {
+        self.map.displacement(x, y)
+    }
+}
+
+/// Modules between the points a refit to a partial decode anchors where
+/// no anchor is, and how far each must lie from every anchor and corner:
+/// a point nearer than that is held by the anchor already.
+const FEEDBACK_STEP: usize = 8;
+const FEEDBACK_CLEAR: f64 = 5.0;
+/// Fewest known modules the window about such a point must hold: half
+/// as many as a finder pattern with its separator has, so that the fit
+/// is to modules and not to a stray few.
+const FEEDBACK_LEAST_KNOWN: usize = 32;
+
+/// The points of a lattice [`FEEDBACK_STEP`] modules apart, each in the
+/// middle of a module, that lie [`FEEDBACK_CLEAR`] modules or more from
+/// every one of `anchors` and from the symbol's corners.
+fn feedback_points(func: &FunctionMap, anchors: &[Anchor]) -> Vec<[f64; 2]> {
+    let (w, h) = (func.width as f64, func.height as f64);
+    let held: Vec<[f64; 2]> = anchors.iter().map(|a| a.at).chain([[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]]).collect();
+    let half = (FEEDBACK_STEP / 2) as f64;
+    (0..func.height)
+        .step_by(FEEDBACK_STEP)
+        .flat_map(|y| (0..func.width).step_by(FEEDBACK_STEP).map(move |x| [x as f64 + 0.5 + half, y as f64 + 0.5 + half]))
+        .filter(|at| at[0] < w && at[1] < h)
+        .filter(|&at| held.iter().all(|p| distance(*p, at) >= FEEDBACK_CLEAR))
+        .collect()
 }
 
 /// The window of `template` [`FEEDBACK_WINDOW`] modules either way about
@@ -1300,8 +1629,47 @@ const RIVALS: usize = 3;
 /// verifies no block, the words next nearest the bits are tried
 /// ([`rival_decode`]), and one the blocks bear out is the format.
 fn decode_as(grid: &ModuleGrid, func: &Arc<FunctionMap>, analysis: &GridAnalysis, opts: &DecodeOptions) -> Option<DecodeReport> {
+    decode_as_ranked(grid, func, analysis, opts, &OnceLock::new(), false)
+}
+
+/// Levels and masks a brute force of one grid of a placement hands on to
+/// those of the grids sampled after it ([`brute_force_preferring`]).
+const RANKED_FORMATS: usize = 2;
+
+/// [`decode_as`] of one of the grids a placement is sampled into: the
+/// first, which `ranks`, where it is brute forced leaves in `formats`
+/// the levels and masks that ranked best ([`RANKED_FORMATS`]), and the
+/// rest are searched in stages under those alone and under the one each
+/// ranks first itself ([`brute_force_preferring`]). Where the first is
+/// not brute forced, its format bits having read, the rest are brute
+/// forced whole. The level and mask are the symbol's, the
+/// same however its modules are sampled, and the grids of one placement
+/// are each brute forced where its format bits do not read: over the
+/// photographs of BoofCV's benchmark that took longest to search, the
+/// most of the time went on the stages of every level and mask of each
+/// sampling, decoding noise. The first grid is sampled alone before the
+/// others ([`work::first_then_in_turn`]), so that what the others are
+/// handed does not hang on which of them came first.
+fn decode_as_ranked(
+    grid: &ModuleGrid,
+    func: &Arc<FunctionMap>,
+    analysis: &GridAnalysis,
+    opts: &DecodeOptions,
+    formats: &OnceLock<Vec<(EcLevel, u8)>>,
+    ranks: bool,
+) -> Option<DecodeReport> {
     if !analysis.format.is_reliable() {
-        return Some(brute_force(grid, func, None, opts).into_iter().next()?.report);
+        let attempts = match formats.get() {
+            Some(preferred) if !ranks => brute_force_preferring(grid, func, None, opts, preferred),
+            _ => {
+                let attempts = brute_force(grid, func, None, opts);
+                if ranks {
+                    let _ = formats.set(attempts.iter().take(RANKED_FORMATS).map(|a| (a.ec, a.mask)).collect());
+                }
+                attempts
+            }
+        };
+        return Some(attempts.into_iter().next()?.report);
     }
     let best = analysis.format.best().expect("a reliable format has a best candidate");
     let layout = SymbolLayout::new(func.clone(), best.fields.ec)?;
@@ -1331,6 +1699,13 @@ fn decode_as(grid: &ModuleGrid, func: &Arc<FunctionMap>, analysis: &GridAnalysis
 /// without doubting first, which tells the right mask from the rest
 /// when any block of it reads nearly clean, and only one borne out so
 /// is decoded again with it.
+///
+/// Beside the nearest words, the word the data and the format bits
+/// favour together is a rival, wherever it lies, when the data reads as
+/// a message under it and it is likelier so than the word settled
+/// ([`likeliest_word`]): a word misread in more bits than the code
+/// corrects lies beyond reach of the nearest, and the data says which
+/// it was.
 fn rival_decode(grid: &ModuleGrid, func: &Arc<FunctionMap>, format: &FormatAnalysis, opts: &DecodeOptions) -> Option<DecodeReport> {
     let best = format.best()?;
     let mut rivals: Vec<&FormatCandidate> = format
@@ -1341,6 +1716,11 @@ fn rival_decode(grid: &ModuleGrid, func: &Arc<FunctionMap>, format: &FormatAnaly
         .collect();
     rivals.sort_by_key(|c| (c.best_mismatches, c.best_weight));
     rivals.truncate(RIVALS);
+    if let Some(likeliest) = likeliest_word(grid, func, format, best)
+        && !rivals.iter().any(|c| c.fields == likeliest.fields)
+    {
+        rivals.push(likeliest);
+    }
     let borne_out = |report: &DecodeReport| report.blocks_verified() > 0;
     let opts = &opts.among(rivals.len() + 1);
     let two_passes = (opts.reliability && grid.has_reliability()) || opts.erase_by_trial;
@@ -1360,6 +1740,31 @@ fn rival_decode(grid: &ModuleGrid, func: &Arc<FunctionMap>, format: &FormatAnaly
         }
     }
     found
+}
+
+/// The word of the grid's size, painted as `settled` is, that the data
+/// read under it and the format bits together favour most
+/// ([`crate::decode::pipeline::Attempt::odds_bits`]), when the data
+/// reads as a message under it ([`LIKENESS_FLOOR`]) and the two favour
+/// it over `settled`. `None` when they favour `settled`, or the data
+/// reads as a message under no word.
+fn likeliest_word<'a>(grid: &ModuleGrid, func: &Arc<FunctionMap>, format: &'a FormatAnalysis, settled: &FormatCandidate) -> Option<&'a FormatCandidate> {
+    let layouts: Vec<(EcLevel, SymbolLayout)> =
+        func.version.ec_levels().iter().filter_map(|&ec| Some((ec, SymbolLayout::new(func.clone(), ec)?))).collect();
+    let odds = |c: &FormatCandidate| -> Option<(f64, f64)> {
+        let (_, layout) = layouts.iter().find(|(ec, _)| *ec == c.fields.ec)?;
+        let likeness = likeness_bits(&stream_as_read(grid, layout, c.fields.mask));
+        Some((likeness - f64::from(c.weight) / 8.0, likeness))
+    };
+    let (settled_odds, _) = odds(settled)?;
+    format
+        .candidates
+        .iter()
+        .filter(|c| c.fits_grid && (c.unmasked, c.other_model) == (settled.unmasked, settled.other_model) && c.fields != settled.fields)
+        .filter_map(|c| odds(c).map(|o| (c, o)))
+        .filter(|(_, (odds, likeness))| *likeness >= LIKENESS_FLOOR && *odds > settled_odds)
+        .max_by(|a, b| a.1.0.total_cmp(&b.1.0))
+        .map(|(c, _)| c)
 }
 
 /// Bring a detection made in the photo turned `quarters` quarter turns
@@ -1406,6 +1811,20 @@ mod tests {
         let asked = Reads::new(&opts).one_of(3);
         let other = asked.past();
         assert_eq!((asked.first.tries, asked.again.tries, other.first.tries), (1, 2 * 3, 2 * 3));
+    }
+
+    #[test]
+    fn an_outline_off_the_photo_reads_nothing() {
+        // Past the right edge of the photo, or below it: the box about the
+        // outline, with its margin, holds none of the photo. Past the
+        // right, the measure of the blur there once cut the photo's rows
+        // backwards and panicked.
+        let image = Luma::new(200, 200, vec![0.9; 200 * 200]);
+        let opts = DecodeOptions::default();
+        for region in [[[400.0, 50.0], [500.0, 50.0], [500.0, 150.0], [400.0, 150.0]], [[50.0, 400.0], [150.0, 400.0], [150.0, 500.0], [50.0, 500.0]]] {
+            assert!(read_outline(&image, SymbolVersion::Qr(1), region, &SampleParams::default(), &opts).is_none(), "{region:?}");
+            assert!(!worth_deblurring(&image, region, None), "{region:?}");
+        }
     }
 
     /// A version 10 symbol lying square to the photo at eight pixels a
@@ -1636,6 +2055,31 @@ mod tests {
         // lie on it and is read once.
         let offered = seated(&image, vec![upright.clone(), turned], &params);
         assert_eq!(offered, [upright]);
+    }
+
+    #[test]
+    fn a_placement_found_deblurred_is_read_as_it_is_where_the_photo_about_it_is_sharp() {
+        // Found in the photo deblurred, as a search finds a symbol where
+        // the whole photo is blurred, and sharp about the symbol itself:
+        // no copy deblurred is made there, and the placement is read
+        // through the photo enlarged as the copy would have been, and
+        // sharpened no more. It was once not read at all.
+        let text = "sharp where it was found";
+        let (image, square) = drawn(text);
+        let (params, opts) = (SampleParams::default(), DecodeOptions::default());
+        let [tl, tr, _, bl] = square;
+        let centre = |corner: [f64; 2], [dx, dy]: [f64; 2]| [corner[0] + 28.0 * dx, corner[1] + 28.0 * dy];
+        let found = on_finders(square, &[centre(tl, [1.0, 1.0]), centre(tr, [-1.0, 1.0]), centre(bl, [1.0, -1.0])]);
+        let around = outline_around(square, AROUND_FOUND);
+        for enlarge in [1, 2] {
+            let deblurred = Enhance { enlarge, sharpen: Sharpen::Deblur };
+            assert!(Enhanced::around(&image, around, deblurred).is_none(), "{enlarge}: no blur to undo");
+            let mut best = None;
+            assert!(read_found_through(&image, found.clone(), around, &params, Reads::new(&opts), deblurred, &mut best), "{enlarge}: settled");
+            let read = best.expect("a read");
+            assert_eq!(read.text(), text);
+            assert_eq!((read.enhance, read.deblurred), (Enhance { enlarge, sharpen: Sharpen::Off }, None), "{enlarge}");
+        }
     }
 
     #[test]

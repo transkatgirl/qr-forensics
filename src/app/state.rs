@@ -10,11 +10,12 @@ use qr_forensics::decode::sequence::Sequence;
 use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::adjust::{Adjust, Enlarge};
 use qr_forensics::imaging::binarize::BinarizeParams;
+use qr_forensics::imaging::deblur;
 use qr_forensics::imaging::detect::{Anchor, AnchorKind, Detection};
 use qr_forensics::imaging::projection::{ControlPoint, Projection};
 use qr_forensics::imaging::detect::SearchParams;
 use qr_forensics::imaging::read::ReadResult;
-use qr_forensics::imaging::sample::{Classified, SampleParams, Sharpening};
+use qr_forensics::imaging::sample::{Classified, SAMPLED_MAX, SampleParams, Sharpening};
 use qr_forensics::symbol::function_map::FunctionMap;
 use qr_forensics::symbol::grid::{CERTAIN, Mirror, Module, ModuleGrid};
 use qr_forensics::symbol::layout::{CwId, SymbolLayout};
@@ -101,10 +102,31 @@ pub struct FoundReads {
     /// read's own polarity is reckoned, as a detection's is from the
     /// setting it was found under.
     pub photo_inverted: bool,
-    /// The photo's enlargement when they were read: a read made through
-    /// a copy of the photo enlarged again was made at so many times
-    /// this, whatever the photo has been set to since.
-    pub enlarge: Enlarge,
+    /// The photo as it was adjusted when they were read: a read made
+    /// through a copy of the photo was made of it so, whatever the photo
+    /// has been set to since.
+    pub under: ReadUnder,
+}
+
+/// The photo as it was adjusted when a read was made: what a read that
+/// decoded only through a copy of it sets the photo's adjustments from
+/// ([`super::App::adjust_as_read`]), a copy being made of the photo as
+/// it was then.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReadUnder {
+    /// The photo's adjustments then, its enlargement among them, which
+    /// a copy enlarged again was enlarged from.
+    pub adjust: Adjust,
+    /// The blur the photo's Deblur filter measured over the whole of it
+    /// then, in its pixels, when it measured one ([`Luma::deblurred`]).
+    pub measured: Option<deblur::Spread>,
+}
+
+impl ReadUnder {
+    /// The photo as it is adjusted now.
+    pub fn of(photo: &Photo) -> Self {
+        Self { adjust: photo.adjust, measured: photo.luma.deblurred }
+    }
 }
 
 /// The placements of the symbol inside the outline the detector ranks,
@@ -445,9 +467,10 @@ impl History {
 pub struct Crop {
     /// Left, top, width and height, in the pixels of the photo as loaded.
     pub rect: [u32; 4],
-    /// The lens term the photo was straightened by before it was cut:
-    /// the cut is of the straightened photo, whose lens term is then 0,
-    /// and the whole photo takes this one back.
+    /// The lens term the photo is straightened by about its centre: the
+    /// part is of the photo so straightened, after it is enlarged as the
+    /// whole is, and its own lens term is 0. The whole photo takes this
+    /// one back.
     pub k1: f32,
     /// The enlargement the whole photo had when it was cut, which it
     /// takes back. The part starts with the same, and may be taken
@@ -466,7 +489,8 @@ pub struct Photo {
     pub crop: Option<Crop>,
     /// RGBA of the part on show, at its own size: the photo as loaded
     /// itself, when the whole of it is on show. What the adjustments
-    /// are made to, the enlargement among them.
+    /// are made to, the enlargement among them, but for a part cut under
+    /// a lens term, which they make from the photo as loaded about it.
     pub original: Arc<image::RgbaImage>,
     pub adjust: Adjust,
     /// The enlargements on offer for the part on show, least first: the
@@ -643,12 +667,12 @@ pub enum Ink {
 pub const DOUBT_RELIABILITY: u8 = 16;
 
 /// The most a module painted by hand may be believed short of certain:
-/// eight bits of likelihood, one module in two hundred and fifty-six
-/// misread. The painted reliability slider runs from a guess to here,
-/// and one step beyond to certain; a module believed further than this
-/// and still open to doubt is a nicety the decoder never needs, since
-/// nothing it doubts by reliability reaches so far down the order.
-pub const PAINT_RELIABILITY_MAX: u8 = 56;
+/// as far as any sampled module is ([`SAMPLED_MAX`]), eight bits of
+/// likelihood, one module in two hundred and fifty-six misread. The
+/// painted reliability slider runs from a guess to here, and one step
+/// beyond to certain; a module believed further than this and still
+/// open to doubt would be surer than any reading of a photograph is.
+pub const PAINT_RELIABILITY_MAX: u8 = SAMPLED_MAX;
 
 /// Which modules a sampling of the photo writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

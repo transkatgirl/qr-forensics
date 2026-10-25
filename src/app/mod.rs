@@ -26,7 +26,7 @@ use qr_forensics::decode::repair::{quiet_zone, render_rgba, render_svg, repaired
 use qr_forensics::decode::rs::{TrialReach, trial_reach};
 use qr_forensics::decode::sequence::Part;
 use qr_forensics::decode::text::Charset;
-use qr_forensics::imaging::adjust::{Adjust, Enlarge, LENS_MIN_PAIRS, estimate_k1, remap_point, undistort};
+use qr_forensics::imaging::adjust::{Adjust, Enlarge, Filter, LENS_MIN_PAIRS, estimate_k1, remap_point, straightened};
 use qr_forensics::imaging::photo::{crop_box, flatten_alpha};
 use qr_forensics::imaging::resize::resize;
 use qr_forensics::imaging::detect::{
@@ -35,8 +35,9 @@ use qr_forensics::imaging::detect::{
 };
 use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline, read_outline_one_of, standing_of};
 use qr_forensics::imaging::refine::{Refinement, placement_agreement, refine_corners, refine_corners_expecting};
-use qr_forensics::imaging::Luma;
-use qr_forensics::imaging::enhance::{Enhance, Sharpen};
+use qr_forensics::imaging::{Luma, SharedRgba};
+use qr_forensics::imaging::deblur;
+use qr_forensics::imaging::enhance::{Enhance, Enhanced, Sharpen};
 use qr_forensics::imaging::sample::{
     Classified, Kernel, Rule, SampleParams, VersionGuess, read_modules, suggest_versions,
 };
@@ -129,6 +130,8 @@ pub(crate) enum Action {
     /// Estimate the lens term from the corners and anchors and apply it,
     /// moving them with the photo. Only ever at the user's asking.
     EstimateLens,
+    /// Measure the blur inside the outline for the Deblur filter to undo.
+    MeasureDeblur,
     SetFormat(FormatSel),
     BruteForce,
     /// Search a block again with every dear solver's budget at its most,
@@ -288,6 +291,11 @@ struct PendingJob {
     /// with it.
     corners: [[f64; 2]; 4],
     anchors: Vec<Anchor>,
+    /// The photo's adjustments when the job began. A read the job makes
+    /// is of the photo so adjusted, and one that decoded only through a
+    /// copy of it sets the photo's adjustments from those
+    /// ([`App::adjust_as_read`]): its result is dropped if they changed.
+    adjust: Option<Adjust>,
     receiver: std::sync::mpsc::Receiver<JobResult>,
     started: std::time::Instant,
     /// Calls the job off, as a search's does: see [`PendingSearch`].
@@ -418,6 +426,9 @@ struct ReadNote {
     /// What it read the photo through: a copy of it about the symbol,
     /// enlarged and sharpened, or the photo as it is.
     enhance: Enhance,
+    /// The blur that copy undid, when it was deblurred, in the photo's
+    /// pixels ([`ReadResult::deblurred`]).
+    deblurred: Option<deblur::Spread>,
     /// Whether it sharpened the modules against their neighbours, as
     /// Sampling asked when the read began.
     sharpen_modules: bool,
@@ -868,7 +879,7 @@ impl App {
         let original = part_on_show(&source, crop);
         let (own_width, own_height) = original.dimensions();
         let adjust = Adjust { enlarge: adjust.enlarge.within(own_width, own_height), ..adjust };
-        let (display, luma) = adjust.apply(original.as_raw(), own_width as usize, own_height as usize);
+        let (display, luma) = adjusted(&adjust, &source, &original, crop);
         let (width, height) = (luma.width, luma.height);
         let greyscale = self.view.greyscale;
         let display = if greyscale { luma.to_rgba() } else { display };
@@ -899,9 +910,9 @@ impl App {
     /// Show another part of the photo as loaded, `rect` of it or the
     /// whole, with the outline and the anchors carried to where they lie
     /// in it. A lens term in force is of the whole photo, about its
-    /// centre, and means nothing of a part: the part is cut from the
-    /// photo straightened by it, and takes 0 for its own, and the whole
-    /// photo takes the term back. The enlargement is of the pixels as
+    /// centre, and means nothing of a part: the part is of the photo
+    /// straightened by it, after it is enlarged as the whole is, and
+    /// takes 0 for its own, and the whole photo takes the term back. The enlargement is of the pixels as
     /// loaded, and a part keeps it whatever its size, as it keeps the
     /// other adjustments: the symbol is as large after the cut as it
     /// was before it, and Enlarge is the user's to set. The whole photo
@@ -962,7 +973,7 @@ impl App {
         }
         text.push_str(". What was found in the photo was dropped with the rest of it: search, or Find in outline, again.");
         if lens {
-            text.push_str(" The lens setting was applied before the cut, and is 0 for the cropped photo.");
+            text.push_str(" The cropped part keeps the whole photo's lens correction, and Lens reads 0 until the whole photo is shown again.");
         }
         self.notify(text);
     }
@@ -986,8 +997,7 @@ impl App {
     /// adjustments, at the size its enlargement now makes of it.
     fn reapply_adjust(&mut self) {
         if let Some(photo) = &mut self.photo {
-            let (own_width, own_height) = photo.original.dimensions();
-            let (display, luma) = photo.adjust.apply(photo.original.as_raw(), own_width as usize, own_height as usize);
+            let (display, luma) = adjusted(&photo.adjust, &photo.source, &photo.original, photo.crop);
             (photo.width, photo.height) = (luma.width, luma.height);
             photo.greyscale = self.view.greyscale;
             let display = if photo.greyscale { luma.to_rgba() } else { display };
@@ -1006,8 +1016,7 @@ impl App {
         let display = if photo.greyscale {
             photo.luma.to_rgba()
         } else {
-            let (own_width, own_height) = photo.original.dimensions();
-            photo.adjust.apply(photo.original.as_raw(), own_width as usize, own_height as usize).0
+            adjusted(&photo.adjust, &photo.source, &photo.original, photo.crop).0
         };
         photo.texture.set(texture_image(display, photo.width, photo.height, self.texture_limit), egui::TextureOptions::LINEAR);
     }
@@ -1165,42 +1174,129 @@ impl App {
 
     /// Set the photo's Enlarge and Sharpen to what a read decoded
     /// through: a copy of the photo about the symbol, enlarged so many
-    /// times again from `base`, the photo's enlargement when the read
-    /// was made, and sharpened ([`qr_forensics::imaging::enhance`]).
+    /// times again from the photo as it was adjusted when the read was
+    /// made, `under`, and sharpened ([`qr_forensics::imaging::enhance`]).
     /// The whole photo so adjusted shows what the copy showed, and
     /// Sample reads the symbol as the read did. The outline, the anchors
     /// and whatever was found go with the photo to its new size. A
     /// large photo is not enlarged for it, which would make it many
     /// times the pixels to hold with no one having asked: that is left
-    /// to the user, and said. A photo blurred under Sharpen stays so
-    /// through a read that only enlarged its copy, which was made of
-    /// the photo blurred; one that sharpened its copy has Sharpen set
-    /// to that, in place of the blur. Returns what to tell the user;
-    /// `None` for a read of the photo as it is, or when the photo is so
-    /// adjusted already. The caller has taken the undo point.
-    fn adjust_as_read(&mut self, enhance: Enhance, base: Enlarge) -> Option<String> {
+    /// to the user, and said. A photo blurred or sharpened under Sharpen
+    /// stays so through a read that only enlarged its copy, which was
+    /// made of the photo so; one that sharpened its copy has Sharpen set
+    /// to that, in place of what it was, the copy having been made of the
+    /// photo without it ([`qr_forensics::imaging::Luma::as_shot`]). One
+    /// that deblurred its copy has the Deblur filter undo what the copy
+    /// undid, `deblurred` in the pixels of the photo as it was enlarged
+    /// then: measured about the symbol, which the blur measured over the
+    /// whole photo may not be. One that enlarged or sharpened a copy of a
+    /// photo under the Deblur filter with no blur set for it holds the
+    /// filter to the blur it measured over the whole photo, which the copy
+    /// undid: measured again over the photo so enlarged and sharpened, it
+    /// comes out otherwise. Where it measured none, and the copy was left
+    /// unfiltered, the filter is set to None.
+    ///
+    /// Sharpen and the filter are set from what they were when the read
+    /// was made, as the copy was made under them: a read loaded from the
+    /// list Read all made, after another of them set the photo otherwise,
+    /// or after the user did, has them set back for it, and said. The
+    /// tone is left as it is. Returns what to tell the user; `None` for a
+    /// read of the photo as it is, or when the photo is so adjusted
+    /// already. The caller has taken the undo point.
+    fn adjust_as_read(&mut self, enhance: Enhance, deblurred: Option<deblur::Spread>, under: ReadUnder) -> Option<String> {
         if enhance.is_none() {
             return None;
         }
         let photo = self.photo.as_ref()?;
         let (own_width, own_height) = photo.original.dimensions();
-        let before = self.doc.adjust;
-        let wanted = base.by(enhance.enlarge);
+        // The photo as it is now, and as the read had it.
+        let (before, was) = (self.doc.adjust, under.adjust);
+        let wanted = was.enlarge.by(enhance.enlarge);
         // Left as it is, too small, where the photo is too large to be
         // enlarged unasked.
         let left = before.enlarge < wanted && !wanted.fits_unasked(own_width, own_height);
+        // A deblurred copy lays no mask: the photo is deblurred as the
+        // copy was, by its Deblur filter at full strength undoing the blur
+        // the copy undid, carried to the photo's own pixels, with Sharpen
+        // as it was.
+        let deblur = enhance.sharpen == Sharpen::Deblur;
+        let kernel = deblurred.filter(|_| deblur).map(|spread| spread.scaled(1.0 / was.enlarge.factor()));
+        let enlarge = if left { before.enlarge } else { before.enlarge.max(wanted) };
+        let sharpen = if matches!(enhance.sharpen, Sharpen::Off | Sharpen::Deblur) { was.sharpen } else { enhance.sharpen.amount() };
+        // A copy made under the photo's own Deblur filter, with no blur set
+        // for it, undid the blur the filter measured over the whole photo,
+        // carried to the copy's pixels, and not one measured again at the
+        // copy's size and sharpness ([`Enhanced::window`]). So the photo,
+        // enlarged or sharpened as the copy was, is held to that blur, in
+        // its own pixels: `Some(None)` where the filter measured none and
+        // the copy was left unfiltered.
+        let held = (!deblur && was.filter == Filter::Deblur && was.kernel.is_none() && (enlarge != was.enlarge || sharpen != was.sharpen))
+            .then(|| under.measured.map(|spread| spread.scaled(1.0 / was.enlarge.factor())));
         let adjust = Adjust {
-            enlarge: if left { before.enlarge } else { before.enlarge.max(wanted) },
-            sharpen: if enhance.sharpen == Sharpen::Off { before.sharpen } else { before.sharpen.max(enhance.sharpen.amount()) },
+            enlarge,
+            sharpen,
+            filter: match held {
+                _ if deblur => Filter::Deblur,
+                Some(None) => Filter::None,
+                _ => was.filter,
+            },
+            radius: was.radius,
+            strength: if deblur { 1.0 } else { was.strength },
+            kernel: kernel.or(held.flatten()).or(was.kernel),
             ..before
         };
-        let set = match (adjust.enlarge != before.enlarge, adjust.sharpen != before.sharpen) {
-            (true, true) => format!("Enlarge was set to {} and Sharpen to {:.2}", adjust.enlarge, adjust.sharpen),
-            (true, false) => format!("Enlarge was set to {}", adjust.enlarge),
-            (false, true) => format!("Sharpen was set to {:.2}", adjust.sharpen),
-            (false, false) if !left => return None,
-            (false, false) => String::new(),
+        // What was set, the first said as set and the rest after it.
+        let mut set = String::new();
+        let mut say = |first: String, later: String, joined: &str| {
+            if set.is_empty() {
+                set = first;
+            } else {
+                set.push_str(joined);
+                set.push_str(&later);
+            }
         };
+        if adjust.enlarge != before.enlarge {
+            say(format!("Enlarge was set to {}", adjust.enlarge), format!("Enlarge to {}", adjust.enlarge), " and ");
+        }
+        if adjust.sharpen != before.sharpen {
+            say(format!("Sharpen was set to {:.2}", adjust.sharpen), format!("Sharpen to {:.2}", adjust.sharpen), " and ");
+        }
+        // The filter and what of its settings it heeds.
+        let filtered = |a: &Adjust| (a.filter, a.filter.has_radius().then_some(a.radius), (a.filter == Filter::Deblur).then_some((a.strength, a.kernel)));
+        if held == Some(None) && before.filter != Filter::None {
+            let none = "None, as Deblur found no blur to undo";
+            say(format!("Filter was set to {none}"), format!("Filter to {none}"), ", and ");
+        } else if held.is_some() && filtered(&before) == filtered(&was) && filtered(&adjust) != filtered(&before) {
+            let kept = "kept at the blur it had measured over the whole photo";
+            say(format!("Deblur was {kept}"), format!("Deblur {kept}"), ", and ");
+        } else if held != Some(None) && filtered(&adjust) != filtered(&before) {
+            // Deblurred as the copy was, or set back to what the copy was
+            // made under.
+            let mut filter = adjust.filter.label().to_owned();
+            if adjust.filter.has_radius() && adjust.radius != before.radius {
+                filter.push_str(&format!(" {} px either side", adjust.radius));
+            }
+            if adjust.filter == Filter::Deblur {
+                if adjust.strength != before.strength {
+                    filter.push_str(&if deblur { " at full strength".to_owned() } else { format!(" at strength {:.2}", adjust.strength) });
+                }
+                if adjust.kernel != before.kernel {
+                    filter.push_str(match adjust.kernel {
+                        _ if deblur => ", undoing the blur measured around the symbol",
+                        Some(_) if held.is_some() => ", undoing the blur it had measured over the whole photo",
+                        Some(_) => ", undoing the blur it was set to undo",
+                        None => ", undoing the blur it measures over the whole photo",
+                    });
+                }
+            }
+            if !deblur {
+                filter.push_str(", as it was when the symbol was read");
+            }
+            say(format!("Filter was set to {filter}"), format!("Filter to {filter}"), ", and ");
+        }
+        if set.is_empty() && !left {
+            return None;
+        }
         let mut text = format!("It decoded only with the photo {enhance}");
         text.push_str(&if set.is_empty() { ".".to_owned() } else { format!(", so under Photo {set}, and Sample reads it that way.") });
         if left {
@@ -1330,6 +1426,51 @@ impl App {
         });
     }
 
+    /// Measure the blur the photo shows inside the outline, off the photo
+    /// as its adjustments make it there but for its filter, and have the
+    /// Deblur filter undo that, in the photo's own pixels, in place of
+    /// the blur the whole photo shows. Never of its own accord: the user
+    /// asks, with the outline on the symbol.
+    fn measure_deblur(&mut self) {
+        let Some(photo) = &self.photo else {
+            self.fail("Load a photo first.");
+            return;
+        };
+        let corners = self.doc.corners;
+        let (x0, x1) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), c| (lo.min(c[0]), hi.max(c[0])));
+        let (y0, y1) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), c| (lo.min(c[1]), hi.max(c[1])));
+        if !(x1 > x0 && y1 > y0) {
+            self.fail("The outline has no area: drag its corners apart, around the symbol, first.");
+            return;
+        }
+        let window = [x0.floor().max(0.0) as usize, y0.floor().max(0.0) as usize, x1.ceil().max(0.0) as usize, y1.ceil().max(0.0) as usize];
+        let Some(view) = Enhanced::unfiltered(&photo.luma, window) else {
+            self.fail("The outline is off the photo: drag its corners onto the symbol first.");
+            return;
+        };
+        let Some(spread) = deblur::spread_of(&view.luma.data, view.luma.width, view.luma.height) else {
+            self.fail(
+                "No blur found inside the outline: the symbol is sharp or has too few edges to measure. If it looks \
+                 blurred, check that the outline is around the symbol.",
+            );
+            return;
+        };
+        let (widest, narrowest) = spread.extremes();
+        let own = spread.scaled(1.0 / photo.scale());
+        self.checkpoint();
+        self.doc.adjust.kernel = Some(own);
+        let mut text = format!(
+            "Measured the blur inside the outline: σ {widest:.1} × {narrowest:.1} px at {:.0}°. Deblur now undoes this instead \
+             of the whole photo's blur.",
+            spread.angle()
+        );
+        if let Some(dropped) = self.sync_adjust() {
+            text.push(' ');
+            text.push_str(&dropped);
+        }
+        self.notify(text);
+    }
+
     /// Estimate the radial lens term from the corners and anchors, and
     /// apply it, moving the corners and anchors with the photo so that
     /// they stay on the symbol. Never run of its own accord: the user
@@ -1394,11 +1535,11 @@ impl App {
     /// sampled. `what` names the symbol in the notice of a read loaded.
     fn take_in(&mut self, ctx: &egui::Context, mut prepared: Prepared, what: &str) -> String {
         let read = prepared.result.take().filter(|read| self.view.load_reads && read.is_trustworthy());
-        // The photo's enlargement is still what the read was made at: a
-        // job outlives no change of it.
-        let enlarge = self.photo.as_ref().map(|photo| photo.adjust.enlarge);
-        match (read, enlarge) {
-            (Some(read), Some(enlarge)) => self.load_read_result(*read, prepared.searched_inverted, enlarge, what),
+        // The photo is still adjusted as it was when the read was made: a
+        // job outlives no change of that ([`Self::poll_job`]).
+        let under = self.photo.as_ref().map(ReadUnder::of);
+        match (read, under) {
+            (Some(read), Some(under)) => self.load_read_result(*read, prepared.searched_inverted, under, what),
             _ => self.adopt_prepared(ctx, prepared),
         }
     }
@@ -1756,6 +1897,7 @@ impl App {
             version: self.doc.version,
             corners: self.doc.corners,
             anchors: self.doc.anchors.iter().map(|a| a.anchor).collect(),
+            adjust: self.photo.as_ref().map(|photo| photo.adjust),
             receiver,
             started: std::time::Instant::now(),
             cancel,
@@ -1803,7 +1945,18 @@ impl App {
         // that, and would be shown as one made on these corners.
         let outline_moved =
             job.corners != self.doc.corners || self.doc.anchors.iter().map(|a| a.anchor).ne(job.anchors.iter().copied());
+        // The photo adjusted otherwise while the step ran, by the user or a
+        // read taken in meanwhile: what the step read was read off the
+        // photo as it was, and a read that decoded only through a copy of
+        // it would set the photo's filter and sharpening from what they
+        // are now. A change of size or lens has dropped it already.
+        let adjusted = self.photo.as_ref().map(|photo| photo.adjust) != job.adjust;
         match result {
+            JobResult::Corners(_) | JobResult::Adopt(..) | JobResult::ReadFound { .. } if adjusted => self.notify(format!(
+                "{} was dropped: the photo's adjustments changed while it ran, and what it read was read off the photo \
+                 as it was. Run it again.",
+                job.kind.label()
+            )),
             JobResult::Corners(_) if outline_moved => self.notify(
                 "The outline or the anchors changed while the symbol inside the outline was being found, so the \
                  result was dropped; press Find in outline again.",
@@ -2061,10 +2214,12 @@ impl App {
         let parts = found.len() - left_out.len();
         let left_out: Vec<usize> = found.iter().filter(|(_, part)| left_out.contains(part)).map(|(i, _)| i + 1).collect();
         let total = reads.len();
-        let enlarge = self.photo.as_ref().map_or(Enlarge::NONE, |photo| photo.adjust.enlarge);
+        // As the photo is adjusted now, which is as it was when the reads
+        // were made: a change meanwhile dropped them ([`Self::poll_job`]).
+        let Some(under) = self.photo.as_ref().map(ReadUnder::of) else { return };
         let decodes = |i: usize| reads.get(i).and_then(Option::as_ref).is_some_and(ReadResult::is_trustworthy);
         let load = symbol_to_load(&proposals.found, proposals.adopted, &self.doc.corners, decodes).filter(|_| self.view.load_reads);
-        proposals.reads = Some(FoundReads { results: reads, photo_inverted, enlarge });
+        proposals.reads = Some(FoundReads { results: reads, photo_inverted, under });
         let mut text =
             format!("Read {decoded} of {total} symbols found through to a message: the list under Alignment says how each read stands.");
         if parts > 0 {
@@ -2177,19 +2332,19 @@ impl App {
         let proposals = self.proposals.as_mut()?;
         let reads = proposals.reads.as_ref()?;
         let read = reads.results.get(i)?.clone()?;
-        let (read_inverted, read_enlarge) = (reads.photo_inverted, reads.enlarge);
+        let (read_inverted, under) = (reads.photo_inverted, reads.under);
         proposals.adopted = Some(i);
-        Some(self.load_read_result(read, read_inverted, read_enlarge, &format!("symbol {}", i + 1)))
+        Some(self.load_read_result(read, read_inverted, under, &format!("symbol {}", i + 1)))
     }
 
     /// Make the document what `read` read: the outline and anchors on its
     /// symbol, the symbol's version, the modules as they were sampled,
     /// but for the fixed patterns, which are filled in as the standard
     /// has them, and the pins the read was made under. `read_inverted` and
-    /// `read_enlarge` are the photo's Invert setting and enlargement when
-    /// the read was made, and `what` names the symbol for the notice,
-    /// which comes back.
-    fn load_read_result(&mut self, read: ReadResult, read_inverted: bool, read_enlarge: Enlarge, what: &str) -> String {
+    /// `under` are the photo's Invert setting and adjustments when the
+    /// read was made, and `what` names the symbol for the notice, which
+    /// comes back.
+    fn load_read_result(&mut self, read: ReadResult, read_inverted: bool, under: ReadUnder, what: &str) -> String {
         self.checkpoint();
         let (version, decoded, padding_pinned) = (read.version(), read.is_trustworthy(), read.padding_pinned());
         let (verified, blocks) = (read.report.blocks_verified(), read.report.blocks.len());
@@ -2257,7 +2412,7 @@ impl App {
             let sharpen_modules = read.sharpen_modules;
             let band = if read.unsure_kept { 0.0 } else { self.view.sample.band };
             self.view.sample = SampleParams { kernel: read.kernel, sharpen_modules, band, ..self.view.sample.under(read.rule) };
-            through = self.adjust_as_read(read.enhance, read_enlarge);
+            through = self.adjust_as_read(read.enhance, read.deblurred, under);
         }
         // The stage is left as it is: a read loaded from the Align stage
         // is looked over there, on the photo, and the grid is a click away.
@@ -2298,8 +2453,8 @@ impl App {
         // step takes.
         let decoded = read.as_ref().is_some_and(|r| r.trustworthy);
         // What a read that decoded was made through, of the photo as it
-        // is enlarged now.
-        let through = read.as_ref().filter(|read| read.trustworthy).map(|read| (read.enhance, photo.adjust.enlarge));
+        // is adjusted now.
+        let through = read.as_ref().filter(|read| read.trustworthy).map(|read| (read.enhance, read.deblurred, ReadUnder::of(photo)));
         let adopt = adopts_version(&found, self.doc.version, decoded);
         let suggest = found.version != self.doc.version && !adopt;
         let family = self.doc.version.family();
@@ -2481,8 +2636,8 @@ impl App {
         // has the photo so adjusted, and samples the same way. Last,
         // since the outline, the anchors and the detection, placed
         // above, go with the photo to its new size.
-        if let Some((enhance, base)) = through
-            && let Some(note) = self.adjust_as_read(enhance, base)
+        if let Some((enhance, deblurred, under)) = through
+            && let Some(note) = self.adjust_as_read(enhance, deblurred, under)
         {
             text.push(' ');
             text.push_str(&note);
@@ -2618,7 +2773,7 @@ impl App {
                             // module has one handle and not two.
                             let sited = match anchor.anchor.kind {
                                 AnchorKind::Edge => true,
-                                AnchorKind::Custom => {
+                                AnchorKind::Custom | AnchorKind::Data => {
                                     if let Some(site) = sites.iter().find(same_place) {
                                         anchor.anchor.kind = site.kind;
                                     }
@@ -2846,6 +3001,7 @@ impl App {
                 }
             }
             Action::EstimateLens => self.estimate_lens(),
+            Action::MeasureDeblur => self.measure_deblur(),
             Action::SetFormat(format) => {
                 if self.doc.format != format {
                     self.begin_edit();
@@ -3893,6 +4049,7 @@ fn read_note(result: &ReadResult) -> ReadNote {
         kernel: result.kernel,
         rule: result.rule,
         enhance: result.enhance,
+        deblurred: result.deblurred,
         sharpen_modules: result.sharpen_modules,
         unsure_kept: result.unsure_kept,
         verified: result.report.blocks_verified(),
@@ -4155,9 +4312,11 @@ fn listed(luma: &Luma, mut all: Vec<Detection>, params: &SampleParams) -> Vec<De
     merge_detections(all)
 }
 
-/// The pixels the adjustments are made to: those of the photo as
-/// loaded, shared, or of the part `crop` of it, cut from the photo
-/// straightened by the lens term the crop was made under.
+/// The part on show at its own size: the photo as loaded, shared, or
+/// the part `crop` of it, straightened by the lens term the crop was
+/// made under, as the whole photo straightened has it there. What the
+/// adjustments are made to, but for a part so straightened, which they
+/// make from the photo as loaded about it ([`adjusted`]).
 fn part_on_show(source: &Arc<image::RgbaImage>, crop: Option<Crop>) -> Arc<image::RgbaImage> {
     let Some(crop) = crop else { return source.clone() };
     let [x, y, w, h] = crop.rect;
@@ -4166,9 +4325,25 @@ fn part_on_show(source: &Arc<image::RgbaImage>, crop: Option<Crop>) -> Arc<image
     }
     // The outline the crop was made to lay on the photo straightened.
     let (width, height) = source.dimensions();
-    let straightened = undistort(source.as_raw(), width as usize, height as usize, crop.k1);
-    let straightened = image::RgbaImage::from_raw(width, height, straightened).expect("straightening keeps the photo's size");
-    Arc::new(image::imageops::crop_imm(&straightened, x, y, w, h).to_image())
+    let part = straightened(source.as_raw(), width as usize, height as usize, crop.k1, [x, y, w, h].map(|side| side as usize));
+    Arc::new(image::RgbaImage::from_raw(w, h, part).expect("the part straightened is the part's size"))
+}
+
+/// The part on show under `adjust`: the RGBA image to display and the
+/// luminance to sample, made of the pixels on show ([`part_on_show`]),
+/// or, for a part cut under a lens term, of the photo as loaded about
+/// it, which is straightened about the whole photo's centre after it is
+/// enlarged, as the whole photo is ([`Adjust::apply_to`]). The pixels are
+/// handed over shared, so that the luminance keeps the photo as loaded
+/// beside it as these same bytes, and not as a copy of them
+/// ([`Adjust::apply_to_shared`]).
+fn adjusted(adjust: &Adjust, source: &Arc<image::RgbaImage>, original: &Arc<image::RgbaImage>, crop: Option<Crop>) -> (Vec<u8>, Luma) {
+    let (pixels, adjust, part) = match crop {
+        Some(crop) if crop.k1 != 0.0 => (source, Adjust { k1: crop.k1, ..*adjust }, crop.rect.map(|side| side as usize)),
+        _ => (original, *adjust, [0, 0, original.width() as usize, original.height() as usize]),
+    };
+    let shared: SharedRgba = pixels.clone();
+    adjust.apply_to_shared(&shared, pixels.width() as usize, pixels.height() as usize, part)
 }
 
 /// Pixels as a texture holds them: as they are when they fit within
@@ -5158,6 +5333,14 @@ mod tests {
         assert_eq!(bench.app.doc.grid.count(Module::Unknown), unknown_before);
     }
 
+    /// [`App::adjust_as_read`] of a read made through a copy of the photo
+    /// as the bench has it adjusted now, but enlarged `base` times.
+    fn adjust_as_read(app: &mut App, enhance: Enhance, deblurred: Option<deblur::Spread>, base: Enlarge) -> Option<String> {
+        let photo = app.photo.as_ref().expect("the bench has a photo");
+        let under = ReadUnder { adjust: Adjust { enlarge: base, ..photo.adjust }, measured: photo.luma.deblurred };
+        app.adjust_as_read(enhance, deblurred, under)
+    }
+
     /// The bench's render with its ink in red, so that a photo shown in
     /// its colours can be told from one shown in grey.
     fn red_render() -> image::RgbaImage {
@@ -5362,6 +5545,183 @@ mod tests {
     }
 
     #[test]
+    fn the_blur_the_deblur_filter_undoes_is_measured_inside_the_outline_when_asked() {
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        // The red render blurred, with the outline on its symbol.
+        let photo = image::imageops::blur(&red_render(), 1.6);
+        bench.app.set_photo(&ctx, "blurred".into(), photo);
+        bench.app.doc.corners = STRAIGHT;
+        bench.step();
+        bench.step();
+        // With Deblur on, the panel offers the kernel and its strength,
+        // and shows the blur measured over the whole photo.
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { filter: Filter::Deblur, ..bench.app.doc.adjust }));
+        bench.step();
+        for text in ["Kernel", "Measure in outline", "Use whole photo", "Strength"] {
+            bench.text_at(text);
+        }
+        let photo = bench.app.photo.as_ref().expect("the photo is loaded");
+        let whole = photo.luma.deblurred.expect("the whole photo's blur is measured");
+        assert!(bench.texts().iter().any(|text| text.ends_with("measured over the whole photo")), "{:?}", bench.texts());
+        // Measured inside the outline, the blur is kept in the photo's own
+        // pixels, undone in place of the whole photo's, and said; an undo
+        // takes it back.
+        bench.act(Action::MeasureDeblur);
+        bench.step();
+        assert!(bench.notice().text.starts_with("Measured the blur inside the outline"), "{}", bench.notice().text);
+        let kernel = bench.app.doc.adjust.kernel.expect("the blur is set");
+        let photo = bench.app.photo.as_ref().expect("the photo is loaded");
+        assert_eq!(photo.luma.deblurred, Some(kernel.scaled(photo.scale())));
+        assert_ne!(Some(kernel), Some(whole));
+        assert!(bench.texts().iter().any(|text| text.ends_with("set by Measure in outline or a read")), "{:?}", bench.texts());
+        bench.act(Action::Undo);
+        bench.step();
+        assert_eq!(bench.app.doc.adjust.kernel, None);
+        // An outline off the photo has nothing to measure.
+        bench.app.doc.corners = [[-50.0, -50.0], [-10.0, -50.0], [-10.0, -10.0], [-50.0, -10.0]];
+        bench.act(Action::MeasureDeblur);
+        assert!(bench.notice().is_error && bench.app.doc.adjust.kernel.is_none(), "{}", bench.notice().text);
+        assert!(bench.notice().text.starts_with("The outline is off the photo"), "{}", bench.notice().text);
+        // Nor has an outline drawn to a line on it, which is not said to be
+        // off the photo.
+        bench.app.doc.corners = [[60.0, 60.0], [200.0, 60.0], [200.0, 60.0], [60.0, 60.0]];
+        bench.act(Action::MeasureDeblur);
+        assert!(bench.notice().is_error && bench.app.doc.adjust.kernel.is_none(), "{}", bench.notice().text);
+        assert!(bench.notice().text.starts_with("The outline has no area"), "{}", bench.notice().text);
+        // A read that decoded only through a copy deblurred at full
+        // strength sets the filter's strength back to that, and has it
+        // undo what the copy undid, measured about the symbol, in place
+        // of the blur the whole photo shows.
+        bench.act(Action::SetAdjust(Adjust { strength: 0.4, ..bench.app.doc.adjust }));
+        let undid = deblur::Spread { xx: 2.0, xy: 0.3, yy: 1.2 };
+        let deblurred = Enhance { enlarge: 1, sharpen: Sharpen::Deblur };
+        let text = adjust_as_read(&mut bench.app, deblurred, Some(undid), Enlarge::NONE).expect("the strength is set");
+        assert!(text.contains("Filter was set to Deblur at full strength, undoing the blur measured around the symbol"), "{text}");
+        let adjust = bench.app.doc.adjust;
+        assert_eq!((adjust.filter, adjust.strength, adjust.kernel), (Filter::Deblur, 1.0, Some(undid)));
+        // Read in the photo enlarged, the blur is carried back to the
+        // photo's own pixels.
+        bench.act(Action::SetAdjust(Adjust { enlarge: Enlarge::times(2), ..bench.app.doc.adjust }));
+        let text = adjust_as_read(&mut bench.app, deblurred, Some(undid), Enlarge::times(2)).expect("the kernel is set");
+        assert!(text.contains("Filter was set to Deblur, undoing the blur measured around the symbol"), "{text}");
+        assert_eq!(bench.app.doc.adjust.kernel, Some(undid.scaled(0.5)));
+    }
+
+    #[test]
+    fn a_read_is_set_against_the_photo_as_it_was_adjusted_when_it_was_made() {
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        bench.app.set_photo(&ctx, "blurred".into(), image::imageops::blur(&red_render(), 1.6));
+        bench.app.doc.corners = STRAIGHT;
+        bench.step();
+        // A step under way while the user changes the photo's filter: what
+        // it read was read off the photo filtered as it was, and its
+        // result is dropped, the version and the outline as they were.
+        // Taken in, a read that decoded only through a copy of the photo
+        // made under the Deblur filter set the photo up as though the copy
+        // had been made with none.
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { filter: Filter::Deblur, ..bench.app.doc.adjust }));
+        let version = bench.app.doc.version;
+        let found = detection(SymbolVersion::Qr(6), STRAIGHT);
+        bench.app.start_job(&ctx, JobKind::Adopt, move || JobResult::Adopt(prepared(found), String::new(), None));
+        bench.act(Action::SetAdjust(Adjust { filter: Filter::None, ..bench.app.doc.adjust }));
+        bench.settle();
+        let notice = bench.notice();
+        assert!(notice.text.starts_with("Placing the corners on the symbol found was dropped: the photo's adjustments changed"), "{}", notice.text);
+        assert_eq!((bench.app.doc.version, bench.app.doc.adjust.filter), (version, Filter::None));
+        // A read Read all made under a median filter, loaded after the user
+        // took the filter off: its copy was made of the photo filtered, and
+        // the filter is set back, and said, with Sharpen as the copy had it.
+        let under = ReadUnder { adjust: Adjust { filter: Filter::Median, radius: 2, ..bench.app.doc.adjust }, measured: None };
+        let text = bench.app.adjust_as_read(Enhance { enlarge: 1, sharpen: Sharpen::Light }, None, under).expect("the photo is set");
+        assert!(text.contains("Sharpen was set to 0.50, and Filter to Median 2 px either side, as it was when the symbol was read"), "{text}");
+        assert_eq!((bench.app.doc.adjust.filter, bench.app.doc.adjust.radius, bench.app.doc.adjust.sharpen), (Filter::Median, 2, 0.5));
+        // And one read under the Deblur filter with no blur set for it,
+        // through a copy enlarged twice: the filter is set back, held to
+        // the blur it measured over the whole photo then, carried to the
+        // photo's own pixels, whatever the photo shows now.
+        let measured = deblur::Spread::round(1.4);
+        let under = ReadUnder { adjust: Adjust { filter: Filter::Deblur, sharpen: 0.0, ..Adjust::default() }, measured: Some(measured) };
+        let text = bench.app.adjust_as_read(Enhance { enlarge: 2, sharpen: Sharpen::Off }, None, under).expect("the photo is set");
+        assert!(text.contains("Enlarge was set to 2× and Sharpen to 0.00, and Filter to Deblur, undoing the blur it had measured"), "{text}");
+        let adjust = bench.app.doc.adjust;
+        assert_eq!((adjust.enlarge, adjust.filter, adjust.kernel), (Enlarge::times(2), Filter::Deblur, Some(measured)));
+    }
+
+    #[test]
+    fn anchors_on_no_site_are_counted_apart_from_the_sites_set() {
+        // A finder pattern found, two patches of data a read placed, a point
+        // traced along an edge and a custom anchor set by hand: one site
+        // set, and the rest on none. The patches and the edge point were
+        // once counted among the sites set, which a read's hundred patches
+        // took far past the sites there are.
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        bench.app.set_photo(&ctx, "red".into(), red_render());
+        bench.app.doc.corners = STRAIGHT;
+        bench.app.doc.set_anchor(finder_anchor([75.0, 75.0]), AnchorSource::Detected);
+        bench.app.doc.set_anchor(anchor(AnchorKind::Data, [12.5, 12.5], [165.0, 165.0]), AnchorSource::Detected);
+        bench.app.doc.set_anchor(anchor(AnchorKind::Data, [16.5, 12.5], [205.0, 165.0]), AnchorSource::Detected);
+        bench.app.doc.set_anchor(anchor(AnchorKind::Edge, [12.0, 0.0], [160.0, 40.0]), AnchorSource::Detected);
+        bench.app.doc.set_anchor(anchor(AnchorKind::Custom, [14.5, 18.5], [185.0, 225.0]), AnchorSource::Manual);
+        bench.step();
+        bench.step();
+        let sites = anchor_sites(&bench.app.derived.func).len();
+        let want = format!("Anchors: 1 of {sites} sites set (1 found, 0 by hand), and 1 edge point, 2 data patches and 1 custom");
+        assert!(bench.texts().contains(&want), "{:?}", bench.texts().iter().filter(|text| text.starts_with("Anchors")).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_read_through_a_copy_enlarged_and_sharpened_fixes_the_deblur_filter_to_the_blur_it_undid() {
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        // The red render blurred, under the Deblur filter with no blur set
+        // for it: it undoes what it measures over the whole photo.
+        bench.app.set_photo(&ctx, "blurred".into(), image::imageops::blur(&red_render(), 1.6));
+        bench.app.doc.corners = STRAIGHT;
+        bench.step();
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { filter: Filter::Deblur, ..bench.app.doc.adjust }));
+        bench.step();
+        let photo = bench.app.photo.as_ref().expect("the photo is loaded");
+        let (before, base) = (photo.luma.clone(), photo.adjust.enlarge);
+        let measured = before.deblurred.expect("the whole photo's blur is measured");
+        // A read that decoded only through a copy enlarged and sharpened,
+        // made under the filter, which undid the blur measured at the
+        // photo's size and not the one the photo enlarged and sharpened
+        // shows: the photo so adjusted holds the filter to that blur, and
+        // shows the copy again, pixel for pixel. Measured again, it once
+        // came out narrower, and the photo differed from the copy by most
+        // of the contrast along its edges.
+        let enhance = Enhance { enlarge: 2, sharpen: Sharpen::Strong };
+        let copy = Enhanced::window(&before, [0, 0, before.width, before.height], enhance).expect("a copy");
+        let text = adjust_as_read(&mut bench.app, enhance, None, base).expect("the photo is enlarged and sharpened");
+        assert!(text.contains("and Deblur kept at the blur it had measured over the whole photo"), "{text}");
+        let adjust = bench.app.doc.adjust;
+        assert_eq!((adjust.filter, adjust.kernel), (Filter::Deblur, Some(measured.scaled(1.0 / base.factor()))));
+        let photo = bench.app.photo.as_ref().expect("the photo is loaded");
+        assert_eq!((photo.luma.width, photo.luma.height), (copy.luma.width, copy.luma.height));
+        assert!(photo.luma.data == copy.luma.data, "the photo shows the copy again");
+        // Where the filter measured no blur, the copy was left unfiltered,
+        // and so is the photo.
+        let mut bench = Bench::new();
+        bench.app.set_photo(&ctx, "flat".into(), image::RgbaImage::from_pixel(330, 330, image::Rgba([128, 128, 128, 255])));
+        bench.step();
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { filter: Filter::Deblur, ..bench.app.doc.adjust }));
+        bench.step();
+        let photo = bench.app.photo.as_ref().expect("the photo is loaded");
+        assert_eq!(photo.luma.deblurred, None);
+        let base = photo.adjust.enlarge;
+        let text = adjust_as_read(&mut bench.app, Enhance { enlarge: 2, sharpen: Sharpen::Light }, None, base).expect("the photo is enlarged");
+        assert!(text.contains("and Filter to None, as Deblur found no blur to undo"), "{text}");
+        assert_eq!((bench.app.doc.adjust.filter, bench.app.doc.adjust.kernel), (Filter::None, None));
+    }
+
+    #[test]
     fn the_sharpen_slider_blurs_the_photo_below_nought() {
         let mut bench = Bench::new();
         let ctx = bench.ctx.clone();
@@ -5380,7 +5740,7 @@ mod tests {
         let rail = bench.rail_beside("Sharpen");
         bench.click(egui::pos2(rail.left() + 3.0, rail.center().y), egui::PointerButton::Primary);
         let photo = bench.app.photo.as_ref().expect("the photo is loaded");
-        assert_eq!((bench.app.doc.adjust.sharpen, photo.adjust.sharpen, photo.width, photo.height), (-1.0, -1.0, 330, 330));
+        assert_eq!((bench.app.doc.adjust.sharpen, photo.adjust.sharpen, photo.width, photo.height), (-2.0, -2.0, 330, 330));
         // The photo is the size it was, and still in its colours: flat
         // ink and flat paper as they were, and the edge between them run
         // together, part ink and part paper.
@@ -5408,17 +5768,24 @@ mod tests {
         // The copy was made of the photo blurred, and enlarged: the
         // photo is enlarged with the blur it had, and nothing is said of
         // Sharpen.
-        let text = bench.app.adjust_as_read(Enhance { enlarge: 2, sharpen: Sharpen::Off }, Enlarge::NONE).expect("the photo is enlarged");
+        let text = adjust_as_read(&mut bench.app, Enhance { enlarge: 2, sharpen: Sharpen::Off }, None, Enlarge::NONE).expect("the photo is enlarged");
         assert!(text.contains("so under Photo Enlarge was set to 2×, and Sample reads it that way.") && !text.contains("Sharpen"), "{text}");
         assert_eq!(bench.app.doc.adjust, Adjust { enlarge: Enlarge::times(2), sharpen: -0.5, ..Adjust::default() });
         assert_eq!(bench.app.photo.as_ref().map(|photo| (photo.width, photo.adjust.sharpen)), Some((660, -0.5)));
         // A copy sharpened decoded where the photo blurred did not: the
         // sharpening takes the blur's place.
-        let text = bench.app.adjust_as_read(Enhance { enlarge: 1, sharpen: Sharpen::Light }, Enlarge::times(2)).expect("the photo is sharpened");
+        let text = adjust_as_read(&mut bench.app, Enhance { enlarge: 1, sharpen: Sharpen::Light }, None, Enlarge::times(2)).expect("the photo is sharpened");
         assert!(text.contains("so under Photo Sharpen was set to 0.50, and Sample reads it that way."), "{text}");
         assert_eq!(bench.app.doc.adjust, Adjust { enlarge: Enlarge::times(2), sharpen: 0.5, ..Adjust::default() });
         // Set so, a read through the same copy has nothing to add.
-        assert_eq!(bench.app.adjust_as_read(Enhance { enlarge: 1, sharpen: Sharpen::Light }, Enlarge::times(2)), None);
+        assert_eq!(adjust_as_read(&mut bench.app, Enhance { enlarge: 1, sharpen: Sharpen::Light }, None, Enlarge::times(2)), None);
+        // Nor is a sharpening the photo had kept past one a read made in
+        // its place, weaker though that is: the copy was made of the
+        // photo without it.
+        bench.act(Action::SetAdjust(Adjust { sharpen: 1.5, ..bench.app.doc.adjust }));
+        let text = adjust_as_read(&mut bench.app, Enhance { enlarge: 1, sharpen: Sharpen::Light }, None, Enlarge::times(2)).expect("the photo is sharpened");
+        assert!(text.contains("so under Photo Sharpen was set to 0.50, and Sample reads it that way."), "{text}");
+        assert_eq!(bench.app.doc.adjust.sharpen, 0.5);
     }
 
     #[test]
@@ -5479,6 +5846,7 @@ mod tests {
                 kernel,
                 rule,
                 enhance,
+                deblurred: None,
                 sharpen_modules: true,
                 unsure_kept: false,
                 verified,
@@ -5536,7 +5904,7 @@ mod tests {
         assert!(bench.texts().iter().any(|text| text == "3×"), "{:?}", bench.texts());
         // So adjusted already, a read through the same copy of the photo
         // as it was has nothing to add.
-        assert_eq!(bench.app.adjust_as_read(Enhance { enlarge: 3, sharpen: Sharpen::Off }, Enlarge::NONE), None);
+        assert_eq!(adjust_as_read(&mut bench.app, Enhance { enlarge: 3, sharpen: Sharpen::Off }, None, Enlarge::NONE), None);
         // A photo too large to be enlarged so far without its being
         // asked for is sharpened, and says what to do about the rest:
         // the slider offers it.
@@ -5553,7 +5921,7 @@ mod tests {
         bench.act(Action::SetAdjust(Adjust { enlarge: Enlarge::times(4), ..bench.app.doc.adjust }));
         assert_eq!(bench.app.photo.as_ref().map(|photo| (photo.width, photo.height)), Some((6000, 1200)));
         assert_eq!(bench.app.doc.corners, STRAIGHT.map(|[x, y]| [4.0 * x, 4.0 * y]));
-        assert_eq!(bench.app.adjust_as_read(Enhance { enlarge: 4, sharpen: Sharpen::Strong }, Enlarge::NONE), None);
+        assert_eq!(adjust_as_read(&mut bench.app, Enhance { enlarge: 4, sharpen: Sharpen::Strong }, None, Enlarge::NONE), None);
     }
 
     #[test]
@@ -6675,6 +7043,9 @@ mod tests {
         bench.settle();
         assert!(!bench.app.derived.report.is_trustworthy());
         bench.act(Action::Undo);
+        // Drawn again before the checkbox is looked for: the anchors went
+        // with the undo, and the lines that count them with them.
+        bench.step();
         assert_eq!(bench.app.doc.version, SymbolVersion::Qr(2));
         // With reads loaded, picking it makes the document what was
         // read: the symbol's version and modules, under the outline the
@@ -7052,16 +7423,22 @@ mod tests {
         assert_eq!(bench.app.doc.corners, on_symbol);
         assert_eq!(bench.app.doc.anchors[0].anchor.center, [3075.0, 675.0]);
         assert!(bench.notice().text.starts_with("Showing the whole photo again (5000 × 1500)"), "{}", bench.notice().text);
-        // With a lens term in force, the crop is cut from the photo
-        // straightened by it and takes none of its own; the whole photo
-        // takes the term back.
+        // With a lens term in force, the crop is of the photo
+        // straightened by it, pixel for pixel what the whole photo shows
+        // there, and takes none of its own; the whole photo takes the
+        // term back.
         bench.app.history.checkpoint(&bench.app.doc);
         bench.act(Action::SetAdjust(Adjust { k1: -0.05, ..bench.app.doc.adjust }));
         bench.act(Action::CropToOutline);
         let photo = bench.app.photo.as_ref().expect("the photo is on show");
         assert_eq!(photo.crop.map(|crop| crop.k1), Some(-0.05));
         assert_eq!((bench.app.doc.adjust.k1, photo.adjust.k1), (0.0, 0.0));
-        assert!(bench.notice().text.contains("The lens setting was applied before the cut"), "{}", bench.notice().text);
+        assert!(bench.notice().text.contains("The cropped part keeps the whole photo's lens correction"), "{}", bench.notice().text);
+        let [x, y, w, h] = photo.crop.expect("cropped").rect.map(|side| side as usize);
+        let whole = Adjust { k1: -0.05, ..photo.adjust }.apply(photo.source.as_raw(), 5000, 1500).0;
+        let there: Vec<u8> = (y..y + h).flat_map(|row| whole[(row * 5000 + x) * 4..(row * 5000 + x + w) * 4].to_vec()).collect();
+        assert!(adjusted(&photo.adjust, &photo.source, &photo.original, photo.crop).0 == there, "the part is the whole straightened");
+        assert!(photo.original.as_raw() == &there, "and so are its own pixels");
         bench.act(Action::ShowWholePhoto);
         assert_eq!(bench.app.doc.adjust.k1, -0.05);
         assert!(bench.app.photo.as_ref().is_some_and(|photo| photo.crop.is_none() && photo.adjust.k1 == -0.05));

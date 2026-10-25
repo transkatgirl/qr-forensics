@@ -10,6 +10,7 @@ use super::bitstream::{self, Certainty, EndOfData, ParseReport, StreamBits};
 use super::clustering::Clustering;
 use super::codewords::{Pin, Pins, apply_pins, codeword_bit_mask, read_codewords};
 use super::evidence::{Laid, MessageEvidence};
+use super::likeness::{likeness_bits, stream_as_read};
 use super::list::{LIST_COST, LIST_COST_MAX, LIST_COST_MIN, rs_decode_listing};
 use super::padding::{self, TailCheck};
 use super::rs::{
@@ -2921,11 +2922,35 @@ pub struct Attempt {
     pub mask: u8,
     /// Mismatches between this choice's format codeword and the bits read.
     pub format_mismatches: u32,
+    /// What the format bits say against this choice's word, in eighths of
+    /// a bit of likelihood ([`bch::FormatCandidate::weight`]).
+    pub format_weight: u32,
+    /// How far the data read under this level and mask is like a message
+    /// rather than noise, in bits of likelihood
+    /// ([`super::likeness::likeness_bits`]).
+    pub likeness_bits: f64,
     /// The grid was reflected this way before decoding: the attempt is of
     /// the symbol's mirror image.
     pub mirror: Option<Mirror>,
     pub report: DecodeReport,
 }
+
+impl Attempt {
+    /// What the data and the format bits say together for this level and
+    /// mask, in bits of likelihood against the bits as read: the data's
+    /// likeness to a message, less what the format bits say against the
+    /// word. The two are on one scale, and add.
+    pub fn odds_bits(&self) -> f64 {
+        self.likeness_bits - f64::from(self.format_weight) / 8.0
+    }
+}
+
+/// Bits of likeness to a message the data must show under some level and
+/// mask before the data has a say in ranking them
+/// ([`attempt_every_format`]). The likeness is charged already for the
+/// runs and alignments it chose among, so that noise comes to nothing;
+/// this is a margin on top, a byte of text's worth several times over.
+pub const LIKENESS_FLOOR: f64 = 8.0;
 
 /// Block solves the second pass of [`brute_force`] may spend on doubting:
 /// enough to retry every attempt of a symbol with a few blocks, and a
@@ -2955,7 +2980,29 @@ pub fn brute_force(
     pins: Option<(EcLevel, &Pins)>,
     opts: &DecodeOptions,
 ) -> Vec<Attempt> {
-    attempt_every_format(grid, func, pins, &opts.among(formats(func)))
+    attempt_every_format(grid, func, pins, &opts.among(formats(func)), None)
+}
+
+/// [`brute_force`] of a grid read again of a symbol another grid of it
+/// was brute forced from, `preferred` the levels and masks that ranked
+/// best there: every level and mask decoded as the first pass decodes
+/// them, and the second pass, the dear one, made only of those preferred
+/// and of the attempt the first pass ranks best here. The level and mask
+/// are the symbol's, the same whichever way its modules are read, and
+/// under the wrong ones every block is noise that no stage helps; a read
+/// of a placement tries its grid under several samplings, and each
+/// once brute forced in full spent the most of a read that did not
+/// decode on decoding noise in stages. Each attempt is counted as
+/// [`brute_force`] counts it, one of every level and mask: which are
+/// searched in stages was chosen by the data, of another reading.
+pub fn brute_force_preferring(
+    grid: &ModuleGrid,
+    func: &Arc<FunctionMap>,
+    pins: Option<(EcLevel, &Pins)>,
+    opts: &DecodeOptions,
+    preferred: &[(EcLevel, u8)],
+) -> Vec<Attempt> {
+    attempt_every_format(grid, func, pins, &opts.among(formats(func)), Some(preferred))
 }
 
 /// [`brute_force`] with every attempt given the budgets of `opts` whole
@@ -2969,7 +3016,7 @@ pub fn brute_force_whole(
     pins: Option<(EcLevel, &Pins)>,
     opts: &DecodeOptions,
 ) -> Vec<Attempt> {
-    attempt_every_format(grid, func, pins, &opts.one_of(formats(func)))
+    attempt_every_format(grid, func, pins, &opts.one_of(formats(func)), None)
 }
 
 /// The levels and masks a brute force of `func`'s version tries: what a
@@ -2978,12 +3025,20 @@ pub fn formats(func: &FunctionMap) -> usize {
     func.version.ec_levels().len() * func.version.mask_count() as usize
 }
 
-/// The decodes of [`brute_force`], under `opts` as counted for them.
+/// What the format bits say against a level and mask's word: the bits
+/// they mismatch in, and the weight of those ([`Attempt::format_weight`]).
+type FormatAgainst = (u32, u32);
+
+/// The decodes of [`brute_force`], under `opts` as counted for them,
+/// the second pass made of the attempts at the levels and masks
+/// `preferred` names and the first attempt where it names any
+/// ([`brute_force_preferring`]).
 fn attempt_every_format(
     grid: &ModuleGrid,
     func: &Arc<FunctionMap>,
     pins: Option<(EcLevel, &Pins)>,
     opts: &DecodeOptions,
+    preferred: Option<&[(EcLevel, u8)]>,
 ) -> Vec<Attempt> {
     let format = bch::analyze_format(grid, func);
     let no_pins = Pins::new();
@@ -3004,34 +3059,57 @@ fn attempt_every_format(
     // Every level and mask, decoded side by side on the cores to spare
     // ([`work::map`]) and taken in their order: each decode stands alone,
     // and on a symbol of a block or two there is nothing else to spread.
-    let mut tried: Vec<(EcLevel, u8, u32, Arc<SymbolLayout>)> = Vec::new();
+    // Each level and mask, with the format bits' mismatches and weight
+    // against its word.
+    let mut tried: Vec<(EcLevel, u8, FormatAgainst, Arc<SymbolLayout>)> = Vec::new();
     for &ec in func.version.ec_levels() {
         let Some(layout) = SymbolLayout::new(func.clone(), ec) else { continue };
         let layout = Arc::new(layout);
         for mask in 0..func.version.mask_count() {
-            let format_mismatches = format
+            let against = format
                 .candidates
                 .iter()
                 .find(|c| c.fits_grid && c.is_standard() && c.fields.ec == ec && c.fields.mask == mask)
-                .map_or(0, |c| c.best_mismatches);
-            tried.push((ec, mask, format_mismatches, layout.clone()));
+                .map_or((0, 0), |c| (c.best_mismatches, c.weight));
+            tried.push((ec, mask, against, layout.clone()));
         }
     }
-    let reports = work::map(&tried, |(ec, mask, _, layout)| decode(grid, layout, *mask, pins_at(*ec), &first_pass));
+    let reports = work::map(&tried, |(ec, mask, _, layout)| {
+        (decode(grid, layout, *mask, pins_at(*ec), &first_pass), likeness_bits(&stream_as_read(grid, layout, *mask)))
+    });
     let mut attempts: Vec<(Attempt, Arc<SymbolLayout>)> = tried
         .into_iter()
         .zip(reports)
-        .map(|((ec, mask, format_mismatches, layout), report)| (Attempt { ec, mask, format_mismatches, mirror: None, report }, layout))
+        .map(|((ec, mask, (format_mismatches, format_weight), layout), (report, likeness_bits))| {
+            (Attempt { ec, mask, format_mismatches, format_weight, likeness_bits, mirror: None, report }, layout)
+        })
         .collect();
-    let by_score = |(a, _): &(Attempt, Arc<SymbolLayout>), (b, _): &(Attempt, Arc<SymbolLayout>)| {
-        b.report.score.cmp(&a.report.score).then(a.format_mismatches.cmp(&b.format_mismatches))
-    };
-    attempts.sort_by(by_score);
+    // Where no block is confirmed under any level and mask, and the data
+    // reads as a message under some, the attempts are told apart by the
+    // data and the format bits together ([`Attempt::odds_bits`]): under
+    // the wrong format every block is noise, and the unconfirmed
+    // solutions noise yields, and how many, say nothing of which format
+    // is right. Nor does a stream that parses through bits no block
+    // confirmed, once a message's likeness is to be had: noise parses so
+    // now and then, and of thirty-one wrong formats one did, ahead of the
+    // right one, whose stream two hundred bits of likeness spoke for, and
+    // whose headers a misread bit had broken. Where a block is confirmed,
+    // or the data reads as a message under no level and mask, the
+    // attempts are ranked as they decode and then by the format bits
+    // ([`ranked_by_data`]).
+    let by_data = ranked_by_data(attempts.iter().map(|(a, _)| a));
+    attempts.sort_by(|(a, _), (b, _)| rank_attempts(a, b, by_data));
     if two_passes {
         let blocks = attempts.iter().map(|(a, _)| a.report.blocks.len()).max().unwrap_or(1).max(1);
         // An rMQR grid has two attempts, fewer than the minimum: then all of them.
         let retry = (DOUBTING_BUDGET / blocks).max(DOUBTING_MIN_ATTEMPTS).min(attempts.len());
-        let again: Vec<usize> = (0..retry).filter(|&i| !attempts[i].0.report.is_trustworthy()).collect();
+        let again: Vec<usize> = match preferred {
+            None => (0..retry).filter(|&i| !attempts[i].0.report.is_trustworthy()).collect(),
+            Some(preferred) => (0..attempts.len())
+                .filter(|&i| i == 0 || preferred.contains(&(attempts[i].0.ec, attempts[i].0.mask)))
+                .filter(|&i| !attempts[i].0.report.is_trustworthy())
+                .collect(),
+        };
         // In the stages a decode is made in ([`decode_trying_harder`]),
         // each stage of every attempt before the next stage of any, every
         // attempt keeping the best its stages reach as a decode keeps it,
@@ -3054,9 +3132,38 @@ fn attempt_every_format(
                 break;
             }
         }
-        attempts.sort_by(by_score);
+        // Ranked again, by the data only if the doubting confirmed no
+        // block.
+        let by_data = ranked_by_data(attempts.iter().map(|(a, _)| a));
+        attempts.sort_by(|(a, _), (b, _)| rank_attempts(a, b, by_data));
     }
     attempts.into_iter().map(|(attempt, _)| attempt).collect()
+}
+
+/// Whether `attempts`, every level and mask of a grid, are ranked by the
+/// data they read as and the format bits together ([`rank_attempts`]):
+/// where no block is confirmed under any of them, and the data reads as
+/// a message under some ([`LIKENESS_FLOOR`]). A block confirmed anywhere
+/// says more of which is right than the data does, and whether the data
+/// reads as a message under some other level and mask, which a patch of
+/// one colour once made it seem to, says nothing of how two attempts the
+/// blocks tell apart are to be ranked.
+fn ranked_by_data<'a>(attempts: impl Iterator<Item = &'a Attempt> + Clone) -> bool {
+    !attempts.clone().any(|a| a.report.score.blocks_verified > 0) && attempts.into_iter().any(|a| a.likeness_bits >= LIKENESS_FLOOR)
+}
+
+/// How two attempts at a grid rank, the better first, as
+/// [`attempt_every_format`] ranks them: with `by_data` ([`ranked_by_data`]),
+/// by the data and the format bits together ([`Attempt::odds_bits`]);
+/// then as each decodes, every field of [`AttemptScore`] in its turn, and
+/// last by the format bits' mismatches. Attempts with a block confirmed
+/// are never ranked by the data: of two clean attempts at two levels
+/// whose blocks are laid out alike, both confirmed, the one that checked
+/// more confirming bits is the real one, which the data, read alike
+/// under both, does not say.
+fn rank_attempts(a: &Attempt, b: &Attempt, by_data: bool) -> std::cmp::Ordering {
+    let told = if by_data { b.odds_bits().total_cmp(&a.odds_bits()) } else { std::cmp::Ordering::Equal };
+    told.then(b.report.score.cmp(&a.report.score)).then(a.format_mismatches.cmp(&b.format_mismatches))
 }
 
 /// Decode the grid's mirror images under every EC level and mask, best
@@ -3084,7 +3191,11 @@ type BruteForce = fn(&ModuleGrid, &Arc<FunctionMap>, Option<(EcLevel, &Pins)>, &
 /// The attempts of `brute_force` on each of the grid's mirror images,
 /// best first, each counted as one of the mirror images
 /// ([`DecodeOptions::one_of`]): the best of them is taken, and each is a
-/// fresh chance for noise to pass, which went uncounted once.
+/// fresh chance for noise to pass, which went uncounted once. They are
+/// ranked together as [`attempt_every_format`] ranks those of one grid
+/// ([`rank_attempts`]): where no block of any mirror image is confirmed
+/// and the data reads as a message under some level and mask of one, by
+/// the data and the format bits.
 fn mirror_every_way(grid: &ModuleGrid, func: &Arc<FunctionMap>, opts: &DecodeOptions, brute_force: BruteForce) -> Vec<Attempt> {
     let mut attempts = Vec::new();
     let opts = &opts.one_of(func.version.mirrors().len());
@@ -3095,9 +3206,8 @@ fn mirror_every_way(grid: &ModuleGrid, func: &Arc<FunctionMap>, opts: &DecodeOpt
             attempts.push(attempt);
         }
     }
-    attempts.sort_by(|a, b| {
-        b.report.score.cmp(&a.report.score).then(a.format_mismatches.cmp(&b.format_mismatches))
-    });
+    let by_data = ranked_by_data(attempts.iter());
+    attempts.sort_by(|a, b| rank_attempts(a, b, by_data));
     attempts
 }
 
@@ -3684,6 +3794,63 @@ mod tests {
         let func = Arc::new(FunctionMap::new(SymbolVersion::Qr(v)));
         let best = analyze(&grid, &func).format.best().cloned().unwrap();
         (SymbolLayout::new(func, best.fields.ec).unwrap(), grid, best.fields.mask)
+    }
+
+    #[test]
+    fn attempts_with_a_block_confirmed_rank_as_they_decode_whatever_the_data_says() {
+        use std::cmp::Ordering;
+        // A decode with its block confirmed and its stream parsing, as an
+        // attempt checked by more confirming bits than another and one
+        // the data and the format bits favour over it: of two levels whose
+        // blocks are laid out alike, the one checked more is the real
+        // one, and the data read under both says nothing of which. Ranked
+        // by the data and the format bits first, the other once came
+        // first.
+        let (layout, grid, mask) = clean(1, qrcode_generator::qr::ErrorCorrection::Medium, qrcode_generator::Segment::bytes("forensics"));
+        let report = decode(&grid, &layout, mask, &Pins::new(), &DecodeOptions::default());
+        assert!(report.score.blocks_verified == 1 && report.score.all_verified && report.score.stream_valid, "{:?}", report.score);
+        let attempt = |more_bits: u32, blocks_verified: usize, likeness_bits: f64| Attempt {
+            ec: layout.ec,
+            mask,
+            format_mismatches: 0,
+            format_weight: 0,
+            likeness_bits,
+            mirror: None,
+            report: DecodeReport {
+                score: AttemptScore {
+                    confidence_bits: report.score.confidence_bits + more_bits,
+                    blocks_verified,
+                    all_verified: blocks_verified > 0,
+                    ..report.score
+                },
+                ..report.clone()
+            },
+        };
+        let (surer, likelier) = (attempt(8, 1, 10.0), attempt(0, 1, 200.0));
+        assert!(!ranked_by_data([&surer, &likelier].into_iter()));
+        assert_eq!(rank_attempts(&surer, &likelier, false), Ordering::Less);
+        // Of attempts with no block confirmed under any format, the data
+        // and the format bits rank first, the decode after.
+        let (noise, text) = (attempt(8, 0, 10.0), attempt(0, 0, 200.0));
+        assert!(ranked_by_data([&noise, &text].into_iter()));
+        assert_eq!(rank_attempts(&text, &noise, true), Ordering::Less);
+        assert_eq!(rank_attempts(&text, &noise, false), Ordering::Greater);
+        // A block confirmed under one format, and the data reading as a
+        // message under another: every attempt is ranked as it decodes,
+        // as where the data reads as a message nowhere. The data once had
+        // its say wherever it read as one, and put every attempt with a
+        // block confirmed before every one whose stream parsed with none,
+        // the other way round from where it read as none.
+        let parsing = attempt(0, 0, 0.0);
+        assert!(parsing.report.score.stream_valid);
+        let confirmed = attempt(0, 1, 0.0);
+        let blocked = Attempt { report: DecodeReport { score: AttemptScore { stream_valid: false, ..confirmed.report.score }, ..confirmed.report.clone() }, ..confirmed };
+        for elsewhere in [0.0, 200.0] {
+            let other = attempt(0, 0, elsewhere);
+            let by_data = ranked_by_data([&parsing, &blocked, &other].into_iter());
+            assert!(!by_data, "{elsewhere}");
+            assert_eq!(rank_attempts(&parsing, &blocked, by_data), Ordering::Less, "{elsewhere}");
+        }
     }
 
     /// A symbol of version `v` at `level` holding `forensics`, sampled

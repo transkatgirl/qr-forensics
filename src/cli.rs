@@ -9,10 +9,11 @@
 //!
 //! ```text
 //! qr-forensics decode [--family qr|micro|rmqr|model1]
-//!                     [--outline x,y,x,y,x,y,x,y] [--hex | --escaped]
-//!                     [--charset name] [--corners] [--details] [--grid]
-//!                     [--partial] [--surface] [--enlarge n]
-//!                     [--sharpen light|strong] [--full-search] [--] <image>...
+//!                     [--outline x,y,x,y,x,y,x,y | --placed x,y,x,y,x,y,x,y]
+//!                     [--hex | --escaped] [--charset name] [--corners]
+//!                     [--details] [--grid] [--metrics] [--partial]
+//!                     [--surface] [--enlarge n] [--sharpen light|strong|deblur]
+//!                     [--full-search] [--] <image>...
 //! ```
 //!
 //! An option that takes a value takes the next argument, or what follows
@@ -62,6 +63,36 @@
 //! about them, which `--outline` takes as it is. A read through an
 //! outline tries more than a search of the whole photo does.
 //!
+//! `--metrics` prints read-quality figures under each symbol's line,
+//! indented two spaces, for measuring the pipeline over a corpus
+//! ([`ReadMeasures`]). Only modules in confirmed blocks count, since only
+//! there does the decode settle their true colours:
+//!
+//! - `modules`: how many; `misread` and `unknown`: how many were read as
+//!   the wrong colour, or left unknown.
+//! - `blocks`: how many blocks were confirmed; `load_mean` and
+//!   `load_max`: the mean and largest share of a block's error correction
+//!   used.
+//! - `calibration`: one `bits:modules:misread:expected` entry per whole
+//!   number of bits of reliability: the modules read at it, how many were
+//!   wrong, and how many it predicted would be.
+//!
+//! ```text
+//!   metrics: modules=1234 misread=12 unknown=30 blocks=4 load_mean=0.210 load_max=0.550 calibration=1:20:9:10.000000,2:41:5:10.250000
+//! ```
+//!
+//! A read that confirmed no block prints no metrics line.
+//!
+//! `--placed` takes the symbol's four corners, as you'd place them in the
+//! Align stage, and reads from them with no search. It tries the few
+//! versions that best fit the corners, then refines, samples and decodes
+//! each as it would a placement the search found, retrying on an
+//! enlarged, sharpened copy if the modules are small, and on a deblurred
+//! copy if edges blur by a fifth of a module or more. The corners can
+//! start anywhere and go either way round. On a benchmark with
+//! hand-marked corners this works as an oracle: a symbol that reads from
+//! its marks but not by searching was lost by the search.
+//!
 //! `--surface` reads every symbol first against one threshold that lies
 //! as a smooth surface across it, the window's Threshold surface, where
 //! each module is otherwise judged against its neighbourhood first, then
@@ -78,12 +109,19 @@
 //! two across, or a symbol out of focus. The window makes the same of
 //! the whole photo, with Enlarge and Sharpen under Photo, where `light`
 //! is 0.5 and `strong` 1; here the outline stays in the photo's pixels.
-//! Neither is needed for such a symbol to be read: a read that does not
-//! decode, of a symbol whose modules are small, is made again through
-//! the photo enlarged and sharpened of itself, as wechat_qrcode reads a
-//! small crop a second time enlarged, and `--details` says of each
-//! symbol what it was read through when that was not the photo as it
-//! is. They set what is tried first, and reproduce a read.
+//! `--sharpen deblur` deconvolves instead of masking: it measures the
+//! blur's width and direction from edges around the symbol and undoes
+//! it, on a copy scaled so the blur is at most a couple of pixels wide.
+//! Use it for motion blur, or a photo too far out of focus for a mask to
+//! help. The window's Deblur filter, under Photo, does the same to the
+//! whole photo.
+//! Neither option is needed for such a symbol to be read: a failed read
+//! is retried on an enlarged, sharpened copy when the modules are small
+//! (as wechat_qrcode retries a small crop enlarged), and on a deblurred
+//! copy when edges blur by a fifth of a module or more, at any module
+//! size. `--details` says which copy each symbol was read from, if not
+//! the original photo. The options only change what is tried first,
+//! which helps to reproduce a read.
 //!
 //! `--full-search` searches a photo at the full size a search goes to
 //! from the start, where the search otherwise looks at a copy no larger
@@ -168,17 +206,19 @@ use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::adjust::Enlarge;
 use qr_forensics::imaging::detect::{Lead, SearchParams, search_for_families};
 use qr_forensics::imaging::enhance::{Enhance, Sharpen};
+use qr_forensics::imaging::measure::ReadMeasures;
 use qr_forensics::imaging::photo;
-use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline};
+use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline, read_placed};
 use qr_forensics::imaging::sample::{Rule, SampleParams};
 use qr_forensics::symbol::function_map::FunctionMap;
 use qr_forensics::symbol::layout::SymbolLayout;
 use qr_forensics::symbol::{Family, SymbolVersion};
 use qr_forensics::work;
 
-const USAGE: &str = "usage: qr-forensics decode [--family qr|micro|rmqr|model1] [--outline x,y,x,y,x,y,x,y] \
-                     [--hex | --escaped] [--charset name] [--corners] [--details] [--grid] [--partial] \
-                     [--surface] [--enlarge n] [--sharpen light|strong] [--full-search] [--] <image>...\n\
+const USAGE: &str = "usage: qr-forensics decode [--family qr|micro|rmqr|model1] \
+                     [--outline x,y,x,y,x,y,x,y | --placed x,y,x,y,x,y,x,y] \
+                     [--hex | --escaped] [--charset name] [--corners] [--details] [--grid] [--metrics] [--partial] \
+                     [--surface] [--enlarge n] [--sharpen light|strong|deblur] [--full-search] [--] <image>...\n\
                      A message is printed on its symbol's line, its control characters other than tab spelt out as \
                      <CR>, <LF> and so on; --escaped spells out every one and the unreadable mark, --hex prints the \
                      bytes.";
@@ -193,6 +233,8 @@ enum Show {
 struct Options {
     family: Option<Family>,
     outline: Option<[[f64; 2]; 4]>,
+    /// The symbol's own corners, read through with no search.
+    placed: Option<[[f64; 2]; 4]>,
     show: Show,
     /// The character set byte data is read in when the symbol declares
     /// none.
@@ -203,6 +245,8 @@ struct Options {
     details: bool,
     /// Print the modules as read below each line.
     grid: bool,
+    /// Print what each read made of the modules its decode came to know.
+    metrics: bool,
     /// Print the symbols that did not decode beside those that did.
     partial: bool,
     /// Read each symbol against a threshold surface first.
@@ -247,11 +291,13 @@ fn parse_options(args: &[OsString]) -> Result<Option<Options>, String> {
     let mut options = Options {
         family: None,
         outline: None,
+        placed: None,
         show: Show::Text,
         charset: Charset::Auto,
         corners: false,
         details: false,
         grid: false,
+        metrics: false,
         partial: false,
         surface: false,
         enhance: Enhance::NONE,
@@ -290,15 +336,10 @@ fn parse_options(args: &[OsString]) -> Result<Option<Options>, String> {
                 });
             }
             "--outline" => {
-                let value = value("eight numbers")?;
-                let numbers: Vec<f64> = value.split(',').map(|v| v.trim().parse::<f64>().map_err(|e| format!("outline {value:?}: {e}"))).collect::<Result<_, _>>()?;
-                let [x0, y0, x1, y1, x2, y2, x3, y3] = numbers[..] else {
-                    return Err(format!("an outline is eight numbers, not {}", numbers.len()));
-                };
-                if let Some(bad) = numbers.iter().find(|n| !n.is_finite()) {
-                    return Err(format!("outline {value:?}: {bad} is no pixel position"));
-                }
-                options.outline = Some([[x0, y0], [x1, y1], [x2, y2], [x3, y3]]);
+                options.outline = Some(four_points("an", "outline", &value("eight numbers")?)?);
+            }
+            "--placed" => {
+                options.placed = Some(four_points("a", "placement", &value("eight numbers")?)?);
             }
             "--hex" => {
                 flag()?;
@@ -330,6 +371,10 @@ fn parse_options(args: &[OsString]) -> Result<Option<Options>, String> {
                 flag()?;
                 options.grid = true;
             }
+            "--metrics" => {
+                flag()?;
+                options.metrics = true;
+            }
             "--partial" => {
                 flag()?;
                 options.partial = true;
@@ -346,12 +391,13 @@ fn parse_options(args: &[OsString]) -> Result<Option<Options>, String> {
                 };
             }
             "--sharpen" => {
-                let value = value("light or strong")?;
+                let value = value("light, strong or deblur")?;
                 options.enhance.sharpen = match value.as_str() {
                     "off" => Sharpen::Off,
                     "light" => Sharpen::Light,
                     "strong" => Sharpen::Strong,
-                    other => return Err(format!("--sharpen takes light or strong, not {other}")),
+                    "deblur" => Sharpen::Deblur,
+                    other => return Err(format!("--sharpen takes light, strong or deblur, not {other}")),
                 };
             }
             "--full-search" => {
@@ -366,7 +412,24 @@ fn parse_options(args: &[OsString]) -> Result<Option<Options>, String> {
     if options.images.is_empty() {
         return Err("no image given".to_owned());
     }
+    if options.outline.is_some() && options.placed.is_some() {
+        return Err("--outline and --placed can't be used together".to_owned());
+    }
     Ok(Some(options))
+}
+
+/// Four points in the photo's pixels, as `--outline` and `--placed` take
+/// them: eight numbers with commas between, `x` before `y`. `what` names
+/// them in what is said of a bad one, after `article`.
+fn four_points(article: &str, what: &str, value: &str) -> Result<[[f64; 2]; 4], String> {
+    let numbers: Vec<f64> = value.split(',').map(|v| v.trim().parse::<f64>().map_err(|e| format!("{what} {value:?}: {e}"))).collect::<Result<_, _>>()?;
+    let [x0, y0, x1, y1, x2, y2, x3, y3] = numbers[..] else {
+        return Err(format!("{article} {what} is eight numbers, not {}", numbers.len()));
+    };
+    if let Some(bad) = numbers.iter().find(|n| !n.is_finite()) {
+        return Err(format!("{what} {value:?}: {bad} is no pixel position"));
+    }
+    Ok([[x0, y0], [x1, y1], [x2, y2], [x3, y3]])
 }
 
 /// A photo as the app loads it: the file's pixels, enlarged when the
@@ -638,8 +701,14 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
         // given is read, and nothing is searched for.
         let mut leads: Vec<Lead> = Vec::new();
         // An outline is given in the photo's own pixels, and read in
-        // those the photo was loaded at.
+        // those the photo was loaded at; so is a placement.
+        let placed = options.placed.map(|corners| corners.map(|[x, y]| [x * times, y * times]));
         let results: Vec<ReadResult> = match options.outline.map(|outline| outline.map(|[x, y]| [x * times, y * times])) {
+            // A placement is read as the family named, or as a QR Code,
+            // and nothing is searched for.
+            _ if placed.is_some() => {
+                read_placed(&luma, options.family.unwrap_or(Family::Qr), placed.expect("a placement"), &params, &opts).into_iter().collect()
+            }
             // A family named is the one family the outline is read as;
             // with none named it is read as Find in outline reads one, as a
             // QR Code and then as the other families.
@@ -697,6 +766,12 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
                         return status;
                     }
                 }
+            }
+            if options.metrics
+                && let Some(measures) = ReadMeasures::of(result)
+                && writeln!(out, "  metrics: {measures}").is_err()
+            {
+                return status;
             }
         }
         // What the search found the finders of and fitted no symbol to
@@ -758,6 +833,14 @@ mod tests {
         assert_eq!(options.images, ["a.png", "--hex", "--", "-b.png"].map(OsString::from));
         assert!(options.corners && options.show == Show::Text);
         assert!(parse(&[OsString::from("--")]).is_err());
+        // A placement is read through, an outline looked inside: not both.
+        let placed: Vec<OsString> = ["--placed=1,2,3,4,5,6,7,8", "--metrics", "a.png"].iter().map(OsString::from).collect();
+        let options = parse(&placed).unwrap();
+        assert_eq!(options.placed, Some([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]));
+        assert!(options.metrics && options.outline.is_none());
+        assert!(parse(&[OsString::from("--placed=1,2,3,4,5,6,7,8"), OsString::from("--outline=1,2,3,4,5,6,7,8"), OsString::from("a.png")]).is_err());
+        assert!(parse(&[OsString::from("--placed=1,2,3"), OsString::from("a.png")]).is_err());
+        assert!(parse(&[OsString::from("--metrics=yes"), OsString::from("a.png")]).is_err());
         // The photo enlarged and sharpened, each on its own or both.
         assert_eq!(options.enhance, Enhance::NONE);
         let enhanced: Vec<OsString> = ["--enlarge", "3", "--sharpen=strong", "a.png"].iter().map(OsString::from).collect();

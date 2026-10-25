@@ -3,9 +3,12 @@
 
 pub mod adjust;
 pub mod binarize;
+pub mod deblur;
 pub mod detect;
 pub mod enhance;
 pub mod homography;
+pub mod measure;
+pub mod patches;
 pub mod photo;
 pub mod projection;
 pub mod pure;
@@ -15,7 +18,16 @@ pub(crate) mod regions;
 pub mod resize;
 pub mod sample;
 
+use std::fmt;
+use std::ops::Deref;
+use std::panic::RefUnwindSafe;
 use std::sync::Arc;
+
+/// RGBA bytes held once and shared: a photo as loaded, by the window
+/// that shows it and by the luminance made of it, which keeps it beside
+/// itself ([`AsShot`]) and would otherwise hold it a second time. Safe
+/// to hand across a panic, as a [`Luma`] holding plain bytes was.
+pub type SharedRgba = Arc<dyn Deref<Target = [u8]> + Send + Sync + RefUnwindSafe>;
 
 /// Single-channel image, row-major, 0.0 black to 1.0 white.
 #[derive(Clone, Debug, PartialEq)]
@@ -25,10 +37,83 @@ pub struct Luma {
     pub data: Vec<f32>,
     /// The image at its own size, when this is a photo enlarged for the
     /// pipeline ([`adjust::Enlarge`]): a whole number of times smaller
-    /// each way. The enlargement smooths every edge and rounds every
-    /// corner, and a symbol rendered pixel for pixel is read off the
-    /// pixels it had ([`pure`]), which are these.
+    /// each way, and made as the photo would be at its own size, under
+    /// the same adjustments in the same order but the filter, whose
+    /// neighbourhood would be that many times too wide there. The enlargement
+    /// smooths every edge and rounds every corner, and a symbol rendered
+    /// pixel for pixel is read off the pixels it had ([`pure`]), which
+    /// are these.
     pub unenlarged: Option<Arc<Luma>>,
+    /// The photo as loaded, with the adjustments the image was made
+    /// under, when they are more than a whole number of times its size
+    /// ([`adjust::Adjust`]): what a copy of the image made otherwise is
+    /// made from ([`enhance::Enhanced::window`]), by the same steps in
+    /// the same order, so that the photo so adjusted shows the copy
+    /// again.
+    pub as_shot: Option<Arc<AsShot>>,
+    /// The blur the photo's Deblur filter undid, in the image's pixels
+    /// and before its strength ([`adjust::Adjust::strength`]): the one
+    /// set for it, or the one measured over the image; `None` where it
+    /// measured none, and left the image as it was.
+    pub deblurred: Option<deblur::Spread>,
+}
+
+/// The photo as loaded about the part of it an image is of, in its
+/// colours, and the adjustments the image was made under.
+#[derive(Clone)]
+pub struct AsShot {
+    /// RGBA, `width` by `height`, beginning at `at` in the photo as
+    /// loaded, which is `photo` pixels across and down: the part, and as
+    /// much about it as straightening the part draws on. The photo's own
+    /// bytes where that is the whole of what they were made from and they
+    /// were handed over shared ([`adjust::Adjust::apply_to_shared`]).
+    pub rgba: SharedRgba,
+    pub width: usize,
+    pub height: usize,
+    pub at: [usize; 2],
+    pub photo: [usize; 2],
+    /// The part of the photo the image is of: left, top, width and
+    /// height.
+    pub part: [usize; 4],
+    /// The adjustments, with the enlargement the part's size held them
+    /// to.
+    pub adjust: adjust::Adjust,
+    /// Quarter turns clockwise the image has been turned since it was
+    /// made ([`Luma::rotated_cw`]); the rest is of the image as it was
+    /// made, and lies as it did. A copy of the image is made again as
+    /// the image lay and turned after ([`enhance::Enhanced::window`]), so
+    /// that it is straightened, reduced and deblurred among the pixels
+    /// the image was, and not among those of the photo turned, which lie
+    /// otherwise against its edges: a deblurred image turned, and a copy
+    /// of it made again from the photo turned, once differed by more
+    /// than a quarter of the way from black to white along their edges.
+    pub turned: u8,
+}
+
+/// The same pixels of the same photo under the same adjustments, whether
+/// held apart or shared.
+impl PartialEq for AsShot {
+    fn eq(&self, other: &Self) -> bool {
+        self.rgba[..] == other.rgba[..]
+            && (self.width, self.height, self.at, self.photo, self.part) == (other.width, other.height, other.at, other.photo, other.part)
+            && (self.adjust, self.turned) == (other.adjust, other.turned)
+    }
+}
+
+/// All but the bytes, of which their count.
+impl fmt::Debug for AsShot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AsShot")
+            .field("rgba", &format_args!("{} bytes", self.rgba.len()))
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("at", &self.at)
+            .field("photo", &self.photo)
+            .field("part", &self.part)
+            .field("adjust", &self.adjust)
+            .field("turned", &self.turned)
+            .finish()
+    }
 }
 
 /// The pixels that copies of a photo worked side by side may come to
@@ -41,13 +126,24 @@ const PIXELS_AT_ONCE: usize = 48_000_000;
 impl Luma {
     pub fn new(width: usize, height: usize, data: Vec<f32>) -> Self {
         assert_eq!(data.len(), width * height);
-        Self { width, height, data, unenlarged: None }
+        Self { width, height, data, unenlarged: None, as_shot: None, deblurred: None }
     }
 
-    /// How many copies the size of this image may be worked side by
-    /// side: as many as come to [`PIXELS_AT_ONCE`], and one at least.
+    /// How many copies of this image may be worked side by side: as many
+    /// as come to [`PIXELS_AT_ONCE`], and one at least. A copy turned
+    /// holds the photo at its own size turned too. A copy made again from
+    /// the photo as loaded ([`Luma::as_shot`]) is worked in its colours at
+    /// its own size before it is toned, four bytes to the pixel as the
+    /// image's own are, and counts twice; the photo as loaded it is made
+    /// from is held once, shared by every copy and every copy turned, and
+    /// counts against none of them. Counted by its bytes, a photo of
+    /// forty-eight megapixels shown at a quarter of its size was worked a
+    /// copy at a time.
     pub(crate) fn copies_at_once(&self) -> usize {
-        (PIXELS_AT_ONCE / (self.width * self.height).max(1)).max(1)
+        let pixels = self.width * self.height;
+        let own = self.unenlarged.as_ref().map_or(0, |own| own.width * own.height);
+        let worked = if self.as_shot.is_some() { pixels } else { 0 };
+        (PIXELS_AT_ONCE / (pixels + own + worked).max(1)).max(1)
     }
 
     /// Bilinear sample at pixel coordinates, where (0.5, 0.5) is the centre
@@ -125,7 +221,9 @@ impl Luma {
     }
 
     /// The image turned clockwise by `quarters` quarter turns, pixel for
-    /// pixel, and the image at its own size turned with it.
+    /// pixel, and the image at its own size and the blur undone turned
+    /// with it; the photo as loaded is kept as it lay, with the turn
+    /// ([`AsShot::turned`]).
     pub fn rotated_cw(&self, quarters: u8) -> Luma {
         let mut out = Luma::new(self.width, self.height, self.data.clone());
         for _ in 0..quarters % 4 {
@@ -141,6 +239,8 @@ impl Luma {
             out = Luma::new(h, w, data);
         }
         out.unenlarged = self.unenlarged.as_ref().map(|small| Arc::new(small.rotated_cw(quarters)));
+        out.as_shot = self.as_shot.as_ref().map(|shot| Arc::new(AsShot { turned: (shot.turned + quarters % 4) % 4, ..(**shot).clone() }));
+        out.deblurred = self.deblurred.map(|spread| (0..quarters % 4).fold(spread, |spread, _| spread.turned_cw()));
         out
     }
 }
@@ -229,11 +329,29 @@ mod tests {
 
     #[test]
     fn the_larger_the_photo_the_fewer_copies_of_it_at_once() {
-        let of = |width: usize, height: usize| Luma { width, height, data: Vec::new(), unenlarged: None }.copies_at_once();
+        let of = |width: usize, height: usize| Luma { width, height, data: Vec::new(), unenlarged: None, as_shot: None, deblurred: None }.copies_at_once();
         assert!(of(1280, 960) >= 8, "a small photo has every rung of the ladder at once");
         assert_eq!(of(4032, 3024), 3);
         assert_eq!(of(8064, 6048), 1);
         assert_eq!(of(20_000, 20_000), 1, "never none");
         assert_eq!(of(2, 3), 8_000_000);
+        // A copy of a photo adjusted is made again from the photo as
+        // loaded, worked in its colours at its own size, and counts twice;
+        // the photo as loaded, shared by every copy, counts against none,
+        // however much larger than the image it is. Enlarged, the image
+        // keeps its own pixels as well, which a copy turned turns.
+        let adjusted = |(width, height): (usize, usize), (w, h): (usize, usize), enlarged: bool| {
+            let own = enlarged.then(|| Arc::new(Luma::new(w, h, vec![0.0; w * h])));
+            let shot: SharedRgba = Arc::new(vec![0u8; w * h * 4]);
+            let as_shot = AsShot { rgba: shot, width: w, height: h, at: [0, 0], photo: [w, h], part: [0, 0, w, h], adjust: adjust::Adjust::default(), turned: 0 };
+            Luma { width, height, data: Vec::new(), unenlarged: own, as_shot: Some(Arc::new(as_shot)), deblurred: None }.copies_at_once()
+        };
+        assert_eq!(adjusted((4032, 3024), (4032, 3024), false), 1);
+        assert_eq!(adjusted((2000, 1500), (2000, 1500), false), 8);
+        assert_eq!(adjusted((2000, 1500), (1000, 750), true), 7);
+        // A photo of forty-eight megapixels shown at a quarter of its
+        // size: as many at once as one of three megapixels adjusted at its
+        // own. Counted by the bytes kept of it, it was one at a time.
+        assert_eq!(adjusted((2000, 1500), (8000, 6000), false), 8);
     }
 }

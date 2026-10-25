@@ -1,6 +1,6 @@
 //! The adjustments made to the photo before it is shown and sampled: its
-//! size, its sharpness, its tone, and a filter over each pixel's
-//! neighbourhood.
+//! size, its lens, its sharpness, its tone, and a filter over each
+//! pixel's neighbourhood.
 //!
 //! A photo is enlarged or reduced, and sharpened or blurred, as it is
 //! toned: the whole of it, in its colours, so that what is shown is
@@ -10,12 +10,15 @@
 //! grey; a read that does not decode still makes itself such copies,
 //! and what it read through one the photo so adjusted shows again.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use super::Luma;
-use super::enhance::{mask_for, unsharp_rgba, unsharp_values};
-use super::resize::{Sample, resize, resize_into};
+use super::enhance::{mask_for, unsharp_rgba};
+use super::deblur::{self, Spread};
+use super::resize::{Sample, resize};
+use super::detect::most_shrunk;
+use super::{AsShot, Luma, SharedRgba};
 use crate::work;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -42,11 +45,14 @@ impl Channel {
 }
 
 /// A filter over each pixel's neighbourhood, applied to the luminance after
-/// the tone adjustments. The finder scan reads runs of whole pixels and
-/// breaks on a symbol printed as dots or a scan full of specks, where the
-/// averaging of the module sampler copes; the filter mends the photo for
-/// the scan. zxing-cpp's `tryDenoise` closes 2D symbols before binarising
-/// them for the same reason, and its `tryDownscale` blurs by shrinking.
+/// the tone adjustments: last of all, once the photo is enlarged, among
+/// the pixels it is worked on at, as it is over a copy a read makes of
+/// it once the copy is enlarged ([`Luma::as_shot`]). The finder scan
+/// reads runs of whole pixels and breaks on a symbol printed as dots or
+/// a scan full of specks, where the averaging of the module sampler
+/// copes; the filter mends the photo for the scan. zxing-cpp's
+/// `tryDenoise` closes 2D symbols before binarising them for the same
+/// reason, and its `tryDownscale` blurs by shrinking.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Filter {
     #[default]
@@ -59,13 +65,17 @@ pub enum Filter {
     /// neighbourhood, then the lightest of that. The dots of a dot-matrix
     /// or inkjet print join into solid modules.
     Close,
-    /// A plain average over the neighbourhood, for grain and halftone
-    /// screens.
-    Blur,
+    /// The blur the photo shows, measured off its own edges, undone
+    /// ([`super::deblur`]): a photo out of focus, or shaken. It has no
+    /// neighbourhood of its own to set; what it undoes is the blur
+    /// measured over the whole photo, as a read that decoded only through
+    /// a copy of the photo deblurred so made it, or inside an outline
+    /// ([`Adjust::kernel`]), as far as its strength asks, however little.
+    Deblur,
 }
 
 impl Filter {
-    pub const ALL: [Filter; 4] = [Filter::None, Filter::Median, Filter::Close, Filter::Blur];
+    pub const ALL: [Filter; 4] = [Filter::None, Filter::Median, Filter::Close, Filter::Deblur];
     /// Widest neighbourhood offered, as a half-width in pixels.
     pub const MAX_RADIUS: u8 = 3;
 
@@ -74,7 +84,7 @@ impl Filter {
             Filter::None => "None",
             Filter::Median => "Median",
             Filter::Close => "Close dots",
-            Filter::Blur => "Blur",
+            Filter::Deblur => "Deblur",
         }
     }
 
@@ -83,8 +93,17 @@ impl Filter {
             Filter::None => "The photo as it is",
             Filter::Median => "Removes specks and dropouts a pixel or two across while keeping edges sharp",
             Filter::Close => "Joins the dots of a dot-matrix or inkjet print into solid dark modules",
-            Filter::Blur => "Averages away grain and halftone screens",
+            Filter::Deblur => {
+                "Measures the blur's width and direction from edges in the photo (or inside the outline) and \
+                 deconvolves it, for a photo so out of focus or motion-blurred that the finder patterns' rings have \
+                 run into their centres"
+            }
         }
+    }
+
+    /// Whether the filter has a neighbourhood whose radius may be set.
+    pub fn has_radius(self) -> bool {
+        matches!(self, Filter::Median | Filter::Close)
     }
 
     /// The filter over a `width` × `height` luminance image, with a
@@ -100,7 +119,7 @@ impl Filter {
                 let darkest = separable(data, width, height, radius, |w| w.iter().copied().fold(f32::INFINITY, f32::min));
                 separable(&darkest, width, height, radius, |w| w.iter().copied().fold(f32::NEG_INFINITY, f32::max))
             }
-            Filter::Blur => separable(data, width, height, radius, |w| w.iter().sum::<f32>() / w.len() as f32),
+            Filter::Deblur => super::deblur::undone(data, width, height),
         }
     }
 }
@@ -392,20 +411,34 @@ pub struct Adjust {
     pub filter: Filter,
     /// Half-width of the filter's neighbourhood, in pixels.
     pub radius: u8,
-    /// Radial lens distortion to take out first, as Brown's model has it:
-    /// negative straightens barrel, positive pincushion; 0.0 leaves the
-    /// photo as shot. Corners and anchors are in the straightened image.
+    /// Radial lens distortion to take out once the photo is resized, as
+    /// Brown's model has it, about the photo's centre: negative
+    /// straightens barrel, positive pincushion; 0.0 leaves the photo as
+    /// shot. Corners and anchors are in the straightened image.
     pub k1: f32,
     /// The size the photo is worked on at, against its own. Corners and
     /// anchors are in the pixels it comes to.
     pub enlarge: Enlarge,
     /// How far the photo is sharpened by an unsharp mask, from 0.0 for
-    /// not at all to 1.0, or below nought blurred instead, with the
-    /// mask's own Gaussian, as far as -1.0: see [`mask_for`]. The mask
-    /// is laid on the photo at the smaller of its own size and the size
-    /// it is worked on at: before it is enlarged, or after it is reduced.
+    /// not at all to 2.0, or below nought blurred instead, with the
+    /// mask's own Gaussian, as far as -2.0: see [`mask_for`]. The mask
+    /// is laid on the photo after it is resized, as wide in the photo's
+    /// own pixels, or in those a reduction leaves: on the photo
+    /// enlarged, as many times as wide.
     pub sharpen: f32,
+    /// The blur the Deblur filter undoes, in the photo's own pixels, as
+    /// measured inside an outline, or as a read that decoded through a
+    /// copy of the photo undid it: `None` for the blur the photo shows,
+    /// measured over the whole of it whenever it is filtered.
+    pub kernel: Option<Spread>,
+    /// How far the Deblur filter undoes the blur: its kernel spread so
+    /// many times as wide, from nought, which leaves the photo as it is,
+    /// past 1.0, as measured, to [`STRENGTH_RANGE`]'s end.
+    pub strength: f32,
 }
+
+/// How far the Deblur filter's strength goes ([`Adjust::strength`]).
+pub const STRENGTH_RANGE: std::ops::RangeInclusive<f32> = 0.0..=2.0;
 
 impl Default for Adjust {
     fn default() -> Self {
@@ -419,6 +452,8 @@ impl Default for Adjust {
             k1: 0.0,
             enlarge: Enlarge::NONE,
             sharpen: 0.0,
+            kernel: None,
+            strength: 1.0,
         }
     }
 }
@@ -602,37 +637,202 @@ pub fn estimate_k1(width: usize, height: usize, current_k1: f32, pairs: &[([f64;
 /// same ray from the centre, bilinearly, and white where that falls off
 /// the photo. Inverse mapping leaves no holes.
 pub fn undistort(rgba: &[u8], width: usize, height: usize, k1: f32) -> Vec<u8> {
+    straightened(rgba, width, height, k1, [0, 0, width, height])
+}
+
+/// The part `[x, y, w, h]` of the photo with its radial distortion taken
+/// out about the whole photo's centre, as [`undistort`] takes it out of
+/// the whole and pixel for pixel the same, read from no more of the
+/// photo than the part draws on.
+pub fn straightened(rgba: &[u8], width: usize, height: usize, k1: f32, [x, y, w, h]: [usize; 4]) -> Vec<u8> {
     assert_eq!(rgba.len(), width * height * 4);
-    let (w, h) = (width as f32, height as f32);
+    let frame = [width as f32, height as f32];
+    let [x0, y0, x1, y1] = shot_about(frame, k1, [x as f32, y as f32], (w, h), [1.0; 2], [width, height]);
+    let region = if [x0, y0, x1, y1] == [0, 0, width, height] { Cow::Borrowed(rgba) } else { Cow::Owned(cut(rgba, width, 4, [x0, y0, x1, y1])) };
+    let shot = Shot { pixels: &region, width: x1 - x0, height: y1 - y0, channels: 4, at: [x0 as f32, y0 as f32], step: [1.0; 2] };
+    straighten(&shot, frame, k1, [x as f32, y as f32], (w, h), &[255; 4])
+}
+
+/// Pixels of a photo as loaded, RGBA, that a part of it is adjusted
+/// from ([`Adjust::made`]): `width` by `height` of them, beginning at
+/// `at` in the photo, which is `photo` pixels across and down. `shared`
+/// is the same bytes held to be shared, when they are, for the
+/// luminance to keep beside it rather than a copy of them.
+#[derive(Clone, Copy)]
+pub(crate) struct Loaded<'a> {
+    pub rgba: &'a [u8],
+    pub width: usize,
+    pub height: usize,
+    pub at: [usize; 2],
+    pub photo: [usize; 2],
+    pub shared: Option<&'a SharedRgba>,
+}
+
+/// Pixels of a photo as shot, `channels` values to each, that a part of
+/// it is straightened from: in the pixels of a frame the whole photo is
+/// resized to, where they begin and how many of the frame's pixels apart
+/// they lie.
+pub(crate) struct Shot<'a, T> {
+    pub pixels: &'a [T],
+    pub width: usize,
+    pub height: usize,
+    pub channels: usize,
+    pub at: [f32; 2],
+    pub step: [f32; 2],
+}
+
+/// Rows of a part straightened as one piece, spread over the cores.
+const STRAIGHTENED_AT_ONCE: usize = 1 << 18;
+
+/// The part `width` by `height` of a frame beginning at `out_at` in it,
+/// the whole photo `frame` of the frame's pixels across and down, with
+/// the photo's radial distortion `k1` taken out about its centre: each
+/// pixel read from `shot` at [`source_radius`] along the same ray from
+/// the centre, bilinearly, and `fill` where that falls off the photo.
+/// The arithmetic is of the frame's own places, so that a part and the
+/// whole straightened in a frame of whole pixels come to the same values
+/// where they meet, whatever part of the photo as shot each is read
+/// from: `shot` holds what the part draws on ([`drawn_on`]). A `shot`
+/// that holds nothing is of a part that draws on none of the photo, and
+/// the part is `fill` throughout.
+pub(crate) fn straighten<T: Sample>(shot: &Shot<'_, T>, frame: [f32; 2], k1: f32, out_at: [f32; 2], (width, height): (usize, usize), fill: &[T]) -> Vec<T> {
+    let channels = shot.channels;
+    assert_eq!(shot.pixels.len(), shot.width * shot.height * channels);
+    assert_eq!(fill.len(), channels);
+    if width == 0 || height == 0 {
+        return Vec::new();
+    }
+    if shot.width == 0 || shot.height == 0 {
+        return fill.repeat(width * height);
+    }
+    let (w, h) = (frame[0], frame[1]);
     let (cx, cy) = (w / 2.0, h / 2.0);
     let norm = (w * w + h * h).sqrt() / 2.0;
-    let at = |x: usize, y: usize| &rgba[(y * width + x) * 4..(y * width + x) * 4 + 4];
-    let mut out = Vec::with_capacity(rgba.len());
-    for y in 0..height {
-        for x in 0..width {
-            let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
-            let r = (dx * dx + dy * dy).sqrt() / norm;
-            let f = if r > 0.0 { source_radius(r, k1) / r } else { 1.0 };
-            // Source pixel centres sit at half-integers, as in `Luma::sample`.
-            let (sx, sy) = (cx + dx * f - 0.5, cy + dy * f - 0.5);
-            if !(sx >= -0.5 && sy >= -0.5 && sx <= w - 0.5 && sy <= h - 0.5) {
-                out.extend_from_slice(&[255, 255, 255, 255]);
-                continue;
-            }
-            let x0 = sx.floor().clamp(0.0, w - 1.0) as usize;
-            let y0 = sy.floor().clamp(0.0, h - 1.0) as usize;
-            let (x1, y1) = ((x0 + 1).min(width - 1), (y0 + 1).min(height - 1));
-            let tx = (sx - x0 as f32).clamp(0.0, 1.0);
-            let ty = (sy - y0 as f32).clamp(0.0, 1.0);
-            let (p00, p10, p01, p11) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
-            for c in 0..4 {
-                let top = p00[c] as f32 * (1.0 - tx) + p10[c] as f32 * tx;
-                let bottom = p01[c] as f32 * (1.0 - tx) + p11[c] as f32 * tx;
-                out.push((top * (1.0 - ty) + bottom * ty).round() as u8);
+    let at = |x: usize, y: usize| &shot.pixels[(y * shot.width + x) * channels..(y * shot.width + x + 1) * channels];
+    let rows = (STRAIGHTENED_AT_ONCE / width).max(1);
+    let bands: Vec<(usize, usize)> = (0..height).step_by(rows).map(|y| (y, (y + rows).min(height))).collect();
+    work::map(&bands, |&(top, bottom)| {
+        let mut out = Vec::with_capacity((bottom - top) * width * channels);
+        for y in top..bottom {
+            for x in 0..width {
+                let (dx, dy) = (out_at[0] + x as f32 + 0.5 - cx, out_at[1] + y as f32 + 0.5 - cy);
+                let r = (dx * dx + dy * dy).sqrt() / norm;
+                let f = if r > 0.0 { source_radius(r, k1) / r } else { 1.0 };
+                // Source pixel centres sit at half-integers, as in `Luma::sample`.
+                let (sx, sy) = (cx + dx * f - 0.5, cy + dy * f - 0.5);
+                if !(sx >= -0.5 && sy >= -0.5 && sx <= w - 0.5 && sy <= h - 0.5) {
+                    out.extend_from_slice(fill);
+                    continue;
+                }
+                // Where that lies among the pixels held.
+                let (lx, ly) = ((sx - shot.at[0]) / shot.step[0], (sy - shot.at[1]) / shot.step[1]);
+                let x0 = lx.floor().clamp(0.0, shot.width as f32 - 1.0) as usize;
+                let y0 = ly.floor().clamp(0.0, shot.height as f32 - 1.0) as usize;
+                let (x1, y1) = ((x0 + 1).min(shot.width - 1), (y0 + 1).min(shot.height - 1));
+                let tx = (lx - x0 as f32).clamp(0.0, 1.0);
+                let ty = (ly - y0 as f32).clamp(0.0, 1.0);
+                let (p00, p10, p01, p11) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+                for c in 0..channels {
+                    let top = p00[c].to_f32() * (1.0 - tx) + p10[c].to_f32() * tx;
+                    let bottom = p01[c].to_f32() * (1.0 - tx) + p11[c].to_f32() * tx;
+                    out.push(T::from_f32(top * (1.0 - ty) + bottom * ty));
+                }
             }
         }
-    }
-    out
+        out
+    })
+    .concat()
+}
+
+/// The box of a frame, `[x0, y0, x1, y1]` in its pixels, that the part
+/// `width` by `height` of it beginning at `out_at` draws on straightened
+/// ([`straighten`]): the sources of the pixels along the part's edges,
+/// which bound those of the pixels within, since the straightening moves
+/// every place along its ray from the centre and keeps the order of
+/// places along it; and the pixels beside them that the bilinear
+/// sampling reads, and one more for the edges' bending between their
+/// pixels. Within the whole photo: a part whose every pixel is read from
+/// past one edge of it, as a strip along that edge is where a lens term
+/// straightens pincushion, draws on none of it, and comes to a box with
+/// no pixels in it, on that edge.
+pub(crate) fn drawn_on(frame: [f32; 2], k1: f32, out_at: [f32; 2], (width, height): (usize, usize)) -> [f32; 4] {
+    let (w, h) = (frame[0], frame[1]);
+    let (cx, cy) = (w / 2.0, h / 2.0);
+    let norm = (w * w + h * h).sqrt() / 2.0;
+    let source = |x: usize, y: usize| {
+        let (dx, dy) = (out_at[0] + x as f32 + 0.5 - cx, out_at[1] + y as f32 + 0.5 - cy);
+        let r = (dx * dx + dy * dy).sqrt() / norm;
+        let f = if r > 0.0 { source_radius(r, k1) / r } else { 1.0 };
+        [cx + dx * f - 0.5, cy + dy * f - 0.5]
+    };
+    let (last_x, last_y) = (width.saturating_sub(1), height.saturating_sub(1));
+    let edges = (0..width).flat_map(|x| [source(x, 0), source(x, last_y)]).chain((0..height).flat_map(|y| [source(0, y), source(last_x, y)]));
+    let [x0, y0, x1, y1] = edges.fold([f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY], |[x0, y0, x1, y1], [x, y]| {
+        [x0.min(x), y0.min(y), x1.max(x), y1.max(y)]
+    });
+    [(x0.floor() - 1.0).clamp(0.0, w), (y0.floor() - 1.0).clamp(0.0, h), (x1.floor() + 3.0).clamp(0.0, w), (y1.floor() + 3.0).clamp(0.0, h)]
+}
+
+/// How far past what a straightening reads, in the pixels the photo is
+/// resized from, the photo as shot is kept: past what the enlargement
+/// draws on beyond a pixel, so that the part as shot enlarged is the
+/// whole as shot enlarged where the straightening reads it.
+pub(crate) const SHOT_MARGIN: usize = 4;
+
+/// What of a photo as shot, `[x0, y0, x1, y1]` of its own `size` in
+/// pixels, the part `width` by `height` of a frame beginning at `out_at`
+/// draws on straightened, the frame `scale` of its pixels to one of the
+/// photo's: [`drawn_on`] in the photo's pixels, with [`SHOT_MARGIN`] of
+/// the frame's pixels about it, or of the photo's where they are the
+/// larger.
+fn shot_about(frame: [f32; 2], k1: f32, out_at: [f32; 2], out: (usize, usize), scale: [f32; 2], size: [usize; 2]) -> [usize; 4] {
+    let [x0, y0, x1, y1] = drawn_on(frame, k1, out_at, out);
+    let margin = |scale: f32| SHOT_MARGIN as f32 * (1.0 / scale).max(1.0);
+    let low = |at: f32, scale: f32| ((at / scale).floor() - margin(scale)).max(0.0) as usize;
+    let high = |at: f32, scale: f32, size: usize| (((at / scale).ceil() + margin(scale)) as usize).min(size);
+    [low(x0, scale[0]), low(y0, scale[1]), high(x1, scale[0], size[0]), high(y1, scale[1], size[1])]
+}
+
+/// Most of a photo's own pixels [`whole_after`] looks among for a number
+/// that a scale makes whole.
+const MOST_WHOLE_AFTER: usize = 64;
+
+/// The fewest of a photo's own pixels, along one way, that come to a
+/// whole number of the pixels of a copy `scale` times its size: one at a
+/// whole scale, two at a half, three at a third or two, four at a
+/// quarter, eight at an eighth. A part of the photo cut at a whole
+/// number of these from where the copy's pixels begin is resized among
+/// the pixels the whole copy is ([`super::resize`] centres each pixel of
+/// the part's copy where it centres it in the whole's), and its own come
+/// to a whole number of the copy's. Four, a quarter's, where no number
+/// up to [`MOST_WHOLE_AFTER`] does.
+pub(crate) fn whole_after(scale: f64) -> usize {
+    (1..=MOST_WHOLE_AFTER)
+        .find(|&n| {
+            let pixels = n as f64 * scale;
+            pixels.round() >= 1.0 && (pixels - pixels.round()).abs() < 1e-5 * pixels
+        })
+        .unwrap_or(4)
+}
+
+/// The box `[x0, y0, x1, y1]` of a photo's own pixels within `held`, and
+/// out to whole `steps` of them each way from the photo's corner: a part
+/// so cut is resized among the pixels the whole photo is, where its step
+/// is what [`whole_after`] gives for the scale it is resized by. A box
+/// that lies outside `held` comes to one with no pixels in it, on its
+/// edge.
+fn aligned([x0, y0, x1, y1]: [usize; 4], [across, down]: [usize; 2], held: [usize; 4]) -> [usize; 4] {
+    let (left, right) = (x0 / across * across, x1.div_ceil(across) * across);
+    let (top, bottom) = (y0 / down * down, y1.div_ceil(down) * down);
+    let horizontal = |v: usize| v.clamp(held[0], held[2]);
+    let vertical = |v: usize| v.clamp(held[1], held[3]);
+    [horizontal(left), vertical(top), horizontal(right), vertical(bottom)]
+}
+
+/// The rectangle `[x0, y0, x1, y1]`, far sides exclusive, of an image
+/// `width` pixels across with `channels` values to a pixel.
+pub(crate) fn cut<T: Copy>(data: &[T], width: usize, channels: usize, [x0, y0, x1, y1]: [usize; 4]) -> Vec<T> {
+    (y0..y1).flat_map(|y| data[(y * width + x0) * channels..(y * width + x1) * channels].iter().copied()).collect()
 }
 
 impl Adjust {
@@ -660,67 +860,185 @@ impl Adjust {
     /// enlargement makes of it ([`Enlarge::size`]), which is the
     /// luminance's. With a filter on, the display is the filtered
     /// luminance in grey, so that what is shown is what is sampled.
+    pub fn apply(&self, rgba: &[u8], width: usize, height: usize) -> (Vec<u8>, Luma) {
+        self.apply_to(rgba, width, height, [0, 0, width, height])
+    }
+
+    /// [`Self::apply`] to the part `[x, y, w, h]` of a photo `width` by
+    /// `height`, whose lens distortion is the whole photo's, taken out
+    /// about its centre: the part is what the whole photo so adjusted
+    /// shows there, but for the mask and the filter, which read no
+    /// further than the part's edges. With no lens term the enlargement
+    /// reads no further either: the part is resized on its own, and its
+    /// edges come out as a photo's edges do, not as the whole photo's
+    /// pixels there.
     ///
-    /// The lens comes first, which bends the photo about its own centre.
-    /// Then the photo is sharpened and resized, in its colours: sharpened
-    /// at its own size and then enlarged, where a mask a pixel or two
-    /// wide is as wide as what a lens blurred and the enlargement is the
-    /// better for the mask's overshoot, which it holds its own result
-    /// to; or reduced and then sharpened, at the size the reduction left
-    /// it. A blur, the mask the other way up, is laid at the same size.
-    /// The tone comes after, a curve for each pixel alone, and the
-    /// filter last, whose neighbourhood is measured in the pixels the
-    /// photo is worked on at.
+    /// The adjustments are made in the order the Photo section sets
+    /// them in. The photo is resized first, in its colours, and its lens
+    /// distortion taken out at the size it comes to, which bends it
+    /// about its centre: straightened among the pixels it is worked on
+    /// at, a photo enlarged keeps the edges the enlargement drew between
+    /// its pixels. Then it is sharpened or blurred, in its colours: the
+    /// mask is as wide in the photo's own pixels as Sharpen says, or in
+    /// those a reduction leaves, and on the photo enlarged as many times
+    /// as wide, as wide as what a lens blurred however large the photo
+    /// is drawn. The tone comes after, a curve for each pixel alone, and
+    /// the filter last, whose neighbourhood is measured in the pixels
+    /// the photo is worked on at.
     ///
     /// The luminance of a photo enlarged keeps that of the photo at its
-    /// own size beside it ([`Luma::unenlarged`]), under the same
-    /// adjustments less the filter, whose neighbourhood would be that
-    /// many times too wide there. An enlargement the photo's size does
-    /// not allow is held to the most that it does ([`Enlarge::within`]).
-    pub fn apply(&self, rgba: &[u8], width: usize, height: usize) -> (Vec<u8>, Luma) {
+    /// own size beside it ([`Luma::unenlarged`]), made as the photo
+    /// would be at that size less the filter, whose neighbourhood would
+    /// be that many times too wide there; and that of a photo adjusted more than
+    /// that keeps the photo as loaded beside it, with the adjustments
+    /// ([`Luma::as_shot`]), for a copy of it to be made from in the same
+    /// order. An enlargement the part's size does not allow is held to
+    /// the most that it does ([`Enlarge::within`]).
+    pub fn apply_to(&self, rgba: &[u8], width: usize, height: usize, part: [usize; 4]) -> (Vec<u8>, Luma) {
+        self.applied(rgba, None, width, height, part)
+    }
+
+    /// [`Self::apply_to`] of a photo whose bytes are held to be shared,
+    /// as a window that shows the photo holds them: what the luminance
+    /// keeps beside it of the photo as loaded ([`Luma::as_shot`]) is
+    /// those same bytes where it is the whole of them, and not a second
+    /// copy of a photo of many megapixels.
+    pub fn apply_to_shared(&self, rgba: &SharedRgba, width: usize, height: usize, part: [usize; 4]) -> (Vec<u8>, Luma) {
+        self.applied(rgba, Some(rgba), width, height, part)
+    }
+
+    /// [`Self::apply_to`], with the bytes held to be shared, if they are.
+    fn applied(&self, rgba: &[u8], shared: Option<&SharedRgba>, width: usize, height: usize, [x, y, w, h]: [usize; 4]) -> (Vec<u8>, Luma) {
         assert_eq!(rgba.len(), width * height * 4);
-        if width == 0 || height == 0 {
-            return self.tone(rgba.to_vec(), width, height);
+        assert!(x + w <= width && y + h <= height, "the part [{x}, {y}, {w}, {h}] lies within the photo, {width} by {height}");
+        if w == 0 || h == 0 {
+            return self.tone(Vec::new(), w, h, 1.0, 0);
         }
-        // Nothing is resampled while there is no distortion to take out.
-        let straightened;
-        let rgba = if self.k1 != 0.0 {
-            straightened = undistort(rgba, width, height, self.k1);
-            &straightened[..]
-        } else {
-            rgba
+        let enlarge = self.enlarge.within(w as u32, h as u32);
+        let photo = Loaded { rgba, width, height, at: [0, 0], photo: [width, height], shared };
+        let size = enlarge.size(w, h);
+        Adjust { enlarge, ..*self }.made(photo, [x, y, w, h], size, size.0 * size.1, true)
+    }
+
+    /// Whether the tone is the photo's own: a copy made of the photo's
+    /// luminance and toned no further is the copy toned.
+    fn plain_tone(&self) -> bool {
+        self.channel == Channel::Color && !self.invert && self.brightness == 0.0 && self.contrast == 0.0
+    }
+
+    /// The part `[x, y, w, h]` of a photo, made from what of it `from`
+    /// holds as loaded, `to_width` by `to_height`, by every adjustment
+    /// in its turn ([`Self::apply_to`]) but the size, which `to_width`
+    /// and `to_height` give: what the whole photo so adjusted would show
+    /// there, at that size. `whole_pixels` is how many pixels that whole
+    /// comes to at that size, which the Deblur filter is reduced for as the
+    /// whole is ([`deblur::undone_within`]). With `keep`, the luminance
+    /// keeps the part made at its own size beside it, when it is made a
+    /// whole number of times larger, and the photo as loaded, when it is
+    /// adjusted more than that.
+    pub(crate) fn made(&self, from: Loaded<'_>, [x, y, w, h]: [usize; 4], (to_width, to_height): (usize, usize), whole_pixels: usize, keep: bool) -> (Vec<u8>, Luma) {
+        let [ax, ay] = from.at;
+        let held = [ax, ay, ax + from.width, ay + from.height];
+        // Unbent, the part is read where it lies. Bent, it is read from
+        // what it draws on, which may lie elsewhere, a lens term that
+        // straightens barrel drawing the photo's edges in from nearer its
+        // centre, and which is held to what `from` holds ([`aligned`]).
+        assert!(
+            self.k1 != 0.0 || (x >= ax && y >= ay && x + w <= held[2] && y + h <= held[3]),
+            "the part [{x}, {y}, {w}, {h}] is held, in {held:?}"
+        );
+        let pixels = |[x0, y0, x1, y1]: [usize; 4]| {
+            if [x0, y0, x1, y1] == held { Cow::Borrowed(from.rgba) } else { Cow::Owned(cut(from.rgba, from.width, 4, [x0 - ax, y0 - ay, x1 - ax, y1 - ay])) }
         };
-        let enlarge = self.enlarge.within(width as u32, height as u32);
-        let (to_width, to_height) = enlarge.size(width, height);
+        let scale = [to_width as f32 / w as f32, to_height as f32 / h as f32];
         let mask = mask_for(self.sharpen);
-        if enlarge <= Enlarge::NONE {
-            let reduced;
-            let rgba = if (to_width, to_height) != (width, height) {
-                reduced = resize(rgba, width, height, 4, to_width, to_height);
-                &reduced[..]
+        // The part resized and straightened, and what of the photo it
+        // draws on.
+        let (worked, drawn) = if self.k1 == 0.0 {
+            let part = pixels([x, y, x + w, y + h]);
+            let worked = if (to_width, to_height) != (w, h) { Cow::Owned(resize(&part, w, h, 4, to_width, to_height)) } else { part };
+            (worked, [x, y, x + w, y + h])
+        } else {
+            // In a frame of the pixels the photo is worked on at, the
+            // photo as loaded about the part, resized into it, and
+            // straightened.
+            let [pw, ph] = from.photo;
+            let frame = [pw as f32 * scale[0], ph as f32 * scale[1]];
+            let out_at = [x as f32 * scale[0], y as f32 * scale[1]];
+            let steps = scale.map(|scale| whole_after(f64::from(scale)));
+            let region = aligned(shot_about(frame, self.k1, out_at, (to_width, to_height), scale, from.photo), steps, held);
+            let (gw, gh) = (region[2] - region[0], region[3] - region[1]);
+            let shot = pixels(region);
+            // A part that draws on none of the photo has nothing to resize,
+            // and is white throughout.
+            let (rw, rh) = if gw == 0 || gh == 0 {
+                (0, 0)
             } else {
-                rgba
+                (((gw as f32 * scale[0]).round() as usize).max(1), ((gh as f32 * scale[1]).round() as usize).max(1))
             };
-            let sharp = match mask {
-                Some((sigma, amount)) => unsharp_rgba(rgba, to_width, to_height, sigma, amount),
-                None => rgba.to_vec(),
-            };
-            return self.tone(sharp, to_width, to_height);
-        }
-        // The photo at its own size as it is enlarged from, when that is
-        // not the photo as given, and the photo enlarged.
-        let (own, larger) = match mask {
-            Some((sigma, amount)) => {
-                let sharp = unsharp_values(rgba, width, height, sigma, amount);
-                let larger = resize_into(&sharp, width, height, 4, to_width, to_height);
-                (Some(sharp.iter().map(|&value| u8::from_f32(value)).collect::<Vec<u8>>()), larger)
-            }
-            None => (None, resize(rgba, width, height, 4, to_width, to_height)),
+            let resized = if (rw, rh) != (gw, gh) && rw > 0 { Cow::Owned(resize(&shot, gw, gh, 4, rw, rh)) } else { shot };
+            let at = [region[0] as f32 * scale[0], region[1] as f32 * scale[1]];
+            let step = [gw as f32 * scale[0] / rw.max(1) as f32, gh as f32 * scale[1] / rh.max(1) as f32];
+            let from = Shot { pixels: &resized, width: rw, height: rh, channels: 4, at, step };
+            (Cow::Owned(straighten(&from, frame, self.k1, out_at, (to_width, to_height), &[255; 4])), region)
         };
-        let (display, mut luma) = self.tone(larger, to_width, to_height);
-        if enlarge.whole().is_some() {
+        let sharp = match mask {
+            Some((sigma, amount)) => unsharp_rgba(&worked, to_width, to_height, sigma * f64::from(scale[0]).max(1.0), amount),
+            None => worked.into_owned(),
+        };
+        let (display, mut luma) = self.tone(sharp, to_width, to_height, scale[0], whole_pixels);
+        if !keep {
+            return (display, luma);
+        }
+        let times = to_width / w;
+        let whole = to_width == w * times && to_height == h * times && times >= 1;
+        if whole && times > 1 {
+            // Less the filter, whose neighbourhood would be that many
+            // times too wide there: a symbol rendered pixel for pixel is
+            // read off these pixels ([`super::pure`]), and a median a
+            // pixel either way of each of them would take out every
+            // module that stands alone, and a finder pattern's ring.
             let unfiltered = Adjust { filter: Filter::None, ..*self };
-            luma.unenlarged = Some(Arc::new(unfiltered.tone(own.unwrap_or_else(|| rgba.to_vec()), width, height).1));
+            luma.unenlarged = Some(Arc::new(unfiltered.made(from, [x, y, w, h], (w, h), w * h, false).1));
+        }
+        if !whole || self.k1 != 0.0 || mask.is_some() || self.filter != Filter::None || !self.plain_tone() {
+            // As much of the photo as a copy of the part at any size
+            // draws on straightened: what the part draws on at its own
+            // size, and as far again as what a copy draws on beyond a
+            // pixel of its own, at the smallest a search makes of the
+            // part ([`most_shrunk`]), and as its cut out to whole steps
+            // of its pixels reaches past that; out to whole fours of the
+            // photo's pixels. Kept short of that, a copy shrunk further
+            // was cut at the edge of what was kept and not at a whole
+            // step, and resized among other pixels than the whole's.
+            let region = if self.k1 == 0.0 {
+                drawn
+            } else {
+                let [rx0, ry0, rx1, ry1] = shot_about([from.photo[0] as f32, from.photo[1] as f32], self.k1, [x as f32, y as f32], (w, h), [1.0; 2], from.photo);
+                // A copy's pixels are each `1 / least` of the photo's,
+                // and what it draws on reaches three of them past what it
+                // maps ([`drawn_on`]) and [`SHOT_MARGIN`] past that.
+                let least = f64::from(scale[0]) / f64::from(most_shrunk(to_width, to_height));
+                let beyond = (3 + SHOT_MARGIN) as f64 * ((1.0 / least).max(1.0) - 1.0);
+                let far = 3 * SHOT_MARGIN + beyond.ceil() as usize + whole_after(least);
+                aligned([rx0.saturating_sub(far), ry0.saturating_sub(far), rx1 + far, ry1 + far], [whole_after(0.25); 2], held)
+            };
+            // The bytes as they were handed over, where they are the
+            // whole of what is kept and are held to be shared.
+            let rgba: SharedRgba = match from.shared {
+                Some(shared) if region == held => shared.clone(),
+                _ => Arc::new(pixels(region).into_owned()),
+            };
+            luma.as_shot = Some(Arc::new(AsShot {
+                rgba,
+                width: region[2] - region[0],
+                height: region[3] - region[1],
+                at: [region[0], region[1]],
+                photo: from.photo,
+                part: [x, y, w, h],
+                adjust: *self,
+                turned: 0,
+            }));
         }
         (display, luma)
     }
@@ -729,8 +1047,10 @@ impl Adjust {
     /// resized and sharpened: the RGBA image to display, which is made
     /// of those pixels where they stand, and the luminance to sample
     /// from. A photo enlarged is many times the photo, and is not held
-    /// a second time to be toned.
-    fn tone(&self, mut rgba: Vec<u8>, width: usize, height: usize) -> (Vec<u8>, Luma) {
+    /// a second time to be toned. The pixels are a part of a whole of
+    /// `whole` pixels at this size, which the Deblur filter is reduced
+    /// for ([`Self::made`]).
+    fn tone(&self, mut rgba: Vec<u8>, width: usize, height: usize, scale: f32, whole: usize) -> (Vec<u8>, Luma) {
         let table = self.lookup_table();
         let mut luma = vec![0.0f32; width * height];
         // A curve for each pixel alone: the pixels are toned a piece at
@@ -753,8 +1073,18 @@ impl Adjust {
             }
         });
         drop(pieces);
+        let mut deblurred = None;
         if self.filter != Filter::None && width > 0 && height > 0 {
-            luma = self.filter.apply(&luma, width, height, self.radius.clamp(1, Filter::MAX_RADIUS) as usize);
+            luma = if self.filter == Filter::Deblur {
+                // By the kernel set, carried to the pixels the photo is
+                // worked on at, or by the blur it shows there.
+                let kernel = self.kernel.map(|kernel| kernel.scaled(f64::from(scale)));
+                let (sharp, spread) = deblur::undone_within(&luma, width, height, kernel, f64::from(self.strength), whole);
+                deblurred = spread;
+                sharp
+            } else {
+                self.filter.apply(&luma, width, height, self.radius.clamp(1, Filter::MAX_RADIUS) as usize)
+            };
             for (pixel, &value) in rgba.as_chunks_mut::<4>().0.iter_mut().zip(&luma) {
                 let grey = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
                 pixel[0] = grey;
@@ -762,7 +1092,9 @@ impl Adjust {
                 pixel[2] = grey;
             }
         }
-        (rgba, Luma::new(width, height, luma))
+        let mut luma = Luma::new(width, height, luma);
+        luma.deblurred = deblurred;
+        (rgba, luma)
     }
 }
 
@@ -898,24 +1230,33 @@ mod tests {
     }
 
     #[test]
-    fn a_photo_enlarged_keeps_its_own_size_adjusted_but_not_filtered() {
-        // Ink on the left half and paper on the right, enlarged twice.
-        let own = pixels(4, 2, |x, _| if x < 2 { [0; 3] } else { [255; 3] });
-        let adjust = Adjust { invert: true, filter: Filter::Blur, radius: 1, enlarge: Enlarge::times(2), ..Default::default() };
-        let (display, luma) = adjust.apply(&own, 4, 2);
-        assert_eq!((display.len(), luma.width, luma.height), (8 * 4 * 4, 8, 4));
-        // The working pixels are inverted and blurred across the edge...
-        assert!((luma.data[0] - 1.0).abs() < 1e-6 && (luma.data[7] - 0.0).abs() < 1e-6, "{:?}", &luma.data[..8]);
-        assert!(luma.data[3] < 0.9 && luma.data[4] > 0.1, "{:?}", &luma.data[..8]);
-        // ...and the photo's own inverted alike, with its edge as it was.
+    fn a_photo_enlarged_keeps_its_own_size_made_as_it_would_be_there_but_unfiltered() {
+        // A speck of ink on paper, enlarged twice.
+        let own = pixels(6, 6, |x, y| if (x, y) == (2, 2) { [0; 3] } else { [255; 3] });
+        let adjust = Adjust { invert: true, filter: Filter::Median, radius: 1, enlarge: Enlarge::times(2), ..Default::default() };
+        let (display, luma) = adjust.apply(&own, 6, 6);
+        assert_eq!((display.len(), luma.width, luma.height), (12 * 4 * 12, 12, 12));
+        // The working pixels are inverted and the speck taken out of
+        // them, where without the filter it shows...
+        let brightest = |data: &[f32]| data.iter().copied().fold(0.0f32, f32::max);
+        let unfiltered = Adjust { filter: Filter::None, ..adjust }.apply(&own, 6, 6).1;
+        assert!(luma.data[0].abs() < 1e-6 && brightest(&unfiltered.data) > 0.8, "{:?}", unfiltered.data);
+        assert!(brightest(&luma.data) < 0.3, "{:?}", luma.data);
+        // ...and the photo's own pixels are the photo at its own size
+        // under the same adjustments less the filter, whose median of
+        // three pixels a side would take out a module a pixel across:
+        // the speck inverted where it was, filtered or not.
         let small = luma.unenlarged.as_ref().expect("the photo's own pixels are kept");
-        assert_eq!((small.width, small.height), (4, 2));
-        for (value, want) in small.data.iter().zip([1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]) {
+        assert_eq!((small.width, small.height), (6, 6));
+        assert_eq!(small.data, Adjust { enlarge: Enlarge::NONE, filter: Filter::None, ..adjust }.apply(&own, 6, 6).1.data);
+        for (i, value) in small.data.iter().enumerate() {
+            let want = if i == 2 * 6 + 2 { 1.0 } else { 0.0 };
             assert!((value - want).abs() < 1e-6, "{:?}", small.data);
         }
+        assert_eq!(unfiltered.unenlarged.as_ref().map(|plain| &plain.data), Some(&small.data));
         assert!(small.unenlarged.is_none());
         // A photo worked on at its own size keeps nothing beside it.
-        assert!(Adjust { enlarge: Enlarge::NONE, ..adjust }.apply(&own, 4, 2).1.unenlarged.is_none());
+        assert!(Adjust { enlarge: Enlarge::NONE, ..adjust }.apply(&own, 6, 6).1.unenlarged.is_none());
     }
 
     #[test]
@@ -944,16 +1285,17 @@ mod tests {
             assert!(step > 60, "{sharpen}: {step}");
             steps.push(step);
             // What is sampled is the luminance of what is shown.
-            assert_eq!(luma, Adjust::default().apply(&display, 40, 12).1);
+            assert_eq!(luma.data, Adjust::default().apply(&display, 40, 12).1.data);
         }
         assert!(steps.windows(2).all(|pair| pair[0] < pair[1]), "the more the sharper: {steps:?}");
-        // Sharpened at its own size and then enlarged, with the photo
-        // at its own size, sharpened, beside it.
+        // Enlarged and then sharpened, with the mask as wide in the
+        // photo's own pixels, and the photo at its own size, sharpened,
+        // beside it.
         let sharp = Adjust { sharpen: 0.5, ..Default::default() };
         let both = Adjust { enlarge: Enlarge::times(3), ..sharp };
         let (display, luma) = both.apply(&photo, 40, 12);
         assert_eq!((display.len(), luma.width, luma.height), (120 * 36 * 4, 120, 36));
-        assert_eq!(luma.unenlarged.as_deref(), Some(&sharp.apply(&photo, 40, 12).1));
+        assert_eq!(luma.unenlarged.as_ref().map(|own| &own.data), Some(&sharp.apply(&photo, 40, 12).1.data));
         assert_eq!(&display[(15 * 120 + 9) * 4..(15 * 120 + 9) * 4 + 4], &[220, 40, 60, 255]);
         // Reduced and then sharpened, at the size the reduction left.
         let large = edge(80, 64);
@@ -1009,10 +1351,17 @@ mod tests {
             // about it.
             assert!(display.as_chunks::<4>().0.iter().all(|&[_, g, b, _]| (40..=220).contains(&g) && (60..=220).contains(&b)), "{sharpen}");
             // What is sampled is the luminance of what is shown.
-            assert_eq!(luma, Adjust::default().apply(&display, 40, 12).1);
+            assert_eq!(luma.data, Adjust::default().apply(&display, 40, 12).1.data);
         }
         assert!(spreads.windows(2).all(|pair| pair[0] > pair[1]), "the further down the softer: {spreads:?}");
         assert!(specks.windows(2).all(|pair| pair[0] > pair[1]), "and the fainter the specks: {specks:?}");
+        // Past where the mask stops, at the end, it is twice as wide
+        // again: softer and fainter still, and still with nothing past
+        // the tones about it.
+        let (display, _) = Adjust { sharpen: -2.0, ..Default::default() }.apply(&photo, 40, 12);
+        let green = |x: usize| i32::from(pixel(&display, x)[1]);
+        assert!(green(21) - green(18) < spreads[2] && green(8) < specks[2].into(), "{} and {}", green(21) - green(18), green(8));
+        assert!(display.as_chunks::<4>().0.iter().all(|&[_, g, b, _]| (40..=220).contains(&g) && (60..=220).contains(&b)));
         // Half way down is the whole of a Gaussian blur a pixel wide:
         // a speck a pixel across on flat ground keeps the middle weight
         // of the blur, across and down, over the ground, and no more.
@@ -1020,13 +1369,13 @@ mod tests {
         let middle = 1.0 / (1.0 + 2.0 * ((-0.5f32).exp() + (-2.0f32).exp() + (-4.5f32).exp()));
         let want = 40.0 + 180.0 * middle * middle;
         assert!((f32::from(pixel(&display, 8)[1]) - want).abs() < 1.0, "{} against {want}", pixel(&display, 8)[1]);
-        // Blurred at its own size and then enlarged, with the photo at
-        // its own size, blurred, beside it; and reduced and then
-        // blurred, at the size the reduction left.
+        // Enlarged and then blurred, as wide in the photo's own pixels,
+        // with the photo at its own size, blurred, beside it; and
+        // reduced and then blurred, at the size the reduction left.
         let blur = Adjust { sharpen: -0.5, ..Default::default() };
         let (display, luma) = Adjust { enlarge: Enlarge::times(3), ..blur }.apply(&photo, 40, 12);
         assert_eq!((display.len(), luma.width, luma.height), (120 * 36 * 4, 120, 36));
-        assert_eq!(luma.unenlarged.as_deref(), Some(&blur.apply(&photo, 40, 12).1));
+        assert_eq!(luma.unenlarged.as_ref().map(|own| &own.data), Some(&blur.apply(&photo, 40, 12).1.data));
         assert_eq!(&display[(15 * 120 + 9) * 4..(15 * 120 + 9) * 4 + 4], &[220, 40, 60, 255]);
         let large = edge(80, 64);
         let reduced = Adjust { enlarge: Enlarge::HALF, ..Default::default() }.apply(&large, 80, 64).0;
@@ -1039,21 +1388,33 @@ mod tests {
     fn a_photo_sharpened_and_enlarged_reads_as_a_copy_of_it_made_for_a_read() {
         use crate::imaging::enhance::{Enhance, Enhanced, Sharpen};
         // Busy grey pixels. What a read sees through a copy of the photo
-        // about a symbol, sharpened and enlarged, the whole photo under
-        // the same two adjustments shows, to the half of a grey level a
-        // byte rounds away.
+        // about a symbol, enlarged and sharpened, the whole photo under
+        // the same two adjustments shows, edges and all: to the half of
+        // a grey level a byte rounds away where only one of the two is
+        // made, and where both are, to what the mask makes of the half
+        // a level the bytes the photo is enlarged into round away before
+        // it is sharpened, which the copy holds as values.
         let (w, h) = (48, 36);
         let photo = pixels(w, h, |x, y| [((((x * 31 + y * 17) % 23) * 255 / 22 + ((x / 5 + y / 3) % 2) * 255) / 2) as u8; 3]);
         let plain = Adjust::default().apply(&photo, w, h).1;
-        let near = |adjusted: &Luma, copy: &Luma, what: &str| {
+        let differences = |adjusted: &Luma, copy: &Luma, what: &str| {
             assert_eq!((adjusted.width, adjusted.height), (copy.width, copy.height), "{what}");
-            let worst = adjusted.data.iter().zip(&copy.data).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-            assert!(worst < 0.0025, "{what}: {worst}");
+            let differences: Vec<f32> = adjusted.data.iter().zip(&copy.data).map(|(a, b)| (a - b).abs()).collect();
+            (differences.iter().copied().fold(0.0f32, f32::max), differences.iter().sum::<f32>() / differences.len() as f32)
+        };
+        let near = |adjusted: &Luma, copy: &Luma, both: bool, what: &str| {
+            let (worst, mean) = differences(adjusted, copy, what);
+            if both {
+                assert!(worst < 0.01 && mean < 0.002, "{what}: {worst} at the most, {mean} on the whole");
+            } else {
+                assert!(worst < 0.0025, "{what}: {worst}");
+            }
         };
         for (sharpen, enlarge) in [(Sharpen::Light, 1u8), (Sharpen::Strong, 1), (Sharpen::Light, 3), (Sharpen::Strong, 4), (Sharpen::Off, 2)] {
             let copy = Enhanced::window(&plain, [0, 0, w, h], Enhance { enlarge, sharpen }).unwrap();
             let adjust = Adjust { sharpen: sharpen.amount(), enlarge: Enlarge::NONE.by(enlarge), ..Default::default() };
-            near(&adjust.apply(&photo, w, h).1, &copy.luma, &format!("{sharpen:?}, {enlarge} times"));
+            let both = enlarge > 1 && sharpen != Sharpen::Off;
+            near(&adjust.apply(&photo, w, h).1, &copy.luma, both, &format!("{sharpen:?}, {enlarge} times"));
         }
         // A photo enlarged already is read through a copy made from the
         // pixels it had, in one step: so is the photo enlarged as many
@@ -1062,7 +1423,593 @@ mod tests {
         let copy = Enhanced::window(&twice.apply(&photo, w, h).1, [0, 0, 2 * w, 2 * h], Enhance { enlarge: 2, sharpen: Sharpen::Light }).unwrap();
         let adjust = Adjust { sharpen: Sharpen::Light.amount(), enlarge: twice.enlarge.by(2), ..Default::default() };
         assert_eq!(adjust.enlarge, Enlarge::times(4));
-        near(&adjust.apply(&photo, w, h).1, &copy.luma, "enlarged twice, and twice again");
+        near(&adjust.apply(&photo, w, h).1, &copy.luma, true, "enlarged twice, and twice again");
+        // Bent by a lens, the photo is straightened after it is enlarged,
+        // and a copy of it is the photo made again from the photo as
+        // loaded under the copy's Enlarge and Sharpen, by the same steps:
+        // the photo so adjusted, pixel for pixel. So for a window of it,
+        // and a part of it cut alone.
+        let lensed = |what: &str, adjusted: &Luma, copy: &Luma| {
+            let (worst, _) = differences(adjusted, copy, what);
+            assert!(worst == 0.0, "{what}: {worst}");
+        };
+        for k1 in [0.12, -0.2] {
+            let plain = Adjust { k1, ..Default::default() }.apply(&photo, w, h).1;
+            for (sharpen, enlarge) in [(Sharpen::Light, 2u8), (Sharpen::Strong, 4), (Sharpen::Off, 2)] {
+                let copy = Enhanced::window(&plain, [0, 0, w, h], Enhance { enlarge, sharpen }).unwrap();
+                let adjust = Adjust { k1, sharpen: sharpen.amount(), enlarge: Enlarge::NONE.by(enlarge), ..Default::default() };
+                lensed(&format!("{k1}: {sharpen:?}, {enlarge} times"), &adjust.apply(&photo, w, h).1, &copy.luma);
+            }
+            let twice = Adjust { k1, ..twice };
+            let copy = Enhanced::window(&twice.apply(&photo, w, h).1, [0, 0, 2 * w, 2 * h], Enhance { enlarge: 2, sharpen: Sharpen::Light }).unwrap();
+            let adjust = Adjust { sharpen: Sharpen::Light.amount(), enlarge: twice.enlarge.by(2), ..twice };
+            lensed(&format!("{k1}: enlarged twice, and twice again"), &adjust.apply(&photo, w, h).1, &copy.luma);
+            let copy = Enhanced::window(&plain, [10, 8, 40, 30], Enhance { enlarge: 3, sharpen: Sharpen::Strong }).unwrap();
+            let adjusted = Adjust { k1, sharpen: 1.0, enlarge: Enlarge::times(3), ..Default::default() }.apply(&photo, w, h).1;
+            lensed(&format!("{k1}: a window"), &Luma::new(90, 66, cut(&adjusted.data, adjusted.width, 1, [30, 24, 120, 90])), &copy.luma);
+            let part = [6, 4, 36, 28];
+            let copy = Enhanced::window(&Adjust { k1, ..Default::default() }.apply_to(&photo, w, h, part).1, [0, 0, 36, 28], Enhance { enlarge: 2, sharpen: Sharpen::Light }).unwrap();
+            let adjusted = Adjust { k1, sharpen: 0.5, enlarge: Enlarge::times(2), ..Default::default() }.apply_to(&photo, w, h, part).1;
+            lensed(&format!("{k1}: a part"), &adjusted, &copy.luma);
+            // The photo turned gives the copy turned, pixel for pixel: the
+            // copy is made of the photo as it lay, and turned after. Made of
+            // the photo as loaded turned, it was straightened among other
+            // pixels, and a half grey level rounded the other way here and
+            // there, which the mask made a few.
+            let enhance = Enhance { enlarge: 2, sharpen: Sharpen::Light };
+            for quarters in 1..4u8 {
+                let (tw, th) = if quarters % 2 == 1 { (h, w) } else { (w, h) };
+                let turned = Enhanced::window(&plain.rotated_cw(quarters), [0, 0, tw, th], enhance).unwrap();
+                let copy = Enhanced::window(&plain, [0, 0, w, h], enhance).unwrap();
+                lensed(&format!("{k1}: turned {quarters} times"), &copy.luma.rotated_cw(quarters), &turned.luma);
+                assert_eq!((turned.origin, turned.factor), ([0.0; 2], copy.factor), "{k1}: turned {quarters} times");
+            }
+        }
+        // A photo sharpened or blurred already: a copy that lays a mask
+        // of its own is made of the photo without the photo's, and one
+        // that lays none of the photo with it, so that the photo with
+        // Sharpen set to the copy's, or left as it was, shows the copy
+        // again; bent by a lens or not, and enlarged or not.
+        for k1 in [0.0, 0.12] {
+            for own in [0.3, 1.5, -0.6] {
+                let plain = Adjust { k1, sharpen: own, ..Default::default() }.apply(&photo, w, h).1;
+                for (sharpen, enlarge) in [(Sharpen::Light, 1u8), (Sharpen::Strong, 3), (Sharpen::Off, 2)] {
+                    let copy = Enhanced::window(&plain, [0, 0, w, h], Enhance { enlarge, sharpen }).unwrap();
+                    let set = if sharpen == Sharpen::Off { own } else { sharpen.amount() };
+                    let adjusted = Adjust { k1, sharpen: set, enlarge: Enlarge::NONE.by(enlarge), ..Default::default() }.apply(&photo, w, h).1;
+                    lensed(&format!("{k1}: sharpened {own} already, then {sharpen:?}, {enlarge} times"), &adjusted, &copy.luma);
+                }
+            }
+        }
+        // A photo filtered: a copy runs the photo's filter over it last,
+        // once it is enlarged, straightened and sharpened, with the same
+        // half-width in its own pixels, as the photo so adjusted does.
+        for k1 in [0.0, 0.12] {
+            for (filter, radius) in [(Filter::Median, 1), (Filter::Close, 2)] {
+                let plain = Adjust { k1, filter, radius, ..Default::default() }.apply(&photo, w, h).1;
+                for (sharpen, enlarge) in [(Sharpen::Off, 2u8), (Sharpen::Light, 3), (Sharpen::Light, 1)] {
+                    let copy = Enhanced::window(&plain, [0, 0, w, h], Enhance { enlarge, sharpen }).unwrap();
+                    let adjusted = Adjust { k1, filter, radius, sharpen: sharpen.amount(), enlarge: Enlarge::NONE.by(enlarge), ..Default::default() }.apply(&photo, w, h).1;
+                    lensed(&format!("{k1}: {filter:?} {radius}, then {sharpen:?}, {enlarge} times"), &adjusted, &copy.luma);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_copy_of_a_photo_adjusted_is_the_photo_made_again() {
+        use crate::imaging::enhance::{Enhance, Enhanced, Sharpen};
+        // Busy colours. Whatever the photo's adjustments, its tone among
+        // them, and whatever size it is worked on at, a reduction among
+        // them, a copy a read makes of a window of it is that window of
+        // the photo made again under the Enlarge and Sharpen a read that
+        // decoded through the copy sets, pixel for pixel: the tone after
+        // the mask, as the photo has it, and a reduced photo enlarged
+        // once from its own pixels, with its mask as wide as it is there.
+        let (w, h) = (48, 36);
+        let photo = pixels(w, h, |x, y| [((x * 37 + y * 11) % 256) as u8, ((x * 13 + y * 29) % 256) as u8, (((x / 3 + y / 2) % 2) * 255) as u8]);
+        let same = |what: &str, copy: &Enhanced, whole: &Luma| {
+            let [x, y] = std::array::from_fn(|i| (copy.origin[i] * copy.factor[i]).round() as usize);
+            let there = cut(&whole.data, whole.width, 1, [x, y, x + copy.luma.width, y + copy.luma.height]);
+            assert!(copy.luma.data == there, "{what}: the copy is not the photo so adjusted at ({x}, {y})");
+        };
+        let tones = [
+            Adjust::default(),
+            Adjust { contrast: 0.6, brightness: -0.1, ..Default::default() },
+            Adjust { invert: true, channel: Channel::Green, contrast: 0.3, ..Default::default() },
+        ];
+        for tone in tones {
+            for (k1, sharpen, filter) in [(0.0, 0.3, Filter::None), (0.12, 0.0, Filter::Median), (-0.2, -0.6, Filter::Close), (0.0, 0.0, Filter::None)] {
+                for base in [Enlarge::NONE, Enlarge::times(2), Enlarge::HALF] {
+                    let adjust = Adjust { k1, sharpen, filter, radius: 1, enlarge: base, ..tone };
+                    let plain = adjust.apply(&photo, w, h).1;
+                    // A photo adjusted no more than enlarged is copied from
+                    // its luminance, as the test above has it.
+                    if plain.as_shot.is_none() {
+                        continue;
+                    }
+                    for (read, enlarge) in [(Sharpen::Light, 2u8), (Sharpen::Strong, 1), (Sharpen::Off, 3)] {
+                        let set = Adjust { enlarge: base.by(enlarge), sharpen: if read == Sharpen::Off { sharpen } else { read.amount() }, ..adjust };
+                        let whole = set.apply(&photo, w, h).1;
+                        for window in [[0, 0, plain.width, plain.height], [5, 3, plain.width / 2 + 3, plain.height - 4]] {
+                            let copy = Enhanced::window(&plain, window, Enhance { enlarge, sharpen: read }).unwrap();
+                            same(&format!("{adjust:?}, read {read:?} {enlarge} times through {window:?}"), &copy, &whole);
+                        }
+                    }
+                }
+            }
+        }
+        // So for a part of the photo cut alone; and so for the views the
+        // search looks at the photo through, shrunk, or closed in place of
+        // its own filter.
+        let part = [8, 4, 32, 28];
+        for (k1, sharpen, contrast) in [(0.0, 0.3, 0.4), (0.12, -0.6, 0.0)] {
+            for (base, half) in [(Enlarge::NONE, Enlarge::HALF), (Enlarge::times(2), Enlarge::NONE), (Enlarge::HALF, Enlarge::QUARTER)] {
+                let adjust = Adjust { k1, sharpen, contrast, filter: Filter::Median, radius: 1, enlarge: base, ..Default::default() };
+                let what = format!("{adjust:?}");
+                let plain = adjust.apply_to(&photo, w, h, part).1;
+                let copy = Enhanced::window(&plain, [2, 2, plain.width - 1, plain.height - 3], Enhance { enlarge: 2, sharpen: Sharpen::Light }).unwrap();
+                same(&format!("{what}, a part"), &copy, &Adjust { enlarge: base.by(2), sharpen: 0.5, ..adjust }.apply_to(&photo, w, h, part).1);
+                let plain = adjust.apply(&photo, w, h).1;
+                let shrunk = Enhanced::shrunk(&plain, [0, 0, plain.width, plain.height], 2).unwrap();
+                same(&format!("{what}, shrunk"), &shrunk, &Adjust { enlarge: half, ..adjust }.apply(&photo, w, h).1);
+                let closed = Enhanced::closed(&plain, [3, 3, plain.width - 2, plain.height - 2], 2).unwrap();
+                same(&format!("{what}, closed"), &closed, &Adjust { filter: Filter::Close, radius: 2, ..adjust }.apply(&photo, w, h).1);
+            }
+        }
+        // Shrunk, a window well inside a larger photo closed over gaps of
+        // three pixels, with no mask to widen the margin taken about it: a
+        // closing draws on twice its neighbourhood, and a margin of it
+        // once left the copy's edges a grey level off.
+        let (bw, bh) = (300, 240);
+        let busy = pixels(bw, bh, |x, y| [((x * 37 + y * 11) % 256) as u8, ((x * 13 + y * 29) % 256) as u8, (((x / 3 + y / 2) % 2) * 255) as u8]);
+        let adjust = Adjust { filter: Filter::Close, radius: 3, ..Default::default() };
+        let plain = adjust.apply(&busy, bw, bh).1;
+        for (factor, smaller) in [(2, Enlarge::HALF), (4, Enlarge::QUARTER)] {
+            let shrunk = Enhanced::shrunk(&plain, [76, 60, 224, 180], factor).unwrap();
+            same(&format!("closed over 3 px, shrunk {factor} times"), &shrunk, &Adjust { enlarge: smaller, ..adjust }.apply(&busy, bw, bh).1);
+        }
+        // A photo deblurred by a kernel set for it, so far: a copy of the
+        // whole of it is the photo made again, the kernel carried to the
+        // copy's pixels and undone as far as it was.
+        for strength in [0.7, 1.4] {
+            let kernel = Some(deblur::Spread { xx: 0.8, xy: 0.2, yy: 0.5 });
+            let adjust = Adjust { filter: Filter::Deblur, kernel, strength, contrast: 0.2, ..Default::default() };
+            let plain = adjust.apply(&photo, w, h).1;
+            assert_eq!(plain.deblurred, kernel);
+            let copy = Enhanced::window(&plain, [0, 0, w, h], Enhance { enlarge: 2, sharpen: Sharpen::Light }).unwrap();
+            let whole = Adjust { enlarge: Enlarge::times(2), sharpen: 0.5, ..adjust }.apply(&photo, w, h).1;
+            assert_eq!(whole.deblurred, kernel.map(|kernel| kernel.scaled(2.0)));
+            same(&format!("deblurred at {strength}"), &copy, &whole);
+        }
+        // With none set, the blur the photo's filter measured over the
+        // whole of it, and not one measured again over the copy, which
+        // enlarged or shrunk measures otherwise: a copy is the photo made
+        // again with that blur set, carried to the copy's pixels, as are
+        // the views the search makes. Squares of ink six pixels a side
+        // blurred by a pixel and a half, for a blur to measure: the busy
+        // colours, drawn sharp to the pixel and their edges two or three
+        // pixels apart, once measured nearly two pixels long and none
+        // wide, fitted over a fan of directions too narrow to say, and
+        // now measure nothing.
+        let squares = pixels(w, h, |x, y| if (x / 6 * 7 + y / 6 * 13 + x / 6 * (y / 6)) % 3 == 0 { [40, 30, 120] } else { [230, 220, 200] });
+        let blurry = crate::imaging::enhance::unsharp_rgba(&squares, w, h, 1.5, -1.0);
+        let adjust = Adjust { filter: Filter::Deblur, contrast: 0.2, ..Default::default() };
+        let plain = adjust.apply(&blurry, w, h).1;
+        let measured = plain.deblurred.expect("edges enough to measure");
+        let set = Adjust { kernel: Some(measured), ..adjust };
+        let window = [0, 0, w, h];
+        let copy = Enhanced::window(&plain, window, Enhance { enlarge: 2, sharpen: Sharpen::Light }).unwrap();
+        let larger = Adjust { enlarge: Enlarge::times(2), sharpen: 0.5, ..adjust };
+        assert_ne!(larger.apply(&blurry, w, h).1.deblurred, Some(measured.scaled(2.0)), "the photo enlarged measures otherwise");
+        same("deblurred by the blur measured", &copy, &Adjust { kernel: Some(measured), ..larger }.apply(&blurry, w, h).1);
+        let shrunk = Enhanced::shrunk(&plain, [0, 0, w, h], 2).unwrap();
+        same("deblurred by the blur measured, shrunk", &shrunk, &Adjust { enlarge: Enlarge::HALF, ..set }.apply(&blurry, w, h).1);
+        // And where it measured none and left the photo as it was, a copy
+        // is left so too.
+        let flat = pixels(w, h, |_, _| [128; 3]);
+        let plain = adjust.apply(&flat, w, h).1;
+        assert_eq!(plain.deblurred, None);
+        let copy = Enhanced::window(&plain, window, Enhance { enlarge: 2, sharpen: Sharpen::Light }).unwrap();
+        same("not deblurred", &copy, &Adjust { enlarge: Enlarge::times(2), sharpen: 0.5, filter: Filter::None, ..adjust }.apply(&flat, w, h).1);
+        // A photo adjusted no more than enlarged is shrunk and closed as
+        // it is, where there is nothing to make in any other order.
+        let plain = Adjust { enlarge: Enlarge::times(2), ..Default::default() }.apply(&photo, w, h).1;
+        assert!(Enhanced::shrunk(&plain, [0, 0, 96, 72], 2).is_none() && Enhanced::closed(&plain, [0, 0, 96, 72], 1).is_none());
+    }
+
+    #[test]
+    fn the_deblur_filter_undoes_its_kernel_where_the_photo_is_worked_on() {
+        use crate::imaging::enhance::unsharp;
+        // Squares blurred by eight tenths of a pixel.
+        let (w, h) = (60, 48);
+        let squares: Vec<f32> = (0..w * h).map(|i| if ((i % w) / 6 + (i / w) / 6) % 2 == 0 { 0.1 } else { 0.9 }).collect();
+        let photo: Vec<u8> = unsharp(&squares, w, h, 1, 0.8, -1.0).iter().flat_map(|&v| [(v * 255.0).round() as u8; 3].into_iter().chain([255])).collect();
+        // A kernel set in the photo's own pixels is carried to those it
+        // is worked on at, and undone there as far as the strength asks,
+        // after everything else.
+        let kernel = Spread::round(0.8);
+        for (enlarge, strength) in [(1u16, 1.0), (2, 0.6), (3, 1.7)] {
+            let adjust = Adjust { filter: Filter::Deblur, kernel: Some(kernel), strength, enlarge: Enlarge::times(enlarge), ..Default::default() };
+            let luma = adjust.apply(&photo, w, h).1;
+            let carried = kernel.scaled(f64::from(enlarge));
+            assert_eq!(luma.deblurred, Some(carried), "{enlarge} times");
+            let unfiltered = Adjust { filter: Filter::None, ..adjust }.apply(&photo, w, h).1;
+            assert!(luma.data == deblur::undone_by(&unfiltered.data, luma.width, luma.height, Some(carried), f64::from(strength)).0, "{enlarge} times, {strength}");
+        }
+        // With none set, the blur measured over the whole photo is undone,
+        // however little, and said.
+        let luma = Adjust { filter: Filter::Deblur, ..Default::default() }.apply(&photo, w, h).1;
+        let measured = luma.deblurred.expect("edges enough to measure");
+        assert!(measured.extremes().0 < deblur::LEAST_SPREAD && luma.data != Adjust::default().apply(&photo, w, h).1.data);
+        // The blur undone turns with the photo; the photo as loaded is
+        // kept as it lay, with its kernel, and the turn.
+        let leaning = Spread { xx: 2.0, xy: 0.5, yy: 1.0 };
+        let turned = Adjust { filter: Filter::Deblur, kernel: Some(leaning), ..Default::default() }.apply(&photo, w, h).1.rotated_cw(1);
+        assert_eq!(turned.deblurred, Some(leaning.turned_cw()));
+        assert_eq!(turned.as_shot.as_ref().map(|shot| (shot.adjust.kernel, shot.turned)), Some((Some(leaning), 1)));
+    }
+
+    #[test]
+    fn a_copy_is_deblurred_after_it_is_enlarged() {
+        use crate::imaging::enhance::{Enhance, Enhanced, Sharpen, unsharp};
+        // Squares six pixels a side, blurred by eight tenths of a pixel:
+        // too little to be worth undoing at the photo's own size, and as
+        // much again once it is enlarged twice.
+        let (w, h) = (60, 48);
+        let squares: Vec<f32> = (0..w * h).map(|i| if ((i % w) / 6 + (i / w) / 6) % 2 == 0 { 0.1 } else { 0.9 }).collect();
+        let photo: Vec<u8> = unsharp(&squares, w, h, 1, 0.8, -1.0).iter().flat_map(|&v| [(v * 255.0).round() as u8; 3].into_iter().chain([255])).collect();
+        let deblurred = Enhance { enlarge: 1, sharpen: Sharpen::Deblur };
+        let own = Adjust::default().apply(&photo, w, h).1;
+        assert!(Enhanced::window(&own, [0, 0, w, h], deblurred).is_none(), "nothing worth undoing at its own size");
+        // Deblurred among the pixels it was enlarged to, a copy of the
+        // photo is what the photo enlarged so shows under its Deblur
+        // filter, bent by a lens or not: enlarged by the copy itself, as
+        // a read that decoded only so sets Enlarge and Filter, and as
+        // the photo was enlarged before.
+        for k1 in [0.0, 0.12] {
+            let twice = Adjust { k1, enlarge: Enlarge::times(2), ..Default::default() };
+            let filtered = Adjust { filter: Filter::Deblur, ..twice }.apply(&photo, w, h).1;
+            let copies = [
+                Enhanced::window(&Adjust { k1, ..Default::default() }.apply(&photo, w, h).1, [0, 0, w, h], Enhance { enlarge: 2, ..deblurred }),
+                Enhanced::window(&twice.apply(&photo, w, h).1, [0, 0, 2 * w, 2 * h], deblurred),
+            ];
+            for (copy, how) in copies.into_iter().zip(["by the copy", "before"]) {
+                let copy = copy.unwrap_or_else(|| panic!("{k1}, enlarged {how}: the blur is worth undoing"));
+                assert_eq!((copy.luma.width, copy.luma.height, copy.factor), (2 * w, 2 * h, [if how == "before" { 1.0 } else { 2.0 }; 2]));
+                let differences: Vec<f32> = copy.luma.data.iter().zip(&filtered.data).map(|(a, b)| (a - b).abs()).collect();
+                let worst = differences.iter().copied().fold(0.0f32, f32::max);
+                let mean = differences.iter().sum::<f32>() / differences.len() as f32;
+                assert!(worst < 0.02 && mean < 0.003, "{k1}, enlarged {how}: {worst} at the most, {mean} on the whole");
+            }
+        }
+    }
+
+    #[test]
+    fn a_photo_larger_than_the_search_deblurs_is_deblurred_as_a_read_copy_of_it_is() {
+        use crate::imaging::enhance::{Enhance, Enhanced, Sharpen, unsharp};
+        // A photograph larger than the copies the search deblurs, with a
+        // patch of squares four pixels a side blurred by two and a fifth:
+        // under the Deblur filter set to the blur a read's copy of the
+        // patch undid, as a read that decoded only so sets it, the photo
+        // shows the patch as the copy did. Deconvolved at the most the
+        // search's copies are, the photo was reduced first, and read
+        // modules wrong that the copy read right.
+        let (w, h) = (1600, 1000);
+        assert!(w * h > deblur::MOST_PIXELS);
+        let sharp: Vec<f32> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                let inside = (300..420).contains(&x) && (300..420).contains(&y);
+                if inside && ((x / 4) * 7 + (y / 4) * 13 + (x / 4) * (y / 4)) % 3 == 0 { 0.1 } else { 0.9 }
+            })
+            .collect();
+        let photo: Vec<u8> = unsharp(&sharp, w, h, 1, 2.2, -1.0).iter().flat_map(|&v| [(v * 255.0).round() as u8; 3].into_iter().chain([255])).collect();
+        let plain = Adjust::default().apply(&photo, w, h).1;
+        let window = [280, 280, 440, 440];
+        let copy = Enhanced::window(&plain, window, Enhance { enlarge: 1, sharpen: Sharpen::Deblur }).expect("a blur worth undoing");
+        assert_eq!((copy.origin, copy.factor), ([280.0, 280.0], [1.0; 2]));
+        let filtered = Adjust { filter: Filter::Deblur, kernel: copy.luma.deblurred, ..Default::default() }.apply(&photo, w, h).1;
+        let there = cut(&filtered.data, w, 1, window);
+        let worst = copy.luma.data.iter().zip(&there).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-3, "{worst}");
+    }
+
+    #[test]
+    fn a_window_of_a_photo_deblurred_is_the_photo_made_again_there() {
+        use crate::imaging::enhance::{Enhance, Enhanced, Sharpen, unsharp};
+        // Squares blurred, under a Deblur filter whose kernel, carried to
+        // the copy's pixels, is wider than a deconvolution works at, and
+        // narrower: a copy of a window of the photo is reduced as the
+        // whole photo made again at the copy's size is, on its grid, and
+        // reads as far about the window as the deconvolution does, and it
+        // comes out as the whole does there. Cut off that grid and short
+        // of that reach, as it once was, it differed by a quarter of the
+        // contrast.
+        let (w, h) = (150, 120);
+        let squares: Vec<f32> = (0..w * h).map(|i| if ((i % w) / 7 + (i / w) / 7 + (i % w) / 21) % 3 == 0 { 0.1 } else { 0.9 }).collect();
+        let photo: Vec<u8> = unsharp(&squares, w, h, 1, 1.3, -1.0).iter().flat_map(|&v| [(v * 255.0).round() as u8; 3].into_iter().chain([255])).collect();
+        let mut reduced = 0;
+        for (kernel, strength) in [(Spread::round(1.2), 1.0), (Spread { xx: 1.6, xy: 0.4, yy: 0.7 }, 1.4), (Spread::round(0.6), 0.8)] {
+            let adjust = Adjust { filter: Filter::Deblur, kernel: Some(kernel), strength, contrast: 0.2, ..Default::default() };
+            let plain = adjust.apply(&photo, w, h).1;
+            for (enlarge, read) in [(2u8, Sharpen::Light), (2, Sharpen::Off), (1, Sharpen::Strong), (3, Sharpen::Light)] {
+                let set = Adjust { enlarge: Enlarge::times(enlarge.into()), sharpen: if read == Sharpen::Off { 0.0 } else { read.amount() }, ..adjust };
+                let whole = set.apply(&photo, w, h).1;
+                let widest = kernel.scaled(f64::from(enlarge) * f64::from(strength)).extremes().0;
+                reduced += usize::from(deblur::Reduction::for_blur(widest, whole.width * whole.height, deblur::MOST_READ_PIXELS, 1.0) != deblur::Reduction::NONE);
+                for window in [[30, 24, 110, 90], [0, 0, 60, 50], [95, 70, 150, 120]] {
+                    let copy = Enhanced::window(&plain, window, Enhance { enlarge, sharpen: read }).unwrap();
+                    let [cx, cy] = std::array::from_fn(|i| (copy.origin[i] * copy.factor[i]).round() as usize);
+                    let there = cut(&whole.data, whole.width, 1, [cx, cy, cx + copy.luma.width, cy + copy.luma.height]);
+                    let worst = copy.luma.data.iter().zip(&there).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    assert!(worst < 1e-4, "{kernel:?} at {strength}, read {read:?} {enlarge} times through {window:?}: {worst}");
+                }
+            }
+        }
+        assert!(reduced >= 3, "the deconvolution was reduced for {reduced} of the copies");
+    }
+
+    #[test]
+    fn a_photo_deblurred_and_turned_is_made_again_as_it_lay_and_turned() {
+        use crate::imaging::enhance::{Enhance, Enhanced, Sharpen, unsharp};
+        // Squares blurred, a photo whose height the deconvolution's
+        // reduction does not divide, under a Deblur filter with a kernel
+        // set wide enough to be reduced for, and bent by a lens with the
+        // blur it measures. Turned each way, the photo made again from the
+        // photo as loaded at its size is the photo turned, and a window of
+        // it enlarged and sharpened is what the photo so adjusted, turned,
+        // shows there. Made again from the photo as loaded turned, its
+        // reduction's grid was laid from the corner the turn brought
+        // round, and the copy differed from the photo by more than a
+        // quarter of the way from black to white along its edges.
+        let (w, h) = (300, 241);
+        let squares: Vec<f32> = (0..w * h).map(|i| if ((i % w) / 9 + (i / w) / 9 + (i % w) / 27) % 3 == 0 { 0.1 } else { 0.9 }).collect();
+        let photo: Vec<u8> = unsharp(&squares, w, h, 1, 2.5, -1.0).iter().flat_map(|&v| [(v * 255.0).round() as u8; 3].into_iter().chain([255])).collect();
+        let kernel = Spread { xx: 12.0, xy: 2.0, yy: 7.0 };
+        assert!(deblur::Reduction::for_blur(kernel.extremes().0, w * h, deblur::MOST_READ_PIXELS, 1.0) != deblur::Reduction::NONE);
+        for adjust in [Adjust { filter: Filter::Deblur, kernel: Some(kernel), ..Default::default() }, Adjust { filter: Filter::Deblur, k1: 0.1, contrast: 0.2, ..Default::default() }] {
+            let plain = adjust.apply(&photo, w, h).1;
+            let enhance = Enhance { enlarge: 2, sharpen: Sharpen::Light };
+            let larger = Adjust { enlarge: Enlarge::times(2), sharpen: Sharpen::Light.amount(), kernel: adjust.kernel.or(plain.deblurred), ..adjust }.apply(&photo, w, h).1;
+            for quarters in 1..4u8 {
+                let turned = plain.rotated_cw(quarters);
+                let what = format!("{:?}, {quarters} turns", adjust.kernel);
+                let worst = |copy: &Enhanced, whole: &Luma| {
+                    let [cx, cy] = std::array::from_fn(|i| (copy.origin[i] * copy.factor[i]).round() as usize);
+                    let there = cut(&whole.data, whole.width, 1, [cx, cy, cx + copy.luma.width, cy + copy.luma.height]);
+                    copy.luma.data.iter().zip(&there).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max)
+                };
+                let again = Enhanced::shrunk(&turned, [0, 0, turned.width, turned.height], 1).expect("the photo made again");
+                assert_eq!((again.origin, again.factor, again.luma.width, again.luma.height), ([0.0; 2], [1.0; 2], turned.width, turned.height), "{what}");
+                assert!(worst(&again, &turned) < 1e-4, "{what}: made again, {}", worst(&again, &turned));
+                for window in [[20, 30, 140, 110], [0, 0, 90, 70], [150, 170, 241, 241]] {
+                    let part = Enhanced::shrunk(&turned, window, 1).expect("a window made again");
+                    assert!(worst(&part, &turned) < 1e-4, "{what}: {window:?} made again, {}", worst(&part, &turned));
+                    let copy = Enhanced::window(&turned, window, enhance).expect("a copy");
+                    let whole = larger.rotated_cw(quarters);
+                    assert!(worst(&copy, &whole) < 1e-4, "{what}: {window:?} enlarged, {}", worst(&copy, &whole));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_copy_of_a_photo_adjusted_shrunk_any_number_of_times_lies_where_its_pixels_were() {
+        use crate::imaging::enhance::Enhanced;
+        // A step from ink to paper at the photo's 600th pixel across, the
+        // photo toned, and so made again for every copy, at its own size,
+        // twice and half and a quarter of it. Shrunk two or three times,
+        // a window of it is cut at whole steps of the copy's own pixels,
+        // and the step lies in the copy where the copy says it does. Cut
+        // at whole fours of the photo's pixels, as it once was, a copy a
+        // third of its size or an eighth lay up to a pixel and a half
+        // off.
+        let (w, h) = (1200, 160);
+        let photo = pixels(w, h, |x, _| if x < 600 { [30; 3] } else { [220; 3] });
+        for (base, factor) in [(Enlarge::NONE, 3u8), (Enlarge::times(2), 3), (Enlarge::HALF, 3), (Enlarge::QUARTER, 2), (Enlarge::HALF, 2)] {
+            let luma = Adjust { contrast: 0.2, enlarge: base, ..Default::default() }.apply(&photo, w, h).1;
+            let (dark, light) = (luma.data[0], luma.data[luma.width - 1]);
+            let k = usize::from(factor);
+            for x0 in [0, 5, 37, 61, 98] {
+                let (ww, hh) = (luma.width - x0, luma.height - 4);
+                let copy = Enhanced::shrunk(&luma, [x0, 4, x0 + ww / k * k, 4 + hh / k * k], factor).expect("an adjusted photo is made again");
+                assert!(copy.factor.iter().all(|f| (f - 1.0 / f64::from(factor)).abs() < 1e-12), "{:?}", copy.factor);
+                let row = &copy.luma.data[copy.luma.height / 2 * copy.luma.width..(copy.luma.height / 2 + 1) * copy.luma.width];
+                let middle = (dark + light) / 2.0;
+                let i = row.windows(2).position(|pair| pair[0] < middle && pair[1] >= middle).expect("the step");
+                let at = i as f64 + 0.5 + f64::from((middle - row[i]) / (row[i + 1] - row[i]));
+                let step = copy.to_photo([at, 0.0])[0];
+                assert!((step - 600.0 * base.factor()).abs() < 0.1, "{base} shrunk {factor} times from {x0}: the step at {step}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_copy_of_a_photo_reduced_lies_where_the_photo_reduced_has_its_pixels() {
+        use crate::imaging::enhance::{Enhance, Enhanced, Sharpen};
+        // A block of ink in the top-left of a photo 1,203 pixels across
+        // and 802 down, its edges near the far sides on whole eighths of
+        // the photo's pixels, where every copy's pixels meet and none
+        // reads the edge off by the share of a pixel it falls in. Reduced,
+        // each side comes to the nearest whole pixel, so the photo at half
+        // its size is reduced a little less across than it says and exactly
+        // as it says down, and at a quarter a little less both ways. A copy
+        // of it made again at the photo's own size, or shrunk twice more,
+        // is made on the photo's own grid, and says where its edges lie in
+        // the photo reduced as the photo reduced has them. Placed by the
+        // enlargement alone, such a copy lay a quarter of a pixel off and
+        // more, and half a pixel across at half the photo's size.
+        let (w, h, ex, ey) = (1203, 802, 1160, 760);
+        let photo = pixels(w, h, |x, y| if x < ex && y < ey { [30; 3] } else { [220; 3] });
+        // Where the light crosses the middle along `values`, a pixel apart.
+        let crossing = |values: &[f32], middle: f32| {
+            let i = values.windows(2).position(|pair| pair[0] < middle && pair[1] >= middle).expect("the edge");
+            i as f64 + 0.5 + f64::from((middle - values[i]) / (values[i + 1] - values[i]))
+        };
+        let row = |luma: &Luma, y: usize| luma.data[y * luma.width..(y + 1) * luma.width].to_vec();
+        let column = |luma: &Luma, x: usize| (0..luma.height).map(|y| luma.data[y * luma.width + x]).collect::<Vec<f32>>();
+        for base in [Enlarge::HALF, Enlarge::QUARTER] {
+            let luma = Adjust { enlarge: base, ..Default::default() }.apply(&photo, w, h).1;
+            let middle = (luma.data[0] + luma.data[luma.data.len() - 1]) / 2.0;
+            // Each edge where the photo reduced has it, read across the
+            // middle of the block.
+            let (mx, my) = (luma.width / 2, luma.height / 2);
+            let (across, down) = (crossing(&row(&luma, my), middle), crossing(&column(&luma, mx), middle));
+            let times = (1.0 / base.factor()).round() as u8;
+            let whole = [0, 0, luma.width, luma.height];
+            let own = Enhanced::window(&luma, whole, Enhance { enlarge: times, sharpen: Sharpen::Off }).expect("a copy at the photo's own size");
+            let shrunk = Enhanced::shrunk(&luma, whole, 2).expect("a copy shrunk");
+            for (what, copy) in [("at its own size", own), ("shrunk", shrunk)] {
+                let [cx, cy] = copy.to_view([mx as f64 + 0.5, my as f64 + 0.5]).map(|v| v as usize);
+                let found = [copy.to_photo([crossing(&row(&copy.luma, cy), middle), 0.0])[0], copy.to_photo([0.0, crossing(&column(&copy.luma, cx), middle)])[1]];
+                assert!((found[0] - across).abs() < 0.1, "{base}, {what}: the edge across at {} where the photo has it at {across}", found[0]);
+                assert!((found[1] - down).abs() < 0.1, "{base}, {what}: the edge down at {} where the photo has it at {down}", found[1]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_photo_is_straightened_after_it_is_enlarged() {
+        // Busy colours, bent by a lens: enlarged twice, the photo is
+        // straightened among the pixels the enlargement drew, and not
+        // straightened at its own size and enlarged after.
+        let (w, h) = (48, 36);
+        let photo = pixels(w, h, |x, y| [((x * 37 + y * 11) % 256) as u8, ((x * 13 + y * 29) % 256) as u8, (((x / 3 + y / 2) % 2) * 255) as u8]);
+        let lens = Adjust { k1: 0.12, enlarge: Enlarge::times(2), ..Default::default() };
+        let (display, luma) = lens.apply(&photo, w, h);
+        let enlarged = resize(&photo, w, h, 4, 2 * w, 2 * h);
+        assert_eq!(display, undistort(&enlarged, 2 * w, 2 * h, 0.12));
+        assert_ne!(display, resize(&undistort(&photo, w, h, 0.12), w, h, 4, 2 * w, 2 * h));
+        // Beside it, the photo at its own size straightened there.
+        let own = luma.unenlarged.as_ref().expect("an enlarged photo keeps its own pixels");
+        assert_eq!(own.data, Adjust { enlarge: Enlarge::NONE, ..lens }.apply(&photo, w, h).1.data);
+        // And the photo as loaded, with the adjustments, for a copy of it
+        // to be made from: all of it, which the corners of a photo bent
+        // so draw on.
+        let shot = luma.as_shot.as_ref().expect("a straightened photo keeps the photo as loaded");
+        assert!(shot.rgba[..] == photo[..]);
+        assert_eq!((shot.at, shot.photo, shot.part, shot.adjust), ([0, 0], [w, h], [0, 0, w, h], lens));
+        assert!(Adjust::default().apply(&photo, w, h).1.as_shot.is_none(), "nothing to keep with no adjustment");
+        assert!(Adjust { enlarge: Enlarge::times(3), ..Default::default() }.apply(&photo, w, h).1.as_shot.is_none(), "nor with an enlargement alone");
+        for more in [Adjust { contrast: 0.2, ..Default::default() }, Adjust { enlarge: Enlarge::HALF, ..Default::default() }, Adjust { filter: Filter::Median, ..Default::default() }] {
+            assert!(more.apply(&photo, w, h).1.as_shot.is_some(), "{more:?}");
+        }
+        // Handed over shared, the photo as loaded is kept as the same
+        // bytes, and not copied, and the photo is adjusted the same; a
+        // part drawing on less of it keeps a copy of what it draws on.
+        let shared: SharedRgba = Arc::new(photo.clone());
+        let (display, kept) = lens.apply_to_shared(&shared, w, h, [0, 0, w, h]);
+        assert!(display == lens.apply(&photo, w, h).0 && kept.data == luma.data);
+        let shot = kept.as_shot.as_ref().expect("a straightened photo keeps the photo as loaded");
+        assert!(Arc::ptr_eq(&shot.rgba, &shared), "the photo as loaded is held once");
+        assert_eq!(**shot, **luma.as_shot.as_ref().unwrap());
+        let (w, h) = (160, 120);
+        let larger: SharedRgba = Arc::new(pixels(w, h, |x, y| [((x * 37 + y * 11) % 256) as u8, ((x * 13 + y * 29) % 256) as u8, 128]));
+        let part = lens.apply_to_shared(&larger, w, h, [70, 50, 10, 10]).1;
+        let shot = part.as_shot.as_ref().expect("a straightened part keeps the photo as loaded about it");
+        assert!(!Arc::ptr_eq(&shot.rgba, &larger) && shot.rgba.len() < larger.len(), "{} of {} bytes", shot.rgba.len(), larger.len());
+    }
+
+    #[test]
+    fn a_part_by_the_edge_is_straightened_as_the_whole_is_there() {
+        use crate::imaging::enhance::{Enhance, Enhanced, Sharpen};
+        let (w, h) = (400, 300);
+        let photo = pixels(w, h, |x, y| [((x * 37 + y * 11) % 256) as u8, ((x * 13 + y * 29) % 256) as u8, (((x / 3 + y / 2) % 2) * 255) as u8]);
+        // A strip along the right edge of a photo whose lens term
+        // straightens pincushion reads every one of its pixels from past
+        // that edge: it draws on none of the photo, and is white, as the
+        // whole photo so straightened is there, at its own size and
+        // enlarged.
+        for part @ [x, y, pw, ph] in [[390, 140, 10, 20], [395, 0, 5, 300], [380, 0, 20, 300]] {
+            let whole = undistort(&photo, w, h, 0.3);
+            assert!(straightened(&photo, w, h, 0.3, part) == cut(&whole, w, 4, [x, y, x + pw, y + ph]), "{part:?}");
+            for enlarge in [1, 2] {
+                let adjust = Adjust { k1: 0.3, enlarge: Enlarge::times(enlarge), ..Default::default() };
+                let e = usize::from(enlarge);
+                let whole = adjust.apply(&photo, w, h).0;
+                let there = cut(&whole, w * e, 4, [x * e, y * e, (x + pw) * e, (y + ph) * e]);
+                assert!(adjust.apply_to(&photo, w, h, part).0 == there, "{part:?}, {enlarge} times");
+            }
+        }
+        // A copy of a window by the photo's edges, bent either way, is
+        // the photo made again there: a lens term that straightens barrel
+        // draws the photo's edges in from nearer its centre, from pixels
+        // the window does not cover.
+        for k1 in [-0.3, 0.3] {
+            let adjust = Adjust { k1, contrast: 0.2, ..Default::default() };
+            let plain = adjust.apply(&photo, w, h).1;
+            let whole = Adjust { enlarge: Enlarge::times(2), sharpen: 0.5, ..adjust }.apply(&photo, w, h).1;
+            for window in [[0, 0, 60, 60], [340, 240, 400, 300], [380, 100, 400, 200]] {
+                let copy = Enhanced::window(&plain, window, Enhance { enlarge: 2, sharpen: Sharpen::Light }).unwrap();
+                let [cx, cy] = std::array::from_fn(|i| (copy.origin[i] * copy.factor[i]).round() as usize);
+                let there = cut(&whole.data, whole.width, 1, [cx, cy, cx + copy.luma.width, cy + copy.luma.height]);
+                assert!(copy.luma.data == there, "{k1}: {window:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_part_is_straightened_as_the_whole_is_there() {
+        // The part of a photo bent by a lens, straightened about the
+        // whole photo's centre from what of the photo it draws on alone:
+        // what the whole photo so adjusted shows there, pixel for pixel,
+        // at its own size and enlarged, and by pincushion and barrel.
+        let (w, h) = (128, 96);
+        let photo = pixels(w, h, |x, y| [((x * 37 + y * 11) % 256) as u8, ((x * 13 + y * 29) % 256) as u8, (((x / 3 + y / 2) % 2) * 255) as u8]);
+        let part = [5, 30, 22, 14];
+        for (k1, enlarge) in [(0.12, 1u16), (0.12, 3), (-0.2, 2)] {
+            let adjust = Adjust { k1, enlarge: Enlarge::times(enlarge), ..Default::default() };
+            let e = usize::from(enlarge);
+            let whole = adjust.apply(&photo, w, h).0;
+            let (display, luma) = adjust.apply_to(&photo, w, h, part);
+            let there = cut(&whole, w * e, 4, [part[0] * e, part[1] * e, (part[0] + part[2]) * e, (part[1] + part[3]) * e]);
+            assert_eq!((luma.width, luma.height), (part[2] * e, part[3] * e));
+            assert!(display == there, "{k1}, {enlarge} times");
+            if e == 1 {
+                assert!(display == straightened(&photo, w, h, k1, part), "{k1}");
+                assert!(straightened(&photo, w, h, k1, part) == cut(&undistort(&photo, w, h, k1), w, 4, [5, 30, 27, 44]));
+            }
+            let shot = luma.as_shot.as_ref().expect("a straightened part keeps the photo as loaded about it");
+            assert!(shot.width < w && shot.height < h, "{k1}: no more of the photo than the part draws on");
+            assert_eq!((shot.part, shot.adjust), (part, adjust));
+        }
+    }
+
+    #[test]
+    fn a_part_bent_by_a_lens_is_made_again_shrunk_as_the_whole_photo_makes_it() {
+        use crate::imaging::enhance::Enhanced;
+        // A part of a photo bent by a lens, kept with as much of the photo
+        // as loaded as it draws on, and shrunk for a search as far as a
+        // search shrinks it ([`most_shrunk`]), at its own size and below
+        // it: each copy is the one the whole photo as loaded makes, pixel
+        // for pixel. Kept for copies no smaller than a quarter of the
+        // photo, a part at half its size shrunk three times was cut at the
+        // edge of what was kept, and not at a whole step of its pixels,
+        // and came out as much as eight grey levels off.
+        let (w, h) = (600, 450);
+        let photo = pixels(w, h, |x, y| [((x * 37 + y * 11) % 256) as u8, ((x * 13 + y * 29) % 256) as u8, (((x / 3 + y / 2) % 2) * 255) as u8]);
+        let part = [200, 150, 160, 120];
+        for k1 in [0.2, -0.25] {
+            for enlarge in [Enlarge::NONE, Enlarge::HALF, Enlarge::QUARTER] {
+                let luma = Adjust { k1, contrast: 0.2, enlarge, ..Default::default() }.apply_to(&photo, w, h, part).1;
+                let kept = luma.as_shot.as_deref().expect("a straightened part keeps the photo as loaded about it");
+                assert!(kept.width < w && kept.height < h, "{k1}, {enlarge}: no more of the photo than the part draws on");
+                let mut whole = luma.clone();
+                whole.as_shot = Some(Arc::new(AsShot { rgba: Arc::new(photo.clone()), width: w, height: h, at: [0, 0], ..kept.clone() }));
+                for factor in 2..=most_shrunk(luma.width, luma.height) {
+                    let k = usize::from(factor);
+                    let window = [0, 0, luma.width / k * k, luma.height / k * k];
+                    let copy = Enhanced::shrunk(&luma, window, factor).expect("a copy of the part");
+                    let all = Enhanced::shrunk(&whole, window, factor).expect("a copy of the whole");
+                    let worst = copy.luma.data.iter().zip(&all.luma.data).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                    assert!(
+                        (copy.origin, copy.factor, copy.luma.width, copy.luma.height) == (all.origin, all.factor, all.luma.width, all.luma.height) && worst == 0.0,
+                        "{k1}, {enlarge} shrunk {factor} times: {worst} at the most"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1079,15 +2026,13 @@ mod tests {
     }
 
     #[test]
-    fn filters_mend_specks_dots_and_grain() {
+    fn filters_mend_specks_and_dots() {
         // A 7×7 light field with one dark speck in the middle.
         let (w, h) = (7, 7);
         let mut speck = vec![1.0f32; w * h];
         speck[3 * w + 3] = 0.0;
         let out = Filter::Median.apply(&speck, w, h, 1);
         assert!(out.iter().all(|&v| v == 1.0), "the median removes a lone speck");
-        let out = Filter::Blur.apply(&speck, w, h, 1);
-        assert!((out[3 * w + 3] - 8.0 / 9.0).abs() < 1e-6 && out[0] == 1.0, "the blur spreads it");
         // A dark module printed as a dotted grid: every other pixel dark.
         let dotted: Vec<f32> = (0..w * h).map(|i| if (i % w) % 2 == 0 && (i / w) % 2 == 0 { 0.0 } else { 1.0 }).collect();
         let closed = Filter::Close.apply(&dotted, w, h, 1);
