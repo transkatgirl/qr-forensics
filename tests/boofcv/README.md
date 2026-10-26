@@ -32,11 +32,20 @@ https://boofcv.org/notwiki/regression/fiducial/qrcodes_v3.zip
 and unpacks to a directory `qrcodes` holding `detection/<set>/` with the
 photographs and, beside each, a `.txt` of the corners marked in it, and
 `decoding/`, twenty-six rendered symbols with their messages, which the
-test does not use. Point `QR_BOOFCV_DIR` at `qrcodes` and run the test in
-release mode; without the variable it does nothing.
+test does not use.
+
+The test fetches the archive the first time it runs, checks it against
+the SHA-256 recorded for it in `tests/boofcv.rs`, and unpacks it into
+`target/tmp/datasets/boofcv_qrcodes_v3`, where every later run finds it
+until `cargo clean`. Delete that directory to fetch it again. To use a
+copy unpacked elsewhere instead, point `QR_BOOFCV_DIR` at its `qrcodes`
+directory.
+
+The test is ignored by a plain `cargo test`, since it takes so long; run
+it by name, in release mode:
 
 ```text
-QR_BOOFCV_DIR=path/to/qrcodes cargo test --release --test boofcv -- --nocapture
+cargo test --release --test boofcv -- --ignored --nocapture
 ```
 
 It searches every photograph as `qr-forensics decode --partial --corners`
@@ -85,7 +94,7 @@ search does after a change to the pipeline, run it with
 `QR_BOOFCV_BOOTSTRAP` set and look over what it rewrites:
 
 ```text
-QR_BOOFCV_DIR=path/to/qrcodes QR_BOOFCV_BOOTSTRAP=1 cargo test --release --test boofcv -- --nocapture
+QR_BOOFCV_BOOTSTRAP=1 cargo test --release --test boofcv -- --ignored --nocapture
 ```
 
 With `QR_BOOFCV_ONLY` as well, only the lines of the sets searched are
@@ -121,7 +130,7 @@ revision. A reader that doesn't support `--metrics` or `--placed` is run
 without them.
 
 ```text
-QR_BOOFCV_DIR=path/to/qrcodes QR_BOOFCV_METRICS=1 QR_BOOFCV_ORACLE=1 QR_BOOFCV_REPORT=after.tsv cargo test --release --test boofcv -- --nocapture
+QR_BOOFCV_METRICS=1 QR_BOOFCV_ORACLE=1 QR_BOOFCV_REPORT=after.tsv cargo test --release --test boofcv -- --ignored --nocapture
 ```
 
 ## What BoofCV makes of it

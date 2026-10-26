@@ -8,15 +8,16 @@
 //! search was tuned against, and the figures quoted for it in the source
 //! were counted by hand until this test counted them.
 //!
-//! The photographs are two hundred megabytes and are not kept here. The
-//! test runs only when `QR_BOOFCV_DIR` names the `qrcodes` directory the
-//! archive unpacks to, and does nothing otherwise: see
-//! `tests/boofcv/README.md` for where the archive is. It takes half an
-//! hour over the whole benchmark on a machine of fourteen cores, in
-//! release mode:
+//! The photographs are two hundred megabytes and are not kept here: the
+//! test fetches BoofCV's archive of them the first time it runs, into
+//! the target directory, and reads them from there after
+//! (`tests/datasets/mod.rs`), or reads the `qrcodes` directory the
+//! archive unpacks to wherever `QR_BOOFCV_DIR` names it. It takes half
+//! an hour over the whole benchmark on a machine of fourteen cores, and
+//! so is left out of `cargo test` and runs by hand, in release mode:
 //!
 //! ```text
-//! QR_BOOFCV_DIR=path/to/qrcodes cargo test --release --test boofcv -- --nocapture
+//! cargo test --release --test boofcv -- --ignored --nocapture
 //! ```
 //!
 //! `QR_BOOFCV_ONLY` names the sets to search when that is not all of
@@ -71,6 +72,16 @@ use std::time::Instant;
 
 use image::metadata::Orientation;
 use image::{ImageDecoder, ImageReader};
+
+mod datasets;
+
+/// BoofCV's regression data for its QR Code detector, which unpacks to
+/// `qrcodes`.
+const ARCHIVE: datasets::Archive = datasets::Archive {
+    name: "boofcv_qrcodes_v3",
+    url: "https://boofcv.org/notwiki/regression/fiducial/qrcodes_v3.zip",
+    sha256: "a136c676448e9bafbe5c2fe9487728b0da3c823aeace6bc74d1c7fb2f86fe7be",
+};
 
 type Quad = [[f64; 2]; 4];
 
@@ -427,17 +438,16 @@ impl Tally {
 }
 
 #[test]
+#[ignore = "fetches two hundred megabytes of photographs the first time and searches them: half an hour"]
 fn the_benchmark_is_searched_as_recorded() {
-    let Some(dir) = std::env::var_os("QR_BOOFCV_DIR") else {
-        return;
-    };
+    let dir = std::env::var_os("QR_BOOFCV_DIR").map_or_else(|| datasets::fetched(&ARCHIVE).join("qrcodes"), PathBuf::from);
     let only: Option<Vec<String>> = std::env::var("QR_BOOFCV_ONLY").ok().map(|sets| sets.split(',').map(|set| set.trim().to_owned()).collect());
     let bootstrap = std::env::var_os("QR_BOOFCV_BOOTSTRAP").is_some();
     let metrics = std::env::var_os("QR_BOOFCV_METRICS").is_some() && reader_takes("--metrics");
     let oracle = std::env::var_os("QR_BOOFCV_ORACLE").is_some() && reader_takes("--placed");
     let report = std::env::var_os("QR_BOOFCV_REPORT").map(PathBuf::from);
-    let cases = cases(Path::new(&dir), only.as_deref());
-    assert!(!cases.is_empty(), "no photos of the sets asked for under {}", Path::new(&dir).display());
+    let cases = cases(&dir, only.as_deref());
+    assert!(!cases.is_empty(), "no photos of the sets asked for under {}", dir.display());
     let start = Instant::now();
     let found = each_few_at_a_time(&cases, |case| search(case, metrics));
     let searching = start.elapsed().as_secs_f64();

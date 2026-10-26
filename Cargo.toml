@@ -26,6 +26,11 @@ selftest = []
 [dev-dependencies]
 qrcode-generator = { version = "6.1", default-features = false, features = ["qr", "micro-qr", "rmqr", "kanji"] }
 rxing = { version = "0.9", default-features = false, features = ["decoders", "qrcode", "encoding_rs"] }
+# Fetching the benchmarks too large to keep here: see tests/datasets/mod.rs.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+sha2 = "0.10"
+serde_json = "1"
 
 [profile.dev]
 opt-level = 1
