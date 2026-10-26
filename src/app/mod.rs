@@ -4,6 +4,7 @@
 
 mod canvas;
 mod inspector;
+mod screen;
 #[cfg(feature = "selftest")]
 mod selftest;
 mod state;
@@ -35,6 +36,7 @@ use qr_forensics::imaging::detect::{
 };
 use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline, read_outline_one_of, standing_of};
 use qr_forensics::imaging::refine::{Refinement, placement_agreement, refine_corners, refine_corners_expecting};
+use qr_forensics::imaging::gpu::Shown;
 use qr_forensics::imaging::{Luma, SharedRgba};
 use qr_forensics::imaging::deblur;
 use qr_forensics::imaging::enhance::{Enhance, Enhanced, Sharpen};
@@ -511,6 +513,9 @@ pub struct App {
     /// stretched over the photo's own pixels, which everything else
     /// works in.
     texture_limit: usize,
+    /// The window's drawing, where the graphics card the photo is
+    /// adjusted on draws it: the photo's textures are then laid there.
+    screen: Option<screen::Screen>,
     #[cfg(feature = "selftest")]
     selftest: Option<selftest::SelfTest>,
 }
@@ -610,6 +615,7 @@ impl App {
     /// `image` is a photo to open straight away.
     pub fn new(cc: &eframe::CreationContext<'_>, image: Option<std::path::PathBuf>) -> Self {
         let mut app = Self::blank();
+        app.screen = screen::Screen::of(cc);
         if let Some(path) = image {
             app.load_path(&cc.egui_ctx, &path);
         }
@@ -648,6 +654,7 @@ impl App {
             settle_pending: false,
             // What egui allows until a window says what its own limit is.
             texture_limit: 2048,
+            screen: None,
             #[cfg(feature = "selftest")]
             selftest: selftest::SelfTest::from_env(),
         }
@@ -879,12 +886,11 @@ impl App {
         let original = part_on_show(&source, crop);
         let (own_width, own_height) = original.dimensions();
         let adjust = Adjust { enlarge: adjust.enlarge.within(own_width, own_height), ..adjust };
-        let (display, luma) = adjusted(&adjust, &source, &original, crop);
-        let (width, height) = (luma.width, luma.height);
         let greyscale = self.view.greyscale;
-        let display = if greyscale { luma.to_rgba() } else { display };
+        let (display, luma) = adjusted(&adjust, &source, &original, crop, self.screen.is_some(), greyscale);
+        let (width, height) = (luma.width, luma.height);
         self.texture_limit = ctx.input(|i| i.max_texture_side);
-        let texture = ctx.load_texture("photo", texture_image(display, width, height, self.texture_limit), egui::TextureOptions::LINEAR);
+        let texture = photo_texture(self.screen.as_ref(), ctx, "photo", display, (width, height), self.texture_limit);
         self.history.photo_changed(&self.doc);
         self.doc.adjust = adjust;
         let enlargements = Enlarge::steps_for(own_width, own_height);
@@ -997,12 +1003,11 @@ impl App {
     /// adjustments, at the size its enlargement now makes of it.
     fn reapply_adjust(&mut self) {
         if let Some(photo) = &mut self.photo {
-            let (display, luma) = adjusted(&photo.adjust, &photo.source, &photo.original, photo.crop);
-            (photo.width, photo.height) = (luma.width, luma.height);
             photo.greyscale = self.view.greyscale;
-            let display = if photo.greyscale { luma.to_rgba() } else { display };
+            let (display, luma) = adjusted(&photo.adjust, &photo.source, &photo.original, photo.crop, self.screen.is_some(), photo.greyscale);
+            (photo.width, photo.height) = (luma.width, luma.height);
             photo.luma = Arc::new(luma);
-            photo.texture.set(texture_image(display, photo.width, photo.height, self.texture_limit), egui::TextureOptions::LINEAR);
+            lay_photo_texture(self.screen.as_ref(), &mut photo.texture, display, (photo.width, photo.height), self.texture_limit);
             photo.binarised = None;
             photo.offer(photo.adjust.enlarge);
         }
@@ -1014,11 +1019,11 @@ impl App {
         let Some(photo) = &mut self.photo else { return };
         photo.greyscale = self.view.greyscale;
         let display = if photo.greyscale {
-            photo.luma.to_rgba()
+            Shown::Bytes(photo.luma.to_rgba())
         } else {
-            adjusted(&photo.adjust, &photo.source, &photo.original, photo.crop).0
+            adjusted(&photo.adjust, &photo.source, &photo.original, photo.crop, self.screen.is_some(), false).0
         };
-        photo.texture.set(texture_image(display, photo.width, photo.height, self.texture_limit), egui::TextureOptions::LINEAR);
+        lay_photo_texture(self.screen.as_ref(), &mut photo.texture, display, (photo.width, photo.height), self.texture_limit);
     }
 
     /// Change how the photo is read, and bring the photo up to it. An
@@ -3596,6 +3601,11 @@ impl App {
     fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let mut actions = Vec::new();
+        // The last frame is drawn: the textures on the card it may have
+        // drawn through and has since dropped are let go of.
+        if let Some(screen) = &self.screen {
+            screen.let_go();
+        }
 
         for file in ui.input(|i| i.raw.dropped_files.clone()) {
             let path = file.path().to_owned();
@@ -4336,14 +4346,51 @@ fn part_on_show(source: &Arc<image::RgbaImage>, crop: Option<Crop>) -> Arc<image
 /// enlarged, as the whole photo is ([`Adjust::apply_to`]). The pixels are
 /// handed over shared, so that the luminance keeps the photo as loaded
 /// beside it as these same bytes, and not as a copy of them
-/// ([`Adjust::apply_to_shared`]).
-fn adjusted(adjust: &Adjust, source: &Arc<image::RgbaImage>, original: &Arc<image::RgbaImage>, crop: Option<Crop>) -> (Vec<u8>, Luma) {
+/// ([`Adjust::apply_to_shared`]). What is displayed is in the photo's
+/// colours, or where `grey`, in the grey of the luminance, as the view in
+/// grey shows the photo; and left on the graphics card where `on_card`
+/// and it was made there whole. The colours are made only where they are
+/// shown.
+fn adjusted(adjust: &Adjust, source: &Arc<image::RgbaImage>, original: &Arc<image::RgbaImage>, crop: Option<Crop>, on_card: bool, grey: bool) -> (Shown, Luma) {
     let (pixels, adjust, part) = match crop {
         Some(crop) if crop.k1 != 0.0 => (source, Adjust { k1: crop.k1, ..*adjust }, crop.rect.map(|side| side as usize)),
         _ => (original, *adjust, [0, 0, original.width() as usize, original.height() as usize]),
     };
     let shared: SharedRgba = pixels.clone();
-    adjust.apply_to_shared(&shared, pixels.width() as usize, pixels.height() as usize, part)
+    let (width, height) = (pixels.width() as usize, pixels.height() as usize);
+    match (on_card, grey) {
+        (true, false) => adjust.apply_to_shared_shown(&shared, width, height, part),
+        (true, true) => adjust.apply_to_shared_grey(&shared, width, height, part),
+        (false, false) => {
+            let (display, luma) = adjust.apply_to_shared(&shared, width, height, part);
+            (Shown::Bytes(display), luma)
+        }
+        (false, true) => {
+            let luma = adjust.luma_of_shared(&shared, width, height, part);
+            (Shown::Bytes(luma.to_rgba()), luma)
+        }
+    }
+}
+
+/// A texture of the photo's pixels `shown`, `width` by `height`: laid on
+/// the graphics card where the window is drawn by it and they fit within
+/// `limit`, the most a texture may measure on a side; and otherwise
+/// egui's own, shrunk to fit ([`texture_image`]).
+fn photo_texture(screen: Option<&screen::Screen>, ctx: &egui::Context, name: &str, shown: Shown, (width, height): (usize, usize), limit: usize) -> screen::Texture {
+    match screen {
+        Some(screen) if width.max(height) <= limit => screen::Texture::Card(screen.laid((&shown).into(), (width, height))),
+        _ => screen::Texture::Egui(ctx.load_texture(name, texture_image(shown.into_bytes(), width, height, limit), egui::TextureOptions::LINEAR)),
+    }
+}
+
+/// [`photo_texture`], laid into `texture` where it serves.
+fn lay_photo_texture(screen: Option<&screen::Screen>, texture: &mut screen::Texture, shown: Shown, (width, height): (usize, usize), limit: usize) {
+    match (screen, &mut *texture) {
+        (Some(screen), _) if width.max(height) <= limit => screen.lay(texture, (&shown).into(), (width, height)),
+        (_, screen::Texture::Egui(handle)) => handle.set(texture_image(shown.into_bytes(), width, height, limit), egui::TextureOptions::LINEAR),
+        (Some(screen), screen::Texture::Card(_)) => *texture = photo_texture(Some(screen), screen.ctx(), "photo", shown, (width, height), limit),
+        (None, screen::Texture::Card(_)) => unreachable!("a texture on the card is the screen's"),
+    }
 }
 
 /// Pixels as a texture holds them: as they are when they fit within
@@ -5088,6 +5135,19 @@ mod tests {
             self.frame(Vec::new());
         }
 
+        /// The textures the last frame drew through.
+        fn drawn_through(&self) -> Vec<egui::TextureId> {
+            fn of(shape: &egui::Shape, ids: &mut Vec<egui::TextureId>) {
+                match shape {
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| of(shape, ids)),
+                    shape => ids.push(shape.texture_id()),
+                }
+            }
+            let mut ids = Vec::new();
+            self.shapes.iter().for_each(|clipped| of(&clipped.shape, &mut ids));
+            ids
+        }
+
         /// Frames until no search and no job is under way, and one more.
         fn settle(&mut self) {
             let started = std::time::Instant::now();
@@ -5350,6 +5410,110 @@ mod tests {
             pixel.0 = [200, 30, 40, 255];
         }
         image
+    }
+
+    #[test]
+    fn the_photo_and_its_binarised_view_are_laid_on_the_card_that_draws_the_window() {
+        use qr_forensics::imaging::binarize::binarize;
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        let screen = screen::Screen::on_card(&ctx);
+        bench.app.screen = Some(screen.clone());
+        // Opened with the window drawn by the card, the photo is laid there
+        // in its colours, as adjusted.
+        bench.app.set_photo(&ctx, "red".into(), red_render());
+        bench.app.doc.corners = square(30.0, 30.0, 270.0);
+        bench.step();
+        fn photo(bench: &Bench) -> &Photo {
+            bench.app.photo.as_ref().expect("a photo is on show")
+        }
+        let colours = |photo: &Photo| adjusted(&photo.adjust, &photo.source, &photo.original, photo.crop, false, false).0.into_bytes();
+        assert!(matches!(photo(&bench).texture, screen::Texture::Card(_)));
+        assert_eq!(screen.read(&photo(&bench).texture), colours(photo(&bench)));
+        let id = photo(&bench).texture.id();
+        // In grey, the grey of what is read, laid into the same texture:
+        // drawn again, and made again with the adjustments.
+        bench.app.view.greyscale = true;
+        bench.app.redraw_photo();
+        assert_eq!((photo(&bench).texture.id(), screen.read(&photo(&bench).texture)), (id, photo(&bench).luma.to_rgba()));
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { contrast: 0.2, ..bench.app.doc.adjust }));
+        assert_eq!((photo(&bench).texture.id(), screen.read(&photo(&bench).texture)), (id, photo(&bench).luma.to_rgba()));
+        bench.app.view.greyscale = false;
+        bench.app.redraw_photo();
+        assert_eq!(screen.read(&photo(&bench).texture), colours(photo(&bench)));
+        // The binarised view, laid there too, and laid into its own
+        // texture again as the outline moves.
+        let binarised = |photo: &Photo| {
+            let view = photo.binarised.as_ref().expect("the view was made");
+            let grey: Vec<u8> = binarize(&photo.luma, &view.params).data.iter().flat_map(|&v| if v < 0.5 { [0, 0, 0, 255] } else { [255; 4] }).collect();
+            (view.texture.id(), screen.read(&view.texture), grey)
+        };
+        bench.app.view.align_overlay = AlignOverlay::Binarised;
+        bench.step();
+        let (view_id, shown, made) = binarised(photo(&bench));
+        assert_eq!(shown, made);
+        let params = photo(&bench).binarised.as_ref().expect("the view was made").params;
+        bench.app.doc.corners = square(60.0, 60.0, 210.0);
+        bench.step();
+        assert_ne!(photo(&bench).binarised.as_ref().expect("the view was made").params, params, "made again for the outline moved");
+        let (moved_id, shown, made) = binarised(photo(&bench));
+        assert_eq!((moved_id, shown), (view_id, made));
+        // Enlarged, the photo is laid into a texture of its new size, and
+        // the old one and the old view's are let go of.
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { enlarge: Enlarge::times(2), ..bench.app.doc.adjust }));
+        bench.step();
+        assert_eq!(photo(&bench).texture.size(), [660, 660]);
+        assert!(!screen.registered(id) && !screen.registered(view_id));
+        assert_eq!(screen.read(&photo(&bench).texture), colours(photo(&bench)));
+        let (_, shown, made) = binarised(photo(&bench));
+        assert_eq!(shown, made);
+        // Larger than a texture may be, each is egui's own, shrunk to fit,
+        // and the card's are let go of; laid on the card again where it
+        // fits once more.
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { enlarge: Enlarge::times(4), ..bench.app.doc.adjust }));
+        bench.step();
+        assert!(matches!(photo(&bench).texture, screen::Texture::Card(_)) && photo(&bench).texture.size() == [1320, 1320]);
+        let ids = [photo(&bench).texture.id(), photo(&bench).binarised.as_ref().expect("the view was made").texture.id()];
+        bench.texture_side = Some(1024);
+        bench.step();
+        assert!(matches!(photo(&bench).texture, screen::Texture::Egui(_)) && photo(&bench).texture.size() == [1024, 1024]);
+        assert!(photo(&bench).binarised.as_ref().is_some_and(|view| matches!(view.texture, screen::Texture::Egui(_))));
+        // Dropped in that frame, they are let go of once it is drawn.
+        assert!(ids.iter().all(|&id| screen.registered(id)));
+        bench.step();
+        assert!(!ids.iter().any(|&id| screen.registered(id)));
+        bench.texture_side = Some(8192);
+        bench.step();
+        assert!(matches!(photo(&bench).texture, screen::Texture::Card(_)));
+        assert_eq!(screen.read(&photo(&bench).texture), colours(photo(&bench)));
+        let (_, shown, made) = binarised(photo(&bench));
+        assert_eq!(shown, made);
+        // Undone by a key, as the end of a frame that drew the view in the
+        // photo's place applies it, the photo is made again at its size
+        // before and its view is made anew; the textures let go of are let
+        // go of once that frame is drawn. Let go of as they were dropped,
+        // it drew without them.
+        let key = |modifiers| egui::Event::Key { key: egui::Key::Z, physical_key: None, pressed: true, repeat: false, modifiers };
+        let (undo, redo) = (key(egui::Modifiers::COMMAND), key(egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT)));
+        let ids = [photo(&bench).texture.id(), photo(&bench).binarised.as_ref().expect("the view was made").texture.id()];
+        bench.frame(vec![undo]);
+        assert!(photo(&bench).texture.size() == [660, 660] && photo(&bench).binarised.is_none());
+        assert!(bench.drawn_through().contains(&ids[1]), "the frame drew the view");
+        assert!(ids.iter().all(|&id| screen.registered(id)), "what the frame drew through is there to be drawn");
+        bench.step();
+        assert!(!ids.iter().any(|&id| screen.registered(id)));
+        // And the photo itself, redone by a key in a frame that drew it.
+        bench.app.view.align_overlay = AlignOverlay::LinesOnly;
+        bench.step();
+        let id = photo(&bench).texture.id();
+        bench.frame(vec![redo]);
+        assert_eq!(photo(&bench).texture.size(), [1320, 1320]);
+        assert!(bench.drawn_through().contains(&id) && screen.registered(id), "the frame drew the photo, which is there to be drawn");
+        bench.step();
+        assert!(!screen.registered(id));
     }
 
     #[test]
@@ -7437,7 +7601,7 @@ mod tests {
         let [x, y, w, h] = photo.crop.expect("cropped").rect.map(|side| side as usize);
         let whole = Adjust { k1: -0.05, ..photo.adjust }.apply(photo.source.as_raw(), 5000, 1500).0;
         let there: Vec<u8> = (y..y + h).flat_map(|row| whole[(row * 5000 + x) * 4..(row * 5000 + x + w) * 4].to_vec()).collect();
-        assert!(adjusted(&photo.adjust, &photo.source, &photo.original, photo.crop).0 == there, "the part is the whole straightened");
+        assert!(adjusted(&photo.adjust, &photo.source, &photo.original, photo.crop, false, false).0.into_bytes() == there, "the part is the whole straightened");
         assert!(photo.original.as_raw() == &there, "and so are its own pixels");
         bench.act(Action::ShowWholePhoto);
         assert_eq!(bench.app.doc.adjust.k1, -0.05);

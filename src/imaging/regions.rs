@@ -37,13 +37,22 @@
 //! cuts every line across it, however far from the middle, and only the
 //! closed image reads clean, as zxing-cpp retries a failed read on a
 //! denoised copy with `tryDenoise`. Light-on-dark symbols are found by
-//! running the whole procedure again on the complemented image.
+//! running the whole procedure again on the complemented image. The
+//! reading and its closings are made on the graphics card with the
+//! scan's readings ([`super::gpu::scan`]), and the four labellings of
+//! each reading, of each polarity as it is and closed, run side by side
+//! on the cores with every other reading's, each read from the reading's
+//! own bits rather than from a mask made of them.
 //!
 //! Every candidate goes on to the detector's own template fit, which has
 //! the last word, so the checks here are generous: they are there to keep
 //! the count of candidates small, not to make the final decision.
 
 use std::f64::consts::SQRT_2;
+
+use super::binarize::{DARK, LIGHT, NONE};
+use super::gpu::scan::{CLOSED_DARK, CLOSED_LIGHT, Reading};
+use crate::work;
 
 /// A finder pattern suggested by a connected region of the binarised image.
 #[derive(Clone, Copy, Debug)]
@@ -68,12 +77,6 @@ pub(crate) struct RegionCandidate {
     /// best first.
     pub score: f64,
 }
-
-/// What a pixel of the image reads as: light, dark, or nothing, for a
-/// pixel the photo does not cover.
-const LIGHT: u8 = 0;
-const DARK: u8 = 1;
-const NONE: u8 = 2;
 
 /// A finder's outer ring is seven modules on a side, so a region whose
 /// bounding box is shorter than this many modules on its longer side
@@ -164,55 +167,45 @@ const DIAMETER_SAMPLES: usize = 256;
 /// Rounds of polishing of the quadrilateral's corners against the hull.
 const POLISH_ROUNDS: usize = 3;
 
-/// Finder patterns suggested by the connected regions of a binarised image
-/// of `width` × `height` pixels. `dark(x, y)` is `None` off the image; a
-/// module is between `min_module` and `max_module` pixels. Pixel centres
-/// are at (x + 0.5, y + 0.5), as elsewhere in the crate. Candidates come
-/// best first, at most [`MAX_CANDIDATES`] of them, with any two of the same
-/// polarity whose centres lie within a module of each other merged into
-/// the better.
-pub(crate) fn finder_regions(
-    width: usize,
-    height: usize,
-    dark: &dyn Fn(i64, i64) -> Option<bool>,
-    min_module: f64,
-    max_module: f64,
-) -> Vec<RegionCandidate> {
+/// Finder patterns suggested by the connected regions of each of
+/// `readings`, binarised images of `width` × `height` pixels, a byte to
+/// each as it lies packed among others ([`Reading`]): [`LIGHT`], [`DARK`],
+/// or [`NONE`] off the photo, in its two low bits, and whether it reads
+/// dark once the dark pixels are closed over ([`CLOSED_DARK`]) and light
+/// once the light ones are ([`CLOSED_LIGHT`]), as the card reads a
+/// rectified image closed ([`super::gpu::scan::readings`]); a module is between `min_module` and `max_module` pixels. Pixel
+/// centres are at (x + 0.5, y + 0.5), as elsewhere in the crate. Each
+/// reading's candidates come best first, at most [`MAX_CANDIDATES`] of
+/// them, with any two of the same polarity whose centres lie within a
+/// module of each other merged into the better.
+pub(crate) fn finder_regions(width: usize, height: usize, readings: &[Reading<'_>], min_module: f64, max_module: f64) -> Vec<Vec<RegionCandidate>> {
     if width == 0
         || height == 0
         || !(min_module.is_finite() && max_module.is_finite())
         || min_module <= 0.0
         || max_module < min_module
     {
-        return Vec::new();
+        return vec![Vec::new(); readings.len()];
     }
-    let mut image = Vec::with_capacity(width * height);
-    for y in 0..height {
-        for x in 0..width {
-            image.push(match dark(x as i64, y as i64) {
-                Some(true) => DARK,
-                Some(false) => LIGHT,
-                None => NONE,
-            });
-        }
-    }
+    assert!(readings.iter().all(|kinds| kinds.bytes.len() == width * height));
+    // Each is labelled closed too, from the closings above its kind, where
+    // a reading not closed has the next reading's bits, or none.
+    assert!(readings.iter().all(|kinds| kinds.closings), "the regions are labelled from readings closed");
     let limits = Limits::new(min_module, max_module);
-    let mut found = Vec::new();
-    for inverted in [false, true] {
-        let ink = if inverted { LIGHT } else { DARK };
-        let mask: Vec<u8> = image.iter().map(|&v| u8::from(v == ink)).collect();
-        let closed = close(&mask, width, height);
-        for labelling in [&mask, &closed] {
-            let field = Field { mask: labelling, image: &image, width, height };
-            for points in region_points(labelling, width, height, &limits) {
-                let Some(quad) = quad_of(points) else { continue };
-                if let Some(candidate) = candidate(&quad, &field, &limits, inverted) {
-                    found.push(candidate);
-                }
-            }
-        }
-    }
-    rank(found)
+    // Each reading's each polarity as it is and closed, labelled side by
+    // side and gathered in that order: what a labelling finds takes
+    // nothing from the others'.
+    const LABELLINGS: [(bool, bool); 4] = [(false, false), (false, true), (true, false), (true, true)];
+    let labellings: Vec<(Reading<'_>, bool, bool)> = readings.iter().flat_map(|&kinds| LABELLINGS.map(|(inverted, closed)| (kinds, inverted, closed))).collect();
+    let found = work::map(&labellings, |&(kinds, inverted, closed)| {
+        let field = Field { kinds, ink: Ink::of(inverted, closed, kinds.shift), width, height };
+        region_points(&field, &limits)
+            .into_iter()
+            .filter_map(quad_of)
+            .filter_map(|quad| candidate(&quad, &field, &limits, inverted))
+            .collect::<Vec<RegionCandidate>>()
+    });
+    found.chunks(LABELLINGS.len()).map(|each| rank(each.concat())).collect()
 }
 
 /// Sizes a region must have to be worth a hull, and a module may have.
@@ -241,11 +234,41 @@ impl Limits {
     }
 }
 
-/// The image the lines are read from: a mask of the ink being looked for,
-/// as it is or closed, and the image as read, for where the photo is not.
+/// Which pixels of a reading are the ink a labelling looks for: those
+/// whose bits under `bits` are `want`, the reading's own bits where it
+/// lies packed among others' ([`Reading`]). The dark or the light pixels
+/// as they read, or as they read closed over.
+#[derive(Clone, Copy)]
+struct Ink {
+    bits: u8,
+    want: u8,
+}
+
+impl Ink {
+    /// The light pixels where `inverted`, and the dark otherwise; as they
+    /// read once closed over where `closed`; of a reading `shift` bits up
+    /// each byte.
+    fn of(inverted: bool, closed: bool, shift: u32) -> Self {
+        let (bits, want) = match (inverted, closed) {
+            (false, false) => (3, DARK),
+            (true, false) => (3, LIGHT),
+            (false, true) => (CLOSED_DARK, CLOSED_DARK),
+            (true, true) => (CLOSED_LIGHT, CLOSED_LIGHT),
+        };
+        Self { bits: bits << shift, want: want << shift }
+    }
+
+    /// Whether the pixel whose byte is `byte` is the ink.
+    fn is(self, byte: u8) -> bool {
+        byte & self.bits == self.want
+    }
+}
+
+/// The image the lines are read from: a reading, the ink being looked for
+/// in it, as it is or closed, and where the photo is not.
 struct Field<'a> {
-    mask: &'a [u8],
-    image: &'a [u8],
+    kinds: Reading<'a>,
+    ink: Ink,
     width: usize,
     height: usize,
 }
@@ -259,46 +282,7 @@ impl Field<'_> {
             return None;
         }
         let i = y as usize * self.width + x as usize;
-        (self.image[i] != NONE).then(|| self.mask[i] == 1)
-    }
-}
-
-/// Morphological closing of a mask of 0 and 1 by a 3 × 3 square: a
-/// dilation, then an erosion. Gaps of one or two pixels between pixels of
-/// the mask are filled, and nothing else changes, so a ring cut by thin
-/// scratches comes back whole. Each step is separable into a pass along
-/// the rows and one down the columns.
-fn close(mask: &[u8], width: usize, height: usize) -> Vec<u8> {
-    let mut scratch = vec![0u8; mask.len()];
-    let mut dilated = vec![0u8; mask.len()];
-    spread(mask, &mut scratch, &mut dilated, width, height, u8::max);
-    let mut closed = vec![0u8; mask.len()];
-    spread(&dilated, &mut scratch, &mut closed, width, height, u8::min);
-    closed
-}
-
-/// `dst` takes `op` over each pixel of `src` and its eight neighbours, the
-/// edge pixels standing in for whatever lies beyond the image, so that a
-/// region touching the edge is neither grown nor shrunk there.
-fn spread(src: &[u8], scratch: &mut [u8], dst: &mut [u8], width: usize, height: usize, op: fn(u8, u8) -> u8) {
-    for (row, out) in src.chunks_exact(width).zip(scratch.chunks_exact_mut(width)) {
-        if width == 1 {
-            out[0] = row[0];
-            continue;
-        }
-        out[0] = op(row[0], row[1]);
-        out[width - 1] = op(row[width - 2], row[width - 1]);
-        for (window, o) in row.windows(3).zip(out[1..width - 1].iter_mut()) {
-            *o = op(op(window[0], window[1]), window[2]);
-        }
-    }
-    for y in 0..height {
-        let above = &scratch[y.saturating_sub(1) * width..][..width];
-        let here = &scratch[y * width..][..width];
-        let below = &scratch[(y + 1).min(height - 1) * width..][..width];
-        for (((o, &a), &h), &b) in dst[y * width..][..width].iter_mut().zip(above).zip(here).zip(below) {
-            *o = op(op(a, h), b);
-        }
+        (self.kinds.kind(i) != NONE).then(|| self.ink.is(self.kinds.bytes[i]))
     }
 }
 
@@ -358,25 +342,26 @@ fn unite(runs: &mut [Run], extents: &mut [Extent], a: u32, b: u32) {
     extents[keep as usize].absorb(absorbed);
 }
 
-/// The corners of the pixels of every region of `mask` (1 where the ink
-/// is) whose extent is plausible for a finder, one list of points per
-/// region. The regions are the eight-connected components, labelled in one
-/// pass over the rows: each row's runs are matched against the previous
-/// row's with two cursors, and runs that touch are united. Every pixel in
-/// a run lies between the run's ends, so the hull of the run corners is
-/// the hull of the region.
-fn region_points(mask: &[u8], width: usize, height: usize, limits: &Limits) -> Vec<Vec<[f64; 2]>> {
+/// The corners of the pixels of every region of the ink of `field`
+/// ([`Ink`]) whose extent is plausible for a finder, one list of points
+/// per region. The regions are the eight-connected components, labelled
+/// in one pass over the rows: each row's runs are matched against the
+/// previous row's with two cursors, and runs that touch are united. Every
+/// pixel in a run lies between the run's ends, so the hull of the run
+/// corners is the hull of the region.
+fn region_points(field: &Field<'_>, limits: &Limits) -> Vec<Vec<[f64; 2]>> {
+    let (width, height, ink) = (field.width, field.height, field.ink);
     let mut runs: Vec<Run> = Vec::new();
     let mut extents: Vec<Extent> = Vec::new();
     let mut rows: Vec<usize> = Vec::with_capacity(height + 1);
     rows.push(0);
     for y in 0..height {
-        let row = &mask[y * width..][..width];
+        let row = &field.kinds.bytes[y * width..][..width];
         let first = runs.len();
         let mut x = 0;
-        while let Some(skip) = row[x..].iter().position(|&v| v != 0) {
+        while let Some(skip) = row[x..].iter().position(|&v| ink.is(v)) {
             let x0 = x + skip;
-            x = x0 + row[x0..].iter().position(|&v| v == 0).unwrap_or(width - x0);
+            x = x0 + row[x0..].iter().position(|&v| !ink.is(v)).unwrap_or(width - x0);
             let i = runs.len() as u32;
             runs.push(Run { x0: x0 as u32, x1: x as u32, parent: i });
             extents.push(Extent { count: (x - x0) as u32, x0: x0 as u32, x1: x as u32, y0: y as u32, y1: y as u32 + 1 });
@@ -710,8 +695,99 @@ mod tests {
         }
 
         fn find(&self, min_module: f64, max_module: f64) -> Vec<RegionCandidate> {
-            finder_regions(self.width, self.height, &|x, y| self.at(x, y), min_module, max_module)
+            let kinds = kinds_of(self.width, self.height, &|x, y| self.at(x, y));
+            let found = finder_regions(self.width, self.height, &[Reading { bytes: &kinds, shift: 0, closings: true }], min_module, max_module).remove(0);
+            // Packed above another reading, as the card packs the scan's:
+            // the same regions.
+            let above: Vec<u8> = kinds.iter().enumerate().map(|(i, &kind)| kind << 4 | (i % 7) as u8).collect();
+            let packed = finder_regions(self.width, self.height, &[Reading { bytes: &above, shift: 4, closings: true }], min_module, max_module).remove(0);
+            assert_eq!(format!("{packed:?}"), format!("{found:?}"), "read where it lies packed");
+            found
         }
+    }
+
+    /// The reading of a bitmap as the card makes one of an image: each
+    /// pixel's kind, and its closings, made here by closing each mask over
+    /// on the cores, as the card closes it
+    /// ([`a_reading_is_closed_on_the_card_as_on_the_cores`]).
+    fn kinds_of(width: usize, height: usize, dark: &dyn Fn(i64, i64) -> Option<bool>) -> Vec<u8> {
+        let kinds: Vec<u8> = (0..width * height)
+            .map(|i| match dark((i % width) as i64, (i / width) as i64) {
+                Some(true) => DARK,
+                Some(false) => LIGHT,
+                None => NONE,
+            })
+            .collect();
+        let closed = |ink: u8| close(&kinds.iter().map(|&kind| u8::from(kind == ink)).collect::<Vec<u8>>(), width, height);
+        let (dark, light) = (closed(DARK), closed(LIGHT));
+        kinds.iter().zip(dark.iter().zip(&light)).map(|(&kind, (&d, &l))| kind | if d == 1 { CLOSED_DARK } else { 0 } | if l == 1 { CLOSED_LIGHT } else { 0 }).collect()
+    }
+
+    /// Morphological closing of a mask of 0 and 1 by a 3 × 3 square, as
+    /// the cores made it: a dilation, then an erosion. Gaps of one or two
+    /// pixels between pixels of the mask are filled, and nothing else
+    /// changes, so a ring cut by thin scratches comes back whole. Each step
+    /// is separable into a pass along the rows and one down the columns.
+    fn close(mask: &[u8], width: usize, height: usize) -> Vec<u8> {
+        let mut scratch = vec![0u8; mask.len()];
+        let mut dilated = vec![0u8; mask.len()];
+        spread(mask, &mut scratch, &mut dilated, width, height, u8::max);
+        let mut closed = vec![0u8; mask.len()];
+        spread(&dilated, &mut scratch, &mut closed, width, height, u8::min);
+        closed
+    }
+
+    /// `dst` takes `op` over each pixel of `src` and its eight neighbours,
+    /// the edge pixels standing in for whatever lies beyond the image, so
+    /// that a region touching the edge is neither grown nor shrunk there.
+    fn spread(src: &[u8], scratch: &mut [u8], dst: &mut [u8], width: usize, height: usize, op: fn(u8, u8) -> u8) {
+        for (row, out) in src.chunks_exact(width).zip(scratch.chunks_exact_mut(width)) {
+            if width == 1 {
+                out[0] = row[0];
+                continue;
+            }
+            out[0] = op(row[0], row[1]);
+            out[width - 1] = op(row[width - 2], row[width - 1]);
+            for (window, o) in row.windows(3).zip(out[1..width - 1].iter_mut()) {
+                *o = op(op(window[0], window[1]), window[2]);
+            }
+        }
+        for y in 0..height {
+            let above = &scratch[y.saturating_sub(1) * width..][..width];
+            let here = &scratch[y * width..][..width];
+            let below = &scratch[(y + 1).min(height - 1) * width..][..width];
+            for (((o, &a), &h), &b) in dst[y * width..][..width].iter_mut().zip(above).zip(here).zip(below) {
+                *o = op(op(a, h), b);
+            }
+        }
+    }
+
+    #[test]
+    fn a_reading_is_closed_on_the_card_as_on_the_cores() {
+        use crate::imaging::gpu::scan::{Rule, Values, readings};
+        let (width, height) = (61, 47);
+        let mut seed = 0x9E37_79B9_u32;
+        let data: Vec<f32> = (0..width * height)
+            .map(|i| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                if i % 53 == 0 { f32::NAN } else { (seed >> 8) as f32 / (1 << 24) as f32 }
+            })
+            .collect();
+        // Specks of each kind, a pixel to a few, closed over or not.
+        let card = readings(Values::Cores(&data), (width, height), &[(Rule::Global { threshold: 0.3 }, true)], false).into_only();
+        let cores = kinds_of(width, height, &|x, y| {
+            let value = data[y as usize * width + x as usize];
+            value.is_finite().then_some(value < 0.3)
+        });
+        assert!(card == cores);
+    }
+
+    #[test]
+    #[should_panic(expected = "the regions are labelled from readings closed")]
+    fn a_reading_not_closed_is_not_labelled() {
+        // Of a reading not closed, the bits above its kind are another's.
+        let kinds = vec![DARK; 64];
+        finder_regions(8, 8, &[Reading { bytes: &kinds, shift: 0, closings: false }], 1.0, 2.0);
     }
 
     /// Whether module coordinates (u, v) of a finder pattern, which occupies

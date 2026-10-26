@@ -523,7 +523,7 @@ fn worth_enhancing(image: &Luma, best: Option<&ReadResult>) -> bool {
 fn worth_deblurring(image: &Luma, region: [[f64; 2]; 4], best: Option<&ReadResult>) -> bool {
     let Some([x0, y0, x1, y1]) = Enhanced::window_about(image, region) else { return false };
     let (w, h) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
-    let part: Vec<f32> = (y0..y1).flat_map(|y| image.data[y * image.width + x0..y * image.width + x1].iter().copied()).collect();
+    let part = super::adjust::cut(&image.data, image.width, 1, [x0, y0, x1, y1]);
     let Some(spread) = super::deblur::spread_of(&part, w, h) else { return false };
     let (widest, _) = spread.extremes();
     let module = match best {

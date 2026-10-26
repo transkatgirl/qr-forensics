@@ -9,7 +9,7 @@ use qr_forensics::decode::pipeline::{DecodeOptions, DecodeReport, GridAnalysis, 
 use qr_forensics::decode::sequence::Sequence;
 use qr_forensics::imaging::Luma;
 use qr_forensics::imaging::adjust::{Adjust, Enlarge};
-use qr_forensics::imaging::binarize::BinarizeParams;
+use qr_forensics::imaging::binarize::{BinarizeParams, ViewSource};
 use qr_forensics::imaging::deblur;
 use qr_forensics::imaging::detect::{Anchor, AnchorKind, Detection};
 use qr_forensics::imaging::projection::{ControlPoint, Projection};
@@ -502,7 +502,7 @@ pub struct Photo {
     /// that a search or a job on its own thread starts without copying
     /// the photo; a change of adjustments makes a new one.
     pub luma: Arc<Luma>,
-    pub texture: egui::TextureHandle,
+    pub texture: super::screen::Texture,
     /// Whether the texture shows the photo in grey, as the luminance
     /// has it, or in its colours: what the view asked for when it was
     /// last made.
@@ -514,11 +514,14 @@ pub struct Photo {
 
 /// The adaptive threshold of the photo as a texture, with what it was
 /// made from. It holds the luminance it was built from, so that a new one
-/// cannot take the old one's address and pass for it.
+/// cannot take the old one's address and pass for it, and that luminance
+/// held on the graphics card, where the view is made again whenever its
+/// settings change.
 pub struct Binarised {
     pub source: Arc<Luma>,
+    pub card: ViewSource,
     pub params: BinarizeParams,
-    pub texture: egui::TextureHandle,
+    pub texture: super::screen::Texture,
 }
 
 impl Binarised {

@@ -41,8 +41,14 @@ Vulkan, DirectX 12 or OpenGL elsewhere. Every adjustment in the Photo
 section runs on it (Enlarge, Lens, Sharpen, the tone and Channel, and the
 median, dot-closing and **Deblur** filters), as do the enlarged,
 reduced, sharpened, deblurred and closed copies of the photo the search
-and the reader make. There is no fallback to the processor: without a
-card, QR Forensics says so and exits. A photo too large for one of the
+and the reader make, the measure of the blur that Deblur undoes, and
+the search's reading of the photo as dark and light every way the
+finder scan reads it, which the binarised view shows. The photo is
+resampled through an outline for the search on the processor, in double
+precision, and handed the card to be read. The window is drawn by the
+same card, and what an adjustment makes to be shown is laid into the
+window's textures there. There is no fallback to the processor: without
+a card, QR Forensics says so and exits. A photo too large for one of the
 card's buffers is worked on in tiles, with the same result. The card
 still needs room for the photo and the copies made of it at once: one
 that runs out of memory stops QR Forensics with the graphics driver's

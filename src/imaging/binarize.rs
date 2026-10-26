@@ -39,9 +39,19 @@
 //! quarter of it.
 
 use std::fmt;
+use std::sync::Arc;
 
 use super::Luma;
-use super::sample::{NOISE_RANGE, otsu, robust_spread};
+use super::gpu::scan::{self, Rule, Values};
+use super::sample::{BINS, NOISE_RANGE, histogram_of, otsu_of, robust_spread_of};
+use crate::work;
+
+/// What a reading makes of a pixel, a byte to each: light, dark, or
+/// nothing, where the image has no value, as a rectified image has none
+/// off the photo.
+pub const LIGHT: u8 = 0;
+pub const DARK: u8 = 1;
+pub const NONE: u8 = 2;
 
 /// Pixels on a side of the blocks the local threshold averages.
 pub const BLOCK: usize = 8;
@@ -52,119 +62,72 @@ pub const BLOCK: usize = 8;
 /// never less than the noise of the sensor.
 pub const RANGE_SHARE: f32 = 0.12;
 
-/// Mean luminance around each pixel, over blocks, for a threshold that
-/// follows shadows and glare, and the spread of luminance within each
-/// block and its neighbours, which tells a flat patch from one with
-/// pattern in it. A pixel with no value, `NaN` where a rectified image
-/// has no photo, counts for nothing.
-pub struct BlockMean {
-    blocks_wide: usize,
-    blocks_high: usize,
-    /// Summed-area tables over the block means and the blocks with a value.
-    sums: Vec<f64>,
-    counts: Vec<f64>,
-    /// The neighbourhood's half-width, in blocks.
-    radius: usize,
-    /// Per block: the spread between the darkest and lightest pixel of the
-    /// block and its eight neighbours.
-    range: Vec<f32>,
-    /// The spread below which a block is flat: [`RANGE_SHARE`] of the
-    /// image's own spread, or the sensor's noise if that is more.
-    min_range: f32,
+/// The local threshold's radius, in pixels, for a symbol whose outline is
+/// `side` pixels on its shorter side: wider than a finder pattern, so the
+/// finder's own dark does not pull the threshold down over it.
+pub fn local_radius_for(side: f64) -> f64 {
+    (side / 6.0).clamp(8.0, 256.0)
 }
 
-impl BlockMean {
-    /// The neighbourhood's radius, in pixels, for a symbol whose outline
-    /// is `side` pixels on its shorter side: wider than a finder pattern,
-    /// so the finder's own dark does not pull the threshold down over it.
-    pub fn radius_for(side: f64) -> f64 {
-        (side / 6.0).clamp(8.0, 256.0)
-    }
+/// The spread of luminance below which a block and its neighbours are
+/// flat, for an image whose own spread is `spread`: [`RANGE_SHARE`] of
+/// it, or the sensor's noise if that is more.
+pub fn min_range(spread: f32) -> f32 {
+    (RANGE_SHARE * spread).max(NOISE_RANGE)
+}
 
-    /// The block means of a `width` × `height` image, which must not be
-    /// empty, with the neighbourhood reaching `radius_px` pixels, rounded
-    /// up to whole blocks. The flat floor is set by the spread of the
-    /// whole image.
-    pub fn new(data: &[f32], width: usize, height: usize, radius_px: f64) -> Self {
-        Self::within(data, width, height, radius_px, None)
-    }
+/// The local threshold reaching `radius_px` pixels about each pixel, as
+/// the card is given it: the neighbourhood rounded up to whole blocks.
+pub(crate) fn local_rule(radius_px: f64, spread: f32) -> Rule {
+    Rule::Local { radius: (radius_px.max(0.0) / BLOCK as f64).ceil() as usize, min_range: min_range(spread) }
+}
 
-    /// [`BlockMean::new`] with the flat floor set by the spread of the
-    /// pixels inside `region`, `[x0, y0, x1, y1]` with the far sides
-    /// exclusive, when one is given: the scan sets its floor by the
-    /// spread of the outline it looks at, and a view of that outline
-    /// must do the same, or a dim symbol in a bright photo reads as flat
-    /// in the view where the scan reads it, and the reverse.
-    pub fn within(data: &[f32], width: usize, height: usize, radius_px: f64, region: Option<[usize; 4]>) -> Self {
-        assert!(width > 0 && height > 0 && data.len() == width * height, "a {width} × {height} image of {} values", data.len());
-        let blocks_wide = width.div_ceil(BLOCK);
-        let blocks_high = height.div_ceil(BLOCK);
-        let mut sums = vec![0.0f64; (blocks_wide + 1) * (blocks_high + 1)];
-        let mut counts = vec![0.0f64; (blocks_wide + 1) * (blocks_high + 1)];
-        let mut mins = vec![f32::INFINITY; blocks_wide * blocks_high];
-        let mut maxs = vec![f32::NEG_INFINITY; blocks_wide * blocks_high];
-        let stride = blocks_wide + 1;
-        for by in 0..blocks_high {
-            for bx in 0..blocks_wide {
-                let (mut sum, mut count) = (0.0f64, 0u32);
-                for y in by * BLOCK..((by + 1) * BLOCK).min(height) {
-                    for x in bx * BLOCK..((bx + 1) * BLOCK).min(width) {
-                        let value = data[y * width + x];
-                        if value.is_finite() {
-                            sum += value as f64;
-                            count += 1;
-                            mins[by * blocks_wide + bx] = mins[by * blocks_wide + bx].min(value);
-                            maxs[by * blocks_wide + bx] = maxs[by * blocks_wide + bx].max(value);
-                        }
-                    }
-                }
-                let i = (by + 1) * stride + bx + 1;
-                let mean = if count > 0 { sum / count as f64 } else { 0.0 };
-                sums[i] = mean + sums[i - 1] + sums[i - stride] - sums[i - stride - 1];
-                counts[i] = f64::from(u8::from(count > 0)) + counts[i - 1] + counts[i - stride] - counts[i - stride - 1];
-            }
-        }
-        let mut range = vec![0.0f32; blocks_wide * blocks_high];
-        for by in 0..blocks_high {
-            for bx in 0..blocks_wide {
-                let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-                for ny in by.saturating_sub(1)..(by + 2).min(blocks_high) {
-                    for nx in bx.saturating_sub(1)..(bx + 2).min(blocks_wide) {
-                        lo = lo.min(mins[ny * blocks_wide + nx]);
-                        hi = hi.max(maxs[ny * blocks_wide + nx]);
-                    }
-                }
-                range[by * blocks_wide + bx] = if hi.is_finite() && lo.is_finite() { hi - lo } else { 0.0 };
-            }
-        }
-        let radius = (radius_px.max(0.0) / BLOCK as f64).ceil() as usize;
-        let [x0, y0, x1, y1] = region.map_or([0, 0, width, height], |r| [r[0].min(width), r[1].min(height), r[2].min(width), r[3].min(height)]);
-        let spread = robust_spread((y0..y1).flat_map(|y| (x0..x1).map(move |x| data[y * width + x])).filter(|v| v.is_finite()));
-        let min_range = (RANGE_SHARE * spread).max(NOISE_RANGE);
-        Self { blocks_wide, blocks_high, sums, counts, radius, range, min_range }
-    }
+/// Each pixel of a `width` × `height` image against the lighting around
+/// it, for a threshold that follows shadows and glare: [`DARK`] where it
+/// lies below the mean of the blocks within `radius_px` pixels of its
+/// own block, rounded up to whole blocks, each block's mean weighing the
+/// same, whole or clipped by the image's edge; [`LIGHT`] otherwise, and
+/// where its block and that block's eight neighbours spread less than
+/// the flat floor ([`min_range`]), which tells a flat patch from one with
+/// pattern in it; and [`NONE`] where it has no value, `NaN` where a
+/// rectified image has no photo, which counts for nothing. The floor is
+/// set by the spread of the pixels inside `region`, `[x0, y0, x1, y1]`
+/// with the far sides exclusive, when one is given, and of the whole
+/// image otherwise: the scan sets its floor by the spread of the outline
+/// it looks at, and a view of that outline must do the same, or a dim
+/// symbol in a bright photo reads as flat in the view where the scan
+/// reads it, and the reverse.
+pub fn local_dark(data: &[f32], width: usize, height: usize, radius_px: f64, region: Option<[usize; 4]>) -> Vec<u8> {
+    assert_eq!(data.len(), width * height);
+    let spread = robust_spread_of(&histogram(data, width, height, region));
+    scan::readings(Values::Cores(data), (width, height), &[(local_rule(radius_px, spread), false)], false).into_only()
+}
 
-    /// The spread below which a block and its neighbours are flat.
-    pub fn min_range(&self) -> f32 {
-        self.min_range
-    }
+/// Rows of a region counted as one piece on the cores to spare
+/// ([`histogram`]).
+const HISTOGRAM_BAND: usize = 64;
 
-    /// Whether a pixel of luminance `value` at (`x`, `y`) is dark against
-    /// its surroundings. A pixel in a flat patch never is.
-    pub fn is_dark(&self, value: f32, x: usize, y: usize) -> bool {
-        let (bx, by) = ((x / BLOCK).min(self.blocks_wide - 1), (y / BLOCK).min(self.blocks_high - 1));
-        if self.range[by * self.blocks_wide + bx] < self.min_range {
-            return false;
-        }
-        let stride = self.blocks_wide + 1;
-        let (x0, y0) = (bx.saturating_sub(self.radius), by.saturating_sub(self.radius));
-        let (x1, y1) = ((bx + self.radius + 1).min(self.blocks_wide), (by + self.radius + 1).min(self.blocks_high));
-        let sum = |table: &[f64]| {
-            table[y1 * stride + x1] - table[y0 * stride + x1] - table[y1 * stride + x0] + table[y0 * stride + x0]
-        };
-        let n = sum(&self.counts);
-        n > 0.5 && value < (sum(&self.sums) / n) as f32
+/// How the values of `region` of `data`, an image `width` by `height`,
+/// fall ([`histogram_of`]), or of the whole image where none is given, the
+/// pixels with no value left out: counted on the cores that hold them, a
+/// band of rows to each. Counted on the graphics card, where the
+/// binarised view reads the image, the view waited on the card for the
+/// counts before it could read it, every frame a corner was dragged; and
+/// the card counts as the cores do.
+fn histogram(data: &[f32], width: usize, height: usize, region: Option<[usize; 4]>) -> [u32; BINS] {
+    let [x0, y0, x1, y1] = region.map_or([0, 0, width, height], |r| [r[0].min(width), r[1].min(height), r[2].min(width), r[3].min(height)]);
+    if x0 >= x1 || y0 >= y1 {
+        return [0; BINS];
     }
+    let bands: Vec<usize> = (y0..y1).step_by(HISTOGRAM_BAND).collect();
+    let counted = work::map(&bands, |&from| {
+        let rows = from..(from + HISTOGRAM_BAND).min(y1);
+        histogram_of(rows.flat_map(|y| data[y * width + x0..y * width + x1].iter().copied()).filter(|v| v.is_finite()))
+    });
+    counted.iter().fold([0u32; BINS], |mut all, counts| {
+        all.iter_mut().zip(counts).for_each(|(all, &n)| *all += n);
+        all
+    })
 }
 
 /// Half-widths, in pixels, of the windows the scan thresholds each pixel
@@ -200,7 +163,7 @@ pub enum Binarizer {
     /// [`WINDOW_RADII`].
     Pooled,
     /// Each pixel against the lighting around it alone: the mean of the
-    /// blocks within `radius` pixels ([`BlockMean`]).
+    /// blocks within `radius` pixels ([`local_dark`]).
     Local { radius: f64 },
     /// One threshold alone, Otsu's split of the luminance of what is
     /// scanned.
@@ -240,67 +203,14 @@ impl fmt::Display for Binarizer {
 }
 
 /// Each pixel of a `width` × `height` image against the mean of the
-/// window `radius` pixels either side of it, clipped to the image: 1
-/// where it lies more than `bias` below that mean and reads dark, 0
-/// where it reads light, and 2 where it has no value, `NaN` where a
-/// rectified image has no photo. Pixels without a value count for
-/// nothing in the mean.
-///
-/// The means are running sums, down the columns and then across them,
-/// so the cost does not grow with the window, and what is kept is a
-/// byte a pixel.
+/// window `radius` pixels either side of it, clipped to the image:
+/// [`DARK`] where it lies more than `bias` below that mean, [`LIGHT`]
+/// otherwise, and [`NONE`] where it has no value, `NaN` where a rectified
+/// image has no photo. Pixels without a value count for nothing in the
+/// mean.
 pub fn window_dark(data: &[f32], width: usize, height: usize, radius: usize, bias: f32) -> Vec<u8> {
     assert_eq!(data.len(), width * height);
-    let mut out = vec![2u8; width * height];
-    if width == 0 || height == 0 {
-        return out;
-    }
-    // The sum and count of each column over the rows of the window.
-    let mut sums = vec![0.0f64; width];
-    let mut counts = vec![0i64; width];
-    let take = |sums: &mut [f64], counts: &mut [i64], y: usize, sign: i64| {
-        for (x, &value) in data[y * width..(y + 1) * width].iter().enumerate() {
-            if value.is_finite() {
-                sums[x] += sign as f64 * f64::from(value);
-                counts[x] += sign;
-            }
-        }
-    };
-    for y in 0..=radius.min(height - 1) {
-        take(&mut sums, &mut counts, y, 1);
-    }
-    for y in 0..height {
-        if y > 0 {
-            if y + radius < height {
-                take(&mut sums, &mut counts, y + radius, 1);
-            }
-            if y > radius {
-                take(&mut sums, &mut counts, y - radius - 1, -1);
-            }
-        }
-        let (mut sum, mut count) = (0.0f64, 0i64);
-        for x in 0..=radius.min(width - 1) {
-            sum += sums[x];
-            count += counts[x];
-        }
-        for x in 0..width {
-            if x > 0 {
-                if x + radius < width {
-                    sum += sums[x + radius];
-                    count += counts[x + radius];
-                }
-                if x > radius {
-                    sum -= sums[x - radius - 1];
-                    count -= counts[x - radius - 1];
-                }
-            }
-            let value = data[y * width + x];
-            if value.is_finite() {
-                out[y * width + x] = u8::from(count > 0 && f64::from(value) < sum / count as f64 - f64::from(bias));
-            }
-        }
-    }
-    out
+    scan::readings(Values::Cores(data), (width, height), &[(Rule::Window { radius, bias }, false)], false).into_only()
 }
 
 /// Settings of the view: the scan's rule as it runs for one outline.
@@ -334,7 +244,7 @@ impl BinarizeParams {
     /// radius a sixth of the outline's shorter side, and the region the
     /// outline with the margin the search reaches beyond it. The radius
     /// is whole pixels, taken upward: the blocks it reaches, whole
-    /// blocks rounded up ([`BlockMean::within`]), are then the blocks
+    /// blocks rounded up ([`local_dark`]), are then the blocks
     /// the scan's radius reaches, which is not rounded. Taken to the
     /// nearest pixel it fell a block short of the scan's for a side a
     /// hair over a multiple of forty-eight.
@@ -343,7 +253,7 @@ impl BinarizeParams {
         let across = (distance(corners[0], corners[1]) + distance(corners[3], corners[2])) / 2.0;
         let down = (distance(corners[0], corners[3]) + distance(corners[1], corners[2])) / 2.0;
         let side = across.min(down);
-        let radius = if side.is_finite() && side > 0.0 { BlockMean::radius_for(side).ceil() as usize } else { Self::MIN_RADIUS };
+        let radius = if side.is_finite() && side > 0.0 { local_radius_for(side).ceil() as usize } else { Self::MIN_RADIUS };
         let (x0, x1) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, p| (a.0.min(p[0]), a.1.max(p[0])));
         let (y0, y1) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, p| (a.0.min(p[1]), a.1.max(p[1])));
         let region = if [x0, x1, y0, y1].iter().all(|v| v.is_finite()) {
@@ -391,23 +301,80 @@ pub fn binarize(luma: &Luma, params: &BinarizeParams) -> Luma {
     if width == 0 || height == 0 {
         return Luma::new(width, height, Vec::new());
     }
-    let [x0, y0, x1, y1] = params.region.map_or([0, 0, width, height], |r| [r[0].min(width), r[1].min(height), r[2].min(width), r[3].min(height)]);
-    let dark: Vec<bool> = if let Some(radius) = params.window {
-        let spread = robust_spread((y0..y1).flat_map(|y| (x0..x1).map(move |x| luma.data[y * width + x])).filter(|v| v.is_finite()));
-        window_dark(&luma.data, width, height, radius, WINDOW_BIAS * spread).into_iter().map(|kind| kind == 1).collect()
+    let rule = rule_of(&histogram(&luma.data, width, height, params.region), params);
+    let mask = scan::readings(Values::Cores(&luma.data), (width, height), &[(rule, false)], false).into_only();
+    Luma::new(width, height, mask.into_iter().map(|kind| if kind == DARK { 0.0 } else { 1.0 }).collect())
+}
+
+/// A photo's luminance held on the graphics card for the binarised view
+/// to be made from: handed the card once, and read there again as often
+/// as the outline or the view's settings change, which while a corner is
+/// dragged is every frame. The levels and floors of the readings are
+/// counted from the cores' own luminance ([`histogram`]), so that nothing
+/// made on the card is waited for until the view is shown. A luminance
+/// the card does not hold whole, as an enlarged photo may be for a card
+/// whose buffers are small, is read from the cores' own, in tiles.
+pub struct ViewSource {
+    luma: Arc<Luma>,
+    /// None for a luminance the card does not hold whole
+    /// ([`super::gpu::holds`]), or of no pixels, which has nothing to hand.
+    image: Option<super::gpu::Image>,
+}
+
+impl ViewSource {
+    /// `luma`, handed the card where it holds it whole.
+    pub fn new(luma: Arc<Luma>) -> Self {
+        let image = super::gpu::holds(luma.width, luma.height).then(|| super::gpu::Image::handed(&luma.data, luma.width, luma.height));
+        Self { luma, image }
+    }
+
+    /// [`binarize`] of the luminance, as the binarised view shows it: a
+    /// byte to a pixel, black where it reads dark and white elsewhere, made
+    /// on the card and taken off it in grey.
+    pub fn binarized(&self, params: &BinarizeParams) -> Vec<u8> {
+        scan::readings(self.values(), (self.luma.width, self.luma.height), &[(self.rule(params), false)], true).into_only()
+    }
+
+    /// The same, as opaque pixels left on the card, for a window drawn by
+    /// the card to lay into its texture ([`super::gpu::OnCard::copy_to`]),
+    /// where the card holds the luminance whole; and otherwise taken off
+    /// it, a byte of grey to a pixel.
+    pub fn binarized_shown(&self, params: &BinarizeParams) -> Result<super::gpu::OnCard, Vec<u8>> {
+        // The rule's level and floor taken from the region once, for either.
+        let rule = self.rule(params);
+        let shown = self.image.as_ref().and_then(|image| scan::reading_shown(image, rule));
+        shown.ok_or_else(|| scan::readings(self.values(), (self.luma.width, self.luma.height), &[(rule, false)], true).into_only())
+    }
+
+    /// The luminance as the readings are made from it: where the card
+    /// holds it, and otherwise the cores' own.
+    fn values(&self) -> Values<'_> {
+        self.image.as_ref().map_or(Values::Cores(&self.luma.data), Values::Card)
+    }
+
+    /// The one reading `params` set over the luminance ([`rule_of`]).
+    fn rule(&self, params: &BinarizeParams) -> Rule {
+        rule_of(&histogram(&self.luma.data, self.luma.width, self.luma.height, params.region), params)
+    }
+}
+
+/// The one reading `params` set over an image whose region's values fall
+/// as `counts` counts them ([`histogram`]): its level and floor taken
+/// from them.
+fn rule_of(counts: &[u32; BINS], params: &BinarizeParams) -> Rule {
+    if let Some(radius) = params.window {
+        Rule::Window { radius, bias: WINDOW_BIAS * robust_spread_of(counts) }
     } else if params.global {
-        let threshold = otsu((y0..y1).flat_map(|y| (x0..x1).map(move |x| luma.data[y * width + x])));
-        luma.data.iter().map(|&v| v < threshold).collect()
+        Rule::Global { threshold: otsu_of(counts) }
     } else {
-        let blocks = BlockMean::within(&luma.data, width, height, params.radius as f64, params.region);
-        (0..height).flat_map(|y| (0..width).map(move |x| (x, y))).map(|(x, y)| blocks.is_dark(luma.data[y * width + x], x, y)).collect()
-    };
-    Luma::new(width, height, dark.into_iter().map(|d| if d { 0.0 } else { 1.0 }).collect())
+        local_rule(params.radius as f64, robust_spread_of(counts))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::imaging::sample::robust_spread;
 
     fn image(width: usize, height: usize, value: impl Fn(usize, usize) -> f32) -> Luma {
         Luma::new(width, height, (0..width * height).map(|i| value(i % width, i / width)).collect())
@@ -431,7 +398,7 @@ mod tests {
         // short of the scan's for a side of 49, of 97 and so on.
         for side in 48..=1536 {
             let view = BinarizeParams::for_outline(square(0.0, 0.0, side as f64), 2000, 2000).radius as f64;
-            let scan = BlockMean::radius_for(side as f64);
+            let scan = local_radius_for(side as f64);
             assert_eq!((view / BLOCK as f64).ceil(), (scan / BLOCK as f64).ceil(), "a side of {side}");
         }
     }
@@ -473,27 +440,26 @@ mod tests {
         // fixed floor of a tenth would read the image as flat all over.
         let inside = |x: usize, y: usize| (27..37).contains(&x) && (27..37).contains(&y);
         let dim = image(64, 64, |x, y| if inside(x, y) { 0.004 } else { 0.06 });
-        let blocks = BlockMean::new(&dim.data, 64, 64, 16.0);
-        assert!((blocks.min_range() - NOISE_RANGE).abs() < 1e-6, "{}", blocks.min_range());
+        let floor = |data: &[f32]| min_range(robust_spread(data.iter().copied()));
+        assert!((floor(&dim.data) - NOISE_RANGE).abs() < 1e-6, "{}", floor(&dim.data));
         let out = binarize(&dim, &BinarizeParams { radius: 16, global: false, window: None, region: None });
         assert_eq!(out.data[32 * 64 + 32], 0.0);
         assert_eq!(out.data[5 * 64 + 5], 1.0);
         // On a photo that spans the scale the floor is ZXing's tenth or
         // so, and a patch that varies by less is flat.
         let bright = image(64, 64, |x, y| if inside(x, y) { 0.0 } else { 1.0 });
-        assert!((BlockMean::new(&bright.data, 64, 64, 16.0).min_range() - RANGE_SHARE).abs() < 1e-6);
+        assert!((floor(&bright.data) - RANGE_SHARE).abs() < 1e-6);
         // The dim square again, with a strip of bright paper down the
         // right of the photo: the whole photo spans the scale, and its
         // floor reads the square as flat, where the floor of the region
         // the scan looks at, the square's own part of the photo, reads
         // it dark, as the scan does.
         let mixed = image(64, 64, |x, y| if x >= 56 { 1.0 } else if inside(x, y) { 0.004 } else { 0.06 });
-        let whole = BlockMean::new(&mixed.data, 64, 64, 16.0);
-        assert!(whole.min_range() > 0.1, "{}", whole.min_range());
-        assert!(!whole.is_dark(0.004, 32, 32));
-        let part = BlockMean::within(&mixed.data, 64, 64, 16.0, Some([0, 0, 48, 64]));
-        assert!((part.min_range() - NOISE_RANGE).abs() < 1e-6, "{}", part.min_range());
-        assert!(part.is_dark(0.004, 32, 32));
+        assert!(floor(&mixed.data) > 0.1, "{}", floor(&mixed.data));
+        assert_eq!(local_dark(&mixed.data, 64, 64, 16.0, None)[32 * 64 + 32], LIGHT);
+        let part: Vec<f32> = (0..64).flat_map(|y| mixed.data[y * 64..y * 64 + 48].to_vec()).collect();
+        assert!((floor(&part) - NOISE_RANGE).abs() < 1e-6, "{}", floor(&part));
+        assert_eq!(local_dark(&mixed.data, 64, 64, 16.0, Some([0, 0, 48, 64]))[32 * 64 + 32], DARK);
         let region = BinarizeParams { radius: 16, global: false, window: None, region: Some([0, 0, 48, 64]) };
         assert_eq!(binarize(&mixed, &region).data[32 * 64 + 32], 0.0);
         assert_eq!(binarize(&mixed, &BinarizeParams { region: None, ..region }).data[32 * 64 + 32], 1.0);
@@ -621,7 +587,7 @@ mod tests {
         // mean weighs the same, whole or clipped by the edge.
         let (w, h) = (37, 29);
         let photo = image(w, h, |x, y| ((x * 7 + y * 13) % 11) as f32 / 10.0);
-        let blocks = BlockMean::new(&photo.data, w, h, 8.0);
+        let blocks = local_dark(&photo.data, w, h, 8.0, None);
         let (bw, bh) = (w.div_ceil(BLOCK), h.div_ceil(BLOCK));
         let block_mean = |bx: usize, by: usize| {
             let (mut sum, mut n) = (0.0f64, 0);
@@ -646,7 +612,7 @@ mod tests {
                 let mean = (sum / n as f64) as f32;
                 let value = photo.data[y * w + x];
                 if (value - mean).abs() > 1e-4 {
-                    assert_eq!(blocks.is_dark(value, x, y), value < mean, "at ({x}, {y})");
+                    assert_eq!(blocks[y * w + x] == DARK, value < mean, "at ({x}, {y})");
                 }
             }
         }
@@ -674,5 +640,32 @@ mod tests {
         assert!(out.data.iter().zip(&mask).all(|(&value, &kind)| (value == 0.0) == (kind == 1)));
         // A window given is the rule, whatever else is set beside it.
         assert_eq!(binarize(&photo, &BinarizeParams { global: true, ..params }), out);
+    }
+
+    #[test]
+    fn the_view_held_on_the_card_shows_what_binarize_makes() {
+        let (side, radius) = (90, 6);
+        let photo = image(side, side + 7, |x, y| ((x * 7 + y * 13) % 11) as f32 / 10.0 * (0.4 + 0.6 * x as f32 / side as f32));
+        let source = ViewSource::new(Arc::new(photo.clone()));
+        assert!(source.image.is_some(), "held on the card");
+        // A luminance the card does not hold whole is never handed it, and
+        // is read from the cores' own.
+        let unheld = ViewSource { luma: Arc::new(photo.clone()), image: None };
+        let region = Some([5, 9, 70, 80]);
+        for params in [
+            BinarizeParams { radius: 16, global: false, window: None, region },
+            BinarizeParams { radius: 40, global: true, window: None, region: None },
+            BinarizeParams { radius: 16, global: false, window: Some(radius), region },
+        ] {
+            let grey: Vec<u8> = binarize(&photo, &params).data.iter().map(|&v| if v < 0.5 { 0 } else { 255 }).collect();
+            assert_eq!(source.binarized(&params), grey, "{params:?}");
+            let shown = source.binarized_shown(&params).expect("held whole").read();
+            assert!(shown.as_chunks::<4>().0.iter().zip(&grey).all(|(&[r, g, b, a], &grey)| [r, g, b, a] == [grey, grey, grey, 255]), "{params:?} shown");
+            assert_eq!(unheld.binarized(&params), grey, "{params:?}, not held");
+            assert_eq!(unheld.binarized_shown(&params).err(), Some(grey), "{params:?}, not held, shown");
+        }
+        let empty = ViewSource::new(Arc::new(image(0, 0, |_, _| 0.0)));
+        assert!(empty.image.is_none() && empty.binarized(&BinarizeParams::default()).is_empty());
+        assert_eq!(empty.binarized_shown(&BinarizeParams::default()).err(), Some(Vec::new()));
     }
 }

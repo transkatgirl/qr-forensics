@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use super::enhance::{gaussian, mask_for};
 use super::deblur::{self, Spread};
-use super::gpu::{Lens, Step};
+use super::gpu::{Lens, Shown, Step};
 use super::resize::{Sample, Taps};
 use super::detect::most_shrunk;
 use super::{AsShot, Luma, SharedRgba, gpu};
@@ -385,7 +385,27 @@ pub struct Adjust {
 /// What is shown of a part of the photo and what is read of it, filtered
 /// on the graphics card ([`Adjust::filtered_on`]), with the blur its
 /// Deblur filter undid.
-type Filtered = (Vec<u8>, Vec<f32>, Option<Spread>);
+type Filtered = (Shown, Vec<f32>, Option<Spread>);
+
+/// Whether what a part of the photo shows is made, and where it is left:
+/// not at all, for a copy that is read and never shown; taken off the
+/// graphics card as bytes; or left on it where it was made there whole,
+/// for a window drawn by the card to lay into its texture
+/// ([`gpu::shared_device`]), in its colours, or in the grey of what is
+/// read of it, as the view in grey shows the photo.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Show {
+    Nothing,
+    Bytes,
+    Card,
+    Grey,
+}
+
+impl Show {
+    fn of(shown: bool) -> Self {
+        if shown { Show::Bytes } else { Show::Nothing }
+    }
+}
 
 /// How far the Deblur filter's strength goes ([`Adjust::strength`]).
 pub const STRENGTH_RANGE: std::ops::RangeInclusive<f32> = 0.0..=2.0;
@@ -747,7 +767,17 @@ fn aligned([x0, y0, x1, y1]: [usize; 4], [across, down]: [usize; 2], held: [usiz
 /// The rectangle `[x0, y0, x1, y1]`, far sides exclusive, of an image
 /// `width` pixels across with `channels` values to a pixel.
 pub(crate) fn cut<T: Copy>(data: &[T], width: usize, channels: usize, [x0, y0, x1, y1]: [usize; 4]) -> Vec<T> {
-    (y0..y1).flat_map(|y| data[(y * width + x0) * channels..(y * width + x1) * channels].iter().copied()).collect()
+    // Whole rows lie one after another, and are copied at once; otherwise
+    // a row at a time, each copied whole rather than a value at a time. No
+    // rows at all are none, wherever they would begin.
+    if x0 == 0 && x1 == width && y0 < y1 {
+        return data[y0 * width * channels..y1 * width * channels].to_vec();
+    }
+    let mut out = Vec::with_capacity(x1.saturating_sub(x0) * y1.saturating_sub(y0) * channels);
+    for y in y0..y1 {
+        out.extend_from_slice(&data[(y * width + x0) * channels..(y * width + x1) * channels]);
+    }
+    out
 }
 
 impl Adjust {
@@ -810,7 +840,8 @@ impl Adjust {
     /// order. An enlargement the part's size does not allow is held to
     /// the most that it does ([`Enlarge::within`]).
     pub fn apply_to(&self, rgba: &[u8], width: usize, height: usize, part: [usize; 4]) -> (Vec<u8>, Luma) {
-        self.applied(rgba, None, width, height, part, true)
+        let (display, luma) = self.applied(rgba, None, width, height, part, Show::Bytes);
+        (display.into_bytes(), luma)
     }
 
     /// [`Self::apply_to`] of a photo whose bytes are held to be shared,
@@ -819,29 +850,47 @@ impl Adjust {
     /// those same bytes where it is the whole of them, and not a second
     /// copy of a photo of many megapixels.
     pub fn apply_to_shared(&self, rgba: &SharedRgba, width: usize, height: usize, part: [usize; 4]) -> (Vec<u8>, Luma) {
-        self.applied(rgba, Some(rgba), width, height, part, true)
+        let (display, luma) = self.applied(rgba, Some(rgba), width, height, part, Show::Bytes);
+        (display.into_bytes(), luma)
     }
 
     /// The luminance alone of [`Self::apply_to_shared`], for a photo that
     /// is read and not shown: what would be shown of it is never taken off
     /// the graphics card, which is as many bytes again as the luminance.
     pub fn luma_of_shared(&self, rgba: &SharedRgba, width: usize, height: usize, part: [usize; 4]) -> Luma {
-        self.applied(rgba, Some(rgba), width, height, part, false).1
+        self.applied(rgba, Some(rgba), width, height, part, Show::Nothing).1
+    }
+
+    /// [`Self::apply_to_shared`], with the RGBA image to display left on
+    /// the graphics card where it was made there whole, for a window drawn
+    /// by the card to lay into its own texture ([`gpu::OnCard::copy_to`]),
+    /// and taken off it otherwise.
+    pub fn apply_to_shared_shown(&self, rgba: &SharedRgba, width: usize, height: usize, part: [usize; 4]) -> (Shown, Luma) {
+        self.applied(rgba, Some(rgba), width, height, part, Show::Card)
+    }
+
+    /// [`Self::apply_to_shared_shown`], with what is shown the grey of the
+    /// luminance, as the view in grey shows the photo ([`Luma::to_rgba`]):
+    /// greyed on the card where the luminance was made there whole, and the
+    /// photo's colours, which would be thrown away, never taken off it.
+    pub fn apply_to_shared_grey(&self, rgba: &SharedRgba, width: usize, height: usize, part: [usize; 4]) -> (Shown, Luma) {
+        self.applied(rgba, Some(rgba), width, height, part, Show::Grey)
     }
 
     /// [`Self::apply_to`], with the bytes held to be shared, if they are,
-    /// and the RGBA image to display made only where it is `shown`
-    /// ([`Self::made`]).
-    fn applied(&self, rgba: &[u8], shared: Option<&SharedRgba>, width: usize, height: usize, [x, y, w, h]: [usize; 4], shown: bool) -> (Vec<u8>, Luma) {
+    /// and the RGBA image to display made only where it is shown, as
+    /// `show` says ([`Self::made`]).
+    fn applied(&self, rgba: &[u8], shared: Option<&SharedRgba>, width: usize, height: usize, [x, y, w, h]: [usize; 4], show: Show) -> (Shown, Luma) {
         assert_eq!(rgba.len(), width * height * 4);
         assert!(x + w <= width && y + h <= height, "the part [{x}, {y}, {w}, {h}] lies within the photo, {width} by {height}");
         if w == 0 || h == 0 {
-            return self.filtered(Vec::new(), Vec::new(), w, h, 1.0, 0);
+            let (display, luma) = self.filtered(Vec::new(), Vec::new(), w, h, 1.0, 0);
+            return (Shown::Bytes(display), luma);
         }
         let enlarge = self.enlarge.within(w as u32, h as u32);
         let photo = Loaded { rgba, width, height, at: [0, 0], photo: [width, height], shared };
         let size = enlarge.size(w, h);
-        Adjust { enlarge, ..*self }.made(photo, [x, y, w, h], size, size.0 * size.1, shown, true)
+        Adjust { enlarge, ..*self }.made_as(photo, [x, y, w, h], size, size.0 * size.1, show, true)
     }
 
     /// Whether the tone is the photo's own: a copy made of the photo's
@@ -863,7 +912,16 @@ impl Adjust {
     /// beside it, when it is made a whole number of times larger, and the
     /// photo as loaded, when it is adjusted more than that.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn made(&self, from: Loaded<'_>, [x, y, w, h]: [usize; 4], (to_width, to_height): (usize, usize), whole_pixels: usize, shown: bool, keep: bool) -> (Vec<u8>, Luma) {
+    pub(crate) fn made(&self, from: Loaded<'_>, part: [usize; 4], size: (usize, usize), whole_pixels: usize, shown: bool, keep: bool) -> (Vec<u8>, Luma) {
+        let (display, luma) = self.made_as(from, part, size, whole_pixels, Show::of(shown), keep);
+        (display.into_bytes(), luma)
+    }
+
+    /// [`Self::made`], with what is shown made only where `show` says, and
+    /// left on the graphics card where it says so and it was made there
+    /// whole.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn made_as(&self, from: Loaded<'_>, [x, y, w, h]: [usize; 4], (to_width, to_height): (usize, usize), whole_pixels: usize, show: Show, keep: bool) -> (Shown, Luma) {
         let [ax, ay] = from.at;
         let held = [ax, ay, ax + from.width, ay + from.height];
         // Unbent, the part is read where it lies. Bent, it is read from
@@ -921,7 +979,7 @@ impl Adjust {
         // step at a time, and filtered after.
         let source = gpu::Source { rgba: from.rgba, width: from.width, part: [drawn[0] - ax, drawn[1] - ay, drawn[2] - ax, drawn[3] - ay], shared: from.shared };
         let table = self.lookup_table();
-        let on_card = gpu::adjusted(&source, &chain, &table, self.pick()).map(|toned| self.filtered_on(toned, scale[0], whole_pixels, shown));
+        let on_card = gpu::adjusted(&source, &chain, &table, self.pick(), self.tone(show)).map(|toned| self.filtered_on(toned, scale[0], whole_pixels, show));
         let (display, mut luma) = match on_card {
             Some((display, toned, deblurred)) => {
                 let mut luma = Luma::new(to_width, to_height, toned);
@@ -929,8 +987,10 @@ impl Adjust {
                 (display, luma)
             }
             None => {
-                let (display, toned) = gpu::stepped(&source, &chain, &table, self.pick(), shown);
-                self.filtered(display, toned, to_width, to_height, scale[0], whole_pixels)
+                let (display, toned) = gpu::stepped(&source, &chain, &table, self.pick(), matches!(show, Show::Bytes | Show::Card));
+                let (display, luma) = self.filtered(display, toned, to_width, to_height, scale[0], whole_pixels);
+                let display = if show == Show::Grey { luma.to_rgba() } else { display };
+                (Shown::Bytes(display), luma)
             }
         };
         if !keep {
@@ -1000,11 +1060,26 @@ impl Adjust {
         }
     }
 
+    /// What the part is toned to show on the card ([`gpu::Tone`]), where
+    /// `show` asks it: nothing where a filter is laid over it, whose grey
+    /// is shown in its place; its colours, laid out to be copied to a
+    /// texture where they are left on the card; or the grey of what is read.
+    fn tone(&self, show: Show) -> gpu::Tone {
+        match show {
+            _ if self.filter != Filter::None => gpu::Tone::Nothing,
+            Show::Nothing => gpu::Tone::Nothing,
+            Show::Bytes => gpu::Tone::Colours { padded: false },
+            Show::Card => gpu::Tone::Colours { padded: true },
+            Show::Grey => gpu::Tone::Grey,
+        }
+    }
+
     /// [`Self::filtered`] on the card, over a part of the photo adjusted
     /// and toned there ([`gpu::Toned`]), by the same kernels, to the same
-    /// values: what is shown, where it is `shown`, and what is read taken off
-    /// the card after the filter, with the blur the Deblur filter undid.
-    fn filtered_on(&self, toned: gpu::Toned, scale: f32, whole: usize, shown: bool) -> Filtered {
+    /// values: what is shown, where `show` asks for it, left on the card
+    /// where it asks that, and what is read taken off the card after the
+    /// filter, with the blur the Deblur filter undid.
+    fn filtered_on(&self, toned: gpu::Toned, scale: f32, whole: usize, show: Show) -> Filtered {
         let radius = usize::from(self.radius.clamp(1, Filter::MAX_RADIUS));
         let (filtered, deblurred) = match self.filter {
             Filter::None => (None, None),
@@ -1016,7 +1091,16 @@ impl Adjust {
                 (Some(sharp), spread)
             }
         };
-        let (display, luma) = toned.taken(filtered, shown);
+        let (display, luma) = match show {
+            Show::Card | Show::Grey => {
+                let (on_card, luma) = toned.kept(filtered);
+                (Shown::Card(on_card), luma)
+            }
+            _ => {
+                let (display, luma) = toned.taken(filtered, show == Show::Bytes);
+                (Shown::Bytes(display), luma)
+            }
+        };
         (display, luma, deblurred)
     }
 
@@ -2146,5 +2230,17 @@ mod tests {
         let (display, luma) = Adjust { k1: 0.1, ..Default::default() }.apply(&ramp, w, h);
         assert_eq!(display[(y * w + x) * 4], expected);
         assert!((luma.data[0] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_rectangle_is_cut_as_its_rows_are_joined() {
+        let (width, height, channels) = (7, 5, 3);
+        let data: Vec<u16> = (0..(width * height * channels) as u16).collect();
+        let joined = |[x0, y0, x1, y1]: [usize; 4]| -> Vec<u16> { (y0..y1).flat_map(|y| data[(y * width + x0) * channels..(y * width + x1) * channels].iter().copied()).collect() };
+        // Whole rows, some of them, and none, wherever none would begin:
+        // past the last row, or with the rows the wrong way about.
+        for rect in [[0, 0, width, height], [0, 1, width, 4], [2, 1, 6, 4], [3, 0, 3, height], [0, 2, width, 2], [0, height + 3, width, height + 3], [0, 4, width, 1], [2, 4, 6, 1]] {
+            assert_eq!(cut(&data, width, channels, rect), joined(rect), "{rect:?}");
+        }
     }
 }

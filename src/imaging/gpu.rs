@@ -72,6 +72,18 @@
 //! The tiles are as large as a buffer of the card's takes, and not as
 //! all its memory does. A card that fails, out of memory or otherwise,
 //! stops the work with what it said ([`off_card`]).
+//!
+//! The finder scan's readings of the photo are made here too ([`scan`]):
+//! the photo resampled through an outline's frame, on the cores in double
+//! precision, and handed the card, read as dark and light each way the
+//! scan reads it. So are the edges the blur is measured from
+//! ([`edges`]).
+
+pub(crate) mod edges;
+pub(crate) mod scan;
+mod shown;
+
+pub use shown::{OnCard, Shown};
 
 use std::borrow::Cow;
 use std::ops::{Deref, Range};
@@ -83,7 +95,7 @@ use cubecl::bytes::Bytes;
 use cubecl::prelude::*;
 use cubecl::server::{Handle, ServerError};
 use cubecl::device::{WgpuDevice, WgpuDeviceKind};
-use cubecl::wgpu::{AutoGraphicsApi, RuntimeOptions, WgpuInitError, try_init_setup};
+use cubecl::wgpu::{AutoCompiler, AutoGraphicsApi, RuntimeOptions, WgpuInitError, WgpuServer, WgpuSetup, try_init_setup, wgpu};
 use cubecl::Device;
 
 use super::SharedRgba;
@@ -211,7 +223,7 @@ fn clamped_kernel(values: &mut [f32], count: u32) {
 /// rows, `samples` values across, weighed together by the taps down, from
 /// row `first` and `count` of them, `per` weights to a row of the result;
 /// `height` rows. Added up in their order, from nought.
-#[cube(launch)]
+#[cube(launch_unchecked)]
 fn resized_down_kernel(source: &[f32], rows: &mut [f32], first: &[u32], count: &[u32], weights: &[f32], per: u32, samples: u32, height: u32) {
     let (j, y) = (column(), ABSOLUTE_POS_Y);
     if j < samples && y < height {
@@ -227,7 +239,7 @@ fn resized_down_kernel(source: &[f32], rows: &mut [f32], first: &[u32], count: &
 /// The second: each of those rows, `from` values across, resized across
 /// by the taps across into `width` pixels of `channels`, every channel
 /// alike; each value as a byte holds it where `round` ([`stored`]).
-#[cube(launch)]
+#[cube(launch_unchecked)]
 fn resized_across_kernel(rows: &[f32], out: &mut [f32], first: &[u32], count: &[u32], weights: &[f32], per: u32, from: u32, width: u32, height: u32, channels: u32, #[comptime] round: bool) {
     let (s, y) = (column(), ABSOLUTE_POS_Y);
     if s < width * channels && y < height {
@@ -336,7 +348,7 @@ fn straightened_kernel(shot: &[f32], out: &mut [f32], fill: &[f32], bend: Bend, 
 /// order, from nought.
 // A kernel indexes its slices; it has no iterators to take them by.
 #[allow(clippy::needless_range_loop)]
-#[cube(launch)]
+#[cube(launch_unchecked)]
 fn blurred_across_kernel(values: &[f32], across: &mut [f32], weights: &[f32], reach: u32, width: u32, height: u32, channels: u32) {
     let (s, y) = (column(), ABSOLUTE_POS_Y);
     if s < width * channels && y < height {
@@ -356,7 +368,7 @@ fn blurred_across_kernel(values: &[f32], across: &mut [f32], weights: &[f32], re
 /// ([`stored`]).
 // A kernel indexes its slices; it has no iterators to take them by.
 #[allow(clippy::needless_range_loop)]
-#[cube(launch)]
+#[cube(launch_unchecked)]
 fn unsharp_down_kernel(values: &[f32], across: &[f32], out: &mut [f32], weights: &[f32], reach: u32, amount: f32, width: u32, height: u32, channels: u32, #[comptime] round: bool) {
     let (s, y) = (column(), ABSOLUTE_POS_Y);
     let stride = width * channels;
@@ -371,12 +383,22 @@ fn unsharp_down_kernel(values: &[f32], across: &[f32], out: &mut [f32], weights:
     }
 }
 
+/// The opaque grey of a luminance, four bytes to a word: held from black
+/// to white and rounded to a byte, as [`greyed`] greys it on the cores.
+#[cube]
+fn grey_word(value: f32) -> u32 {
+    let grey = rounded_byte(clamp(value, 0.0f32, 1.0f32) * 255.0f32);
+    grey | (grey << 8) | (grey << 16) | (255u32 << 24)
+}
+
 /// Pixel `i`, of the colours `red`, `green` and `blue`, bytes, toned: each
 /// colour through the curve `table`, or the one `pick` names through it
-/// for all three where it is less than three; the pixel shown so, opaque,
-/// four bytes to a word, and its luminance.
+/// for all three where it is less than three; its luminance, and where
+/// `showing`, the pixel shown so, opaque, four bytes to a word, at `at`,
+/// or where `grey` the grey of its luminance there ([`Tone`]).
 #[cube]
-fn toned_pixel(red: u32, green: u32, blue: u32, table: &[u32], pick: u32, shown: &mut [u32], luma: &mut [f32], i: u32) {
+#[allow(clippy::too_many_arguments)]
+fn toned_pixel(red: u32, green: u32, blue: u32, table: &[u32], pick: u32, shown: &mut [u32], luma: &mut [f32], i: u32, at: u32, #[comptime] showing: bool, #[comptime] grey: bool) {
     let mut colours = Array::<u32>::new(3usize);
     colours[0] = table[red as usize];
     colours[1] = table[green as usize];
@@ -387,32 +409,42 @@ fn toned_pixel(red: u32, green: u32, blue: u32, table: &[u32], pick: u32, shown:
         colours[1] = one;
         colours[2] = one;
     }
-    shown[i as usize] = colours[0] | (colours[1] << 8) | (colours[2] << 16) | (255u32 << 24);
     let (r, g, b) = (colours[0] as f32 / 255.0f32, colours[1] as f32 / 255.0f32, colours[2] as f32 / 255.0f32);
-    luma[i as usize] = 0.299f32 * r + 0.587f32 * g + 0.114f32 * b;
+    let value = 0.299f32 * r + 0.587f32 * g + 0.114f32 * b;
+    luma[i as usize] = value;
+    if comptime!(showing && grey) {
+        shown[at as usize] = grey_word(value);
+    }
+    if comptime!(showing && !grey) {
+        shown[at as usize] = colours[0] | (colours[1] << 8) | (colours[2] << 16) | (255u32 << 24);
+    }
 }
 
 /// `count` pixels of `values`, `channels` to each, bytes as values, the
-/// first three their colours, toned ([`toned_pixel`]).
+/// first three their colours, rows `width` across, toned
+/// ([`toned_pixel`]), what is shown laid out `stride` words to a row.
 #[cube(launch)]
-fn toned_kernel(values: &[f32], shown: &mut [u32], luma: &mut [f32], table: &[u32], pick: u32, count: u32, channels: u32) {
+#[allow(clippy::too_many_arguments)]
+fn toned_kernel(values: &[f32], shown: &mut [u32], luma: &mut [f32], table: &[u32], pick: u32, count: u32, channels: u32, width: u32, stride: u32, #[comptime] showing: bool, #[comptime] grey: bool) {
     let i = line_place();
     if i < count {
         let at = i * channels;
-        toned_pixel(values[at as usize] as u32, values[(at + 1) as usize] as u32, values[(at + 2) as usize] as u32, table, pick, shown, luma, i);
+        toned_pixel(values[at as usize] as u32, values[(at + 1) as usize] as u32, values[(at + 2) as usize] as u32, table, pick, shown, luma, i, (i / width) * stride + i % width, showing, grey);
     }
 }
 
 /// The `count` pixels of the box `width` across beginning at `(x0, y0)`
 /// of an image `across` pixels wide, four bytes to each and a word, the
 /// first three their colours, toned ([`toned_pixel`]) as they lie there,
-/// with no values made of them first.
+/// with no values made of them first, what is shown laid out `stride`
+/// words to a row.
 #[cube(launch)]
-fn toned_words_kernel(words: &[u32], shown: &mut [u32], luma: &mut [f32], table: &[u32], pick: u32, count: u32, across: u32, x0: u32, y0: u32, width: u32) {
+#[allow(clippy::too_many_arguments)]
+fn toned_words_kernel(words: &[u32], shown: &mut [u32], luma: &mut [f32], table: &[u32], pick: u32, count: u32, across: u32, x0: u32, y0: u32, width: u32, stride: u32, #[comptime] showing: bool, #[comptime] grey: bool) {
     let i = line_place();
     if i < count {
         let word = words[((y0 + i / width) * across + x0 + i % width) as usize];
-        toned_pixel(word & 255, (word >> 8) & 255, (word >> 16) & 255, table, pick, shown, luma, i);
+        toned_pixel(word & 255, (word >> 8) & 255, (word >> 16) & 255, table, pick, shown, luma, i, (i / width) * stride + i % width, showing, grey);
     }
 }
 
@@ -637,7 +669,7 @@ fn blurred_at(source: &[f32], across: &[i32], down: &[i32], weights: &[f32], x: 
 }
 
 /// [`ratio_kernel`] for taps that reach further than [`MOST_HALO`].
-#[cube(launch)]
+#[cube(launch_unchecked)]
 fn ratio_wide_kernel(observed: &[f32], estimate: &[f32], ratio: &mut [f32], across: &[i32], down: &[i32], weights: &[f32], width: u32, height: u32, floor: f32) {
     let (x, y) = (ABSOLUTE_POS_X, ABSOLUTE_POS_Y);
     if x < width && y < height {
@@ -647,7 +679,7 @@ fn ratio_wide_kernel(observed: &[f32], estimate: &[f32], ratio: &mut [f32], acro
 }
 
 /// [`update_kernel`] for taps that reach further than [`MOST_HALO`].
-#[cube(launch)]
+#[cube(launch_unchecked)]
 fn update_wide_kernel(ratio: &[f32], estimate: &mut [f32], across: &[i32], down: &[i32], weights: &[f32], width: u32, height: u32, floor: f32) {
     let (x, y) = (ABSOLUTE_POS_X, ABSOLUTE_POS_Y);
     if x < width && y < height {
@@ -656,21 +688,28 @@ fn update_wide_kernel(ratio: &[f32], estimate: &mut [f32], across: &[i32], down:
     }
 }
 
-/// The card's client, made the first time it is asked for, or why there
-/// is none: no graphics API wgpu could open, or no adapter on any of them.
-fn card() -> &'static Result<Client, String> {
-    static CARD: OnceLock<Result<Client, String>> = OnceLock::new();
+/// The card: its client, and what wgpu opened it as, which the window is
+/// drawn with too ([`shared_device`]).
+struct Card {
+    client: Client,
+    setup: WgpuSetup,
+}
+
+/// The card, opened the first time it is asked for, or why there is none:
+/// no graphics API wgpu could open, or no adapter on any of them.
+fn card() -> &'static Result<Card, String> {
+    static CARD: OnceLock<Result<Card, String>> = OnceLock::new();
     CARD.get_or_init(|| {
         // Opened by the call that says why it cannot be, rather than by
         // making the client, which panics, and the panic's message would
         // stand before the program's own.
         let opened = panic::catch_unwind(|| {
             let device = WgpuDevice::new(WgpuDeviceKind::DefaultDevice);
-            RuntimeOptions::try_default().and_then(|options| try_init_setup::<AutoGraphicsApi>(&device, options))?;
-            Ok::<_, WgpuInitError>(Device::Wgpu(device).client())
+            let setup = RuntimeOptions::try_default().and_then(|options| try_init_setup::<AutoGraphicsApi>(&device, options))?;
+            Ok::<_, WgpuInitError>(Card { client: Device::Wgpu(device).client(), setup })
         });
         match opened {
-            Ok(Ok(client)) => Ok(client),
+            Ok(Ok(card)) => Ok(card),
             Ok(Err(why)) => Err(format!("QR Forensics adjusts photos on a graphics card, and could not open one: {why}")),
             Err(_) => Err("QR Forensics adjusts photos on a graphics card, and the one found would not open.".to_owned()),
         }
@@ -683,6 +722,20 @@ pub fn ready() -> Result<(), String> {
     card().as_ref().map(|_| ()).map_err(Clone::clone)
 }
 
+/// The card's wgpu instance, adapter, device and queue, for the window to
+/// be drawn with: what the adjustments make there to be shown is then laid
+/// into the window's textures there ([`Shown`]), and never taken off the
+/// card and handed it again. `None` where there is no card.
+pub fn shared_device() -> Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
+    let setup = &card().as_ref().ok()?.setup;
+    Some((setup.instance.clone(), setup.adapter.clone(), setup.device.clone(), setup.queue.clone()))
+}
+
+/// Whether `device` is the card's own ([`shared_device`]).
+pub fn is_card(device: &wgpu::Device) -> bool {
+    card().as_ref().is_ok_and(|card| card.setup.device == *device)
+}
+
 /// The card's client. An adjustment asked for without one is a program
 /// that did not ask whether it was [`ready`].
 ///
@@ -692,7 +745,7 @@ pub fn ready() -> Result<(), String> {
 /// which is when its room is wanted, rather than by the next photo handed
 /// it. The card takes the room back on its way to making room for more.
 fn client() -> &'static Client {
-    let client = card().as_ref().unwrap_or_else(|why| panic!("{why}"));
+    let client = &card().as_ref().unwrap_or_else(|why| panic!("{why}")).client;
     // Not while the photos are held: whoever holds them lets go of these
     // as it does.
     if let Ok(mut photos) = PHOTOS.try_lock() {
@@ -1077,28 +1130,49 @@ fn taps_on(client: &Client, taps: &Taps, from: usize, to: usize, base: usize) ->
 #[allow(clippy::too_many_arguments)]
 fn resized_on(client: &Client, source: &Held, read: Part, channels: usize, across: &Taps, down: &Taps, tile: Part, round: bool) -> Held {
     let (w, (to_w, to_h)) = (read[2] - read[0], (tile[2] - tile[0], tile[3] - tile[1]));
+    // The taps of the tile reach no further than the box read, which the
+    // source holds: what the kernels are launched unchecked on.
+    let ((left, right), (top, bottom)) = (across.span(tile[0], tile[2]), down.span(tile[1], tile[3]));
+    assert!(tile[2] <= across.first.len() && tile[3] <= down.first.len(), "the tile {tile:?} lies within the image resized");
+    assert!(read[0] <= left && right <= read[2] && read[1] <= top && bottom <= read[3], "the taps of the tile {tile:?} reach within the box {read:?} read");
+    assert!(source.len >= area(read) * channels, "the source holds the box read");
     let [down_first, down_count, down_weights] = taps_on(client, down, tile[1], tile[3], read[1]);
     let [across_first, across_count, across_weights] = taps_on(client, across, tile[0], tile[2], read[0]);
     let rows = Held::empty(client, to_h * w * channels);
     let unit = CubeDim::new_2d(SIDE, SIDE);
-    resized_down_kernel::launch(client, columns(w * channels, to_h), unit, source.arg(), rows.arg(), down_first.arg(), down_count.arg(), down_weights.arg(), down.per as u32, (w * channels) as u32, to_h as u32);
     let out = Held::empty(client, to_w * to_h * channels);
-    resized_across_kernel::launch(
-        client,
-        columns(to_w * channels, to_h),
-        unit,
-        rows.arg(),
-        out.arg(),
-        across_first.arg(),
-        across_count.arg(),
-        across_weights.arg(),
-        across.per as u32,
-        (w * channels) as u32,
-        to_w as u32,
-        to_h as u32,
-        channels as u32,
-        round,
-    );
+    // Unchecked, where each value a tap reads is checked to lie in its
+    // buffer: a step of a loop whose arithmetic is little more than the
+    // check. A part enlarged twice was resized in three quarters of the
+    // time.
+    //
+    // SAFETY: every place read and written is within its values. A value
+    // is worked out only within the tile, of `rows` and `out`, and of the
+    // taps' first, count and weights, of which there are as many as the
+    // tile has rows and columns, `per` weights to each and no more counted.
+    // The first source pixel of a tap, and the last past it, never move
+    // back from one result pixel to the next ([`Taps::new`]), so that the
+    // taps of every pixel of the tile lie within its span, which lies
+    // within the box read, as asserted, counted from its corner.
+    unsafe {
+        resized_down_kernel::launch_unchecked(client, columns(w * channels, to_h), unit, source.arg(), rows.arg(), down_first.arg(), down_count.arg(), down_weights.arg(), down.per as u32, (w * channels) as u32, to_h as u32);
+        resized_across_kernel::launch_unchecked(
+            client,
+            columns(to_w * channels, to_h),
+            unit,
+            rows.arg(),
+            out.arg(),
+            across_first.arg(),
+            across_count.arg(),
+            across_weights.arg(),
+            across.per as u32,
+            (w * channels) as u32,
+            to_w as u32,
+            to_h as u32,
+            channels as u32,
+            round,
+        );
+    }
     out
 }
 
@@ -1206,8 +1280,19 @@ fn unsharp_on(client: &Client, values: &Held, (w, h): (usize, usize), channels: 
     let (across, out, taps) = (Held::empty(client, w * h * channels), Held::empty(client, w * h * channels), Held::of(client, weights));
     let (unit, every) = (CubeDim::new_2d(SIDE, SIDE), columns(w * channels, h));
     let dims = (w as u32, h as u32, channels as u32);
-    blurred_across_kernel::launch(client, every.clone(), unit, values.arg(), across.arg(), taps.arg(), reach as u32, dims.0, dims.1, dims.2);
-    unsharp_down_kernel::launch(client, every, unit, values.arg(), across.arg(), out.arg(), taps.arg(), reach as u32, amount, dims.0, dims.1, dims.2, round);
+    assert!(values.len >= w * h * channels, "the values hold the image");
+    // Unchecked, as a resize is ([`resized_on`]): a photo of twelve
+    // megapixels was sharpened in three quarters of the time.
+    //
+    // SAFETY: every place read and written is within its values. A value
+    // is worked out only within the image, of `values`, `across` and `out`
+    // as many to a pixel as it has channels, as asserted; each tap is read
+    // at a place held within the image; and no more weights are read than
+    // there are.
+    unsafe {
+        blurred_across_kernel::launch_unchecked(client, every.clone(), unit, values.arg(), across.arg(), taps.arg(), reach as u32, dims.0, dims.1, dims.2);
+        unsharp_down_kernel::launch_unchecked(client, every, unit, values.arg(), across.arg(), out.arg(), taps.arg(), reach as u32, amount, dims.0, dims.1, dims.2, round);
+    }
     out
 }
 
@@ -1234,25 +1319,31 @@ fn unsharp_within(most: usize, samples: Samples<'_>, (width, height): (usize, us
     })
 }
 
-/// `values` on the card, `pixels` of `channels` that are bytes as values,
-/// toned: each of their colours through the curve `table`, or the colour
-/// `pick` names through it for all three, and the pixel made opaque; the
-/// pixels shown so, four bytes to each and a word, and their luminance.
-fn toned_on(client: &Client, values: &Held, pixels: usize, channels: usize, table: &[u8; 256], pick: Option<usize>) -> [Held; 2] {
-    let (shown, luma, curve) = (Held::empty(client, pixels), Held::empty(client, pixels), Held::of(client, &table.map(u32::from)));
+/// `values` on the card, an image `width` by `height` of `channels` that
+/// are bytes as values, toned: each of their colours through the curve
+/// `table`, or the colour `pick` names through it for all three, and the
+/// pixel made opaque; what is shown of the pixels so, as `tone` asks, and
+/// their luminance.
+#[allow(clippy::too_many_arguments)]
+fn toned_on(client: &Client, values: &Held, (width, height): (usize, usize), channels: usize, table: &[u8; 256], pick: Option<usize>, tone: Tone) -> [Held; 2] {
+    let pixels = width * height;
+    let (shown, luma, curve) = (tone.room(client, (width, height)), Held::empty(client, pixels), Held::of(client, &table.map(u32::from)));
     let pick = pick.map_or(3, |pick| pick as u32);
-    toned_kernel::launch(client, line_cubes(pixels), CubeDim::new_1d(LINE), values.arg(), shown.arg(), luma.arg(), curve.arg(), pick, pixels as u32, channels as u32);
+    let (showing, grey) = tone.made();
+    toned_kernel::launch(client, line_cubes(pixels), CubeDim::new_1d(LINE), values.arg(), shown.arg(), luma.arg(), curve.arg(), pick, pixels as u32, channels as u32, width as u32, tone.across(width) as u32, showing, grey);
     [shown, luma]
 }
 
 /// The box `width` by `height` beginning at `at` of an image `across`
 /// pixels wide on the card, four bytes to each pixel and a word, toned as
 /// it lies there ([`toned_on`]), with no values made of its bytes first.
-fn toned_words_on(client: &Client, words: &Held, across: usize, [x0, y0]: [usize; 2], (width, height): (usize, usize), table: &[u8; 256], pick: Option<usize>) -> [Held; 2] {
+#[allow(clippy::too_many_arguments)]
+fn toned_words_on(client: &Client, words: &Held, across: usize, [x0, y0]: [usize; 2], (width, height): (usize, usize), table: &[u8; 256], pick: Option<usize>, tone: Tone) -> [Held; 2] {
     let pixels = width * height;
-    let (shown, luma, curve) = (Held::empty(client, pixels), Held::empty(client, pixels), Held::of(client, &table.map(u32::from)));
+    let (shown, luma, curve) = (tone.room(client, (width, height)), Held::empty(client, pixels), Held::of(client, &table.map(u32::from)));
     let pick = pick.map_or(3, |pick| pick as u32);
-    toned_words_kernel::launch(client, line_cubes(pixels), CubeDim::new_1d(LINE), words.arg(), shown.arg(), luma.arg(), curve.arg(), pick, pixels as u32, across as u32, x0 as u32, y0 as u32, width as u32);
+    let (showing, grey) = tone.made();
+    toned_words_kernel::launch(client, line_cubes(pixels), CubeDim::new_1d(LINE), words.arg(), shown.arg(), luma.arg(), curve.arg(), pick, pixels as u32, across as u32, x0 as u32, y0 as u32, width as u32, tone.across(width) as u32, showing, grey);
     [shown, luma]
 }
 
@@ -1268,11 +1359,12 @@ fn toned_within(most: usize, rgba: &mut [u8], table: &[u8; 256], pick: Option<us
     let mut luma = vec![0.0f32; count];
     // Three words a pixel are held on the card for each pixel of a run:
     // its bytes, the pixel shown, and its luminance.
+    let tone = if shown { Tone::Colours { padded: false } } else { Tone::Nothing };
     in_runs_within(most / 3, count, |client, run| {
         let n = run.len();
         let pixels = &mut rgba[run.start * 4..run.end * 4];
         let words = Held::bytes(client, &*pixels);
-        let [toned, values] = toned_words_on(client, &words, n, [0, 0], (n, 1), table, pick);
+        let [toned, values] = toned_words_on(client, &words, n, [0, 0], (n, 1), table, pick, tone);
         if shown {
             let (toned, values) = toned.read_bytes_with(&values, client, n * 4);
             pixels.copy_from_slice(&toned);
@@ -1385,12 +1477,52 @@ pub(crate) enum Step {
     Sharpened { weights: Vec<f32>, amount: f32 },
 }
 
+/// What toning a part of a photo makes of it to be shown, beside its
+/// luminance ([`adjusted`]), four bytes to a pixel and a word: nothing,
+/// for a part that is read and never shown, or shown as the grey of a
+/// filter laid over it; its colours, row after row, or laid out as a copy
+/// to a texture wants them where `padded` ([`OnCard::padded`]); or, laid
+/// out so, the grey of its luminance, as the view in grey shows the photo.
+/// Each is made as the part is toned: its colours were made whatever was
+/// asked, and laid out again or greyed by a call of their own, which for a
+/// photo of twelve megapixels left on the card to be shown was a sixth of
+/// the time a move of a slider took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Tone {
+    Nothing,
+    Colours { padded: bool },
+    Grey,
+}
+
+impl Tone {
+    /// Whether anything is made to be shown, and whether it is grey: as
+    /// the toning kernels are told ([`toned_pixel`]).
+    fn made(self) -> (bool, bool) {
+        (self != Tone::Nothing, self == Tone::Grey)
+    }
+
+    /// Words from the start of a row of what is shown of a part `width`
+    /// across to the next.
+    fn across(self, width: usize) -> usize {
+        match self {
+            Tone::Nothing | Tone::Colours { padded: false } => width,
+            Tone::Colours { padded: true } | Tone::Grey => shown::stride(width),
+        }
+    }
+
+    /// Room on the card for what is shown of a part `width` by `height`:
+    /// a word to stand for none, where nothing is.
+    fn room(self, client: &Client, (width, height): (usize, usize)) -> Held {
+        Held::empty(client, if self == Tone::Nothing { 1 } else { self.across(width) * height })
+    }
+}
+
 /// A part of a photo adjusted and toned on the card, not yet taken off
-/// it: its pixels as they are shown, four bytes to each and a word, and
-/// their luminance, which a filter may yet be laid over there
-/// ([`Self::taken`]).
+/// it: what is shown of its pixels, as `tone` asked, and their luminance,
+/// which a filter may yet be laid over there ([`Self::taken`]).
 pub(crate) struct Toned {
     shown: Held,
+    tone: Tone,
     pub luma: Image,
 }
 
@@ -1409,7 +1541,10 @@ impl Toned {
         let client = client();
         let pixels = self.luma.width * self.luma.height;
         match filtered {
-            None if shown => self.shown.read_bytes_with(&self.luma.values, client, pixels * 4),
+            None if shown => {
+                assert_eq!(self.tone, Tone::Colours { padded: false }, "what is taken off the card to be shown is toned in its colours, row after row");
+                self.shown.read_bytes_with(&self.luma.values, client, pixels * 4)
+            }
             None => (Vec::new(), self.luma.read()),
             Some(filtered) => {
                 let luma = filtered.read();
@@ -1427,25 +1562,26 @@ impl Toned {
 /// The part of a photo `source` holds, made by `steps` and toned by
 /// `table` and `pick` ([`toned_within`]), on the card from first to last:
 /// the photo handed the card once, or not at all where it holds it from
-/// the last time ([`Source::words`]), and the part left there, its
-/// luminance for a filter to be laid over ([`Toned`]). Each step made as
-/// its own call makes it, each value stored as a byte holds it, so that
-/// the part comes out the same to the bit as it does a step at a time
-/// ([`stepped`]). Only the part's colours are worked: its alpha is never
-/// read, and the part is toned opaque. With no step, the part is toned
-/// from the photo's bytes as they lie. `None` where an image along the way
-/// has no pixels, or does not fit what the card is given to hold at once
-/// ([`most_values`]) or [`PIECE_SIDE`] either way.
+/// the last time ([`Source::words`]), and the part left there, what is
+/// shown of it as `tone` asks, and its luminance for a filter to be laid
+/// over ([`Toned`]). Each step made as its own call makes it, each value
+/// stored as a byte holds it, so that the part comes out the same to the
+/// bit as it does a step at a time ([`stepped`]). Only the part's colours
+/// are worked: its alpha is never read, and the part is toned opaque. With
+/// no step, the part is toned from the photo's bytes as they lie. `None`
+/// where an image along the way has no pixels, or does not fit what the
+/// card is given to hold at once ([`most_values`]) or [`PIECE_SIDE`]
+/// either way.
 ///
 /// Taken off the card between steps, a photo of twelve megapixels
 /// enlarged twice, straightened and sharpened spent most of its time going
 /// to the card and back, and took longer than the cores had; made on the
 /// card from first to last, it took three fifths as long as they did.
-pub(crate) fn adjusted(source: &Source<'_>, steps: &[Step], table: &[u8; 256], pick: Option<usize>) -> Option<Toned> {
-    adjusted_within(most_values(client()), source, steps, table, pick)
+pub(crate) fn adjusted(source: &Source<'_>, steps: &[Step], table: &[u8; 256], pick: Option<usize>, tone: Tone) -> Option<Toned> {
+    adjusted_within(most_values(client()), source, steps, table, pick, tone)
 }
 
-fn adjusted_within(most: usize, source: &Source<'_>, steps: &[Step], table: &[u8; 256], pick: Option<usize>) -> Option<Toned> {
+fn adjusted_within(most: usize, source: &Source<'_>, steps: &[Step], table: &[u8; 256], pick: Option<usize>, tone: Tone) -> Option<Toned> {
     // The images along the way, three colours to a pixel, and the most
     // values any holds at once.
     let (width, height) = source.size();
@@ -1465,14 +1601,15 @@ fn adjusted_within(most: usize, source: &Source<'_>, steps: &[Step], table: &[u8
         largest = largest.max(made.0 * made.1 * 3);
         sizes.push(made);
     }
+    let &(w, h) = sizes.last().expect("the part");
+    largest = largest.max(tone.across(w) * h);
     if largest > most || sizes.iter().any(|&(w, h)| w == 0 || h == 0 || w.max(h) > PIECE_SIDE) {
         return None;
     }
     let client = client();
-    let &(w, h) = sizes.last().expect("the part");
     let [shown, luma] = if steps.is_empty() {
         let (words, across, at) = source.words(client);
-        toned_words_on(client, &words, across, at, (w, h), table, pick)
+        toned_words_on(client, &words, across, at, (w, h), table, pick, tone)
     } else {
         let mut image = source.on(client);
         for (step, pair) in steps.iter().zip(sizes.windows(2)) {
@@ -1484,9 +1621,9 @@ fn adjusted_within(most: usize, source: &Source<'_>, steps: &[Step], table: &[u8
                 Step::Sharpened { weights, amount } => unsharp_on(client, &image, (w, h), 3, weights, *amount, true),
             };
         }
-        toned_on(client, &image, w * h, 3, table, pick)
+        toned_on(client, &image, (w, h), 3, table, pick, tone)
     };
-    Some(Toned { shown, luma: Image { values: luma, width: w, height: h } })
+    Some(Toned { shown, tone, luma: Image { values: luma, width: w, height: h } })
 }
 
 /// [`adjusted`] a step at a time, each step in tiles, through the cores'
@@ -1742,8 +1879,19 @@ fn deconvolved_on(client: &Client, values: &Held, (width, height): (usize, usize
         let down = Held::owned(client, taps.iter().map(|&(_, dy, _)| dy as i32).collect::<Vec<i32>>());
         let every = cubes(width, height, [SIDE; 2]);
         paced(client, rounds, per_round, || {
-            ratio_wide_kernel::launch(client, every.clone(), unit, seen.arg(), estimate.arg(), ratio.arg(), across.arg(), down.arg(), weights.arg(), w, h, floor);
-            update_wide_kernel::launch(client, every.clone(), unit, ratio.arg(), estimate.arg(), across.arg(), down.arg(), weights.arg(), w, h, floor);
+            // Unchecked, as the rounds within a tile are: a round past it
+            // took three quarters of the time.
+            //
+            // SAFETY: every place read and written is within its values.
+            // A pixel is worked out only within the image, of which each
+            // of `seen`, `estimate` and `ratio` holds a value to a pixel;
+            // each tap is read at a place held within the image
+            // ([`blurred_at`]); and there are as many places across and
+            // down as weights.
+            unsafe {
+                ratio_wide_kernel::launch_unchecked(client, every.clone(), unit, seen.arg(), estimate.arg(), ratio.arg(), across.arg(), down.arg(), weights.arg(), w, h, floor);
+                update_wide_kernel::launch_unchecked(client, every.clone(), unit, ratio.arg(), estimate.arg(), across.arg(), down.arg(), weights.arg(), w, h, floor);
+            }
         });
     }
     estimate
@@ -2077,7 +2225,7 @@ mod tests {
     /// ([`Toned::taken`]).
     fn greyed_as_taken(luma: &[f32], width: usize, height: usize) -> Vec<u8> {
         let image = Image::handed(luma, width, height);
-        Toned { shown: Held::empty(client(), width * height), luma: image.clone() }.taken(Some(image), true).0
+        Toned { shown: Held::empty(client(), 1), tone: Tone::Nothing, luma: image.clone() }.taken(Some(image), true).0
     }
 
     #[test]
@@ -2165,7 +2313,10 @@ mod tests {
         for pick in [None, Some(2)] {
             for (s, source) in sources.iter().enumerate() {
                 for (i, steps) in chains(source.size()).iter().enumerate() {
-                    let on_card = |shown: bool| adjusted_within(usize::MAX, source, steps, &table, pick).expect("the part fits the card whole").taken(None, shown);
+                    let on_card = |shown: bool| {
+                        let tone = if shown { Tone::Colours { padded: false } } else { Tone::Nothing };
+                        adjusted_within(usize::MAX, source, steps, &table, pick, tone).expect("the part fits the card whole").taken(None, shown)
+                    };
                     let whole = on_card(true);
                     // A step at a time, through the cores' memory, and in
                     // tiles.
@@ -2176,7 +2327,7 @@ mod tests {
                     assert!(on_card(false) == unshown && stepped_within(1 << 12, source, steps, &table, pick, false) == unshown, "chain {i}, {pick:?}, source {s}, not shown");
                 }
             }
-            let made = |source: &Source<'_>, steps: &[Step]| adjusted_within(usize::MAX, source, steps, &table, pick).expect("fits").taken(None, true);
+            let made = |source: &Source<'_>, steps: &[Step]| adjusted_within(usize::MAX, source, steps, &table, pick, Tone::Colours { padded: false }).expect("fits").taken(None, true);
             for (i, steps) in chains(sources[1].size()).iter().enumerate() {
                 assert!(made(&sources[1], steps) == made(&sources[2], steps), "chain {i}, {pick:?}: a part cut on the card is the part handed it");
             }
@@ -2242,7 +2393,7 @@ mod tests {
         // The grey of a luminance filtered there, shown as a filter shows the photo.
         let rgba = colours(width, height);
         let source = Source { rgba: &rgba, width, part: [0, 0, width, height], shared: None };
-        let toned = || adjusted_within(usize::MAX, &source, &[], &std::array::from_fn(|i| i as u8), None).expect("fits");
+        let toned = || adjusted_within(usize::MAX, &source, &[], &std::array::from_fn(|i| i as u8), None, Tone::Nothing).expect("fits");
         let toned = (toned(), toned());
         let filtered = toned.0.luma.median(1);
         let luma = filtered.read();

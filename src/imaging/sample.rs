@@ -1535,13 +1535,29 @@ fn quantize(margin: f32) -> u8 {
 /// lies between the groups. Returns a half-grey split with zero
 /// separability when there is nothing to separate.
 pub fn otsu_split(values: impl Iterator<Item = f32>) -> (f32, [f32; 2], f32) {
-    const BINS: usize = 256;
+    otsu_split_of(&histogram_of(values))
+}
+
+/// Bins of the histograms the splits and spreads are taken from: a grey
+/// level of a byte to each.
+pub const BINS: usize = 256;
+
+/// How many of `values` fall in each of [`BINS`] bins from black to
+/// white, each held from black to white and rounded to its bin, as a
+/// byte is: what [`otsu_split_of`] and [`robust_spread_of`] read. Counted
+/// a piece at a time, as the finder scan counts the photo it resamples a
+/// band of rows at a time, the pieces' counts add up to the whole's.
+pub fn histogram_of(values: impl Iterator<Item = f32>) -> [u32; BINS] {
     let mut histogram = [0u32; BINS];
-    let mut total = 0u32;
     for value in values {
         histogram[((value.clamp(0.0, 1.0) * (BINS - 1) as f32).round()) as usize] += 1;
-        total += 1;
     }
+    histogram
+}
+
+/// [`otsu_split`] of the values `histogram` counts ([`histogram_of`]).
+pub fn otsu_split_of(histogram: &[u32; BINS]) -> (f32, [f32; 2], f32) {
+    let total: u32 = histogram.iter().sum();
     if total == 0 {
         return (0.5, [0.25, 0.75], 0.0);
     }
@@ -1604,6 +1620,11 @@ pub fn otsu(values: impl Iterator<Item = f32>) -> f32 {
     otsu_split(values).0
 }
 
+/// [`otsu`] of the values `histogram` counts ([`histogram_of`]).
+pub fn otsu_of(histogram: &[u32; BINS]) -> f32 {
+    otsu_split_of(histogram).0
+}
+
 /// How far `values` reach from their first to their ninety-ninth
 /// percentile, by a histogram of 256 bins: the spread of a photo from ink
 /// to paper, with the few pixels beyond either left out. Zero for no
@@ -1611,13 +1632,12 @@ pub fn otsu(values: impl Iterator<Item = f32>) -> f32 {
 /// photo, which spans a tenth of the scale, is held to a tenth of the
 /// floor a well exposed one is.
 pub fn robust_spread(values: impl Iterator<Item = f32>) -> f32 {
-    const BINS: usize = 256;
-    let mut histogram = [0u32; BINS];
-    let mut total = 0u32;
-    for value in values {
-        histogram[((value.clamp(0.0, 1.0) * (BINS - 1) as f32).round()) as usize] += 1;
-        total += 1;
-    }
+    robust_spread_of(&histogram_of(values))
+}
+
+/// [`robust_spread`] of the values `histogram` counts ([`histogram_of`]).
+pub fn robust_spread_of(histogram: &[u32; BINS]) -> f32 {
+    let total: u32 = histogram.iter().sum();
     if total == 0 {
         return 0.0;
     }

@@ -20,7 +20,10 @@ fn main() -> eframe::Result {
     }
     // The usage or the version asked for is printed, not opened as an
     // image named `--help`.
-    if args.first().is_some_and(|first| first == "--help" || first == "-h") {
+    if args
+        .first()
+        .is_some_and(|first| first == "--help" || first == "-h")
+    {
         println!("{USAGE}");
         return Ok(());
     }
@@ -41,14 +44,24 @@ fn main() -> eframe::Result {
             .show();
         std::process::exit(1);
     }
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("QR Forensics")
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([960.0, 600.0]),
         ..Default::default()
     };
+    // The window is drawn by the graphics card the photo is adjusted on,
+    // so that what is made there to be shown is laid into the window's
+    // textures there, and not taken off the card to be handed it again.
+    if let Some((instance, adapter, device, queue)) = qr_forensics::imaging::gpu::shared_device() {
+        options.wgpu_options.wgpu_setup = eframe::egui_wgpu::WgpuSetupExisting { instance, adapter, device, queue }.into();
+    }
     // An image path on the command line is opened at startup.
     let image = args.first().map(std::path::PathBuf::from);
-    eframe::run_native("QR Forensics", options, Box::new(|cc| Ok(Box::new(app::App::new(cc, image)))))
+    eframe::run_native(
+        "QR Forensics",
+        options,
+        Box::new(|cc| Ok(Box::new(app::App::new(cc, image)))),
+    )
 }

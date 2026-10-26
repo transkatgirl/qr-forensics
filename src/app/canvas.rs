@@ -7,7 +7,7 @@ use qr_forensics::decode::bitstream::EndOfData;
 use qr_forensics::decode::codewords::PinSource;
 use qr_forensics::decode::pipeline::CwStatus;
 use qr_forensics::imaging::Luma;
-use qr_forensics::imaging::binarize::binarize;
+use qr_forensics::imaging::binarize::ViewSource;
 use qr_forensics::imaging::sample::{SAMPLED_MAX, misread_odds, reliability_bits};
 use qr_forensics::imaging::detect::{Anchor, AnchorKind, anchor_sites, edge_sites};
 use qr_forensics::imaging::projection::{CORNER_CLEARANCE, Project, Projection};
@@ -15,6 +15,7 @@ use qr_forensics::symbol::function_map::Role;
 use qr_forensics::symbol::grid::{CERTAIN, Module};
 use qr_forensics::symbol::mask::mask_bit;
 
+use super::screen::{Pixels, Texture};
 use super::state::*;
 use super::{Action, App};
 
@@ -250,7 +251,7 @@ fn align_stage(
     painter: &egui::Painter,
     actions: &mut Vec<Action>,
 ) {
-    let App { photo, view, derived, preview, doc, history, model, proposals, leads, placements, job, .. } = app;
+    let App { photo, view, derived, preview, doc, history, model, proposals, leads, placements, job, screen, .. } = app;
     let photo = photo.as_mut().expect("align stage needs a photo");
     // Holding H shows the photo and nothing over it, as in the Edit
     // stage: no grid, no handles, no symbols found, and the photo itself
@@ -262,12 +263,44 @@ fn align_stage(
         AlignOverlay::Binarised if !peek => {
             view.binarize = view.binarize_for(doc.corners, photo.width, photo.height);
             if !photo.binarised.as_ref().is_some_and(|b| b.is_for(&photo.luma, &view.binarize)) {
-                let bw = binarize(&photo.luma, &view.binarize);
-                let gray: Vec<u8> = bw.data.iter().map(|&v| if v < 0.5 { 0 } else { 255 }).collect();
-                // Within what a texture may measure, as the photo's own is.
-                let image = super::texture_gray(gray, bw.width, bw.height, ui.input(|i| i.max_texture_side));
-                let texture = ui.ctx().load_texture("binarised", image, egui::TextureOptions::LINEAR);
-                photo.binarised = Some(Binarised { source: photo.luma.clone(), params: view.binarize, texture });
+                // Made on the graphics card from the luminance it holds
+                // from the last time, which a drag of a corner asks for
+                // every frame; handed it afresh only when the luminance is
+                // new.
+                let (card, old) = match photo.binarised.take() {
+                    Some(old) if std::sync::Arc::ptr_eq(&old.source, &photo.luma) => (old.card, Some(old.texture)),
+                    other => (ViewSource::new(photo.luma.clone()), other.map(|old| old.texture)),
+                };
+                let size = (photo.luma.width, photo.luma.height);
+                let limit = ui.input(|i| i.max_texture_side);
+                let texture = match screen.as_ref() {
+                    // Laid from the card into a texture of its own, the
+                    // last one again where it serves.
+                    Some(screen) if size.0.max(size.1) <= limit => {
+                        let shown = card.binarized_shown(&view.binarize);
+                        let rgba: Vec<u8>;
+                        let pixels = match &shown {
+                            Ok(on_card) => Pixels::Card(on_card),
+                            Err(grey) => {
+                                rgba = grey.iter().flat_map(|&g| [g, g, g, 255]).collect();
+                                Pixels::Bytes(&rgba)
+                            }
+                        };
+                        match old {
+                            Some(mut texture) => {
+                                screen.lay(&mut texture, pixels, size);
+                                texture
+                            }
+                            None => Texture::Card(screen.laid(pixels, size)),
+                        }
+                    }
+                    // Within what a texture may measure, as the photo's own is.
+                    _ => {
+                        let image = super::texture_gray(card.binarized(&view.binarize), size.0, size.1, limit);
+                        Texture::Egui(ui.ctx().load_texture("binarised", image, egui::TextureOptions::LINEAR))
+                    }
+                };
+                photo.binarised = Some(Binarised { source: photo.luma.clone(), card, params: view.binarize, texture });
             }
             photo.binarised.as_ref().expect("just built").texture.id()
         }

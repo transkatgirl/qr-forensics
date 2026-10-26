@@ -93,9 +93,8 @@
 
 use std::borrow::Cow;
 
-use super::gpu;
+use super::gpu::{self, scan::Values};
 use super::resize::resize;
-use crate::work;
 
 /// The spread of the light from a point in a photo, as a Gaussian of any
 /// shape: its covariance, in square pixels, across (`xx`), down (`yy`)
@@ -231,82 +230,15 @@ pub(crate) const FLOOR: f32 = 0.01;
 /// differences of a few millionths between its pixels that the gradient
 /// takes for edges of no width.
 pub fn measure(data: &[f32], width: usize, height: usize) -> Option<Spread> {
+    measure_of(Values::Cores(data), width, height)
+}
+
+/// [`measure`] of an image on the graphics card, or held by the cores.
+fn measure_of(image: Values<'_>, width: usize, height: usize) -> Option<Spread> {
     if width < 8 || height < 8 {
         return None;
     }
-    measured_over(data, width, height, &[[0, 0, width, height]])
-}
-
-/// A part of an image as [`measured_over`] reads its edges: the image
-/// smoothed and its gradient each way, over the part and the margin
-/// about it ([`PART_MARGIN`]) within the image.
-struct PartRead {
-    /// The box `[x0, y0, x1, y1]` of the image the pixels are of.
-    held: [usize; 4],
-    /// The part, within it, that the edges are taken in.
-    part: [usize; 4],
-    smoothed: Vec<f32>,
-    gx: Vec<f32>,
-    gy: Vec<f32>,
-}
-
-impl PartRead {
-    fn new(data: &[f32], width: usize, height: usize, part @ [x0, y0, x1, y1]: [usize; 4]) -> Self {
-        let held = [x0.saturating_sub(PART_MARGIN), y0.saturating_sub(PART_MARGIN), (x1 + PART_MARGIN).min(width), (y1 + PART_MARGIN).min(height)];
-        let (w, h) = (held[2] - held[0], held[3] - held[1]);
-        let pixels: Cow<[f32]> = if held == [0, 0, width, height] {
-            Cow::Borrowed(data)
-        } else {
-            Cow::Owned((held[1]..held[3]).flat_map(|y| data[y * width + held[0]..y * width + held[2]].iter().copied()).collect())
-        };
-        let smoothed = blurred(&pixels, w, h, &kernel(&Spread::round(SMOOTHING)));
-        let at = |x: usize, y: usize| smoothed[y * w + x];
-        // The gradient over three pixels each way, a Sobel's, a pixel apart.
-        let mut gx = vec![0.0f32; w * h];
-        let mut gy = vec![0.0f32; w * h];
-        for y in 1..h.saturating_sub(1) {
-            for x in 1..w.saturating_sub(1) {
-                let i = y * w + x;
-                gx[i] = (at(x + 1, y - 1) + 2.0 * at(x + 1, y) + at(x + 1, y + 1) - at(x - 1, y - 1) - 2.0 * at(x - 1, y) - at(x - 1, y + 1)) / 8.0;
-                gy[i] = (at(x - 1, y + 1) + 2.0 * at(x, y + 1) + at(x + 1, y + 1) - at(x - 1, y - 1) - 2.0 * at(x, y - 1) - at(x + 1, y - 1)) / 8.0;
-            }
-        }
-        Self { held, part, smoothed, gx, gy }
-    }
-
-    fn width(&self) -> usize {
-        self.held[2] - self.held[0]
-    }
-
-    /// The index among the pixels held of the image's pixel `(x, y)`.
-    fn index(&self, x: usize, y: usize) -> usize {
-        (y - self.held[1]) * self.width() + x - self.held[0]
-    }
-
-    fn steepness(&self, i: usize) -> f32 {
-        (self.gx[i] * self.gx[i] + self.gy[i] * self.gy[i]).sqrt()
-    }
-
-    /// The indices of the part's own pixels among those held.
-    fn part_pixels(&self) -> impl Iterator<Item = usize> + '_ {
-        let [x0, y0, x1, y1] = self.part;
-        (y0..y1).flat_map(move |y| (x0..x1).map(move |x| self.index(x, y)))
-    }
-
-    /// The light smoothed at `(x, y)` in the image's pixels, bilinear,
-    /// held within the pixels held: within the image, where they reach
-    /// its edges, and elsewhere further than any step is read.
-    fn light(&self, x: f64, y: f64) -> f32 {
-        let (w, h) = (self.width(), self.held[3] - self.held[1]);
-        let (fx, fy) = ((x - 0.5 - self.held[0] as f64).clamp(0.0, (w - 1) as f64), (y - 0.5 - self.held[1] as f64).clamp(0.0, (h - 1) as f64));
-        let (x0, y0) = (fx.floor() as usize, fy.floor() as usize);
-        let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
-        let (tx, ty) = ((fx - x0 as f64) as f32, (fy - y0 as f64) as f32);
-        let at = |x: usize, y: usize| self.smoothed[y * w + x];
-        let top = at(x0, y0) * (1.0 - tx) + at(x1, y0) * tx;
-        let bottom = at(x0, y1) * (1.0 - tx) + at(x1, y1) * tx;
-        top * (1.0 - ty) + bottom * ty
-    }
+    measured_over(image, width, height, &[[0, 0, width, height]])
 }
 
 /// How far the image `width` by `height` spreads an edge, as the module
@@ -314,62 +246,23 @@ impl PartRead {
 /// of its pixels: the whole of it, or the parts of a large image
 /// [`spread_of`] picks, each read with the pixels about it as the whole
 /// image would read them, and the steepest change and the contrast that
-/// an edge is judged against taken over them all.
-fn measured_over(data: &[f32], width: usize, height: usize, parts: &[[usize; 4]]) -> Option<Spread> {
-    let reads: Vec<PartRead> = work::map(parts, |&part| PartRead::new(data, width, height, part));
-    let mut all: Vec<f32> = reads.iter().flat_map(|read| read.part_pixels().map(|i| read.steepness(i))).filter(|&g| g > 0.0).collect();
-    if all.len() < LEAST_EDGES {
+/// an edge is judged against taken over them all. The edges are read on
+/// the graphics card ([`gpu::edges`]), from the image it holds or from
+/// the parts of it handed it, and only their widths taken off it.
+fn measured_over(image: Values<'_>, width: usize, height: usize, parts: &[[usize; 4]]) -> Option<Spread> {
+    let edges = gpu::edges::Edges::of(image, (width, height), parts, PART_MARGIN, &kernel(&Spread::round(SMOOTHING)));
+    let (changing, ranked) = edges.ranked(|n| (n * 99 / 100).min(n.saturating_sub(1)), |m| m / 50, |m| m * 49 / 50);
+    if changing < LEAST_EDGES {
         return None;
     }
-    let top = (all.len() * 99 / 100).min(all.len() - 1);
-    let steepest = *all.select_nth_unstable_by(top, f32::total_cmp).1;
+    let [steepest, darkest, lightest] = ranked?;
     let floor = EDGE_SHARE * steepest;
-    let mut sorted: Vec<f32> = reads.iter().flat_map(|read| read.part_pixels().map(|i| read.smoothed[i])).collect();
-    let (low, high) = (sorted.len() / 50, sorted.len() * 49 / 50);
-    let darkest = *sorted.select_nth_unstable_by(low, f32::total_cmp).1;
-    let lightest = *sorted.select_nth_unstable_by(high, f32::total_cmp).1;
     let least_step = STEP_SHARE * (lightest - darkest);
     // Each edge's width and the direction across it, measured with the
-    // step read `reach` pixels either side, the parts in their order.
+    // step read `reach` pixels either side, in no order.
     let widths = |reach: f64| -> Vec<(f64, f64)> {
-        work::map(&reads, |read| {
-            let mut out = Vec::new();
-            let margin = 2;
-            let [x0, y0, x1, y1] = read.part;
-            for y in y0.max(margin)..y1.min(height - margin) {
-                for x in x0.max(margin)..x1.min(width - margin) {
-                    let i = read.index(x, y);
-                    let g = read.steepness(i);
-                    if g < floor {
-                        continue;
-                    }
-                    let (ux, uy) = (f64::from(read.gx[i] / g), f64::from(read.gy[i] / g));
-                    // Steepest along its own direction: the edge's middle.
-                    let (sx, sy) = ((ux.round() as isize), (uy.round() as isize));
-                    let ahead = read.steepness(read.index((x as isize + sx) as usize, (y as isize + sy) as usize));
-                    let behind = read.steepness(read.index((x as isize - sx) as usize, (y as isize - sy) as usize));
-                    if g < ahead || g < behind {
-                        continue;
-                    }
-                    let (cx, cy) = (x as f64 + 0.5, y as f64 + 0.5);
-                    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-                    let steps = reach.ceil() as i64;
-                    for k in -steps..=steps {
-                        let t = k as f64 * reach / steps.max(1) as f64;
-                        let v = read.light(cx + ux * t, cy + uy * t);
-                        lo = lo.min(v);
-                        hi = hi.max(v);
-                    }
-                    if hi - lo < least_step {
-                        continue;
-                    }
-                    let direction = uy.atan2(ux).rem_euclid(std::f64::consts::PI);
-                    out.push((f64::from((hi - lo) / g), direction));
-                }
-            }
-            out
-        })
-        .concat()
+        let measured = edges.widths(reach, floor, least_step);
+        measured.into_iter().map(|(w, ux, uy)| (f64::from(w), f64::from(uy).atan2(f64::from(ux)).rem_euclid(std::f64::consts::PI))).collect()
     };
     // A first look with a reach of a few pixels says how wide the edges
     // are; the next reads each step over as far as such an edge reaches,
@@ -529,14 +422,16 @@ pub fn kernel(spread: &Spread) -> Vec<(isize, isize, f32)> {
 }
 
 /// Rows worked as one piece on the cores to spare.
+#[cfg(test)]
 const BAND: usize = 32;
 
 /// `data` blurred by `taps`, the pixel on the image's edge standing for
-/// those beyond it.
+/// those beyond it, on the cores: what the tests blur a sharp image by.
+#[cfg(test)]
 fn blurred(data: &[f32], width: usize, height: usize, taps: &[(isize, isize, f32)]) -> Vec<f32> {
     let bands: Vec<(usize, usize)> = (0..height).step_by(BAND).map(|y| (y, (y + BAND).min(height))).collect();
     let (w, h) = (width as isize, height as isize);
-    work::map(&bands, |&(y0, y1)| {
+    crate::work::map(&bands, |&(y0, y1)| {
         let mut out = vec![0.0f32; (y1 - y0) * width];
         for y in y0..y1 {
             let row = &mut out[(y - y0) * width..(y - y0 + 1) * width];
@@ -747,13 +642,18 @@ pub fn deblurred(data: &[f32], width: usize, height: usize, most_pixels: usize) 
 /// ([`busiest_parts`]), at its own size. `None` where it shows no blur,
 /// or too few edges to say.
 pub fn spread_of(data: &[f32], width: usize, height: usize) -> Option<Spread> {
+    spread_of_values(Values::Cores(data), width, height)
+}
+
+/// [`spread_of`] of an image on the graphics card, or held by the cores.
+fn spread_of_values(image: Values<'_>, width: usize, height: usize) -> Option<Spread> {
     if width * height <= MOST_PIXELS {
-        return measure(data, width, height);
+        return measure_of(image, width, height);
     }
     if width < 8 || height < 8 {
         return None;
     }
-    measured_over(data, width, height, &busiest_parts(data, width, height))
+    measured_over(image, width, height, &busiest_parts(image, width, height))
 }
 
 /// The parts of the image `width` by `height`, squares [`PART_SIDE`]
@@ -766,32 +666,9 @@ pub fn spread_of(data: &[f32], width: usize, height: usize) -> Option<Spread> {
 /// ([`EDGE_SHARE`] of the steepest), which grain does not reach. However
 /// far an edge is blurred, the light changes across it by the same in
 /// all, so a blur that spreads it wide does not hide it.
-fn busiest_parts(data: &[f32], width: usize, height: usize) -> Vec<[usize; 4]> {
+fn busiest_parts(image: Values<'_>, width: usize, height: usize) -> Vec<[usize; 4]> {
     let across = width.div_ceil(PART_SIDE);
-    let rows: Vec<usize> = (0..height.saturating_sub(2)).step_by(2).collect();
-    let changes: Vec<Vec<f32>> = work::map(&rows, |&y| {
-        (0..width.saturating_sub(2))
-            .step_by(2)
-            .map(|x| {
-                let here = data[y * width + x];
-                (data[y * width + x + 2] - here).abs() + (data[(y + 2) * width + x] - here).abs()
-            })
-            .collect()
-    });
-    let mut all: Vec<f32> = changes.iter().flatten().copied().filter(|&change| change > 0.0).collect();
-    if all.is_empty() {
-        return Vec::new();
-    }
-    let top = (all.len() * 99 / 100).min(all.len() - 1);
-    let floor = EDGE_SHARE * *all.select_nth_unstable_by(top, f32::total_cmp).1;
-    let mut busy = vec![0.0f64; across * height.div_ceil(PART_SIDE)];
-    for (&y, row) in rows.iter().zip(&changes) {
-        for (k, &change) in row.iter().enumerate() {
-            if change >= floor {
-                busy[y / PART_SIDE * across + 2 * k / PART_SIDE] += f64::from(change);
-            }
-        }
-    }
+    let busy = gpu::edges::busy(image, (width, height), PART_SIDE, EDGE_SHARE);
     let mut order: Vec<usize> = (0..busy.len()).filter(|&i| busy[i] > 0.0).collect();
     order.sort_by(|&a, &b| busy[b].total_cmp(&busy[a]).then(a.cmp(&b)));
     let mut parts = Vec::new();
@@ -849,11 +726,11 @@ pub fn undone_within(data: &[f32], width: usize, height: usize, kernel: Option<S
 
 /// [`undone_within`] of an image on the graphics card, left there: by the
 /// same steps and the same kernels, to the same values ([`gpu::Image`]).
-/// The image is taken off the card only to measure the blur it shows,
-/// where no kernel is `given`.
+/// The blur it shows, where no kernel is `given`, is measured there too,
+/// and the image is not taken off the card.
 pub(crate) fn undone_on(image: &gpu::Image, given: Option<Spread>, strength: f64, whole: usize) -> (gpu::Image, Option<Spread>) {
     let (width, height) = (image.width, image.height);
-    match undoing(given, strength, whole, || spread_of(&image.read(), width, height)) {
+    match undoing(given, strength, whole, || spread_of_values(Values::Card(image), width, height)) {
         Undoing::Nothing(spread) => (image.clone(), spread),
         Undoing::Undo { spread, undone, reduction: Reduction::NONE } => (image.deconvolved(&kernel(&undone), ROUNDS, FLOOR), Some(spread)),
         Undoing::Undo { spread, undone, reduction } => {
@@ -1260,5 +1137,313 @@ mod tests {
         let (x0, y0) = (on_grid(wanted[0]), on_grid(wanted[1]));
         assert!(differs(x0, y0) < 1e-4, "{} on the grid", differs(x0, y0));
         assert!(differs(x0 - 1, y0) > 3e-3, "{} off it", differs(x0 - 1, y0));
+    }
+
+    /// The blur's measure as the cores made it, before its edges were
+    /// read on the card: what the card's is held to.
+    mod on_cores {
+        use std::borrow::Cow;
+
+        use super::super::*;
+        use crate::work;
+
+        /// A part of an image as [`measured_over`] reads its edges: the image
+        /// smoothed and its gradient each way, over the part and the margin
+        /// about it ([`PART_MARGIN`]) within the image.
+        struct PartRead {
+            /// The box `[x0, y0, x1, y1]` of the image the pixels are of.
+            held: [usize; 4],
+            /// The part, within it, that the edges are taken in.
+            part: [usize; 4],
+            smoothed: Vec<f32>,
+            gx: Vec<f32>,
+            gy: Vec<f32>,
+        }
+
+        impl PartRead {
+            fn new(data: &[f32], width: usize, height: usize, part @ [x0, y0, x1, y1]: [usize; 4]) -> Self {
+                let held = [x0.saturating_sub(PART_MARGIN), y0.saturating_sub(PART_MARGIN), (x1 + PART_MARGIN).min(width), (y1 + PART_MARGIN).min(height)];
+                let (w, h) = (held[2] - held[0], held[3] - held[1]);
+                let pixels: Cow<[f32]> = if held == [0, 0, width, height] {
+                    Cow::Borrowed(data)
+                } else {
+                    Cow::Owned((held[1]..held[3]).flat_map(|y| data[y * width + held[0]..y * width + held[2]].iter().copied()).collect())
+                };
+                let smoothed = blurred(&pixels, w, h, &kernel(&Spread::round(SMOOTHING)));
+                let at = |x: usize, y: usize| smoothed[y * w + x];
+                // The gradient over three pixels each way, a Sobel's, a pixel apart.
+                let mut gx = vec![0.0f32; w * h];
+                let mut gy = vec![0.0f32; w * h];
+                for y in 1..h.saturating_sub(1) {
+                    for x in 1..w.saturating_sub(1) {
+                        let i = y * w + x;
+                        gx[i] = (at(x + 1, y - 1) + 2.0 * at(x + 1, y) + at(x + 1, y + 1) - at(x - 1, y - 1) - 2.0 * at(x - 1, y) - at(x - 1, y + 1)) / 8.0;
+                        gy[i] = (at(x - 1, y + 1) + 2.0 * at(x, y + 1) + at(x + 1, y + 1) - at(x - 1, y - 1) - 2.0 * at(x, y - 1) - at(x + 1, y - 1)) / 8.0;
+                    }
+                }
+                Self { held, part, smoothed, gx, gy }
+            }
+
+            fn width(&self) -> usize {
+                self.held[2] - self.held[0]
+            }
+
+            /// The index among the pixels held of the image's pixel `(x, y)`.
+            fn index(&self, x: usize, y: usize) -> usize {
+                (y - self.held[1]) * self.width() + x - self.held[0]
+            }
+
+            fn steepness(&self, i: usize) -> f32 {
+                (self.gx[i] * self.gx[i] + self.gy[i] * self.gy[i]).sqrt()
+            }
+
+            /// The indices of the part's own pixels among those held.
+            fn part_pixels(&self) -> impl Iterator<Item = usize> + '_ {
+                let [x0, y0, x1, y1] = self.part;
+                (y0..y1).flat_map(move |y| (x0..x1).map(move |x| self.index(x, y)))
+            }
+
+            /// The light smoothed at `(x, y)` in the image's pixels, bilinear,
+            /// held within the pixels held: within the image, where they reach
+            /// its edges, and elsewhere further than any step is read.
+            fn light(&self, x: f64, y: f64) -> f32 {
+                let (w, h) = (self.width(), self.held[3] - self.held[1]);
+                let (fx, fy) = ((x - 0.5 - self.held[0] as f64).clamp(0.0, (w - 1) as f64), (y - 0.5 - self.held[1] as f64).clamp(0.0, (h - 1) as f64));
+                let (x0, y0) = (fx.floor() as usize, fy.floor() as usize);
+                let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+                let (tx, ty) = ((fx - x0 as f64) as f32, (fy - y0 as f64) as f32);
+                let at = |x: usize, y: usize| self.smoothed[y * w + x];
+                let top = at(x0, y0) * (1.0 - tx) + at(x1, y0) * tx;
+                let bottom = at(x0, y1) * (1.0 - tx) + at(x1, y1) * tx;
+                top * (1.0 - ty) + bottom * ty
+            }
+        }
+
+        /// How far the image `width` by `height` spreads an edge, as the module
+        /// describes, from the edges in `parts` of it, boxes `[x0, y0, x1, y1]`
+        /// of its pixels: the whole of it, or the parts of a large image
+        /// [`spread_of`] picks, each read with the pixels about it as the whole
+        /// image would read them, and the steepest change and the contrast that
+        /// an edge is judged against taken over them all.
+        fn measured_over(data: &[f32], width: usize, height: usize, parts: &[[usize; 4]]) -> Option<Spread> {
+            let reads: Vec<PartRead> = work::map(parts, |&part| PartRead::new(data, width, height, part));
+            let mut all: Vec<f32> = reads.iter().flat_map(|read| read.part_pixels().map(|i| read.steepness(i))).filter(|&g| g > 0.0).collect();
+            if all.len() < LEAST_EDGES {
+                return None;
+            }
+            let top = (all.len() * 99 / 100).min(all.len() - 1);
+            let steepest = *all.select_nth_unstable_by(top, f32::total_cmp).1;
+            let floor = EDGE_SHARE * steepest;
+            let mut sorted: Vec<f32> = reads.iter().flat_map(|read| read.part_pixels().map(|i| read.smoothed[i])).collect();
+            let (low, high) = (sorted.len() / 50, sorted.len() * 49 / 50);
+            let darkest = *sorted.select_nth_unstable_by(low, f32::total_cmp).1;
+            let lightest = *sorted.select_nth_unstable_by(high, f32::total_cmp).1;
+            let least_step = STEP_SHARE * (lightest - darkest);
+            // Each edge's width and the direction across it, measured with the
+            // step read `reach` pixels either side, the parts in their order.
+            let widths = |reach: f64| -> Vec<(f64, f64)> {
+                work::map(&reads, |read| {
+                    let mut out = Vec::new();
+                    let margin = 2;
+                    let [x0, y0, x1, y1] = read.part;
+                    for y in y0.max(margin)..y1.min(height - margin) {
+                        for x in x0.max(margin)..x1.min(width - margin) {
+                            let i = read.index(x, y);
+                            let g = read.steepness(i);
+                            if g < floor {
+                                continue;
+                            }
+                            let (ux, uy) = (f64::from(read.gx[i] / g), f64::from(read.gy[i] / g));
+                            // Steepest along its own direction: the edge's middle.
+                            let (sx, sy) = ((ux.round() as isize), (uy.round() as isize));
+                            let ahead = read.steepness(read.index((x as isize + sx) as usize, (y as isize + sy) as usize));
+                            let behind = read.steepness(read.index((x as isize - sx) as usize, (y as isize - sy) as usize));
+                            if g < ahead || g < behind {
+                                continue;
+                            }
+                            let (cx, cy) = (x as f64 + 0.5, y as f64 + 0.5);
+                            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+                            let steps = reach.ceil() as i64;
+                            for k in -steps..=steps {
+                                let t = k as f64 * reach / steps.max(1) as f64;
+                                let v = read.light(cx + ux * t, cy + uy * t);
+                                lo = lo.min(v);
+                                hi = hi.max(v);
+                            }
+                            if hi - lo < least_step {
+                                continue;
+                            }
+                            let direction = uy.atan2(ux).rem_euclid(std::f64::consts::PI);
+                            out.push((f64::from((hi - lo) / g), direction));
+                        }
+                    }
+                    out
+                })
+                .concat()
+            };
+            // A first look with a reach of a few pixels says how wide the edges
+            // are; the next reads each step over as far as such an edge reaches,
+            // and again while that moves the reach.
+            let mut reach = 8.0;
+            let mut measured = widths(reach);
+            for _ in 0..2 {
+                let typical = narrowest_share(measured.iter().map(|w| w.0).collect(), 0.5)?;
+                let wider = (1.3 * typical).clamp(4.0, 48.0);
+                if (wider - reach).abs() < 1.0 {
+                    break;
+                }
+                reach = wider;
+                measured = widths(reach);
+            }
+            if measured.len() < LEAST_EDGES {
+                return None;
+            }
+            // The narrowest of each direction's edges, as a variance of the blur.
+            let mut bins: Vec<Vec<f64>> = vec![Vec::new(); DIRECTIONS];
+            for &(w, direction) in &measured {
+                let bin = ((direction / std::f64::consts::PI * DIRECTIONS as f64) as usize).min(DIRECTIONS - 1);
+                bins[bin].push(w);
+            }
+            let rows: Vec<(usize, [f64; 3], f64, f64)> = bins
+                .into_iter()
+                .enumerate()
+                .filter(|(_, widths)| widths.len() >= LEAST_EDGES)
+                .filter_map(|(bin, widths)| {
+                    let count = widths.len() as f64;
+                    let w = narrowest_share(widths, NARROWEST)?;
+                    let theta = (bin as f64 + 0.5) * std::f64::consts::PI / DIRECTIONS as f64;
+                    let (c, s) = (theta.cos(), theta.sin());
+                    // The spread along the edge's normal, less the measure's own.
+                    let variance = (w * w / (2.0 * std::f64::consts::PI) - OWN_VARIANCE).max(0.0);
+                    Some((bin, [c * c, 2.0 * c * s, s * s], variance, count))
+                })
+                .collect();
+            // How far round the half turn the directions reach ([`LEAST_FAN`]):
+            // all of it but the widest gap between two of them, the gap from the
+            // last back round to the first among them.
+            let gaps = rows.windows(2).map(|pair| pair[1].0 - pair[0].0);
+            let round_again = rows.first().zip(rows.last()).map(|(first, last)| DIRECTIONS + first.0 - last.0);
+            let fan = gaps.chain(round_again).max().map_or(0, |widest| DIRECTIONS - widest);
+            let some = |spread: Spread| (spread.extremes().0 >= KERNEL_LEAST).then_some(spread);
+            if rows.len() < 3 || fan < LEAST_FAN {
+                // Too few directions, or too narrow a fan of them, to tell a
+                // shape: the same every way.
+                let all: Vec<f64> = measured.iter().map(|w| w.0).collect();
+                let w = narrowest_share(all, NARROWEST)?;
+                let variance = w * w / (2.0 * std::f64::consts::PI) - OWN_VARIANCE;
+                return (variance > 0.0).then(|| Spread::round(variance.sqrt())).and_then(some);
+            }
+            // Least squares, each direction weighed by its edges.
+            let mut a = [[0.0f64; 3]; 3];
+            let mut b = [0.0f64; 3];
+            for (_, row, value, weight) in &rows {
+                for i in 0..3 {
+                    for j in 0..3 {
+                        a[i][j] += weight * row[i] * row[j];
+                    }
+                    b[i] += weight * row[i] * value;
+                }
+            }
+            let [xx, xy, yy] = solve3(a, b)?;
+            // A covariance is never less than nought either way.
+            let spread = Spread { xx, xy, yy };
+            let mean = (xx + yy) / 2.0;
+            let half = (((xx - yy) / 2.0).powi(2) + xy * xy).sqrt();
+            let (big, small) = ((mean + half).max(0.0), (mean - half).max(0.0));
+            if big <= 0.0 {
+                return None;
+            }
+            // The eigenvalues held at nought and above, the axes kept.
+            let angle = 0.5 * (2.0 * spread.xy).atan2(spread.xx - spread.yy);
+            let (c, s) = (angle.cos(), angle.sin());
+            some(Spread { xx: big * c * c + small * s * s, xy: (big - small) * c * s, yy: big * s * s + small * c * c })
+        }
+
+        /// The parts of the image `width` by `height`, squares [`PART_SIDE`]
+        /// pixels a side on a grid from its corner, that change the most across
+        /// their edges, the busiest first, as many as come to [`MOST_PIXELS`]:
+        /// the symbols and the print about them, where a photograph is mostly
+        /// paper, desk and wall. A part is judged by how far its light changes
+        /// over two pixels each way at every other pixel of every other row,
+        /// added up over the changes as steep as an edge must be to be measured
+        /// ([`EDGE_SHARE`] of the steepest), which grain does not reach. However
+        /// far an edge is blurred, the light changes across it by the same in
+        /// all, so a blur that spreads it wide does not hide it.
+        fn busiest_parts(data: &[f32], width: usize, height: usize) -> Vec<[usize; 4]> {
+            let across = width.div_ceil(PART_SIDE);
+            let rows: Vec<usize> = (0..height.saturating_sub(2)).step_by(2).collect();
+            let changes: Vec<Vec<f32>> = work::map(&rows, |&y| {
+                (0..width.saturating_sub(2))
+                    .step_by(2)
+                    .map(|x| {
+                        let here = data[y * width + x];
+                        (data[y * width + x + 2] - here).abs() + (data[(y + 2) * width + x] - here).abs()
+                    })
+                    .collect()
+            });
+            let mut all: Vec<f32> = changes.iter().flatten().copied().filter(|&change| change > 0.0).collect();
+            if all.is_empty() {
+                return Vec::new();
+            }
+            let top = (all.len() * 99 / 100).min(all.len() - 1);
+            let floor = EDGE_SHARE * *all.select_nth_unstable_by(top, f32::total_cmp).1;
+            let mut busy = vec![0.0f64; across * height.div_ceil(PART_SIDE)];
+            for (&y, row) in rows.iter().zip(&changes) {
+                for (k, &change) in row.iter().enumerate() {
+                    if change >= floor {
+                        busy[y / PART_SIDE * across + 2 * k / PART_SIDE] += f64::from(change);
+                    }
+                }
+            }
+            let mut order: Vec<usize> = (0..busy.len()).filter(|&i| busy[i] > 0.0).collect();
+            order.sort_by(|&a, &b| busy[b].total_cmp(&busy[a]).then(a.cmp(&b)));
+            let mut parts = Vec::new();
+            let mut pixels = 0;
+            for i in order {
+                if pixels >= MOST_PIXELS {
+                    break;
+                }
+                let (x0, y0) = (i % across * PART_SIDE, i / across * PART_SIDE);
+                let part = [x0, y0, (x0 + PART_SIDE).min(width), (y0 + PART_SIDE).min(height)];
+                pixels += (part[2] - part[0]) * (part[3] - part[1]);
+                parts.push(part);
+            }
+            parts
+        }
+
+        /// `spread_of` on the cores.
+        pub(super) fn spread_of(data: &[f32], width: usize, height: usize) -> Option<Spread> {
+            if width * height <= MOST_PIXELS {
+                return measured_over(data, width, height, &[[0, 0, width, height]]);
+            }
+            measured_over(data, width, height, &busiest_parts(data, width, height))
+        }
+    }
+
+    #[test]
+    fn the_blur_is_measured_on_the_card_as_the_cores_measured_it() {
+        let grainy = |data: Vec<f32>| {
+            let mut seed = 0x9E37_79B9_u32;
+            data.into_iter()
+                .map(|v| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (v + ((seed >> 8) as f32 / (1 << 24) as f32 - 0.5) * 0.04).clamp(0.0, 1.0)
+                })
+                .collect::<Vec<f32>>()
+        };
+        let size = 256;
+        let cases: Vec<(Vec<f32>, usize, usize)> = vec![
+            (grainy(blurred(&squares(size, 13), size, size, &kernel(&Spread::round(2.0)))), size, size),
+            (grainy(blurred(&squares(size, 9), size, size, &kernel(&Spread { xx: 6.0, xy: 1.5, yy: 1.0 }))), size, size),
+            // Large enough to be measured in its busiest parts.
+            (grainy(blurred(&squares(1400, 11)[..1400 * 1200], 1400, 1200, &kernel(&Spread::round(2.6)))), 1400, 1200),
+        ];
+        for (data, w, h) in cases {
+            let (card, cores) = (spread_of(&data, w, h).expect("a blur shown"), on_cores::spread_of(&data, w, h).expect("a blur shown"));
+            let ((cw, cn), (rw, rn)) = (card.extremes(), cores.extremes());
+            assert!((cw - rw).abs() < 0.01 * rw && (cn - rn).abs() < 0.01 * rw, "{w} by {h}: {card:?} against {cores:?}");
+            let on_card = gpu::Image::handed(&data, w, h);
+            assert_eq!(spread_of_values(Values::Card(&on_card), w, h), Some(card), "measured where it lies on the card");
+        }
     }
 }
