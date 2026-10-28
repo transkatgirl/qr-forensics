@@ -54,8 +54,8 @@ use std::f32::consts::LN_2;
 
 use super::gf256::{exp, mul};
 use super::rs::{
-    CHASE_MAX_BITS, CwRead, RsSolution, Sightings, Trials, judged, nearest, preferring_the_standard, rs_decode_chasing_bits, rs_decode_core,
-    rs_syndromes, soft_distance, solve_bit_erasures_doubting, tries_charge,
+    CHASE_MAX_BITS, CwRead, RsSolution, Sightings, Trials, counted_against, judged, nearest, preferring_the_standard,
+    rs_decode_chasing_bits_against, rs_decode_core, rs_syndromes, soft_distance, solve_bit_erasures_doubting, tries_charge,
 };
 use crate::symbol::grid::CERTAIN;
 use crate::work;
@@ -323,10 +323,12 @@ fn hard_decision(block: &[CwRead], llr: &[f32]) -> Vec<CwRead> {
 /// solution keeps are its `flipped`. `None` for a solution refused, or
 /// one it would not offer ([`super::rs::Offering`]). Either way the
 /// codeword is noted in `seen`, unless it overturns a pin
-/// ([`Sightings`]).
+/// ([`Sightings`]). What it spends of the reserve is counted against
+/// `read` ([`counted_against`]).
 #[allow(clippy::too_many_arguments)]
 fn account(
     block: &[CwRead],
+    read: &[CwRead],
     bit_reliability: &[[u8; 8]],
     ec_len: usize,
     corrected: Vec<u8>,
@@ -338,7 +340,7 @@ fn account(
 ) -> Option<(u32, Propagated)> {
     let n = block.len();
     seen.see_unless_pinned(block, &corrected);
-    let solution = judged(block, bit_reliability, ec_len, reserved, corrected, tries_charge(tries))?;
+    let solution = counted_against(read, ec_len, judged(block, bit_reliability, ec_len, reserved, corrected, tries_charge(tries))?);
     let flipped: Vec<u8> =
         (0..n).map(|i| (solution.corrected[i] ^ block[i].value) & (refined[i].value ^ block[i].value) & block[i].known).collect();
     Some((soft_distance(block, bit_reliability, &solution.corrected), (rounds, flipped, solution)))
@@ -392,14 +394,32 @@ pub fn rs_decode_propagating(
     chase_bits: usize,
     seen: &mut Sightings,
 ) -> Vec<Propagated> {
-    propagating_damped(block, bit_reliability, ec_len, reserved, rounds, trials, chase_bits, ABP_DAMPING, seen)
+    rs_decode_propagating_against(block, block, bit_reliability, ec_len, reserved, rounds, trials, chase_bits, seen)
 }
 
-/// [`rs_decode_propagating`] with the damping given, for finding out
-/// what the damping should be.
+/// [`rs_decode_propagating`], what each solution spends of the reserve
+/// counted against `read` ([`counted_against`]).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn rs_decode_propagating_against(
+    block: &[CwRead],
+    read: &[CwRead],
+    bit_reliability: &[[u8; 8]],
+    ec_len: usize,
+    reserved: usize,
+    rounds: usize,
+    trials: Trials,
+    chase_bits: usize,
+    seen: &mut Sightings,
+) -> Vec<Propagated> {
+    propagating_damped(block, read, bit_reliability, ec_len, reserved, rounds, trials, chase_bits, ABP_DAMPING, seen)
+}
+
+/// [`rs_decode_propagating_against`] with the damping given, for finding
+/// out what the damping should be.
 #[allow(clippy::too_many_arguments)]
 fn propagating_damped(
     block: &[CwRead],
+    read: &[CwRead],
     bit_reliability: &[[u8; 8]],
     ec_len: usize,
     reserved: usize,
@@ -427,7 +447,7 @@ fn propagating_damped(
         let received: Vec<u8> = refined.iter().map(|c| c.value & c.known).collect();
         let syndromes = rs_syndromes(&received, ec_len);
         if let Ok(solution) = rs_decode_core(&refined, &[], ec_len, reserved, &syndromes, seen)
-            && let Some(kept) = account(block, bit_reliability, ec_len, solution.corrected, reserved, round_tries(round, chased), &refined, round, seen)
+            && let Some(kept) = account(block, read, bit_reliability, ec_len, solution.corrected, reserved, round_tries(round, chased), &refined, round, seen)
         {
             found.push(kept);
         }
@@ -436,15 +456,15 @@ fn propagating_damped(
             let refined_bits = beliefs.reliabilities();
             for doubt in solve_bit_erasures_doubting(&refined, &refined_bits, ec_len, trials, seen) {
                 let tries = as_tries(share * doubt.tries as f64);
-                if let Some(kept) = account(block, bit_reliability, ec_len, doubt.solution.corrected, reserved, tries, &refined, round, seen) {
+                if let Some(kept) = account(block, read, bit_reliability, ec_len, doubt.solution.corrected, reserved, tries, &refined, round, seen) {
                     found.push(kept);
                 }
             }
             if chased && !work::cancelled() {
                 let bits = chase_bits.clamp(1, CHASE_MAX_BITS);
                 let tries = as_tries(share * ((1usize << bits) - 1) as f64);
-                for (_, solution) in rs_decode_chasing_bits(&refined, &refined_bits, ec_len, reserved, bits, seen) {
-                    if let Some(kept) = account(block, bit_reliability, ec_len, solution.corrected, reserved, tries, &refined, round, seen) {
+                for (_, solution) in rs_decode_chasing_bits_against(&refined, read, &refined_bits, ec_len, reserved, bits, seen) {
+                    if let Some(kept) = account(block, read, bit_reliability, ec_len, solution.corrected, reserved, tries, &refined, round, seen) {
                         found.push(kept);
                     }
                 }
@@ -637,10 +657,10 @@ mod tests {
                     let chase = rs_decode_chasing(&read, &reliability, 18, 0, CHASE_BITS).first().is_some_and(|(_, s)| s.corrected == block);
                     let list = rs_decode_listing(&read, &reliability, 18, 0, LIST_COST, &mut Sightings::default()).first().is_some_and(|(_, s)| s.corrected == block);
                     let others = plain || cw || bits || chase || list;
-                    let found = propagating_damped(&read, &reliability, 18, 0, rounds, Trials::NONE, 0, damping, &mut Sightings::default());
+                    let found = propagating_damped(&read, &read, &reliability, 18, 0, rounds, Trials::NONE, 0, damping, &mut Sightings::default());
                     assert!(found.iter().all(|(_, _, s)| s.corrected == block), "a wrong codeword offered");
                     let abp = !found.is_empty();
-                    let found = propagating_damped(&read, &reliability, 18, 0, rounds, Trials::ALL, CHASE_BITS, damping, &mut Sightings::default());
+                    let found = propagating_damped(&read, &read, &reliability, 18, 0, rounds, Trials::ALL, CHASE_BITS, damping, &mut Sightings::default());
                     assert!(found.iter().all(|(_, _, s)| s.corrected == block), "a wrong codeword offered: {found:?}");
                     let abp_chase = !found.is_empty();
                     // The beliefs as a refiner: the bits and the list

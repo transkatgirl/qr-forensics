@@ -230,6 +230,23 @@ impl<P: Project> Project for Shifted<'_, P> {
     }
 }
 
+/// A map moved by `by` pixels in the photo.
+pub(crate) struct Moved<'a, P: Project> {
+    pub(crate) map: &'a P,
+    pub(crate) by: [f64; 2],
+}
+
+impl<P: Project> Project for Moved<'_, P> {
+    fn base(&self, x: f64, y: f64) -> [f64; 2] {
+        let [px, py] = self.map.base(x, y);
+        [px + self.by[0], py + self.by[1]]
+    }
+
+    fn displacement(&self, x: f64, y: f64) -> [f64; 2] {
+        self.map.displacement(x, y)
+    }
+}
+
 /// A spline's weights at the centre of every boundary of a template, laid
 /// out a site at a time: the weight of site `j` at boundary `e` is
 /// `by_site[j * edges + e]`. The displacement at each boundary is its

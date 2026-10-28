@@ -141,6 +141,8 @@
 //! Once the first try of a kind has failed, the tries after it are made
 //! side by side on the cores to spare, as [`crate::work`] describes, and
 //! taken in the order given here: what is read is what one core read.
+//! Each is charged by its place in that order, the first the least
+//! ([`Reads`]).
 //!
 //! One retry costs next to nothing and is made of every decode that is
 //! no read: the padding. A short message in a large symbol leaves most
@@ -157,17 +159,17 @@
 use std::sync::{Arc, OnceLock};
 
 use super::detect::{
-    Anchor, AnchorKind, Climb, Detection, Retry, bled_placement, detect_candidates_by, first_finder_bleed, may_bleed,
-    clockwise, outline_around, placed_by_hand, refine_anchors_with, seen_from_behind, turned_on_symbol,
+    Anchor, AnchorKind, Climb, Detection, Lead, Retry, Search, bled_placement, detect_candidates_by, first_finder_bleed, leads_left,
+    may_bleed, clockwise, outline_around, placed_by_hand, refine_anchors_with, seen_from_behind, turned_on_symbol,
 };
 use super::deblur::Spread;
 use super::enhance::{Enhance, Enhanced, Sharpen};
 use super::patches::with_patches;
 use super::projection::{ControlPoint, Project, Projection};
-use super::refine::{MOVES, Scorer, Shifted, Template, Warp, descend_by, fixed_threshold, refine_corners_expecting};
+use super::refine::{MOVES, Moved, Scorer, Shifted, Template, Warp, descend_by, fixed_threshold, refine_corners_expecting};
 use super::sample::{Kernel, Rule, SampleParams, classify, read_modules, sample_modules_noting, suggest_versions};
 use super::{Luma, rotate_outline_cw, unrotate_point_cw};
-use crate::decode::bch::{FormatAnalysis, FormatCandidate};
+use crate::decode::bch::{FormatAnalysis, FormatCandidate, QUIRK_REACH};
 use crate::decode::codewords::Pins;
 use crate::decode::padding::recover_padding_after;
 use crate::decode::likeness::{likeness_bits, stream_as_read};
@@ -299,9 +301,17 @@ impl ReadResult {
     /// block confirmed outweighs any fit, as it does where the app ranks
     /// the reads of each family that did not decode.
     fn standing(&self) -> (bool, i64, AttemptScore) {
-        let (confirmed, fit) = standing_of(self.report.score.blocks_verified, self.agreement);
-        (confirmed, if confirmed { 0 } else { fit }, self.report.score)
+        standing_by(&self.report.score, self.agreement)
     }
+}
+
+/// Where a read whose decode scored `score`, of a placement whose fixed
+/// modules read `agreement`, stands ([`ReadResult::standing`]): for a
+/// decode to be weighed against another of the same placement before
+/// either is made a read.
+fn standing_by(score: &AttemptScore, agreement: (usize, usize)) -> (bool, i64, AttemptScore) {
+    let (confirmed, fit) = standing_of(score.blocks_verified, agreement);
+    (confirmed, if confirmed { 0 } else { fit }, *score)
 }
 
 /// What a read has to show for itself besides its decode, from the
@@ -391,14 +401,44 @@ pub fn read_outline_one_of(
 /// photo's other turns and copies, the reads in mirror order and
 /// without anchors, as the other QR Code model and refitted, and with
 /// the padding pinned, is a fresh chance for a block of noise to verify,
-/// and the best read is kept: each is charged as one of every read the
+/// and the best read is kept:
+/// each is charged for its share of the chances of every read the
 /// search may make, and a bit more for the share the read asked for
-/// leaves the rest. Those reads were once charged in part, the
-/// placements and samplings counted, the read asked for among them, and
-/// the rest uncounted; and then, past the read asked for, the first way
-/// tried at each turn beneath went uncounted for that turn's others, as
-/// though it were the read asked for, and every sampling of a turned
-/// photo was counted as the only one.
+/// leaves the rest.
+///
+/// The share goes by place. The ways each turn of the search tries,
+/// its placements, the samplings and retries of a placement, the ways
+/// of seeing the photo, are taken in an order fixed before any of them
+/// is read, the likeliest first, and half the turn's chances go to them
+/// by their place, the `k`th, from one, having 1/(k(k+1)), as padding
+/// recovery shares its passes ([`crate::decode::padding::pass_tries`]),
+/// and the last what the others leave, 1/n of `n`; the other half goes
+/// to them evenly, 1/n each ([`by_place`]). The shares of a turn's ways
+/// add to one, and a read's share is the product of its ways' down the
+/// turns above it, so the shares of every read the search may make add
+/// to one too, and to a half past the read asked for: the chance that
+/// noise passes in any of those is no more than half the chance in the
+/// one read that is charged nothing. That holds whichever of them are
+/// made, though what a way showed decides which turns are taken beneath
+/// it, since the ways a turn takes never have more than its whole; and a
+/// read that settles the search leaves the rest unmade, which spends
+/// less. Charged evenly, every read past the first was one of every
+/// read the search might make, some 2^15 of them past a placement's
+/// samplings and retries and the decodes of each, and the threshold
+/// rule tried second, which reads more symbols than any other retry,
+/// paid as much as the fortieth: a block needed about two codewords
+/// more to spare than at the first read. By place the ways tried first
+/// pay a few bits less, and none more than a bit over its even share at
+/// any turn. Within one sampling the decodes it makes, as the other
+/// model, refitted and with the padding pinned, follow from one another
+/// rather than stand in turn, and stay even.
+///
+/// Those reads were once charged in part, the placements and samplings
+/// counted, the read asked for among them, and the rest uncounted; and
+/// then, past the read asked for, the first way tried at each turn
+/// beneath went uncounted for that turn's others, as though it were the
+/// read asked for, and every sampling of a turned photo was counted as
+/// the only one.
 #[derive(Clone, Copy, Debug)]
 struct Reads {
     first: DecodeOptions,
@@ -408,21 +448,51 @@ struct Reads {
     asked: bool,
 }
 
+/// What the way `k` places, counting from nought, of the `n` a turn of
+/// the search tries in its fixed order is counted as, as
+/// [`DecodeOptions::one_of`] counts it: one over its share of the turn's
+/// chances, rounded up, the share half by place and half even
+/// ([`Reads`]). Four at most for the first, two bits; less than twice
+/// `n` for any, at most a bit over its even share; and `n` for the last.
+fn by_place(k: usize, n: usize) -> usize {
+    let n = n.max(1);
+    debug_assert!(k < n, "way {k} of {n}");
+    if k + 1 >= n {
+        return n;
+    }
+    let by_place = (k + 1) * (k + 2);
+    (2 * n * by_place).div_ceil(n + by_place)
+}
+
 impl Reads {
     fn new(opts: &DecodeOptions) -> Self {
         Self { first: *opts, again: opts.one_of(2), asked: true }
     }
 
-    /// These reads at a turn of the search that tries `n` ways, the first
-    /// of them going on as asked where these are the read asked for:
-    /// every other read counted as one of them, and the budgets of the
-    /// dear solvers shared over them all ([`DecodeOptions::among`]).
-    fn among(self, n: usize) -> Self {
-        let again = self.again.among(n);
-        Self { first: if self.asked { self.first.sharing(n) } else { again }, again, ..self }
+    /// These reads at a turn of the search that tries `n` ways, with the
+    /// budgets of the dear solvers shared over them all
+    /// ([`DecodeOptions::sharing`]), and nothing counted: each way is
+    /// counted by its place ([`Self::nth_of`]).
+    fn sharing(self, n: usize) -> Self {
+        Self { first: self.first.sharing(n), again: self.again.sharing(n), ..self }
     }
 
-    /// As [`Self::among`], with the budgets whole.
+    /// The reads of the way `k` places, counting from nought, of the `n`
+    /// a turn of the search tries in an order fixed before any of them is
+    /// read: the first read of the first going on as asked where these
+    /// are the read asked for, and every other counted as one of as many
+    /// as its place's share of the turn's chances is one of
+    /// ([`by_place`]).
+    fn nth_of(self, k: usize, n: usize) -> Self {
+        let again = self.again.one_of(by_place(k, n));
+        let asked = self.asked && k == 0;
+        Self { first: if asked { self.first } else { again }, again, asked }
+    }
+
+    /// These reads at a turn of the search that tries `n` ways, every way
+    /// alike, the first of them going on as asked where these are the
+    /// read asked for: every other read counted as one of them, and the
+    /// budgets whole.
     fn one_of(self, n: usize) -> Self {
         let again = self.again.one_of(n);
         Self { first: if self.asked { self.first } else { again }, again, ..self }
@@ -446,7 +516,8 @@ fn read_outline_as(image: &Luma, version: SymbolVersion, region: [[f64; 2]; 4], 
     let asked = params.enhance;
     // Every read is one of those through each way of seeing the photo
     // that may be tried, the best of which is kept: the way asked for,
-    // the photo as it is, and the rungs, each once. The way asked for was
+    // the photo as it is, and the rungs, each once, and each charged by
+    // its place among them ([`Reads::nth_of`]). The way asked for was
     // once counted again where it is a rung.
     let mut ways = vec![asked];
     for way in std::iter::once(Enhance::NONE).chain(Enhance::rungs(region)).chain([Enhance::deblurred(region)]) {
@@ -454,8 +525,8 @@ fn read_outline_as(image: &Luma, version: SymbolVersion, region: [[f64; 2]; 4], 
             ways.push(way);
         }
     }
-    let reads = reads.one_of(ways.len());
-    let mut best = read_outline_through(image, version, region, params, reads, asked);
+    let way = |enhance: Enhance| reads.nth_of(ways.iter().position(|&way| way == enhance).unwrap_or(ways.len() - 1), ways.len());
+    let mut best = read_outline_through(image, version, region, params, way(asked), asked);
     if best.as_ref().is_some_and(ReadResult::is_trustworthy) || work::cancelled() {
         return best;
     }
@@ -475,7 +546,7 @@ fn read_outline_as(image: &Luma, version: SymbolVersion, region: [[f64; 2]; 4], 
     rungs.retain(|rung| *rung != asked);
     work::in_turn(
         &rungs,
-        |&rung| if work::cancelled() { None } else { read_outline_through(image, version, region, params, reads.past(), rung) },
+        |&rung| if work::cancelled() { None } else { read_outline_through(image, version, region, params, way(rung), rung) },
         |result| result.is_some_and(|result| consider(&mut best, result)),
     );
     best
@@ -601,10 +672,12 @@ fn read_outline_plain(
     // The detector's placements, best fit first, each with every way of
     // sampling it: the reads of each, up to the one that settles it.
     let candidates = seated(image, detect_candidates_by(image, version, region, params, climb), params);
-    // Each read is one of about as many as there are placements and
-    // turns of the photo, times the ways of sampling each.
-    let all = reads.among(candidates.len() + 3);
-    let placements: Vec<(&Detection, Reads)> = candidates.iter().zip(all.first_then_past()).collect();
+    // Each read is one of the placements and turns of the photo, each
+    // charged by its place among them, best fit first and the turns
+    // last, times the ways of sampling each.
+    let placings = candidates.len() + 3;
+    let all = reads.sharing(placings);
+    let placements: Vec<(&Detection, Reads)> = candidates.iter().enumerate().map(|(k, found)| (found, all.nth_of(k, placings))).collect();
     let reads_of = |&(found, counted): &(&Detection, Reads)| {
         let mut reads = Vec::new();
         if work::cancelled() {
@@ -642,10 +715,12 @@ fn read_outline_plain(
         let Some(prepared) = prepare(&turned, seat(&turned, found, params), params) else { return reads };
         // Read as a placement in the photo as it is is read, and, short of
         // a read that settles the search, without its patches of data the
-        // ways that lead with the kernel asked for ([`read_placement`]).
+        // ways that lead with the kernel asked for ([`read_placement`]):
+        // each way charged by its place among them.
         let patched = prepared.detection.anchors.len() != prepared.plain.anchors.len();
         let few = &variants[..variants.len().min(params.rules().count())];
-        let turned_reads = all.past().among(variants.len() + usize::from(patched) * few.len());
+        let ways = variants.len() + usize::from(patched) * few.len();
+        let turned_reads = all.nth_of(candidates.len() + usize::from(quarters) - 1, placings).sharing(ways);
         let mut keep = |result: Option<ReadResult>| {
             let Some(mut result) = result else { return false };
             unturn(&mut result.detection, quarters, image.width, image.height, region);
@@ -653,15 +728,15 @@ fn read_outline_plain(
             reads.push(result);
             settled
         };
-        let settled = work::first_then_in_turn(
-            &variants,
-            |&variant| if work::cancelled() { None } else { read_prepared(&turned, &prepared, variant, params, turned_reads) },
-            &mut keep,
-        );
+        let samplings: Vec<(usize, Variant)> = variants.iter().copied().enumerate().collect();
+        let read = |prepared: &Prepared, variant: Variant, k: usize| {
+            if work::cancelled() { None } else { read_prepared(&turned, prepared, variant, params, turned_reads.nth_of(k, ways)) }
+        };
+        let settled = work::first_then_in_turn(&samplings, |&(k, variant)| read(&prepared, variant, k), &mut keep);
         if patched && !settled && !work::cancelled() {
             let without = Prepared::new(prepared.plain.clone(), prepared.agreement);
-            for &variant in few {
-                if keep(read_prepared(&turned, &without, variant, params, turned_reads)) {
+            for (j, &variant) in few.iter().enumerate() {
+                if keep(read(&without, variant, variants.len() + j)) {
                     break;
                 }
             }
@@ -722,7 +797,13 @@ const AROUND_FOUND: f64 = 0.1;
 /// read at once in an outline drawn by hand was found in the photo
 /// around it and left unread; wechat_qrcode gives every box its detector
 /// finds the same reader an image of one symbol gets, padded.
+///
+/// A placement nothing but a trial decode of the search vouched for is
+/// read charged as one of what its place among the search's trial decodes
+/// says ([`Detection::decoded_charge`]), whoever reads it: the search, a
+/// read of every symbol found, or a pick from the list.
 pub fn read_detection(image: &Luma, found: Detection, params: &SampleParams, opts: &DecodeOptions) -> Option<ReadResult> {
+    let opts = &opts.one_of(found.decoded_charge());
     let (version, around) = (found.version, outline_around(found.corners, AROUND_FOUND));
     // A symbol the search found only in the photo sharpened or enlarged
     // is read as placed through that copy, where its modules read as the
@@ -733,17 +814,74 @@ pub fn read_detection(image: &Luma, found: Detection, params: &SampleParams, opt
     };
     let mut best: Option<ReadResult> = None;
     // The placement found, read every way, then the search about it, each
-    // read one of those of both ([`Reads`]).
-    let reads = Reads::new(opts).one_of(2);
-    if read_found_through(image, found, around, params, reads, through, &mut best) || work::cancelled() {
+    // read one of those of both by its place ([`Reads`]): of two, half
+    // the chances each.
+    let reads = Reads::new(opts);
+    if read_found_through(image, found, around, params, reads.nth_of(0, 2), through, &mut best) || work::cancelled() {
         return best;
     }
-    if let Some(again) = read_outline_as(image, version, around, params, reads.past())
+    if let Some(again) = read_outline_as(image, version, around, params, reads.nth_of(1, 2))
         && best.as_ref().is_none_or(|held| again.outranks(held))
     {
         best = Some(again);
     }
     best
+}
+
+/// A search of the whole photo with the placements it kept aside for a
+/// read ([`Search::unvouched`]) read through, side by side, as a symbol
+/// the search found is ([`read_detection`]): each whose read is to be
+/// trusted is a symbol found, placed as its read placed it and marked as
+/// decoding, and each other is said as a lead, with the version it was
+/// fitted as ([`Lead::fitted`]), ahead of the leads the search had, each
+/// place once. Nothing vouched for such a placement but its fit, and a
+/// read that does not decode leaves it no better a symbol than finders
+/// with nothing fitted to them; one that decodes is the last word on
+/// it, as on any. Returned beside the search are the reads that decoded,
+/// each of a detection it lists and with what it was charged as one of
+/// ([`DecodeOptions::one_of`]), for a caller that reads every symbol
+/// found to take as they are rather than make again, or to read again
+/// charged the same.
+///
+/// The placements are read in the order the search kept them, best fit
+/// first, and none of them is a read asked for: each is a chance the
+/// search took for noise to pass, and is charged by its place among them
+/// as the ways a read tries are ([`by_place`]), so that together they
+/// pass no oftener than one read would. They were once read uncharged,
+/// each as a symbol the search found is, eight chances for one.
+pub fn settle_unvouched(image: &Luma, search: Search, params: &SampleParams, opts: &DecodeOptions) -> (Search, Vec<(ReadResult, usize)>) {
+    let Search { mut detections, leads, unvouched } = search;
+    if unvouched.is_empty() {
+        return (Search { detections, leads, unvouched }, Vec::new());
+    }
+    let placed: Vec<(usize, &Detection)> = unvouched.iter().enumerate().collect();
+    let n = placed.len();
+    let reads = work::map(&placed, |&(k, placement)| {
+        if work::cancelled() { None } else { read_detection(image, placement.clone(), params, &opts.one_of(by_place(k, n))) }
+    });
+    let mut unread: Vec<Lead> = Vec::new();
+    let mut settled: Vec<(ReadResult, usize)> = Vec::new();
+    for (k, (placement, read)) in unvouched.into_iter().zip(reads).enumerate() {
+        match read.filter(ReadResult::is_trustworthy) {
+            Some(read) => {
+                let detection = Detection { decodes: Some(true), ..read.detection.clone() };
+                detections.push(detection.clone());
+                settled.push((ReadResult { detection, ..read }, by_place(k, n)));
+            }
+            // The placement's own corners, as a lead's outline is the one
+            // its finders propose: to sample through as they are, at the
+            // version fitted. Widened as a read searches about a placement,
+            // they sampled a tenth off at every side.
+            None => unread.push(Lead {
+                family: placement.version.family(),
+                outline: placement.corners,
+                finders: placement.anchors.iter().filter(|a| a.kind == AnchorKind::Finder).map(|a| a.center).collect(),
+                fitted: Some(placement.version),
+            }),
+        }
+    }
+    unread.extend(leads);
+    (Search { leads: leads_left(unread, &detections), detections, unvouched: Vec::new() }, settled)
 }
 
 /// Placements by hand a read tries: the versions and turns of the
@@ -756,13 +894,15 @@ const PLACED_VERSIONS: usize = 3;
 
 /// Read a symbol through its own four corners, given as a hand places
 /// them in the Align stage, with no search: at each of the versions and
-/// turns of the corners that fit best, the placement refined, sampled
-/// every way, decoded and refitted as a placement the search found is
-/// ([`read_found_through`]), and read again through the photo enlarged
-/// and sharpened when its modules are small, as an outline is. Where it
-/// does not decode it is not looked for afresh, as a placement the
-/// search found is: what it reads is what the corners give. `None` when
-/// the corners make no outline at any version.
+/// turns of the corners that fit best, the version the symbol's own
+/// version information names first, where it names one
+/// ([`super::detect::version_named_beside_finders`]), the placement
+/// refined, sampled every way, decoded and refitted as a placement the
+/// search found is ([`read_found_through`]), and read again through the
+/// photo enlarged and sharpened when its modules are small, as an
+/// outline is. Where it does not decode it is not looked for afresh, as
+/// a placement the search found is: what it reads is what the corners
+/// give. `None` when the corners make no outline at any version.
 ///
 /// The corners may start at any corner of the symbol and run round it
 /// either way: they are put clockwise first, as the symbol's own run,
@@ -782,13 +922,34 @@ const PLACED_VERSIONS: usize = 3;
 pub fn read_placed(image: &Luma, family: Family, corners: [[f64; 2]; 4], params: &SampleParams, opts: &DecodeOptions) -> Option<ReadResult> {
     let corners = clockwise(corners);
     let mut fits: Vec<(f32, SymbolVersion, [[f64; 2]; 4])> = Vec::new();
+    let mut named: Vec<(f32, SymbolVersion, [[f64; 2]; 4])> = Vec::new();
     for turn in 0..4 {
         let mut turned = corners;
         turned.rotate_left(turn);
-        fits.extend(suggest_versions(image, turned, family, params).into_iter().map(|guess| (guess.score(), guess.version, turned)));
+        let guesses = suggest_versions(image, turned, family, params);
+        // The version information is read through the few versions that
+        // fit the turn best: any version near the symbol's own finds its
+        // finders, and the word names the symbol's.
+        let word = guesses
+            .iter()
+            .take(PLACED_VERSIONS)
+            .find_map(|guess| super::detect::version_named_beside_finders(image, guess.version, turned, params));
+        if let Some(version) = word
+            && let Some(guess) = guesses.iter().find(|guess| guess.version == version)
+        {
+            named.push((guess.score(), version, turned));
+        }
+        fits.extend(guesses.into_iter().map(|guess| (guess.score(), guess.version, turned)));
     }
+    // The versions and turns the symbol's own version information names
+    // come first, best fitting first; then the rest, by their fit.
+    named.sort_by(|a, b| b.0.total_cmp(&a.0));
     fits.sort_by(|a, b| b.0.total_cmp(&a.0));
-    fits.truncate(PLACED_VERSIONS);
+    fits.retain(|fit| !named.iter().any(|n| n.1 == fit.1 && n.2 == fit.2));
+    named.truncate(PLACED_VERSIONS);
+    fits.truncate(PLACED_VERSIONS - named.len());
+    named.extend(fits);
+    let fits = named;
     let around = outline_around(corners, AROUND_FOUND);
     let ways: Vec<Enhance> = std::iter::once(params.enhance)
         .chain(Enhance::rungs(around).into_iter().chain([Enhance::deblurred(around)]).filter(|&rung| rung != params.enhance))
@@ -890,9 +1051,11 @@ const DOUBT_MODULES: f64 = 0.35;
 /// search, the placement again expecting the bleed its finders show,
 /// every way the placement was read, and without its patches of data the
 /// ways it was read without them. The first sampling goes on as the
-/// read asked for, and every other read is charged as one of all these
-/// that may be made, the best of which is kept ([`Reads`]): the reads in
-/// mirror order and without anchors once went uncounted.
+/// read asked for, and every other read is charged by its place among
+/// all these that may be made, in this order, the best of which is kept
+/// ([`Reads`]): the reads in mirror order and without anchors once went
+/// uncounted, and then every read was charged as one of all of them
+/// alike.
 fn read_placement(
     image: &Luma,
     prepared: &Prepared,
@@ -922,12 +1085,21 @@ fn read_placement(
     // went uncounted where its patches placed none and the bled one's
     // placed some.
     let bled_ways = if first_bleed != 0.0 { variants.len() + few } else { 0 };
-    let reads = reads.among(variants.len() + usize::from(patched) * few + few + DOUBT_LIMIT * few + bled_ways);
+    // Where each way stands among those that may be tried, in the order
+    // they are tried: the samplings, then without the patches of data, in
+    // mirror order, without each doubted anchor, and expecting the bleed.
+    let without_at = variants.len();
+    let behind_at = without_at + usize::from(patched) * few;
+    let doubted_at = behind_at + few;
+    let bled_at = doubted_at + DOUBT_LIMIT * few;
+    let ways = bled_at + bled_ways;
+    let reads = reads.sharing(ways);
+    let at = |k: usize| reads.nth_of(k, ways);
     let mut verified = 0;
-    let samplings: Vec<(Variant, Reads)> = variants.iter().copied().zip(reads.first_then_past()).collect();
+    let samplings: Vec<(usize, Variant)> = variants.iter().copied().enumerate().collect();
     let settled = work::first_then_in_turn(
         &samplings,
-        |&(variant, reads)| if work::cancelled() { None } else { read_prepared(image, prepared, variant, params, reads) },
+        |&(k, variant)| if work::cancelled() { None } else { read_prepared(image, prepared, variant, params, at(k)) },
         |result| {
             result.is_some_and(|result| {
                 verified = verified.max(result.report.blocks_verified());
@@ -951,8 +1123,8 @@ fn read_placement(
     // hand as the patterns placed it, and through its patches not at all.
     if patched {
         let without = Prepared::new(plain.clone(), prepared.agreement);
-        for &variant in few {
-            if let Some(result) = read_prepared(image, &without, variant, params, reads.past()) {
+        for (j, &variant) in few.iter().enumerate() {
+            if let Some(result) = read_prepared(image, &without, variant, params, at(without_at + j)) {
                 verified = verified.max(result.report.blocks_verified());
                 if keep(result) {
                     return true;
@@ -965,8 +1137,8 @@ fn read_placement(
         && let Some(detection) = seen_from_behind(image, found, params)
     {
         let behind = Prepared::new(detection, prepared.agreement);
-        for &variant in few {
-            if let Some(result) = read_prepared(image, &behind, variant, params, reads.past())
+        for (j, &variant) in few.iter().enumerate() {
+            if let Some(result) = read_prepared(image, &behind, variant, params, at(behind_at + j))
                 && result.report.blocks_verified() > verified
             {
                 verified = result.report.blocks_verified();
@@ -980,7 +1152,7 @@ fn read_placement(
     // which were placed through the map a doubtful anchor bent, are placed
     // again through the map without it.
     let mut doubted = plain.clone();
-    for _ in 0..DOUBT_LIMIT {
+    for round in 0..DOUBT_LIMIT {
         // A block that verified knows which anchors mislead, and the
         // refit to it has already dropped them.
         if verified > 0 || work::cancelled() {
@@ -989,8 +1161,8 @@ fn read_placement(
         let Some(k) = doubtful_anchor(&doubted) else { break };
         doubted.anchors.remove(k);
         let without = Prepared::patched(image, doubted.clone(), prepared.agreement);
-        for &variant in few {
-            if let Some(result) = read_prepared(image, &without, variant, params, reads.past()) {
+        for (j, &variant) in few.iter().enumerate() {
+            if let Some(result) = read_prepared(image, &without, variant, params, at(doubted_at + round * few.len() + j)) {
                 verified = verified.max(result.report.blocks_verified());
                 if keep(result) {
                     return true;
@@ -1019,8 +1191,8 @@ fn read_placement(
     // that the levels and masks it ranks for them do not hang on which of
     // them came first ([`decode_as_ranked`]).
     if work::first_then_in_turn(
-        variants,
-        |&variant| if work::cancelled() { None } else { read_prepared(image, &bled, variant, params, reads.past()) },
+        &samplings,
+        |&(k, variant)| if work::cancelled() { None } else { read_prepared(image, &bled, variant, params, at(bled_at + k)) },
         |result| result.is_some_and(&mut *keep),
     ) {
         return true;
@@ -1030,7 +1202,8 @@ fn read_placement(
         return false;
     }
     let without = Prepared::new(bled.plain.clone(), bled.agreement);
-    few.iter().any(|&variant| read_prepared(image, &without, variant, params, reads.past()).is_some_and(&mut *keep))
+    let place = |j: usize| bled_at + variants.len() + j;
+    few.iter().enumerate().any(|(j, &variant)| read_prepared(image, &without, variant, params, at(place(j))).is_some_and(&mut *keep))
 }
 
 /// The anchor, no finder's, that lies farthest from where the corners
@@ -1217,7 +1390,10 @@ fn read_prepared(image: &Luma, prepared: &Prepared, variant: Variant, params: &S
     // The format bits may spell a word of the other QR Code model where
     // none of this one is near: a Model 1 symbol found as Model 2, or the
     // reverse. The two lay their data out differently, so the grid is read
-    // again as the other model, and the better-ranked read is kept.
+    // again as the other model, and the better-ranked read is kept, ranked
+    // as reads are ([`ReadResult::standing`]): a block confirmed first.
+    // By the decode's score alone, a stream of noise that parsed under the
+    // other model outranked blocks confirmed under this one.
     let mut reinterpreted = None;
     if !report.is_trustworthy()
         && analysis.format.other_model_hint().is_some()
@@ -1225,7 +1401,7 @@ fn read_prepared(image: &Luma, prepared: &Prepared, variant: Variant, params: &S
     {
         let other_func = Arc::new(FunctionMap::new(other));
         if let Some(again) = decode_as(&grid, &other_func, &analyze(&grid, &other_func), retry)
-            && again.score > report.score
+            && standing_by(&again.score, prepared.agreement) > standing_by(&report.score, prepared.agreement)
         {
             report = again;
             reinterpreted = Some(other);
@@ -1301,15 +1477,20 @@ const FEEDBACK_MAX_EDGES: usize = 2000;
 const FEEDBACK_WINDOW: f64 = 5.0;
 
 /// Turn a partial decode back on the placement, as the module describes,
-/// for as long as each round improves the decode's rank. `params` carry
-/// the kernel and threshold rule the read was made with.
+/// for as long as each round outranks the read before it, ranked as
+/// reads are ([`ReadResult::outranks`]). `params` carry the kernel and
+/// threshold rule the read was made with. Ranked by the decode's score
+/// alone, which puts a stream that parses before the blocks confirmed, a
+/// refit that lost every block its read had confirmed, and whose stream
+/// of noise parsed, took that read's place, and the read it came from
+/// was not seen again.
 fn refit_by_decode(image: &Luma, mut current: ReadResult, params: &SampleParams, opts: &DecodeOptions) -> ReadResult {
     for _ in 0..FEEDBACK_ROUNDS {
         if work::cancelled() {
             break;
         }
         let Some(next) = feedback_round(image, &current, params, opts) else { break };
-        if next.report.score <= current.report.score {
+        if !next.outranks(&current) {
             break;
         }
         let settled = next.is_trustworthy();
@@ -1480,23 +1661,6 @@ fn feedback_round(image: &Luma, current: &ReadResult, params: &SampleParams, opt
         sharpen_modules: current.sharpen_modules,
         unsure_kept: current.unsure_kept,
     })
-}
-
-/// A map moved by `by` pixels in the photo.
-struct Moved<'a, P: Project> {
-    map: &'a P,
-    by: [f64; 2],
-}
-
-impl<P: Project> Project for Moved<'_, P> {
-    fn base(&self, x: f64, y: f64) -> [f64; 2] {
-        let [px, py] = self.map.base(x, y);
-        [px + self.by[0], py + self.by[1]]
-    }
-
-    fn displacement(&self, x: f64, y: f64) -> [f64; 2] {
-        self.map.displacement(x, y)
-    }
 }
 
 /// Modules between the points a refit to a partial decode anchors where
@@ -1681,13 +1845,8 @@ fn decode_as_ranked(
 }
 
 /// The best decode of `grid` under the format words nearest its format
-/// bits after the one they settle, when the blocks bear one out: the
-/// words of the grid's own size, painted as the settled one is, within
-/// [`RIVAL_REACH`] bits of the bits read, the [`RIVALS`] nearest of them.
-/// A word wrong in four bits or five that reads as another is always
-/// among the three nearest of the rest, and a word read clean, or with
-/// one bit wrong, has no other within reach, so a symbol whose format
-/// reads well and whose blocks are past correcting costs nothing here.
+/// bits after the one they settle, when the blocks bear one out
+/// ([`nearest_rivals`]).
 ///
 /// A rival stands on its blocks alone, the bits having spoken for
 /// another: on a block it verifies, every decode charged as one of the
@@ -1708,14 +1867,7 @@ fn decode_as_ranked(
 /// it was.
 fn rival_decode(grid: &ModuleGrid, func: &Arc<FunctionMap>, format: &FormatAnalysis, opts: &DecodeOptions) -> Option<DecodeReport> {
     let best = format.best()?;
-    let mut rivals: Vec<&FormatCandidate> = format
-        .candidates
-        .iter()
-        .filter(|c| c.fits_grid && (c.unmasked, c.other_model) == (best.unmasked, best.other_model))
-        .filter(|c| c.fields != best.fields && c.best_mismatches <= RIVAL_REACH)
-        .collect();
-    rivals.sort_by_key(|c| (c.best_mismatches, c.best_weight));
-    rivals.truncate(RIVALS);
+    let mut rivals = nearest_rivals(format, best);
     if let Some(likeliest) = likeliest_word(grid, func, format, best)
         && !rivals.iter().any(|c| c.fields == likeliest.fields)
     {
@@ -1742,25 +1894,67 @@ fn rival_decode(grid: &ModuleGrid, func: &Arc<FunctionMap>, format: &FormatAnaly
     found
 }
 
-/// The word of the grid's size, painted as `settled` is, that the data
-/// read under it and the format bits together favour most
-/// ([`crate::decode::pipeline::Attempt::odds_bits`]), when the data
-/// reads as a message under it ([`LIKENESS_FLOOR`]) and the two favour
-/// it over `settled`. `None` when they favour `settled`, or the data
-/// reads as a message under no word.
+/// The format words [`rival_decode`] tries beside `best`, the word the
+/// format bits settle: the words of the grid's own size within
+/// [`RIVAL_REACH`] bits of the bits read, or, painted without the mask,
+/// within [`QUIRK_REACH`], as far as such a word is ever taken for the
+/// format; the [`RIVALS`] nearest of them, each level and mask once,
+/// those painted as `best` is before those painted the other way the
+/// grid's model paints, with or without the mask. A word wrong in four
+/// bits or five that reads as another is always among the three nearest
+/// of the rest, and a word painted the standard way read clean, or with
+/// one bit wrong, has no other within reach, so a symbol whose format
+/// reads well and whose blocks are past correcting costs nothing here.
+/// The words painted otherwise than the settled one were once never
+/// tried, and a word settled on as painted without the mask had for
+/// rivals only the words so painted, every one of them six bits from
+/// the read and more. Those painted without the mask are held to the
+/// nearer reach: five of them lie just five bits from a QR Code's word
+/// read clean, and some four from one read a bit wrong, which says
+/// nothing for any of them, and within the reach of a standard word
+/// three of them would be decoded each time such a symbol's blocks were
+/// past correcting.
+fn nearest_rivals<'a>(format: &'a FormatAnalysis, best: &FormatCandidate) -> Vec<&'a FormatCandidate> {
+    let reach = |c: &FormatCandidate| if c.unmasked { QUIRK_REACH } else { RIVAL_REACH };
+    let mut rivals: Vec<&FormatCandidate> = format
+        .candidates
+        .iter()
+        .filter(|c| c.fits_grid && c.other_model == best.other_model)
+        .filter(|c| c.fields != best.fields && c.best_mismatches <= reach(c))
+        .collect();
+    rivals.sort_by_key(|c| (c.unmasked != best.unmasked, c.best_mismatches, c.best_weight));
+    // Each level and mask once, at the painting that comes first.
+    let mut named = Vec::new();
+    rivals.retain(|c| !named.contains(&c.fields) && {
+        named.push(c.fields);
+        true
+    });
+    rivals.truncate(RIVALS);
+    rivals
+}
+
+/// The word of the grid's size, painted either way the grid's model
+/// paints as `settled` is, with or without the mask, that the data read
+/// under it and the format bits together favour most
+/// ([`crate::decode::pipeline::Attempt::odds_bits`]), each word weighed
+/// with what its painting weighs before any bit is read
+/// ([`FormatCandidate::prior_weight`]), when the data reads as a message
+/// under it ([`LIKENESS_FLOOR`]) and the two favour it over `settled`.
+/// `None` when they favour `settled`, or the data reads as a message
+/// under no word.
 fn likeliest_word<'a>(grid: &ModuleGrid, func: &Arc<FunctionMap>, format: &'a FormatAnalysis, settled: &FormatCandidate) -> Option<&'a FormatCandidate> {
     let layouts: Vec<(EcLevel, SymbolLayout)> =
         func.version.ec_levels().iter().filter_map(|&ec| Some((ec, SymbolLayout::new(func.clone(), ec)?))).collect();
     let odds = |c: &FormatCandidate| -> Option<(f64, f64)> {
         let (_, layout) = layouts.iter().find(|(ec, _)| *ec == c.fields.ec)?;
         let likeness = likeness_bits(&stream_as_read(grid, layout, c.fields.mask));
-        Some((likeness - f64::from(c.weight) / 8.0, likeness))
+        Some((likeness - f64::from(c.prior_weight()) / 8.0, likeness))
     };
     let (settled_odds, _) = odds(settled)?;
     format
         .candidates
         .iter()
-        .filter(|c| c.fits_grid && (c.unmasked, c.other_model) == (settled.unmasked, settled.other_model) && c.fields != settled.fields)
+        .filter(|c| c.fits_grid && c.other_model == settled.other_model && c.fields != settled.fields)
         .filter_map(|c| odds(c).map(|o| (c, o)))
         .filter(|(_, (odds, likeness))| *likeness >= LIKENESS_FLOOR && *odds > settled_odds)
         .max_by(|a, b| a.1.0.total_cmp(&b.1.0))
@@ -1791,19 +1985,23 @@ mod tests {
     #[test]
     fn every_read_but_the_one_asked_for_is_counted_at_every_turn() {
         // The read asked for goes uncounted at every turn of the search,
-        // and every other read is one of all those of every turn above it,
-        // a bit more for the share the read asked for leaves the rest.
+        // and every other read is counted by its way's place at every turn
+        // above it, a bit more for the share the read asked for leaves the
+        // rest: the first of five ways at a turn as one of three, and the
+        // turn beneath it, of three ways alike, as one of three.
         let opts = DecodeOptions::default();
-        let asked = Reads::new(&opts).among(5).one_of(3);
-        assert_eq!((asked.first.tries, asked.again.tries), (1, 2 * 5 * 3));
+        let asked = Reads::new(&opts).sharing(5).nth_of(0, 5).one_of(3);
+        assert_eq!((asked.first.tries, asked.again.tries), (1, 2 * 3 * 3));
         // Past it, the first way tried at each turn beneath is counted as
         // the rest are: it once went uncounted for its turn, as though it
         // were the read asked for. So, with every sampling of a turned
         // photo, which were each counted as the only one.
-        let past = Reads::new(&opts).among(5).past().among(4).one_of(3);
-        assert_eq!((past.first.tries, past.again.tries), (2 * 5 * 4 * 3, 2 * 5 * 4 * 3));
-        // The budgets are shared over every turn alike.
-        assert_eq!(past.first.trial_sets, Reads::new(&opts).among(5).among(4).first.trial_sets);
+        let past = Reads::new(&opts).sharing(5).nth_of(1, 5).sharing(4).nth_of(0, 4).one_of(3);
+        let counted = 2 * by_place(1, 5) * by_place(0, 4) * 3;
+        assert_eq!((past.first.tries, past.again.tries), (counted, counted));
+        // The budgets are shared over every turn alike, whatever the place.
+        assert_eq!(past.first.trial_sets, Reads::new(&opts).sharing(5).sharing(4).first.trial_sets);
+        assert_eq!(past.first.trial_sets, Reads::new(&opts).sharing(5).nth_of(4, 5).sharing(4).nth_of(3, 4).first.trial_sets);
         // An outline read as one of three ways, as the families are
         // ([`read_outline_one_of`]): the first read of the way asked for
         // goes uncounted, and the first of every other way is counted as
@@ -1811,6 +2009,65 @@ mod tests {
         let asked = Reads::new(&opts).one_of(3);
         let other = asked.past();
         assert_eq!((asked.first.tries, asked.again.tries, other.first.tries), (1, 2 * 3, 2 * 3));
+    }
+
+    #[test]
+    fn the_ways_of_a_turn_take_no_more_than_its_whole_by_their_places() {
+        // However many ways a turn tries, their shares add to no more than
+        // one, so that the reads past the one asked for, charged by their
+        // places down every turn, are as likely to let noise through as
+        // ever. The first of many pays two bits at most, the last its even
+        // share, and none a bit more than that.
+        for n in 1..=200 {
+            let shares: f64 = (0..n).map(|k| 1.0 / by_place(k, n) as f64).sum();
+            assert!(shares <= 1.0 + 1e-12, "{n} ways take {shares}");
+            assert_eq!(by_place(n - 1, n), n);
+            for k in 0..n {
+                assert!(by_place(k, n) < 2 * n, "way {k} of {n}: {}", by_place(k, n));
+                assert!(k == 0 || k + 1 == n || by_place(k, n) >= by_place(k - 1, n), "way {k} of {n}");
+            }
+            assert!(by_place(0, n) <= 4, "{n}");
+        }
+        // Of two, half each, as before.
+        assert_eq!((by_place(0, 2), by_place(1, 2)), (2, 2));
+        // The second sampling of a placement with forty-two ways to try,
+        // the threshold rule that reads more than any retry, pays three and
+        // a half bits where it paid more than five; the last but one six
+        // and a third, and the last as ever.
+        assert_eq!((by_place(1, 42), by_place(40, 42), by_place(41, 42)), (11, 82, 42));
+    }
+
+    #[test]
+    fn a_decode_that_lost_every_confirmed_block_ranks_below_its_read_whatever_parses() {
+        // The decode ranks its attempts at one grid with a stream that
+        // parses first; a read, and so a refit of one or a read of it as
+        // the other model, ranks a block confirmed first. A refit whose
+        // every block failed, and whose stream of noise parsed, once took
+        // the place of the read it came from by the decode's order.
+        let confirmed = AttemptScore {
+            stream_valid: false,
+            all_verified: false,
+            tail_plausible: false,
+            blocks_verified: 2,
+            blocks_solved: 2,
+            confidence_bits: 64,
+            neg_errata: -3,
+        };
+        let parsed = AttemptScore {
+            stream_valid: true,
+            tail_plausible: true,
+            blocks_verified: 0,
+            blocks_solved: 3,
+            confidence_bits: 0,
+            ..confirmed
+        };
+        assert!(parsed > confirmed);
+        let agreement = (230, 236);
+        assert!(standing_by(&confirmed, agreement) > standing_by(&parsed, agreement));
+        // Between two that each confirm a block, the decode's own order.
+        let more = AttemptScore { blocks_verified: 3, ..confirmed };
+        assert!(standing_by(&more, agreement) > standing_by(&confirmed, agreement));
+        assert!(standing_by(&AttemptScore { stream_valid: true, ..confirmed }, agreement) > standing_by(&more, agreement));
     }
 
     #[test]
@@ -1859,6 +2116,7 @@ mod tests {
             turned: 0,
             decodes: None,
             bloom: 0.0,
+            decoded_at: None,
         }
     }
 
@@ -1986,6 +2244,59 @@ mod tests {
             measured_corners: finders.iter().map(|&center| nearest(center)).collect(),
             ..placed()
         }
+    }
+
+    #[test]
+    fn placements_kept_aside_are_symbols_where_they_read_and_leads_where_they_do_not() {
+        // The symbol on the left of a sheet, and bare paper on the right
+        // as wide again, each with a placement of version 2 nothing
+        // vouched for.
+        let (drawn, corners) = drawn("kept aside for a read");
+        let (width, height) = (2 * drawn.width, drawn.height);
+        let mut data = vec![0.92f32; width * height];
+        for y in 0..height {
+            data[y * width..y * width + drawn.width].copy_from_slice(&drawn.data[y * drawn.width..(y + 1) * drawn.width]);
+        }
+        let image = Luma::new(width, height, data);
+        let params = SampleParams::default();
+        let beside = corners.map(|[x, y]| [x + drawn.width as f64, y]);
+        let symbol = placed_by_hand(&image, SymbolVersion::Qr(2), corners, &params).unwrap();
+        let paper = placed_by_hand(&image, SymbolVersion::Qr(2), beside, &params).unwrap();
+        let alone = read_detection(&image, symbol.clone(), &params, &DecodeOptions::default()).expect("the symbol reads");
+        let search = Search { detections: Vec::new(), leads: Vec::new(), unvouched: vec![symbol, paper] };
+        let (settled, reads) = settle_unvouched(&image, search, &params, &DecodeOptions::default());
+        // The symbol reads, and is found, as decoding; the paper is a lead
+        // with the version it was fitted as, about where it lay.
+        assert!(settled.unvouched.is_empty());
+        // Its read comes with it, of the detection listed, charged by its
+        // place among the two read, the first of two, as one of two, where
+        // read alone it is a read asked for.
+        assert_eq!(reads.len(), 1);
+        let (read, among) = &reads[0];
+        assert_eq!((read.detection.corners, read.detection.decodes), (settled.detections[0].corners, Some(true)));
+        assert_eq!(read.text(), "kept aside for a read");
+        assert_eq!(*among, by_place(0, 2));
+        assert_eq!(read.report.tries, among * alone.report.tries, "{} against {}", read.report.tries, alone.report.tries);
+        assert_eq!(settled.detections.iter().map(|d| (d.version, d.decodes)).collect::<Vec<_>>(), [(SymbolVersion::Qr(2), Some(true))]);
+        assert_eq!(settled.leads.iter().map(|lead| (lead.family, lead.fitted)).collect::<Vec<_>>(), [(Family::Qr, Some(SymbolVersion::Qr(2)))]);
+        let middle = |quad: [[f64; 2]; 4]| [quad.iter().map(|p| p[0]).sum::<f64>() / 4.0, quad.iter().map(|p| p[1]).sum::<f64>() / 4.0];
+        assert!(distance(middle(settled.leads[0].outline), middle(beside)) < 1.0);
+    }
+
+    #[test]
+    fn a_placement_a_trial_decode_vouched_for_is_read_charged_by_its_place() {
+        // The fifth trial decode of the search vouched for it: read, it is
+        // one of thirty ([`Detection::decoded_charge`]), wherever it is
+        // read from, where read as one anything else vouched for it is a
+        // read asked for.
+        let (image, corners) = drawn("vouched by a decode");
+        let params = SampleParams::default();
+        let symbol = placed_by_hand(&image, SymbolVersion::Qr(2), corners, &params).unwrap();
+        let alone = read_detection(&image, symbol.clone(), &params, &DecodeOptions::default()).expect("the symbol reads");
+        let decoded = Detection { decoded_at: Some(4), ..symbol };
+        let read = read_detection(&image, decoded, &params, &DecodeOptions::default()).expect("the symbol reads");
+        assert_eq!(read.text(), "vouched by a decode");
+        assert_eq!(read.report.tries, 30 * alone.report.tries, "{} against {}", read.report.tries, alone.report.tries);
     }
 
     #[test]
@@ -2207,8 +2518,10 @@ mod tests {
         }
         assert_eq!(neighbours, 30);
 
-        // A word read clean has no other within reach, and a symbol whose
-        // blocks are past correcting is decoded under it once and left.
+        // A word read clean, or a bit wrong, has no other within reach,
+        // painted either way: every word painted without the mask lies
+        // four bits from it or more. And a symbol whose blocks are past
+        // correcting is decoded under it once and left.
         let mut torn = clean.clone();
         for y in 9..func.height {
             for x in 9..func.width {
@@ -2219,6 +2532,11 @@ mod tests {
         }
         let analysis = analyze(&torn, &func);
         assert!(analysis.format.is_reliable());
+        assert!(nearest_rivals(&analysis.format, analysis.format.best().unwrap()).is_empty());
+        for b in 0..15 {
+            let format = analyze(&misread(&[b]), &func).format;
+            assert!(format.is_reliable() && nearest_rivals(&format, format.best().unwrap()).is_empty(), "bit {b}");
+        }
         assert!(rival_decode(&torn, &func, &analysis.format, &opts).is_none());
         let report = decode_as(&torn, &func, &analysis, &opts).unwrap();
         assert_eq!((report.ec, report.mask, report.blocks_verified()), (ec, mask, 0));

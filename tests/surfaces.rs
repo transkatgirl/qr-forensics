@@ -185,7 +185,7 @@ fn fared(printed: &str, prefix: &str, message: &str) -> (Fared, Vec<String>) {
         }
         let this = if standing.ends_with("no symbol fitted") {
             Fared::Lead
-        } else if standing != "read" && standing != "read, padding pinned" {
+        } else if standing != "read" && !standing.starts_with("read, ") {
             Fared::Found
         } else if read == message {
             Fared::Read
@@ -371,6 +371,10 @@ fn what_the_reader_prints_is_held_to_the_message() {
     // found all the same.
     assert_eq!(fared(&lines(&["QR Code 7: read: y"]), prefix, "x"), (Fared::Found, vec!["y".to_owned()]));
     assert_eq!(fared(&lines(&["QR Code: 2 finder patterns, no symbol fitted: at 1,2,3,4,5,6,7,8"]), prefix, "x"), (Fared::Lead, Vec::new()));
+    // A placement the search fitted and could not read is a symbol found
+    // that did not decode, and no lead.
+    let fitted = lines(&["QR Code 1: 3 finder patterns, fitted and not read: at 1,2,3,4,5,6,7,8"]);
+    assert_eq!(fared(&fitted, prefix, "x"), (Fared::Found, Vec::new()));
     // Lines of another image, and none at all, are nothing found.
     assert_eq!(fared("other.jpg: QR Code 7: read: x\n", prefix, "x"), (Fared::NotFound, Vec::new()));
     assert_eq!(Fared::ALL.map(|fared| Fared::named(fared.label())), Fared::ALL.map(Some));

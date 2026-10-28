@@ -31,7 +31,11 @@
 //! and the curve is bent toward whichever the rest of the block bears
 //! out. That is soft decision decoding, which the chase
 //! ([`super::rs::rs_decode_chasing`]) does by trying every pattern of the
-//! ten faintest bits, and this does for every bit at once.
+//! ten faintest bits, and this does for every bit at once. Where every
+//! codeword is as sure as every other, as in a block painted by hand,
+//! each is given the same multiplicity where that is sure to reach
+//! further than shares that differ by a unit as they fall
+//! ([`multiplicities`]).
 //!
 //! What such a solution confirms is counted as any other's
 //! ([`super::rs::list_solution_bits`]): how rarely a block of noise has
@@ -49,8 +53,8 @@ use std::collections::BinaryHeap;
 
 use super::gf256::{self, Scale, div, exp, mul, poly_eval};
 use super::rs::{
-    CwRead, Offering, RsSolution, Sightings, doubted_agreement, list_solution_balance, list_solution_bits, nearest, preferring_the_standard,
-    settle, soft_distance,
+    CwRead, Offering, RsSolution, Sightings, counted_against, doubted_agreement, list_solution_balance, list_solution_bits, nearest,
+    preferring_the_standard, settle, soft_distance,
 };
 use crate::symbol::grid::{CERTAIN, misread_chance};
 use crate::work;
@@ -59,13 +63,17 @@ use crate::work;
 /// of multiplicity `m` as `m(m+1)/2`: what the curve costs, since every
 /// constraint is a pass over every coefficient of every polynomial in
 /// hand, and how far it reaches, since the multiplicities grow with the
-/// square root of it. Two thousand puts a multiplicity of nine on every
-/// codeword of a 40-H block read whole, which reaches nineteen wrong of
-/// its forty-five, and of twelve on a 1-H block's twenty-six, which
-/// reaches eleven; a block of a hundred and fifty codewords gets five,
-/// which on a block of high rate reaches no further than half the
-/// distance does, and nothing would. A tenth of a second on the largest
-/// blocks, and a few milliseconds on the smallest.
+/// square root of it. Two thousand puts a multiplicity of nine or ten on
+/// every codeword of a 40-H block read whole, which reaches nineteen
+/// wrong of its forty-five, and of twelve or thirteen on a 1-H block's
+/// twenty-six, which reaches eleven; a block of a hundred and fifty
+/// codewords gets four or five, which on a block of high rate is sure
+/// of no further than half the distance, and nothing would be. A block
+/// read whole that one multiplicity alike takes further uses no more of
+/// them than that takes ([`multiplicities`]): five on each of an 8-Q
+/// block's forty, six hundred, reach thirteen wrong where the units
+/// given one at a time were sure of twelve. A tenth of a second on the
+/// largest blocks, and a few milliseconds on the smallest.
 pub const LIST_COST: usize = 2048;
 /// Fewest constraints a decode that is one of many is given
 /// ([`super::pipeline::DecodeOptions::among`]).
@@ -211,12 +219,51 @@ impl Ord for Claim {
 }
 
 /// Koetter and Vardy's multiplicities for the points, within `cost`
-/// constraints: a unit at a time to the point whose likelihood divided
-/// by one more than its multiplicity is the greatest, which is their
-/// greedy algorithm, until the next unit would not fit. A point of
-/// likelihood one, a codeword painted by hand or pinned, draws the most,
-/// and a faint bit's other colour draws its share.
-fn multiplicities(points: &[Point], cost: usize) -> Vec<usize> {
+/// constraints, for a curve whose data is of degree `w` at most: a unit
+/// at a time to the point whose likelihood divided by one more than its
+/// multiplicity is the greatest, which is their greedy algorithm, until
+/// the next unit would not fit. A point of likelihood one, a codeword
+/// painted by hand or pinned, draws the most, and a faint bit's other
+/// colour draws its share.
+///
+/// Where every point is as likely as every other, as every codeword of a
+/// block painted by hand is, the greedy has no likelihood to choose by,
+/// and hands the units left past the last multiplicity it could give
+/// them all to the points first in the block, one each: the curve they
+/// raise reaches a codeword more where the wrong codewords miss those
+/// points, and less far where they fall on them. There one multiplicity
+/// alike ([`even_multiplicity`]) is given instead where it is sure to
+/// reach further wherever the wrong codewords fall ([`sure_reach`]), or
+/// as far where the greedy's are alike too, at fewer constraints. An
+/// M4-M block is sure of five wrong at two thousand constraints a unit
+/// at a time, and of six at six hundred and seventy-two given alike,
+/// and a 3-M block of thirteen and fourteen. Given alike always, a 7-M
+/// block at a thousand and twenty-four constraints, just short of a
+/// multiplicity of six on every codeword, was sure of nine, no further
+/// than half the distance, where the greedy's, six on all but one, are
+/// sure of ten; and where the two were sure of as many, a block wrong
+/// in one codeword more than that never decoded, where the greedy's
+/// reached it as often as not. Short of half the distance, which the
+/// plain decoder reaches by itself before the curve is asked, how far
+/// either is sure of counts for nothing: a block of high rate, sure of
+/// half the distance alike only at a multiplicity of one, which adds
+/// nothing to the plain decode, keeps the greedy's, and what they reach
+/// past it where the wrong codewords miss the points first in the block.
+fn multiplicities(points: &[Point], cost: usize, w: usize) -> Vec<usize> {
+    let greedy = greedy_multiplicities(points, cost);
+    let Some(even) = even_multiplicity(points, cost, w) else { return greedy };
+    let even = vec![even; points.len()];
+    let mut codewords: Vec<usize> = points.iter().map(|p| p.codeword).collect();
+    codewords.dedup();
+    let half = codewords.len().saturating_sub(w + 1) / 2;
+    let (sure_even, sure_greedy) = (sure_reach(points, &even, w).max(half), sure_reach(points, &greedy, w).max(half));
+    let greedy_alike = greedy.windows(2).all(|pair| pair[0] == pair[1]);
+    if sure_even > sure_greedy || (sure_even == sure_greedy && greedy_alike) { even } else { greedy }
+}
+
+/// Koetter and Vardy's greedy multiplicities for the points, within
+/// `cost` constraints ([`multiplicities`]).
+fn greedy_multiplicities(points: &[Point], cost: usize) -> Vec<usize> {
     let mut m = vec![0usize; points.len()];
     let mut claims: BinaryHeap<Claim> = points
         .iter()
@@ -235,6 +282,59 @@ fn multiplicities(points: &[Point], cost: usize) -> Vec<usize> {
         claims.push(Claim { key: points[point].likelihood / (m[point] + 1) as f64, point });
     }
     m
+}
+
+/// The one multiplicity to give every point where all are alike in
+/// likelihood ([`multiplicities`]), within `cost` constraints for a curve
+/// whose data is of degree `w` at most: of those whose curve is sure to
+/// reach the most wrong codewords, wherever they fall, the least, which
+/// costs the least time. Given alike, a codeword of the code is a factor
+/// of the curve once the codewords it agrees with outnumber its weighted
+/// degree over the multiplicity, and is not otherwise, so that this is
+/// how far the curve reaches, and no further for any block; the greedy's
+/// multiplicities, which differ by a unit, may reach further at the
+/// same `cost`, and [`multiplicities`] weighs the two. `None` where the
+/// points differ, or no multiplicity alike fits `cost`.
+fn even_multiplicity(points: &[Point], cost: usize, w: usize) -> Option<usize> {
+    let likelihood = points.first()?.likelihood;
+    if likelihood <= 0.0 || points.iter().any(|p| p.likelihood != likelihood) {
+        return None;
+    }
+    // A codeword of the code agrees with one point of a codeword at most.
+    let mut codewords: Vec<usize> = points.iter().map(|p| p.codeword).collect();
+    codewords.dedup();
+    let (points, codewords) = (points.len(), codewords.len());
+    let constraints = |m: usize| points * m * (m + 1) / 2;
+    (1..)
+        .take_while(|&m| constraints(m) <= cost)
+        .filter_map(|m| {
+            let (_, delta) = list_size(constraints(m), w);
+            codewords.checked_sub(delta / m + 1).map(|reach| (reach, m))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
+        .map(|(_, m)| m)
+}
+
+/// How many wrong codewords a curve whose points have multiplicities `m`,
+/// for data of degree `w` at most, is sure to reach wherever they fall:
+/// a codeword of the code is a factor of the curve once the
+/// multiplicities of the points it passes through sum past the curve's
+/// weighted degree, and a codeword read right adds the least of its
+/// points' at the least, a wrong one nothing. As [`hard_reach`] counts
+/// it, where each codeword has one point.
+fn sure_reach(points: &[Point], m: &[usize], w: usize) -> usize {
+    let total: usize = m.iter().map(|&m| m * (m + 1) / 2).sum();
+    let (_, delta) = list_size(total, w);
+    let mut least: Vec<(usize, usize)> = Vec::new();
+    for (point, &m) in points.iter().zip(m) {
+        match least.last_mut() {
+            Some((codeword, least)) if *codeword == point.codeword => *least = (*least).min(m),
+            _ => least.push((point.codeword, m)),
+        }
+    }
+    let mut least: Vec<usize> = least.into_iter().map(|(_, m)| m).collect();
+    least.sort_unstable();
+    (0..=least.len()).take_while(|&t| least[..least.len() - t].iter().sum::<usize>() > delta).last().unwrap_or(0)
 }
 
 /// A polynomial in `x` and `y`: `coef[t]` is the coefficient of `y^t`, a
@@ -636,14 +736,29 @@ fn y_roots(curve: &Curve, k: usize) -> Vec<Vec<u8>> {
 /// ([`list_solution_bits`]): a block of noise shows a codeword within so
 /// many whole errors of it once in so many blocks. The slack is what
 /// those errors leave of the redundancy, as a chased solution's is what
-/// its flipped block's decode left, and the standard's reserve is held
-/// against it.
+/// its flipped block's decode left; whether it keeps the standard's
+/// reserve is what it changes of the block as read, the codewords it
+/// changes only in bits it doubted among them ([`super::rs::keeps_reserve`]).
 ///
 /// Every codeword the curve passes through that overturns no pin is
 /// noted in `seen`, those returned among them, whether or not anything
 /// confirms it ([`Sightings`]).
 pub fn rs_decode_listing(
     block: &[CwRead],
+    bit_reliability: &[[u8; 8]],
+    ec_len: usize,
+    reserved: usize,
+    cost: usize,
+    seen: &mut Sightings,
+) -> Vec<(usize, RsSolution)> {
+    rs_decode_listing_against(block, block, bit_reliability, ec_len, reserved, cost, seen)
+}
+
+/// [`rs_decode_listing`], what each solution spends of the reserve
+/// counted against `as_read` ([`counted_against`]).
+pub(super) fn rs_decode_listing_against(
+    block: &[CwRead],
+    as_read: &[CwRead],
     bit_reliability: &[[u8; 8]],
     ec_len: usize,
     reserved: usize,
@@ -662,7 +777,7 @@ pub fn rs_decode_listing(
         return Vec::new();
     }
     let pts = points(block, bit_reliability);
-    let m = multiplicities(&pts, usable_cost(n, ec_len, cost));
+    let m = multiplicities(&pts, usable_cost(n, ec_len, cost), k - 1);
     let grs = grs_points(n, ec_len);
     let constraints: Vec<(u8, u8, usize)> = pts
         .iter()
@@ -727,7 +842,11 @@ pub fn rs_decode_listing(
         // ([`settle`]).
         let slack = redundancy.saturating_sub(2 * hard).min(bits.max(0) as usize / 8);
         let located = bits - 8 * slack as i64;
-        let Ok(solution) = settle(block, &doubted_erased, &erased, corrected, errors, slack, located, reserved, offering.seen()) else { continue };
+        let Ok(solution) = settle(block, ec_len, &doubted_erased, &erased, corrected, errors, slack, located, reserved, offering.seen())
+            .map(|solution| counted_against(as_read, ec_len, solution))
+        else {
+            continue;
+        };
         if !offering.offers_solution(&solution) {
             continue;
         }
@@ -741,8 +860,11 @@ pub fn rs_decode_listing(
 /// `n` codewords with `ec_len` of error correction, read whole and every
 /// module certain, for `cost` constraints, and with `needed` bits to
 /// confirm it, which is what verifies a block charged for what the
-/// solution was found among ([`super::pipeline::verifying_bits`]): for
-/// the app to say how far it goes in a symbol. Each codeword is a
+/// solution was found among ([`super::pipeline::verifying_bits`]), or,
+/// where it is less, what the block itself must show of the codeword
+/// whatever found it ([`super::pipeline::judged_verifying_bits`]): the
+/// count here is both its own and the block's. For the app to say how
+/// far it goes in a symbol. Each codeword is a
 /// point of likelihood one, given its multiplicity as [`multiplicities`]
 /// gives it, and a codeword of the code agreeing with the block on
 /// points whose multiplicities sum past the curve's weighted degree is a
@@ -759,7 +881,7 @@ pub fn hard_reach(n: usize, ec_len: usize, cost: usize, needed: u32) -> usize {
         return 0;
     }
     let block = vec![CwRead::known(0); n];
-    let mut m = multiplicities(&points(&block, &vec![[CERTAIN; 8]; n]), usable_cost(n, ec_len, cost));
+    let mut m = multiplicities(&points(&block, &vec![[CERTAIN; 8]; n]), usable_cost(n, ec_len, cost), n - ec_len - 1);
     let total: usize = m.iter().map(|&m| m * (m + 1) / 2).sum();
     let (_, delta) = list_size(total, n - ec_len - 1);
     m.sort_unstable();
@@ -1142,6 +1264,88 @@ mod tests {
         }
         let found = rs_decode_listing(&read, &vec![[CERTAIN; 8]; 45], 30, 0, LIST_COST_MAX, &mut Sightings::default());
         assert!(found.iter().any(|(_, s)| s.corrected == block), "{found:?}");
+    }
+
+    #[test]
+    fn codewords_read_alike_are_given_one_multiplicity_and_reach_as_far_wherever_the_errors_fall() {
+        // An M4-M block, five codewords its half of the distance, and a
+        // 3-M block, thirteen: given the default's constraints a unit at
+        // a time, their codewords had twelve or thirteen and five or six,
+        // the units past the last multiplicity all could have going to
+        // the codewords first in the block, and a curve sure of five and
+        // thirteen. Wrong in those, a codeword more was past it, where
+        // wrong elsewhere it was mostly not. Given one multiplicity alike,
+        // seven and five, they are sure of six and fourteen, wherever the
+        // wrong codewords fall, the first ones among them, at a third and
+        // a half of the constraints.
+        let mut rng = Rng(0xE7E1);
+        for (n, ec_len, reach, multiplicity) in [(24, 10, 6, 7), (70, 26, 14, 5)] {
+            let w = n - ec_len - 1;
+            let certain = vec![[CERTAIN; 8]; n];
+            let m = multiplicities(&points(&vec![CwRead::known(0); n], &certain), usable_cost(n, ec_len, LIST_COST), w);
+            assert!(m.iter().all(|&m| m == multiplicity), "({n}, {ec_len}): {m:?}");
+            assert_eq!(hard_reach(n, ec_len, LIST_COST, 0), reach, "({n}, {ec_len})");
+            for first in [true, false] {
+                let block = codeword(&mut rng, n - ec_len, ec_len);
+                let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+                let wrong = if first { (0..reach).collect() } else { rng.distinct(reach, n) };
+                for &i in &wrong {
+                    read[i].value ^= rng.nonzero();
+                }
+                let found = rs_decode_listing(&read, &certain, ec_len, 0, LIST_COST, &mut Sightings::default());
+                assert!(found.iter().any(|(_, s)| s.corrected == block), "({n}, {ec_len}) wrong in {wrong:?}: {found:?}");
+            }
+        }
+        // Read faintly, the codewords' likelihoods differ, and the units
+        // go by them as Koetter and Vardy's greedy gives them.
+        let mut read = vec![CwRead::known(0); 24];
+        read[3].value = 0x10;
+        let mut bits = vec![[CERTAIN; 8]; 24];
+        bits[3][4] = 20;
+        let m = multiplicities(&points(&read, &bits), usable_cost(24, 10, LIST_COST), 13);
+        assert!(m.iter().min() != m.iter().max(), "{m:?}");
+    }
+
+    #[test]
+    fn codewords_read_alike_keep_the_greedys_units_where_one_multiplicity_reaches_no_further() {
+        let mut rng = Rng(0x7A11);
+        let decodes = |rng: &mut Rng, n: usize, ec_len: usize, cost: usize, wrong: &[usize]| {
+            let block = codeword(rng, n - ec_len, ec_len);
+            let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
+            for &i in wrong {
+                read[i].value ^= rng.nonzero();
+            }
+            let found = rs_decode_listing(&read, &vec![[CERTAIN; 8]; n], ec_len, 0, cost, &mut Sightings::default());
+            found.iter().any(|(_, s)| s.corrected == block)
+        };
+        let alike = |n: usize, ec_len: usize, cost: usize| {
+            let m = multiplicities(&points(&vec![CwRead::known(0); n], &vec![[CERTAIN; 8]; n]), usable_cost(n, ec_len, cost), n - ec_len - 1);
+            m.iter().min() == m.iter().max()
+        };
+        // A 7-M block at a thousand and twenty-four constraints: a
+        // multiplicity of six on all forty-nine codewords is just past
+        // them, and any less alike is sure of nine, half the distance.
+        // The greedy's, six on all but one, are sure of ten, wherever the
+        // wrong codewords fall.
+        let (n, ec_len, cost) = (49, 18, 1024);
+        assert!(!alike(n, ec_len, cost));
+        assert_eq!(hard_reach(n, ec_len, cost, 0), 10);
+        for _ in 0..4 {
+            let wrong = rng.distinct(10, n);
+            assert!(decodes(&mut rng, n, ec_len, cost, &wrong), "7-M wrong in {wrong:?}");
+        }
+        // A 1-H block at five hundred and twelve: alike or a unit at a
+        // time, sure of ten. The greedy's units past the last
+        // multiplicity all could have went to the first codewords, and
+        // eleven wrong past them are reached as well.
+        let (n, ec_len, cost) = (26, 17, 512);
+        assert!(!alike(n, ec_len, cost));
+        assert_eq!(hard_reach(n, ec_len, cost, 0), 10);
+        assert!(decodes(&mut rng, n, ec_len, cost, &(n - 11..n).collect::<Vec<_>>()));
+        // A block of high rate is sure of half its distance alike only at
+        // a multiplicity of one, which adds nothing to the plain decode,
+        // and keeps the greedy's.
+        assert!(!alike(148, 30, LIST_COST));
     }
 
     #[test]

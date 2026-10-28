@@ -606,6 +606,16 @@ fn doubting_recovers_from_misread_sampled_modules() {
             "{what}: {unaided:?}"
         );
         let report = decode_plain(&grid, &layout, mask);
+        // Past what a block that reserves codewords corrects, as the
+        // standard counts errors, the faint misreads among them however
+        // they were reached: the message, never confirmed. Such a block
+        // of 1-H was once confirmed, the codewords doubted, or the bits
+        // flipped, costing the reserve nothing.
+        if block.reserved > 0 {
+            assert!(report.blocks[0].is_beyond_standard() && !report.is_trustworthy(), "{what}: {:?}", report.blocks[0].outcome);
+            assert_eq!(report.text.plain(), text, "{what}");
+            continue;
+        }
         // Doubting the faint codewords, doubting the faint bits, flipping
         // them and doubting some while flipping the rest all reach the
         // answer; whichever is confirmed by more bits is kept.
@@ -888,6 +898,16 @@ fn doubting_bits_recovers_faint_modules_in_more_codewords_than_erasures_allow() 
             "{what}: {unaided:?}"
         );
         let report = decode_plain(&grid, &layout, mask);
+        // Past what a block that reserves codewords corrects, as the
+        // standard counts errors, the faint misreads among them however
+        // they were reached: the message, never confirmed. Such a block
+        // of 1-H was once confirmed, the codewords doubted, or the bits
+        // flipped, costing the reserve nothing.
+        if block.reserved > 0 {
+            assert!(report.blocks[0].is_beyond_standard() && !report.is_trustworthy(), "{what}: {:?}", report.blocks[0].outcome);
+            assert_eq!(report.text.plain(), text, "{what}");
+            continue;
+        }
         match report.blocks[0].outcome {
             BlockOutcome::Solved { method: SolveMethod::BitReliability { doubted_bits }, errors, confidence_bits, .. } => {
                 assert!(doubted_bits >= wrong && doubted_bits < 8 * block.ec_len, "{what}: doubted {doubted_bits} bits");
@@ -975,6 +995,16 @@ fn chasing_flips_faint_bits_where_erasing_them_costs_too_much() {
             "{what}: {unaided:?}"
         );
         let report = decode_plain(&grid, &layout, mask);
+        // Past what a block that reserves codewords corrects, as the
+        // standard counts errors, the faint misreads among them however
+        // they were reached: the message, never confirmed. Such a block
+        // of 1-H was once confirmed, the codewords doubted, or the bits
+        // flipped, costing the reserve nothing.
+        if block.reserved > 0 {
+            assert!(report.blocks[0].is_beyond_standard() && !report.is_trustworthy(), "{what}: {:?}", report.blocks[0].outcome);
+            assert_eq!(report.text.plain(), text, "{what}");
+            continue;
+        }
         match report.blocks[0].outcome {
             BlockOutcome::Solved { method: SolveMethod::Chase { flipped_bits }, errors, slack, .. } => {
                 assert_eq!((flipped_bits, errors, slack), (faint, solid + faint, block.ec_len - 2 * solid), "{what}");
@@ -995,8 +1025,9 @@ fn chasing_flips_faint_bits_where_erasing_them_costs_too_much() {
     // Painted by hand, every module is certain: nothing to flip, and the
     // same count of wrong codewords stays a failure, but for the algebra,
     // which reaches thirteen wrong of the forty codewords of an 8-Q block
-    // from the bits as painted, at the edge of its bound, given four
-    // times the usual budget.
+    // from the bits as painted, at the edge of its bound, its codewords
+    // given a multiplicity of five alike at the usual budget. Given the
+    // budget a unit at a time it reached thirteen at four times it.
     let (version, ec, mask) = (SymbolVersion::Qr(8), EcLevel::Q, 2);
     let (layout, mut grid, text) = sample(version, ec, mask, &mut rng);
     let block = &layout.blocks[0];
@@ -1006,21 +1037,26 @@ fn chasing_flips_faint_bits_where_erasing_them_costs_too_much() {
     assert!(!grid.has_reliability());
     let no_list = DecodeOptions { list_decode: false, ..Default::default() };
     assert!(matches!(decode(&grid, &layout, mask, &Pins::new(), &no_list).blocks[0].outcome, BlockOutcome::Failed(_)));
-    let listing = DecodeOptions { list_cost: 8192, ..Default::default() };
-    let report = decode(&grid, &layout, mask, &Pins::new(), &listing);
-    assert!(matches!(report.blocks[0].outcome, BlockOutcome::Solved { method: SolveMethod::List { .. }, errors: 13, .. }), "{:?}", report.blocks[0].outcome);
+    let report = decode(&grid, &layout, mask, &Pins::new(), &DecodeOptions::default());
+    assert!(matches!(report.blocks[0].outcome, BlockOutcome::Solved { method: SolveMethod::List { multiplicity: 5 }, errors: 13, .. }), "{:?}", report.blocks[0].outcome);
     assert!(report.blocks[0].is_verified() && report.text.plain() == text);
 }
 
-/// The 8-Q block of [`chasing_flips_faint_bits_where_erasing_them_costs_too_much`]
-/// painted by hand thirteen codewords wrong of forty: past what list
-/// decoding reaches at its usual budget, and within what it reaches at
-/// four times that.
-fn thirteen_wrong(rng: &mut Rng) -> (SymbolLayout, ModuleGrid, String, u8) {
-    let (version, ec, mask) = (SymbolVersion::Qr(8), EcLevel::Q, 2);
+/// A version 11-Q symbol painted by hand with its first block, of
+/// fifty codewords and twenty-eight of error correction, seventeen
+/// codewords wrong: past what list decoding is sure of at its usual
+/// budget, sixteen, and wrong in the first codewords, where the units
+/// past the last multiplicity all could have go, past what it reaches
+/// beyond that where the wrong ones miss them; and within what it
+/// reaches at its most, with ten alike. The 8-Q block of
+/// [`chasing_flips_faint_bits_where_erasing_them_costs_too_much`]
+/// thirteen wrong was once so, its codewords given the budget a unit at
+/// a time; given five alike, the usual budget reaches it.
+fn seventeen_wrong(rng: &mut Rng) -> (SymbolLayout, ModuleGrid, String, u8) {
+    let (version, ec, mask) = (SymbolVersion::Qr(11), EcLevel::Q, 2);
     let (layout, mut grid, text) = sample(version, ec, mask, rng);
     let block = &layout.blocks[0];
-    for i in 0..block.ec_len / 2 + 2 {
+    for i in 0..block.ec_len / 2 + 3 {
         corrupt_codeword(&mut grid, &layout, block.codewords[i], i);
     }
     (layout, grid, text, mask)
@@ -1029,13 +1065,13 @@ fn thirteen_wrong(rng: &mut Rng) -> (SymbolLayout, ModuleGrid, String, u8) {
 #[test]
 fn a_block_tried_harder_is_searched_at_the_most_and_kept_while_it_reads_the_same() {
     let mut rng = Rng(0x4A2D);
-    let (layout, grid, text, mask) = thirteen_wrong(&mut rng);
+    let (layout, grid, text, mask) = seventeen_wrong(&mut rng);
     let opts = DecodeOptions::default();
     let own = decode(&grid, &layout, mask, &Pins::new(), &opts);
     assert!(!own.blocks[0].is_verified() && !own.blocks[0].tried_harder, "{:?}", own.blocks[0].outcome);
     let (report, harder) = decode_trying_harder(&grid, &layout, mask, &Pins::new(), &opts, &Harder::default(), &[0]);
     assert!(report.blocks[0].tried_harder);
-    assert!(matches!(report.blocks[0].outcome, BlockOutcome::Solved { errors: 13, .. }), "{:?}", report.blocks[0].outcome);
+    assert!(matches!(report.blocks[0].outcome, BlockOutcome::Solved { errors: 17, .. }), "{:?}", report.blocks[0].outcome);
     assert!(report.blocks[0].is_verified() && report.text.plain() == text);
     assert!(report.blocks[1..].iter().all(|block| !block.tried_harder), "only the block asked about");
     // A later decode takes the search while the block reads the same,
@@ -1058,7 +1094,7 @@ fn a_block_tried_harder_is_searched_at_the_most_and_kept_while_it_reads_the_same
 #[test]
 fn the_brute_force_asked_for_gives_every_attempt_the_budgets_whole() {
     let mut rng = Rng(0x4A2D);
-    let (layout, grid, text, mask) = thirteen_wrong(&mut rng);
+    let (layout, grid, text, mask) = seventeen_wrong(&mut rng);
     let listing = DecodeOptions { list_cost: 8192, erase_by_trial: false, message_evidence: false, ..Default::default() };
     let attempt = |attempts: Vec<qr_forensics::decode::pipeline::Attempt>| {
         attempts.into_iter().find(|a| (a.ec, a.mask) == (layout.ec, mask)).expect("the symbol's own format is tried")
@@ -1068,7 +1104,7 @@ fn the_brute_force_asked_for_gives_every_attempt_the_budgets_whole() {
     let shared = attempt(brute_force(&grid, &layout.func, None, &listing));
     assert!(!shared.report.blocks[0].is_verified(), "{:?}", shared.report.blocks[0].outcome);
     let whole = attempt(brute_force_whole(&grid, &layout.func, None, &listing));
-    assert!(matches!(whole.report.blocks[0].outcome, BlockOutcome::Solved { method: SolveMethod::List { .. }, errors: 13, .. }));
+    assert!(matches!(whole.report.blocks[0].outcome, BlockOutcome::Solved { method: SolveMethod::List { .. }, errors: 17, .. }));
     assert!(whole.report.is_trustworthy() && whole.report.text.plain() == text);
     // Still one of 32 decodes, for what confirms it.
     let alone = decode(&grid, &layout, mask, &Pins::new(), &listing);
@@ -1092,7 +1128,7 @@ fn the_brute_force_asked_for_gives_every_attempt_the_budgets_whole() {
     let shared = mirrored(brute_force_mirrored(&transposed, &layout.func, &listing));
     assert!(!shared.report.blocks[0].is_verified(), "{:?}", shared.report.blocks[0].outcome);
     let whole = mirrored(brute_force_mirrored_whole(&transposed, &layout.func, &listing));
-    assert!(matches!(whole.report.blocks[0].outcome, BlockOutcome::Solved { method: SolveMethod::List { .. }, errors: 13, .. }));
+    assert!(matches!(whole.report.blocks[0].outcome, BlockOutcome::Solved { method: SolveMethod::List { .. }, errors: 17, .. }));
     assert!(whole.report.is_trustworthy() && whole.report.text.plain() == text);
 }
 
@@ -1366,7 +1402,12 @@ fn rivals_the_block_as_read_lies_as_near_to_are_told_apart_by_the_message() {
     // distance from the block as read, and the block alone cannot say
     // which it is. The message can: under one the stream parses to its
     // terminator and the padding after it is the standard's, and under
-    // the other the header reads as noise.
+    // the other the header reads as noise. Each lies nine codewords from
+    // the block as read, past the eight a 1-H symbol corrects as the
+    // standard counts errors, the codewords the trials erase among them,
+    // so the one the message tells from the other is the message but is
+    // never confirmed: it was once, the codewords erased counted as
+    // erasures, which left the one codeword the standard keeps unspent.
     use qr_forensics::decode::rs::{rs_generator, soft_distance};
     let (version, ec, mask) = (SymbolVersion::Qr(1), EcLevel::H, 0);
     let layout = layout(version, ec);
@@ -1435,12 +1476,12 @@ fn rivals_the_block_as_read_lies_as_near_to_are_told_apart_by_the_message() {
 
     let report = decode_plain(&grid, &layout, mask);
     match report.blocks[0].outcome {
-        BlockOutcome::Solved { method: SolveMethod::Trial { erased: 3 }, errors, .. } => assert_eq!(errors, limit + 1),
+        BlockOutcome::Solved { method: SolveMethod::Trial { .. } | SolveMethod::List { .. }, errors, .. } => assert_eq!(errors, limit + 1),
         other => panic!("{other:?}"),
     }
     assert_eq!(report.blocks[0].rivals, 2, "told from one rival by the message");
-    assert!(report.blocks[0].is_verified());
-    assert!(report.is_trustworthy());
+    assert!(report.blocks[0].is_beyond_standard() && !report.blocks[0].is_verified());
+    assert!(!report.is_trustworthy());
     assert_eq!(report.text.plain(), text);
     for (cw, want) in block.codewords.iter().zip(&read) {
         assert_eq!(report.codewords[*cw].final_value, Some(*want));
@@ -1453,16 +1494,17 @@ fn list_decoding_reaches_a_block_wrong_in_more_codewords_than_the_trials_reach()
     // correction, so half the distance is eleven; erasing codewords by
     // trial reaches twelve by the pairs and thirteen by the fours; the
     // curve through the codewords reaches fourteen, which is the bound
-    // of the algebra for the block, and wants a multiplicity of fifteen
-    // to reach it with room to spare: twice the usual budget. Painted by
-    // hand, every module is certain, and nothing that doubts by
-    // reliability has anything to go on.
+    // of the algebra for the block, its codewords given a multiplicity
+    // of five alike within the usual budget. Given the budget a unit at
+    // a time, it wanted twice the budget and a multiplicity of fifteen
+    // to reach fourteen. Painted by hand, every module is certain, and
+    // nothing that doubts by reliability has anything to go on.
     let mut rng = Rng(0x115D);
     let (version, ec, mask) = (SymbolVersion::Qr(5), EcLevel::H, 2);
     let (layout, clean, text) = sample(version, ec, mask, &mut rng);
     let block = &layout.blocks[0];
     assert_eq!((block.codewords.len(), block.data_len, block.ec_len), (33, 11, 22));
-    let listing = DecodeOptions { list_cost: 4096, ..DecodeOptions::default() };
+    let listing = DecodeOptions::default();
     for round in 0..5 {
         let mut grid = clean.clone();
         for &i in &rng.distinct(14, 33) {
@@ -1475,8 +1517,7 @@ fn list_decoding_reaches_a_block_wrong_in_more_codewords_than_the_trials_reach()
         let report = decode(&grid, &layout, mask, &Pins::new(), &listing);
         match report.blocks[0].outcome {
             BlockOutcome::Solved { method: SolveMethod::List { multiplicity }, errors, erasures: 0, beyond_standard: false, .. } => {
-                assert_eq!(errors, 14, "{what}");
-                assert!(multiplicity >= 15, "{what}: multiplicity {multiplicity}");
+                assert_eq!((errors, multiplicity), (14, 5), "{what}");
             }
             other => panic!("{what}: {other:?}"),
         }
@@ -1560,16 +1601,20 @@ fn a_fallback_spends_the_reserve_as_the_plain_decoder_does() {
     let report = decode_plain(&grid, &layout, mask);
     assert!(matches!(report.blocks[0].outcome, BlockOutcome::Solved { method: SolveMethod::ReedSolomon, errors: 8, slack: 1, beyond_standard: false, .. }), "{:?}", report.blocks[0].outcome);
     assert!(report.blocks[0].is_verified());
-    // A fallback prefers a solution within the standard: nine wrong are
-    // reached by the trials erasing three, which leaves two to spare,
-    // over the curve's and the trials' own that leave nothing.
+    // Nine wrong are past the eight the standard corrects however they
+    // are reached: the trials erasing three of them leave two codewords
+    // of the decode's redundancy unspent, but the three erased were read,
+    // and wrong, and count as the standard counts errors. Such a solution
+    // was once within the standard's limit, and verified; it is the
+    // message all the same, marked beyond the standard.
     let mut grid = clean.clone();
     for i in rng.distinct(9, block.codewords.len()) {
         corrupt_codeword(&mut grid, &layout, block.codewords[i], rng.below(8));
     }
     let report = decode_plain(&grid, &layout, mask);
-    assert!(matches!(report.blocks[0].outcome, BlockOutcome::Solved { method: SolveMethod::Trial { erased: 3 }, errors: 9, slack: 2, beyond_standard: false, .. }), "{:?}", report.blocks[0].outcome);
-    assert!(report.blocks[0].is_verified());
+    assert!(matches!(report.blocks[0].outcome, BlockOutcome::Solved { errors: 9, beyond_standard: true, .. }), "{:?}", report.blocks[0].outcome);
+    assert!(report.blocks[0].is_beyond_standard() && !report.blocks[0].is_verified());
+    assert_eq!(report.text.plain(), text);
     // A block whose every EC codeword is reserved is held to the
     // reserve still: an M1 symbol wrong in two codewords, past the one
     // its two EC codewords detect, has no solution from anyone.

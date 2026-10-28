@@ -7,7 +7,7 @@
 //! a corner of it measure the module, and the box divided by the module is
 //! the size. A photo never passes: its ink has no clean box and no clean
 //! runs, and the fit of the fixed patterns, which the caller checks, is
-//! the last word.
+//! the last word, or, where it falls a little short, the decode.
 //!
 //! A small photo is enlarged before the pipeline sees it
 //! ([`super::adjust::Enlarge`]), smoothly, and a render so enlarged has

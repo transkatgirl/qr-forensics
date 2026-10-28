@@ -20,10 +20,13 @@ fn decode_pinned(grid: &ModuleGrid, layout: &SymbolLayout, mask: u8, pins: &Pins
     decode(grid, layout, mask, pins, &DecodeOptions::default())
 }
 
-/// Decoding without the trials of erasures, which reach a wrong codeword
-/// or two past the code on their own: for showing what pins do.
+/// Decoding without the trials of erasures and list decoding, which
+/// reach a wrong codeword or two past the code on their own: for showing
+/// what pins do. List decoding once reached no further than the code in
+/// the 3-L symbols here, its codewords given their multiplicities a unit
+/// at a time.
 fn unaided() -> DecodeOptions {
-    DecodeOptions { erase_by_trial: false, ..DecodeOptions::default() }
+    DecodeOptions { erase_by_trial: false, list_decode: false, ..DecodeOptions::default() }
 }
 
 /// One module wrong in each of the data codewords `wrong`, by their
@@ -73,48 +76,51 @@ fn a_known_beginning_solves_a_block_past_error_correction() {
 #[test]
 fn the_unread_high_bit_of_every_byte_leans_toward_ascii_without_a_pin() {
     use qr_forensics::symbol::grid::Module;
-    let (version, ec, mask) = (SymbolVersion::Qr(3), EcLevel::L, 2);
-    let layout = layout(version, ec);
+    let mask = 2;
     let text = "https://example.com/q?id=7Q2M-XK4P-99AD";
-    let clean = encode(version, ec, Some(mask), &[Segment::bytes(text)]).unwrap();
-    // The byte segment's header is twelve bits, so byte k has its high
-    // bit at stream bit 12 + 8k.
-    let module_of = |bit: usize| {
-        let (cw, place) = layout.stream_bit_location(bit).unwrap();
-        let pos = layout.codeword_modules(cw)[place as usize];
-        (pos.x as usize, pos.y as usize)
-    };
-    // The high bit of every byte unknown, and ninety more bits of the
-    // message besides, scattered: more unknown bits than the block's
-    // hundred and twenty equations, in more codewords than its fifteen
-    // of error correction can erase.
-    let unread = |text: &str, clean: &ModuleGrid| {
+    // The high bit of every byte unknown, and `others` more bits of the
+    // message besides, scattered. The byte segment's header is twelve
+    // bits, so byte k has its high bit at stream bit 12 + 8k.
+    let unread = |layout: &SymbolLayout, text: &str, clean: &ModuleGrid, others: usize| {
+        let module_of = |bit: usize| {
+            let (cw, place) = layout.stream_bit_location(bit).unwrap();
+            let pos = layout.codeword_modules(cw)[place as usize];
+            (pos.x as usize, pos.y as usize)
+        };
         let mut grid = clean.clone();
         for k in 0..text.len() {
             let (x, y) = module_of(12 + 8 * k);
             grid.set(x, y, Module::Unknown);
         }
         let mut rng = Rng(0xA5C11);
-        let mut others = 0;
-        while others < 90 {
+        let mut set = 0;
+        while set < others {
             let bit = 12 + rng.below(8 * text.len());
             let (x, y) = module_of(bit);
             if bit % 8 == 4 || grid.get(x, y) == Module::Unknown {
                 continue;
             }
             grid.set(x, y, Module::Unknown);
-            others += 1;
+            set += 1;
         }
         grid
     };
-    let grid = unread(text, &clean);
     let without = DecodeOptions { message_evidence: false, ..DecodeOptions::default() };
-    let before = decode(&grid, &layout, mask, &Pins::new(), &without);
+
+    // 3-M, which keeps none of its error correction for detecting
+    // misreads: a hundred and seventy-eight bits besides the high ones,
+    // more unknown bits than the block's two hundred and eight equations,
+    // in more codewords than its twenty-six of error correction can erase.
+    let (version, ec) = (SymbolVersion::Qr(3), EcLevel::M);
+    let unreserved = layout(version, ec);
+    let clean = encode(version, ec, Some(mask), &[Segment::bytes(text)]).unwrap();
+    let grid = unread(&unreserved, text, &clean, 178);
+    let before = decode(&grid, &unreserved, mask, &Pins::new(), &without);
     assert_eq!(before.blocks_solved(), 0);
     // Taking each unread high bit at the lean of a byte, nought but one
     // time in sixteen, leaves thirty equations to spare, and the block
     // solves bit by bit, with nothing pinned.
-    let after = decode_plain(&grid, &layout, mask);
+    let after = decode_plain(&grid, &unreserved, mask);
     assert!(after.is_trustworthy(), "{:?}", after.blocks[0].outcome);
     assert_eq!(after.text.plain(), text);
     assert!(after.blocks[0].message_evidence >= text.len(), "{}", after.blocks[0].message_evidence);
@@ -125,12 +131,32 @@ fn the_unread_high_bit_of_every_byte_leans_toward_ascii_without_a_pin() {
     assert!(matches!(after.blocks[0].outcome, BlockOutcome::Solved { risk_bits: 8..=29, .. }), "{:?}", after.blocks[0].outcome);
     assert!(after.codewords.iter().all(|cw| cw.pin.is_none()));
 
+    // 3-L keeps one of its fifteen codewords of error correction for
+    // detecting misreads. Ninety bits besides the high ones are past its
+    // hundred and twenty equations as they were past 3-M's, and the
+    // leans leave thirty to spare as they did there: the block solves to
+    // the message, but as the standard counts what was read, the high
+    // bits taken at their lean are unread, a hundred and twenty-nine
+    // eighths and the reserve's eight past the hundred and twenty, and
+    // it is never confirmed. It was once, the leaned bits counted as
+    // read where the solution bore them out.
+    let (version, ec) = (SymbolVersion::Qr(3), EcLevel::L);
+    let reserving = layout(version, ec);
+    let clean = encode(version, ec, Some(mask), &[Segment::bytes(text)]).unwrap();
+    let grid = unread(&reserving, text, &clean, 90);
+    assert_eq!(decode(&grid, &reserving, mask, &Pins::new(), &without).blocks_solved(), 0);
+    let after = decode_plain(&grid, &reserving, mask);
+    assert!(after.blocks[0].is_beyond_standard() && !after.is_trustworthy(), "{:?}", after.blocks[0].outcome);
+    assert_eq!(after.text.plain(), text);
+    assert!(after.blocks[0].message_evidence >= text.len(), "{}", after.blocks[0].message_evidence);
+
     // A message with bytes above 127 leans the same way and is wrong in
     // the two bytes of its accented letter: it reads as it is, or is
     // left unconfirmed, and never stands confirmed as something else.
+    let (version, ec) = (SymbolVersion::Qr(3), EcLevel::M);
     let accented = "café at https://example.com/";
     let clean = encode(version, ec, Some(mask), &[Segment::bytes(accented)]).unwrap();
-    let report = decode_plain(&unread(accented, &clean), &layout, mask);
+    let report = decode_plain(&unread(&unreserved, accented, &clean, 178), &unreserved, mask);
     assert!(!report.is_trustworthy() || report.text.plain() == accented, "{:?}", report.text.plain());
 }
 
@@ -184,10 +210,10 @@ fn text_is_pinned_where_it_stands_in_the_message() {
     let clean = encode(version, ec, Some(mask), &[Segment::bytes(text)]).unwrap();
     // Eight wrong, one more than the block corrects, all under the host
     // name: known from its ninth character on, it is restored. (The
-    // trials of erasures would reach the one more by themselves, and
-    // the curve of list decoding reaches it spending the codeword the
-    // standard reserves, which is offered unconfirmed; here the pins
-    // are to confirm it.)
+    // trials of erasures and the curve of list decoding would reach the
+    // one more by themselves, spending the codeword the standard
+    // reserves, and offer it unconfirmed; here the pins are to confirm
+    // it.)
     let grid = damaged(&clean, &layout, 12..=19);
     let before = decode(&grid, &layout, mask, &Pins::new(), &unaided());
     assert_eq!(before.blocks_verified(), 0);
@@ -408,8 +434,9 @@ fn a_message_whose_header_is_gone_is_pinned_from_its_start() {
 fn a_common_beginning_is_kept_only_when_error_correction_bears_it_out() {
     let (version, ec, mask) = (SymbolVersion::Qr(3), EcLevel::L, 2);
     let layout = layout(version, ec);
-    // Without the trials of erasures, which reach a wrong codeword or two
-    // past the code by themselves: the beginnings are to do it here.
+    // Without the trials of erasures and list decoding, which reach a
+    // wrong codeword or two past the code by themselves: the beginnings
+    // are to do it here.
     let opts = unaided();
     let none = Pins::new();
     // An address, with ten codewords wrong under its beginning: three

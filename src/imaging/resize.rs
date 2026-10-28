@@ -167,7 +167,7 @@ impl Taps {
 /// An image `width` by `height` of `channels` interleaved samples a
 /// pixel, row-major, resized to `to_width` by `to_height` with Magic
 /// Kernel Sharp 2013. Every channel is resized alike, so a photo with
-/// transparency is flattened first ([`super::photo::flatten_alpha`]).
+/// transparency is flattened first ([`super::photo::flatten_alpha_onto`]).
 pub fn resize<T: Sample>(data: &[T], width: usize, height: usize, channels: usize, to_width: usize, to_height: usize) -> Vec<T> {
     resize_into(data, width, height, channels, to_width, to_height)
 }

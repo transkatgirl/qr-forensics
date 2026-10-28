@@ -4,20 +4,21 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use super::abp::{ABP_ROUNDS, ABP_ROUNDS_MAX, ABP_ROUNDS_MIN, Propagated, as_tries, nth_of, rs_decode_propagating};
+use super::abp::{ABP_ROUNDS, ABP_ROUNDS_MAX, ABP_ROUNDS_MIN, Propagated, nth_of, rs_decode_propagating_against};
 use super::bch::{self, FormatAnalysis, VersionAnalysis};
 use super::bitstream::{self, Certainty, EndOfData, ParseReport, StreamBits};
 use super::clustering::Clustering;
 use super::codewords::{Pin, Pins, apply_pins, codeword_bit_mask, read_codewords};
 use super::evidence::{Laid, MessageEvidence};
 use super::likeness::{likeness_bits, stream_as_read};
-use super::list::{LIST_COST, LIST_COST_MAX, LIST_COST_MIN, rs_decode_listing};
+use super::list::{LIST_COST, LIST_COST_MAX, LIST_COST_MIN, rs_decode_listing_against};
 use super::padding::{self, TailCheck};
 use super::rs::{
     BitDoubt, BitSolveFailure, CHASE_BITS, CHASE_MAX_BITS, CwRead, DISTANCE_MARGIN, RsFailure, RsSolution, Sightings, TRIAL_SETS,
-    TRIAL_SETS_MAX, TRIAL_SETS_MIN, Trials, VERIFIED_BITS, chase_bits_among, judged, rs_decode_chasing_bits, rs_decode_doubting,
-    rs_decode_reserving, rs_decode_reserving_noting, rs_decode_trying, soft_count_bits, soft_distance, solve_bit_erasures,
-    solve_bit_erasures_doubting, solve_bit_erasures_trying, tries_charge,
+    TRIAL_SETS_MAX, TRIAL_SETS_MIN, Trials, VERIFIED_BITS, chase_bits_among, judged_by, judged_count, keeps_reserve,
+    plain_reach_holds_the_reserve, rs_decode_chasing_bits_against, rs_decode_doubting_against, rs_decode_reserving, rs_decode_reserving_noting,
+    rs_decode_trying_against, soft_count_bits, soft_count_short_of, soft_distance, solve_bit_erasures, solve_bit_erasures_doubting,
+    solve_bit_erasures_trying, tries_charge,
 };
 use super::text::{self, Charset, TextReport};
 use crate::symbol::{EcLevel, SymbolVersion};
@@ -315,6 +316,10 @@ pub enum SolveMethod {
     /// ([`super::abp`]), which overturned `flipped_bits` of the bits as
     /// read.
     BeliefPropagation { rounds: usize, flipped_bits: usize },
+    /// A codeword a solver reached and offered nothing for, verified by
+    /// what the block itself makes of it, as any codeword is whatever
+    /// found it ([`super::rs::judged`]).
+    Reached,
     /// Everything except pinned codewords treated as erased.
     PinnedOnly,
 }
@@ -334,7 +339,7 @@ pub const VERIFIED_RISK_BITS: u32 = VERIFIED_BITS;
 /// propagation, the curve and the trials of erasures, each as the
 /// options let it run. Each is a fresh chance for a block of noise to
 /// pass, and the search keeps whichever ranks best, so a solution any
-/// but the plain decode found is one of them all ([`Search::charge`]),
+/// but the plain decode found is one of them all ([`Search::share`]),
 /// besides the tries of its own solver. Those that go by reliability,
 /// the doubting, the flips, the chase and the propagation, run only
 /// where the block is `faint` with a bit each of them may doubt, flip or
@@ -398,7 +403,7 @@ impl Faint {
 /// the reliabilities the blocks that verified lowered and again with the
 /// message's evidence laid over it ([`EVIDENCE_ROUNDS`]), whichever the
 /// options and the grid allow. Each is given its share of the chances by
-/// its place among these ([`Search::charge`]).
+/// its place among these ([`Search::share`]).
 const SEARCHES_MAX: usize = 1 + 2 * EVIDENCE_ROUNDS;
 
 /// The ways each search of a block of a symbol of `version` is made at
@@ -415,11 +420,41 @@ fn ways(version: SymbolVersion) -> usize {
 /// found in the search of the block as read: [`VERIFIED_RISK_BITS`], and
 /// what it is charged for the decodes of the grid it is one of and for
 /// the search's share of the chances and the solvers of it
-/// ([`Search::charge`]), those that go by reliability only where it was
+/// ([`Search::share`]), those that go by reliability only where it was
 /// `sampled`. For saying how far a solver reaches.
 pub fn verifying_bits(version: SymbolVersion, opts: &DecodeOptions, sampled: bool) -> u32 {
-    let search = Search { as_read: true, nth: 1, ways: ways(version) };
-    VERIFIED_RISK_BITS + tries_charge(opts.tries) + search.charge(opts, false, Faint::sampled(sampled))
+    let search = Search { as_read: true, nth: 1, ways: ways(version), picked: 1 };
+    VERIFIED_RISK_BITS + whole_charge(tries_bits(opts.tries) + search.share(opts, false, Faint::sampled(sampled)))
+}
+
+/// Confirming bits the block itself must show of a codeword, by how
+/// rarely noise has any codeword so near ([`super::rs::judged`]), for the
+/// block to be verified in a decode under `opts`, found in the search of
+/// the block as read: [`VERIFIED_RISK_BITS`], a bit for the choice
+/// between that count and the soft count, and what it is charged for the
+/// decodes of the grid, and nothing for the solver that reached the
+/// codeword or its tries ([`Candidate::weigh`]). A codeword a solver
+/// reaches is verified so where its solver's own count, charged for its
+/// tries and the search's solvers ([`verifying_bits`]), falls short.
+/// For saying how far a solver reaches.
+pub fn judged_verifying_bits(opts: &DecodeOptions) -> u32 {
+    VERIFIED_RISK_BITS + 1 + whole_charge(tries_bits(opts.tries))
+}
+
+/// What a pick of `tries` is charged, in bits worked out to fractions of
+/// one: the log of them, which [`tries_charge`] takes to the bit above.
+fn tries_bits(tries: usize) -> f64 {
+    (tries.max(1) as f64).log2()
+}
+
+/// A charge worked out in fractions of a bit, to the bit above, a hair
+/// allowed for the rounding of the logarithms it was summed from. The
+/// charges a solution owes, for the tries of its solver, the decodes of
+/// the grid it is one of and its search's share of the chances, were
+/// once each taken to the bit above and then added, which lost as much
+/// as a bit for each of them after the first.
+fn whole_charge(bits: f64) -> u32 {
+    (bits - 1e-9).ceil().max(0.0) as u32
 }
 
 /// Where a search of a block stands among those a decode makes of it.
@@ -435,8 +470,30 @@ pub fn verifying_bits(version: SymbolVersion, opts: &DecodeOptions, sampled: boo
 /// stands on its own count and the decodes of the grid it is one of, so
 /// that a block read with a codeword to spare is verified as every
 /// reader has it. Its share of the chances is the whole, and every
-/// other's a share of as much again, so that what the risks claim holds
-/// to within a factor of two, a bit.
+/// other's a share of as much again.
+///
+/// Two counts judge a codeword by the block itself, whatever found it:
+/// how rarely a block of noise has any codeword so few codewords from it,
+/// the known bits of those it could not read agreeing with it as far, and
+/// how rarely any so near in bits weighed by their reliability
+/// ([`super::rs::judged`]). Each bounds the chance that some codeword of
+/// the code, any of them, lies so near noise, and so asks nothing of how
+/// many tries a solver made or how many solvers looked: a thousand
+/// patterns flipped reach no codeword that was not there to be reached.
+/// They are charged for the decodes of the grid, the ways the pins were
+/// picked among, and a bit for the choice between them, and for the
+/// search they judge by its share of as much again once more, by its
+/// place among the searches and the ways it is made ([`Charges`]): the
+/// lowered reliabilities and the evidence laid weigh the block otherwise,
+/// and the nibble filled is another block. In the search of the block as
+/// read they stand on the plain decode's whole share, its own count
+/// being the first of them at the one codeword it reaches. So what the
+/// risks claim holds to within a factor of three, a bit and a half.
+/// Those counts were once charged for the tries of the solver that found
+/// the codeword and for the solvers of its search as a solver's own
+/// count is, ten bits and more for one the chase found, and a codeword
+/// the block itself verified stood unverified for the patterns flipped
+/// to reach it.
 ///
 /// The searches are made one after another, each where those before it
 /// left the block unverified ([`Stage::solve`]), and a solution is
@@ -480,15 +537,41 @@ struct Search {
     /// with ones as well ([`ways`]), and twice again where the block is
     /// searched harder, now or before ([`Harder`]).
     ways: usize,
+    /// The ways the pins the search reaches were picked among
+    /// ([`PinsPicked`]), which the decodes of the grid count in besides
+    /// ([`DecodeOptions::tries`]): what the decode of the block's pinned
+    /// codewords alone is charged.
+    picked: usize,
 }
 
 impl Search {
     /// What a solution any but the plain decode of the block as read
-    /// found is charged, in bits, for the search's share of the chances
-    /// ([`nth_of`]), the ways it is made, and the solvers of it
-    /// ([`routes`]), the plain decode's own among them.
-    fn charge(&self, opts: &DecodeOptions, pinned: bool, faint: Faint) -> u32 {
-        tries_charge(as_tries(nth_of(self.nth, SEARCHES_MAX) * (self.ways * routes(opts, pinned, faint)) as f64))
+    /// found is charged, in bits worked out to fractions of one, for the
+    /// search's share of the chances ([`nth_of`]), the ways it is made,
+    /// and the solvers of it ([`routes`]), the plain decode's own among
+    /// them: what its solver's own count owes.
+    fn share(&self, opts: &DecodeOptions, pinned: bool, faint: Faint) -> f64 {
+        (nth_of(self.nth, SEARCHES_MAX) * (self.ways * routes(opts, pinned, faint)) as f64).log2()
+    }
+
+    /// What the counts that judge a codeword by the block itself owe the
+    /// search, in bits worked out to fractions of one: nothing for the
+    /// block as read, whose plain decode they stand beside on its whole
+    /// share, and for any other search its share of the chances by its
+    /// place and the ways it is made, whatever its solvers.
+    fn judged_share(&self) -> f64 {
+        if self.as_read { 0.0 } else { (nth_of(self.nth, SEARCHES_MAX) * self.ways as f64).log2() }
+    }
+
+    /// What the solutions of this search are charged, under `opts`.
+    fn charges(&self, opts: &DecodeOptions, pinned: bool, faint: Faint) -> Charges {
+        Charges {
+            grid: tries_bits(opts.tries),
+            pins: (self.picked.max(1) as f64).log2(),
+            share: self.share(opts, pinned, faint),
+            judged: self.judged_share(),
+            as_read: self.as_read,
+        }
     }
 
     /// The same search of the block with something laid over it or
@@ -496,6 +579,27 @@ impl Search {
     fn again(self) -> Self {
         Self { as_read: false, ..self }
     }
+}
+
+/// What the solutions of one search of a block are charged, in bits
+/// worked out to fractions of one and taken to the bit above once they
+/// are summed ([`whole_charge`]).
+#[derive(Clone, Copy, Debug)]
+struct Charges {
+    /// The decodes of the grid the search is one of, the ways the pins
+    /// were picked among counted in ([`DecodeOptions::tries`]).
+    grid: f64,
+    /// The ways the pins were picked among alone ([`Search::picked`]),
+    /// for the decode of the block's pinned codewords alone.
+    pins: f64,
+    /// The search's share of the chances among its solvers, for a
+    /// solver's own count ([`Search::share`]).
+    share: f64,
+    /// The search's share of the chances for the counts that judge a
+    /// codeword by the block itself ([`Search::judged_share`]).
+    judged: f64,
+    /// The search is of the block as read ([`Search::as_read`]).
+    as_read: bool,
 }
 
 /// The ways the pins a decode is made under were picked among
@@ -836,6 +940,21 @@ impl DecodeReport {
         self.blocks.iter().all(BlockReport::is_verified) && self.message_risk_bits().is_some_and(|bits| bits < VERIFIED_RISK_BITS)
     }
 
+    /// The message is empty and every bit after its end is nought: the
+    /// data is the zero codeword, which in the grid is the mask's own
+    /// pattern. An encoder may make such a symbol, an empty message
+    /// padded with zeros, but a texture that runs as a mask does reads
+    /// the same, every block of it confirmed as surely as a symbol's:
+    /// on a photo of a monitor, whose rows of pixels read through mask 1
+    /// as its horizontal stripes do, fifteen placements on the screen
+    /// read so, at 1 in 2^9 to 2^89. A read to be warned of, as
+    /// nothing in the decode can tell the two apart.
+    pub fn data_is_the_mask(&self) -> bool {
+        matches!(self.parse.end, EndOfData::At { .. })
+            && self.parse.segments.is_empty()
+            && self.tail.as_ref().is_some_and(|tail| tail.zero_filled)
+    }
+
     pub fn blocks_solved(&self) -> usize {
         self.blocks.iter().filter(|b| b.is_solved()).count()
     }
@@ -862,18 +981,21 @@ struct Candidate {
     outcome: BlockOutcome,
     corrected: Vec<u8>,
     doubted: Vec<u8>,
-    /// What the decodes made to reach it cost, in bits ([`tries_charge`]):
-    /// those its solver made, at the most, and those of which this
-    /// decode is one ([`DecodeOptions::tries`]), as the hard count is
-    /// charged for them ([`RsSolution::charge`]). The soft count is
-    /// charged the same, and a bit for the choice between the two
-    /// counts ([`Candidate::weigh`]), so that the two stand on one
-    /// footing and neither is the lenient one. The soft count was once
-    /// charged for the solver's decodes alone, and under a search of
-    /// every format a solution the fallbacks found stood on it as
-    /// verified where the hard count, charged for the search, fell
-    /// short of it.
-    charge: u32,
+    /// What its solver counts for it before any charge
+    /// ([`RsSolution::uncharged_bits`], [`BitDoubt::uncharged_bits`]).
+    own: u32,
+    /// What its solver's tries cost, in bits worked out to fractions of
+    /// one where the solver counts them so ([`RsSolution::charge`],
+    /// [`BitDoubt::tries`]): what its own count and the soft count, taken
+    /// as its solver's, are charged besides the decodes of the grid and
+    /// the search's share of the chances ([`Candidate::weigh`]). The soft
+    /// count is charged the same, and a bit for the choice between the
+    /// two counts, so that the two stand on one footing and neither is
+    /// the lenient one. The soft count was once charged for the solver's
+    /// decodes alone, and under a search of every format a solution the
+    /// fallbacks found stood on it as verified where the hard count,
+    /// charged for the search, fell short of it.
+    tried: f64,
     /// Bits of risk on its own ([`Candidate::weigh`]), before any other
     /// codeword found is held against it.
     alone: u32,
@@ -893,25 +1015,40 @@ struct Candidate {
 }
 
 impl Candidate {
-    fn new(outcome: BlockOutcome, corrected: Vec<u8>, doubted: Vec<u8>, charge: u32) -> Self {
-        Self { outcome, corrected, doubted, charge, alone: 0, held: 0, distance: 0 }
+    fn new(outcome: BlockOutcome, corrected: Vec<u8>, doubted: Vec<u8>, own: u32, tried: f64) -> Self {
+        Self { outcome, corrected, doubted, own, tried, alone: 0, held: 0, distance: 0 }
     }
 
     /// The candidate, found by searching the block with the message's
     /// evidence laid over it, confirmed against `block` instead, the
     /// block as read with its unread bits at their lean ([`Laid::judged`],
-    /// [`judged`]): its errors, erasures and slack, and what confirms
-    /// it, are what that block makes of its codeword, charged for its
-    /// tries as found; and it carries that charge, so that the soft count
-    /// is charged the same when it is weighed ([`Candidate::weigh`]). The
-    /// search with the evidence is one of the searches of the block the
-    /// decode counts ([`Search`]); it was once charged a bit for that
-    /// here, and a bit again as one of two decodes of the grid. None when
-    /// that block refuses it, or confirms too little of it to offer.
-    fn restated(self, block: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: usize, reserved: usize) -> Option<Self> {
+    /// [`judged`](super::rs::judged)): its errors, erasures and slack,
+    /// and what confirms it, are what that block makes of its codeword,
+    /// charged for its tries as found and for the decodes of the grid
+    /// ([`Charges::grid`]); and it carries its tries, so that the soft
+    /// count is charged the same when it is weighed ([`Candidate::weigh`]).
+    /// The search with the
+    /// evidence is one of the searches of the block the decode counts
+    /// ([`Search`]); it was once charged a bit for that here, and a bit
+    /// again as one of two decodes of the grid. None when that block
+    /// refuses it, or confirms too little of it to offer: as found, or as
+    /// it judges any codeword whatever found it, charged for the decodes
+    /// of the grid and the search's share of such counts and not for the
+    /// solver's tries ([`Candidate::weigh`]). Held to the count as found
+    /// alone, a codeword the block verified was kept back, and came back
+    /// only as one a solver reached and offered nothing for, the bits its
+    /// solver doubted lost ([`promote_reached`]).
+    fn restated(self, block: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: usize, reserved: usize, charges: Charges) -> Option<Self> {
         let BlockOutcome::Solved { method, .. } = self.outcome else { return Some(self) };
-        let charge = self.charge;
-        let solution = judged(block, bit_reliability, ec_len, reserved, self.corrected, charge)?;
+        let unknown: usize = block.iter().map(|c| c.known.count_zeros() as usize).sum();
+        let distance = soft_distance(block, bit_reliability, &self.corrected);
+        let soft = soft_count_bits(block, bit_reliability, (8 * ec_len).saturating_sub(unknown), distance);
+        let solution = judged_count(block, ec_len, reserved, self.corrected, whole_charge(self.tried + charges.grid), soft)?;
+        if solution.confidence_bits() < VERIFIED_BITS
+            && judged_by(block, ec_len, reserved, solution.corrected.clone(), whole_charge(charges.grid + charges.judged), soft).is_none()
+        {
+            return None;
+        }
         let outcome = BlockOutcome::Solved {
             method,
             errors: solution.errors,
@@ -921,28 +1058,79 @@ impl Candidate {
             risk_bits: 0,
             beyond_standard: !solution.within_standard(),
         };
-        Some(Self { outcome, corrected: solution.corrected, ..Self::new(outcome, Vec::new(), self.doubted, charge) })
+        let own = solution.uncharged_bits();
+        Some(Self { outcome, corrected: solution.corrected, ..Self::new(outcome, Vec::new(), self.doubted, own, self.tried) })
     }
 
-    /// The candidate weighed on its own: its risk is what its solver
-    /// counted for it ([`BlockOutcome::confidence_bits`]), or the soft
-    /// count ([`soft_count_bits`]) for the bits it overturns weighed by
-    /// their reliability, charged for the decodes as the solver's count
-    /// is ([`Candidate::charge`]) and one for the choice between the two
-    /// counts, whichever is the more; less `charge` for the solvers and
-    /// searches of the block it is one of ([`Search::charge`]), unless
-    /// it is the plain decode of the block `as_read`, which a candidate
+    /// The candidate weighed on its own, against `block` as the search
+    /// it was found in is charged (`charges`), its risk the more of two.
+    ///
+    /// As its solver found it: what its solver counted for it
+    /// ([`Candidate::own`]), or the soft count ([`soft_count_bits`]) for
+    /// the bits it overturns weighed by their reliability with a bit for
+    /// the choice between the two, charged for its solver's tries
+    /// ([`Candidate::tried`]), the decodes of the grid, and the solvers
+    /// and searches of the block it is one of ([`Search::share`]), unless
+    /// it is the plain decode of the block as read, which a candidate
     /// found with the message's evidence laid over the block never is
-    /// ([`Search::again`]).
-    fn weigh(mut self, block: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: usize, charge: u32, as_read: bool) -> Self {
-        let BlockOutcome::Solved { method, confidence_bits, .. } = self.outcome else { return self };
+    /// ([`Search::again`]). The charges are summed in fractions of a bit
+    /// and taken to the bit above once.
+    ///
+    /// And as the block itself judges it, whatever found it
+    /// ([`judged`](super::rs::judged)): the codewords' count or the soft
+    /// count, charged for the decodes of
+    /// the grid, the search's share of the chances for such counts
+    /// ([`Search::judged_share`]) and a bit for the choice. Where that
+    /// comes to the more, the solution stands on it. Whether it is within
+    /// the standard's limit is the same either way, what the codewords it
+    /// changes of those read and the modules unread leave of the reserve
+    /// ([`keeps_reserve`]), whatever found it. That is counted against
+    /// `read`, the block as read as the reserve counts it ([`heard`]),
+    /// which is `block` but where the message's evidence was laid over
+    /// it: a bit `block` takes at its lean ([`Laid::judged`]) is an
+    /// assumption, not a reading, and is unread there, as it was. Counted
+    /// as read, it cost nothing where the solution bore the lean out, and
+    /// a 3-L block six bytes unread and five codewords wrong, past what
+    /// the standard corrects, kept the reserve when its bytes' high bits
+    /// leaned toward text.
+    fn weigh(mut self, block: &[CwRead], read: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: usize, reserved: usize, charges: Charges) -> Self {
+        let BlockOutcome::Solved { method, .. } = self.outcome else { return self };
         let unknown: usize = block.iter().map(|c| c.known.count_zeros() as usize).sum();
         let distance = soft_distance(block, bit_reliability, &self.corrected);
-        let soft = soft_count_bits(block, bit_reliability, (8 * ec_len).saturating_sub(unknown), distance).saturating_sub(self.charge + 1);
-        let plain = matches!(method, SolveMethod::ReedSolomon) && as_read;
-        let charge = if plain { 0 } else { charge };
-        self.alone = confidence_bits.max(soft).saturating_sub(charge);
+        let soft = soft_count_bits(block, bit_reliability, (8 * ec_len).saturating_sub(unknown), distance);
+        let plain = matches!(method, SolveMethod::ReedSolomon) && charges.as_read;
+        // The decode of the pinned codewords alone is no decode of the
+        // grid as read: its own count is charged for the ways its pins
+        // were picked among and not for the grid's decodes, which change
+        // nothing of it. It was once charged for neither, the two being
+        // counted together ([`Charges::grid`]). Its soft count is of the
+        // block as read, which each decode of the grid reads afresh, and
+        // is charged for them as every other's is: charged for the pins
+        // alone, it stood two bits and more above the same count as the
+        // block judges it, and the lighter charge was the one kept.
+        let solver_grid = if matches!(method, SolveMethod::PinnedOnly) { charges.pins } else { charges.grid };
+        let share = if plain { 0.0 } else { charges.share };
+        // A codeword a solver reached and did not offer has no count of
+        // its solver's to stand on.
+        let own = if matches!(method, SolveMethod::Reached) {
+            0
+        } else {
+            let own = self.own.saturating_sub(whole_charge(self.tried + solver_grid + share));
+            own.max(soft.saturating_sub(whole_charge(self.tried + charges.grid + 1.0 + share)))
+        };
+        let charge = whole_charge(charges.grid + charges.judged);
+        // However little the block's own count comes to: short of
+        // verified, the risk is still the more of the two counts.
+        let judged = judged_count(block, ec_len, reserved, self.corrected.clone(), charge, soft).map_or(0, |solution| solution.confidence_bits());
+        self.alone = own.max(judged);
         self.set_risk(self.alone);
+        // The decode of the pinned codewords alone keeps the reserve as
+        // its own block of pins has it, every codeword not pinned unread.
+        if !matches!(method, SolveMethod::PinnedOnly)
+            && let BlockOutcome::Solved { beyond_standard, .. } = &mut self.outcome
+        {
+            *beyond_standard = !keeps_reserve(read, ec_len, reserved, &self.corrected);
+        }
         self
     }
 
@@ -966,6 +1154,30 @@ impl Candidate {
 
     fn rank(&self) -> (bool, u32, u32) {
         solve_rank(&self.outcome)
+    }
+
+    /// Solved only by spending the codewords the standard reserves.
+    fn is_beyond_standard(&self) -> bool {
+        matches!(self.outcome, BlockOutcome::Solved { beyond_standard: true, .. })
+    }
+
+    /// The decode of the block from its pins alone, keeping the reserve as
+    /// its pins count it ([`Candidate::weigh`]).
+    fn kept_by_its_pins(&self) -> bool {
+        matches!(self.outcome, BlockOutcome::Solved { method: SolveMethod::PinnedOnly, beyond_standard: false, .. })
+    }
+
+    /// The candidate, a solution of the same codeword as `other`, at the
+    /// less risk of the two on their own ([`Candidate::alone`]): what
+    /// `other` confirms of the codeword added to it, as it stands
+    /// ([`distinct_codewords`]).
+    fn confirmed_by(mut self, other: &Candidate) -> Self {
+        debug_assert_eq!(self.corrected, other.corrected);
+        if other.alone > self.alone {
+            self.alone = other.alone;
+            self.set_risk(self.alone);
+        }
+        self
     }
 }
 
@@ -1135,10 +1347,15 @@ const MAX_RIVALS: usize = 8;
 /// `block`, which is then the block as read with its unread bits at their
 /// lean ([`Laid::judged`]): one found in the evidence is restated against
 /// it ([`Candidate::restated`]), and what the evidence did to the bits
-/// that were read counts for nothing in what confirms it.
+/// that were read counts for nothing in what confirms it. Whether a
+/// solution keeps the codewords the standard reserves is counted against
+/// `read`, the block as read as the reserve counts it ([`heard`]), its
+/// unread bits unread, which is `block` itself where nothing is laid over
+/// it and no bit was read at a coin's toss ([`Candidate::weigh`]).
 #[allow(clippy::too_many_arguments)]
 fn solve_block(
     block: &[CwRead],
+    read: &[CwRead],
     bit_reliability: &[[u8; 8]],
     searched: Option<(&[CwRead], &[[u8; 8]])>,
     ec_len: usize,
@@ -1158,7 +1375,7 @@ fn solve_block(
     // only there: a search with the message's evidence laid over it was
     // once charged for it too.
     let pins_alone = !guided && block.iter().any(|c| c.pinned == 0xFF);
-    let route_charge = search_of.charge(opts, pins_alone, faint);
+    let charges = search_of.charges(opts, pins_alone, faint);
     // A codeword as a whole is as reliable as its least reliable module.
     let reliability: Vec<u8> = search_bits.iter().map(|bits| *bits.iter().min().unwrap_or(&CERTAIN)).collect();
     let mut pool: Vec<Candidate> = Vec::new();
@@ -1166,8 +1383,8 @@ fn solve_block(
     // solutions offered are held against besides each other.
     let mut seen = Sightings::default();
     let weigh = |candidate: Candidate| -> Option<Candidate> {
-        let candidate = if guided { candidate.restated(block, bit_reliability, ec_len, reserved)? } else { candidate };
-        Some(candidate.weigh(block, bit_reliability, ec_len, route_charge, search_of.as_read))
+        let candidate = if guided { candidate.restated(block, bit_reliability, ec_len, reserved, charges)? } else { candidate };
+        Some(candidate.weigh(block, read, bit_reliability, ec_len, reserved, charges))
     };
     let verified_so_far = |pool: &[Candidate]| pool.iter().any(Candidate::verified_alone);
     let erased = search.iter().filter(|c| c.is_erasure()).count();
@@ -1177,12 +1394,16 @@ fn solve_block(
     // such a solution all the same, as a last resort, marked as beyond
     // the standard and never verified, and the fallbacks offer theirs
     // the same way, each preferring a solution within the standard where
-    // it finds one ([`super::rs::preferring_the_standard`]): on a
-    // version 1 or 2 symbol, or a Micro QR, that is the only way past
-    // what the plain decoder reaches. A block whose every EC codeword is
-    // reserved, as M1's, the chase, the curve and the propagation leave
-    // alone: there the reserve is all there is, and flipping bits until
-    // the check passes is correction by another name.
+    // it finds one ([`super::rs::preferring_the_standard`]). Whether a
+    // solution is so is what it changes of the block as read, whatever
+    // found it ([`keeps_reserve`]): on a version 1 to 3 symbol, or a
+    // Micro QR, the wrong codewords the fallbacks reach past what the
+    // plain decoder corrects spend the reserve, and what they bring is
+    // confirmation of the codeword it finds, and the modules that could
+    // not be read solved for bit by bit. A block whose every EC codeword
+    // is reserved, as M1's, the chase, the curve and the propagation
+    // leave alone: there the reserve is all there is, and flipping bits
+    // until the check passes is correction by another name.
     let rs_outcome = |method: SolveMethod, solution: &RsSolution| BlockOutcome::Solved {
         method,
         errors: solution.errors,
@@ -1191,6 +1412,14 @@ fn solve_block(
         confidence_bits: solution.confidence_bits(),
         risk_bits: 0,
         beyond_standard: !solution.within_standard(),
+    };
+    // A solution of a solver of codewords: shown as its solver counts it,
+    // charged for the decodes of the grid, and weighed from what it counts
+    // before any charge and what its solver's tries cost.
+    let rs_candidate = |method: SolveMethod, solution: RsSolution, doubted: Vec<u8>| {
+        let (own, tried) = (solution.uncharged_bits(), f64::from(solution.charge));
+        let outcome = rs_outcome(method, &solution.clone().among(opts.tries));
+        weigh(Candidate::new(outcome, solution.corrected, doubted, own, tried))
     };
     let bit_outcome = |doubt: &BitDoubt| {
         let method = match (doubt.erased.len(), doubt.flipped_bits() as usize) {
@@ -1208,26 +1437,38 @@ fn solve_block(
             // to pass, whatever solved the block.
             confidence_bits: doubt.confidence_bits().saturating_sub(tries_charge(opts.tries)),
             risk_bits: 0,
-            beyond_standard: doubt.solution.spare_equations < 8 * reserved,
+            // As the standard counts it, whatever bits were solved for:
+            // two codewords for each codeword read and changed, and an
+            // eighth of one for each module unread ([`keeps_reserve`]).
+            // The spare equations stood in for the unused codewords once,
+            // eight to a codeword, and a bit doubted took one of them as a
+            // bit unread does: a block wrong past the standard's limit,
+            // the faint bits of its wrong codewords doubted, kept the
+            // reserve so.
+            beyond_standard: !keeps_reserve(search, ec_len, reserved, &doubt.solution.corrected),
         }
     };
     let bit_candidate = |doubt: BitDoubt| {
         let outcome = bit_outcome(&doubt);
-        weigh(Candidate::new(outcome, doubt.solution.corrected, doubt.doubted, tries_charge(doubt.tries) + tries_charge(opts.tries)))
+        let (own, tried) = (doubt.uncharged_bits(), tries_bits(doubt.tries));
+        weigh(Candidate::new(outcome, doubt.solution.corrected, doubt.doubted, own, tried))
     };
     let flips = opts.reliability && opts.flip_bits;
     let chase_bits = chase_bits_among(opts.chase_bits, opts.shared);
 
     let mut exact_solved = false;
-    let failure = match rs_decode_reserving_noting(search, ec_len, reserved, &mut seen).map(|s| s.among(opts.tries)) {
+    let failure = match rs_decode_reserving_noting(search, ec_len, reserved, &mut seen) {
         Ok(solution) => {
             seen.see(&solution.corrected);
             // One that overturns bits read in the codewords it filled in
             // leaves the search for another open, as it did when such a
-            // solution was refused outright.
-            exact_solved = solution.flipped_known_bits == 0;
-            let outcome = rs_outcome(SolveMethod::ReedSolomon, &solution);
-            match weigh(Candidate::new(outcome, solution.corrected, Vec::new(), solution.charge)) {
+            // solution was refused outright; and so does one that spends
+            // the codewords the standard reserves where a codeword that
+            // keeps them may lie past the exact decoder's reach
+            // ([`plain_reach_holds_the_reserve`]).
+            exact_solved = solution.flipped_known_bits == 0
+                && (keeps_reserve(read, ec_len, reserved, &solution.corrected) || plain_reach_holds_the_reserve(search, read));
+            match rs_candidate(SolveMethod::ReedSolomon, solution, Vec::new()) {
                 Some(candidate) if candidate.verified_alone() => return BlockSolve::solved(candidate).framed(block, bit_reliability, &seen),
                 Some(candidate) => pool.push(candidate),
                 None => {}
@@ -1242,7 +1483,18 @@ fn solve_block(
     // wrong names the same codeword with a unit of redundancy more to
     // spare, for nothing: a wrong codeword costs two and an erasure one.
     // Nor, for the same reason, for one it solved as searched, whose
-    // solution the block as read refused.
+    // solution the block as read refused. Nor where its solution spends
+    // the codewords the standard reserves and the block searched reads
+    // as the block as read does, every codeword whole or unread: one that
+    // keeps them, as the standard counts a solution's errors against the
+    // block as read ([`keeps_reserve`]), would lie within half the code's
+    // distance as well, where there is no other, and the curve and the
+    // trials would find only codewords past the standard's limit too.
+    // Where a codeword is read in part, or the search reads what the block
+    // as read leaves unread, one that keeps them may lie past the exact
+    // decoder's reach ([`plain_reach_holds_the_reserve`]), and the search
+    // goes on: it once stopped there, and the exact decoder's codeword,
+    // past the standard's limit, stood in the place of one within it.
     let exact_failed = !exact_solved;
 
     let mut partial = None;
@@ -1259,10 +1511,9 @@ fn solve_block(
                     slack: 0,
                     confidence_bits: (solution.spare_equations as u32).saturating_sub(tries_charge(opts.tries)),
                     risk_bits: 0,
-                    // Spare equations stand in for unused codewords.
-                    beyond_standard: solution.spare_equations < 8 * reserved,
+                    beyond_standard: !keeps_reserve(search, ec_len, reserved, &solution.corrected),
                 };
-                pool.extend(weigh(Candidate::new(outcome, solution.corrected, Vec::new(), tries_charge(opts.tries))));
+                pool.extend(weigh(Candidate::new(outcome, solution.corrected, Vec::new(), solution.spare_equations as u32, 0.0)));
             }
             Ok(solution) => partial = Some(solution),
             Err(_) => {}
@@ -1279,17 +1530,15 @@ fn solve_block(
 
     if opts.reliability
         && opts.doubt_codewords
-        && let Some((doubted, solution)) = memo.doubt(search, &reliability, ec_len, reserved, &mut seen)
+        && let Some((doubted, solution)) = memo.doubt(search, read, &reliability, ec_len, reserved, &mut seen)
     {
-        let solution = solution.among(opts.tries);
-        let outcome = rs_outcome(SolveMethod::Reliability { doubted }, &solution);
         // The codewords doubted are those the solution took as erased
         // that were read in full.
         let mut which = vec![0u8; block.len()];
         for erratum in solution.errata.iter().filter(|e| e.was_erasure && !search[e.index].is_erasure()) {
             which[erratum.index] = 0xFF;
         }
-        pool.extend(weigh(Candidate::new(outcome, solution.corrected, which, solution.charge)));
+        pool.extend(rs_candidate(SolveMethod::Reliability { doubted }, solution, which));
     }
 
     // Doubting bits rather than codewords reaches damage spread over more
@@ -1312,11 +1561,9 @@ fn solve_block(
     // solvers below: a thousand decodes buy nothing a verified solution
     // has not.
     if flips && !verified_so_far(&pool) {
-        let found = memo.chase(search, search_bits, ec_len, reserved, chase_bits, &mut seen).into_iter().filter_map(|(flipped, solution)| {
-            let solution = solution.among(opts.tries);
+        let found = memo.chase(search, read, search_bits, ec_len, reserved, chase_bits, &mut seen).into_iter().filter_map(|(flipped, solution)| {
             let flipped_bits = flipped.iter().map(|bits| bits.count_ones() as usize).sum();
-            let outcome = rs_outcome(SolveMethod::Chase { flipped_bits }, &solution);
-            weigh(Candidate::new(outcome, solution.corrected, flipped, solution.charge))
+            rs_candidate(SolveMethod::Chase { flipped_bits }, solution, flipped)
         });
         pool.extend(found);
     }
@@ -1334,12 +1581,10 @@ fn solve_block(
         let rounds = opts.rounds();
         let trials = Trials { flips, free: opts.erase_by_trial && exact_failed, sets: opts.trial_sets };
         let chase = if flips { chase_bits } else { 0 };
-        let found = memo.propagate(search, search_bits, ec_len, reserved, rounds, trials, chase, &mut seen).into_iter().filter_map(
+        let found = memo.propagate(search, read, search_bits, ec_len, reserved, rounds, trials, chase, &mut seen).into_iter().filter_map(
             |(rounds, flipped, solution)| {
-                let solution = solution.among(opts.tries);
                 let flipped_bits = flipped.iter().map(|bits| bits.count_ones() as usize).sum();
-                let outcome = rs_outcome(SolveMethod::BeliefPropagation { rounds, flipped_bits }, &solution);
-                weigh(Candidate::new(outcome, solution.corrected, flipped, solution.charge))
+                rs_candidate(SolveMethod::BeliefPropagation { rounds, flipped_bits }, solution, flipped)
             },
         );
         pool.extend(found);
@@ -1359,14 +1604,12 @@ fn solve_block(
     if opts.list_decode && opts.list_cost > 0 && exact_failed && !verified_so_far(&pool) {
         let certain = vec![[CERTAIN; 8]; block.len()];
         let weighed = if opts.reliability { search_bits } else { &certain[..] };
-        let found = memo.list(search, weighed, ec_len, reserved, opts.list_cost, &mut seen).into_iter().filter_map(|(multiplicity, solution)| {
-            let solution = solution.among(opts.tries);
-            let outcome = rs_outcome(SolveMethod::List { multiplicity }, &solution);
+        let found = memo.list(search, read, weighed, ec_len, reserved, opts.list_cost, &mut seen).into_iter().filter_map(|(multiplicity, solution)| {
             let mut which = vec![0u8; block.len()];
             for erratum in solution.errata.iter().filter(|e| !e.was_erasure) {
                 which[erratum.index] = erratum.magnitude & search[erratum.index].known;
             }
-            weigh(Candidate::new(outcome, solution.corrected, which, solution.charge))
+            rs_candidate(SolveMethod::List { multiplicity }, solution, which)
         });
         pool.extend(found);
     }
@@ -1377,14 +1620,12 @@ fn solve_block(
     // doubt, and the dearest, every set of the block's codewords being
     // a decode. Only when nothing above has verified the block.
     if opts.erase_by_trial && exact_failed && !verified_so_far(&pool) {
-        let found = memo.trial(search, search_bits, ec_len, reserved, opts.trial_sets, &mut seen).into_iter().filter_map(|(erased, solution)| {
-            let solution = solution.among(opts.tries);
-            let outcome = rs_outcome(SolveMethod::Trial { erased: erased.len() }, &solution);
+        let found = memo.trial(search, read, search_bits, ec_len, reserved, opts.trial_sets, &mut seen).into_iter().filter_map(|(erased, solution)| {
             let mut which = vec![0u8; block.len()];
             for &i in &erased {
                 which[i] = search[i].known & !search[i].pinned;
             }
-            weigh(Candidate::new(outcome, solution.corrected, which, solution.charge))
+            rs_candidate(SolveMethod::Trial { erased: erased.len() }, solution, which)
         });
         pool.extend(found);
     }
@@ -1408,7 +1649,8 @@ fn solve_block(
                 risk_bits: 0,
                 beyond_standard: !solution.within_standard(),
             };
-            pool.extend(weigh(Candidate::new(outcome, solution.corrected, Vec::new(), solution.charge)));
+            let (own, tried) = (solution.uncharged_bits(), f64::from(solution.charge));
+            pool.extend(weigh(Candidate::new(outcome, solution.corrected, Vec::new(), own, tried)));
         }
     }
 
@@ -1418,6 +1660,7 @@ fn solve_block(
     // distance, those no solver offered among them, and the best ranked
     // first.
     let mut distinct = distinct_codewords(pool, block, bit_reliability);
+    promote_reached(&mut distinct, &seen, block, read, bit_reliability, ec_len, reserved, charges);
     let unoffered: Vec<u32> = seen
         .codewords()
         .filter(|&codeword| distinct.iter().all(|held| held.corrected != codeword))
@@ -1456,14 +1699,32 @@ fn solve_block(
 /// the first solution found of a codeword, and one ranked above it that
 /// took its place carried nought: the message's arbitration then
 /// measured its margins from the block as read itself.
+///
+/// The decode of a block from its pins alone that keeps the reserve as
+/// its pins count it stands for its codeword wherever another solution
+/// of it spends the reserve as the block as read counts it, with what
+/// that one confirms of the codeword where it is the more
+/// ([`Candidate::confirmed_by`]): the pins name the codeword, and the
+/// standard's reserve, there to catch a misread, has nothing of theirs to
+/// catch, while the other solvers can still add confirmation to it. The
+/// better ranked was once kept alone, and a block its pins solved within
+/// the standard, and a chase confirmed past it, was left unverified.
 fn distinct_codewords(pool: Vec<Candidate>, block: &[CwRead], bit_reliability: &[[u8; 8]]) -> Vec<Candidate> {
     let mut distinct: Vec<Candidate> = Vec::new();
     for candidate in pool {
         match distinct.iter_mut().find(|held| held.corrected == candidate.corrected) {
             Some(held) => {
-                if candidate.rank() > held.rank() {
-                    *held = Candidate { distance: held.distance, ..candidate };
-                }
+                let distance = held.distance;
+                let kept = if held.kept_by_its_pins() && candidate.is_beyond_standard() {
+                    held.clone().confirmed_by(&candidate)
+                } else if candidate.kept_by_its_pins() && held.is_beyond_standard() {
+                    candidate.confirmed_by(held)
+                } else if candidate.rank() > held.rank() {
+                    candidate
+                } else {
+                    continue;
+                };
+                *held = Candidate { distance, ..kept };
             }
             None => {
                 let distance = soft_distance(block, bit_reliability, &candidate.corrected);
@@ -1472,6 +1733,91 @@ fn distinct_codewords(pool: Vec<Candidate>, block: &[CwRead], bit_reliability: &
         }
     }
     distinct
+}
+
+/// `block` as the reserve the standard keeps counts what was read of it
+/// ([`keeps_reserve`]): every bit read at a reliability of nought, a
+/// coin's toss that says nothing either way ([`super::rs::bit_cost`]),
+/// taken as unread, as a module painted as a guess is meant to be. A
+/// module read at any reliability above that is a reading, and a misread
+/// where a solution overturns it. `bit_reliability` is what the modules
+/// were read at, never what a round of the decode lowered it to
+/// ([`Clustering::lowered`]): lowering a module beside errors located is
+/// doubting it after the fact, and a doubted module is read. Taken from
+/// the lowered reliabilities, a solid module lowered to nought was
+/// counted unread, at an eighth of a codeword where the standard counts
+/// two, and a solution past its limit could keep the reserve.
+fn heard(block: &[CwRead], bit_reliability: &[[u8; 8]]) -> Vec<CwRead> {
+    block
+        .iter()
+        .zip(bit_reliability)
+        .map(|(cw, bits)| {
+            let read = cw.known & !cw.pinned;
+            let guessed = (0..8u8).filter(|&b| read >> b & 1 != 0 && bits[usize::from(b)] == 0).fold(0u8, |m, b| m | 1 << b);
+            CwRead { value: cw.value & !guessed, known: cw.known & !guessed, pinned: cw.pinned }
+        })
+        .collect()
+}
+
+/// The codewords a solver reached and offered nothing for that the block
+/// itself verifies, added to `distinct`, the codewords offered, as
+/// solutions of their own ([`SolveMethod::Reached`]). A solver keeps back
+/// a codeword its own count, charged for its tries, would not verify
+/// ([`super::rs::Offering`]), and the propagation's doubting and chase,
+/// and every solver searching the block with the message's evidence laid
+/// over it, tell the codewords they reach apart by another block than
+/// this one, the beliefs' word or the evidence's, and keep the nearest of
+/// that; what the block itself makes of a codeword, by how rarely noise
+/// lies so near one ([`judged`](super::rs::judged)), asks nothing of
+/// what reached it. Only a codeword the block as read lies as near to as
+/// to any reached, within
+/// the tie ([`DISTANCE_MARGIN`]), is weighed: of any further off, the
+/// nearer codeword is the likelier by more than a byte, and holds it
+/// down to nothing ([`held_against`]). Such a codeword once only held
+/// down the solutions offered, the block's own among them, and a block
+/// failed with the codeword it was in hand, unoffered. Whether such a
+/// codeword keeps the reserve is counted against `read`, the block as
+/// read ([`Candidate::weigh`]).
+#[allow(clippy::too_many_arguments)]
+fn promote_reached(
+    distinct: &mut Vec<Candidate>,
+    seen: &Sightings,
+    block: &[CwRead],
+    read: &[CwRead],
+    bit_reliability: &[[u8; 8]],
+    ec_len: usize,
+    reserved: usize,
+    charges: Charges,
+) {
+    let unoffered: Vec<(&[u8], u32)> = seen
+        .codewords()
+        .filter(|&codeword| distinct.iter().all(|held| held.corrected != codeword))
+        .map(|codeword| (codeword, soft_distance(block, bit_reliability, codeword)))
+        .collect();
+    let Some(nearest) = distinct.iter().map(|held| held.distance).chain(unoffered.iter().map(|&(_, distance)| distance)).min() else { return };
+    let charge = whole_charge(charges.grid + charges.judged);
+    let unknown: usize = block.iter().map(|c| c.known.count_zeros() as usize).sum();
+    for (codeword, distance) in unoffered {
+        if distance >= nearest + DISTANCE_MARGIN {
+            continue;
+        }
+        // The soft count only as far as it verifies the codeword: one far
+        // from the block as read, which noise lies as near to as often as
+        // not, is refused on its first few bits.
+        let soft = soft_count_short_of(block, bit_reliability, (8 * ec_len).saturating_sub(unknown), distance, VERIFIED_BITS + 1 + charge);
+        let Some(solution) = judged_by(block, ec_len, reserved, codeword.to_vec(), charge, soft) else { continue };
+        let outcome = BlockOutcome::Solved {
+            method: SolveMethod::Reached,
+            errors: solution.errors,
+            erasures: solution.erasures,
+            slack: solution.slack,
+            confidence_bits: solution.confidence_bits(),
+            risk_bits: 0,
+            beyond_standard: !solution.within_standard(),
+        };
+        let candidate = Candidate::new(outcome, solution.corrected, Vec::new(), 0, 0.0).weigh(block, read, bit_reliability, ec_len, reserved, charges);
+        distinct.push(Candidate { distance, ..candidate });
+    }
 }
 
 /// The risk, in bits, of a solution wrong no oftener than once in two to
@@ -1568,13 +1914,16 @@ fn bit_reliabilities(layout: &SymbolLayout, module_reliability: &[u8]) -> Vec<[u
 /// laid over it, and judged as read with its unread bits at their lean
 /// ([`solve_block`]), the nibble filled the same way in both. The search
 /// with the nibble filled is one of the ways the search is made
-/// ([`ways`]), and is not of the block as read.
+/// ([`ways`]), and is not of the block as read. `sampled` is what each
+/// bit was read at, which `bit_reliability` is too but in a round that
+/// lowered it: what the reserve counts as read is told by it ([`heard`]).
 #[allow(clippy::too_many_arguments)]
 fn solve_spec(
     layout: &SymbolLayout,
     spec: &BlockSpec,
     pinned: &[CwRead],
     bit_reliability: &[[u8; 8]],
+    sampled: &[[u8; 8]],
     laid: Option<&Laid>,
     opts: &DecodeOptions,
     search_of: Search,
@@ -1582,12 +1931,14 @@ fn solve_spec(
 ) -> BlockSolve {
     let read: Vec<CwRead> = spec.codewords.iter().map(|&cw| pinned[cw]).collect();
     let read_bits: Vec<[u8; 8]> = spec.codewords.iter().map(|&cw| bit_reliability[cw]).collect();
+    let sampled_bits: Vec<[u8; 8]> = spec.codewords.iter().map(|&cw| sampled[cw]).collect();
+    let heard_read = heard(&read, &sampled_bits);
     let (block, block_bits) = match laid {
         Some(laid) => (&laid.judged[..], &laid.judged_bits[..]),
         None => (&read[..], &read_bits[..]),
     };
     let search = laid.map(|laid| (&laid.searched[..], &laid.searched_bits[..]));
-    let mut solve = solve_block(block, block_bits, search, spec.ec_len, spec.reserved, opts, search_of, memo);
+    let mut solve = solve_block(block, &heard_read, block_bits, search, spec.ec_len, spec.reserved, opts, search_of, memo);
     if tables::has_half_codeword(layout.version()) && !solve.rank().0 {
         let i = spec.data_len - 1;
         let missing = !codeword_bit_mask(layout, spec.codewords[i]);
@@ -1596,18 +1947,24 @@ fn solve_spec(
             filled[i].value |= missing;
             filled
         };
-        let filled = fill(block);
+        let (filled, filled_read) = (fill(block), fill(&heard_read));
         let filled_search = laid.map(|laid| (fill(&laid.searched), &laid.searched_bits[..]));
         let search = filled_search.as_ref().map(|(block, bits)| (&block[..], *bits));
-        let mut again = solve_block(&filled, block_bits, search, spec.ec_len, spec.reserved, opts, search_of.again(), memo);
+        let mut again = solve_block(&filled, &filled_read, block_bits, search, spec.ec_len, spec.reserved, opts, search_of.again(), memo);
         // Two searches of one block, as any two are: the filled one was
         // once taken with nothing said of the codewords the other had
         // reached, which were then forgotten.
         hold_together(&mut solve, &mut again);
         // A solution that erased the widened codeword by trial owes
         // nothing to the ones: it filled the codeword with whatever fit,
-        // and only counted the nibble as one wrong codeword more.
-        let owes_to_ones = again.doubted.get(i).is_none_or(|&doubted| doubted & missing == 0);
+        // and only counted the nibble as one wrong codeword more. Nor
+        // does one whose codeword there holds anything but ones in the
+        // nibble, whatever reached it: a codeword a solver reached and
+        // offered nothing for doubts no bit ([`promote_reached`]), and
+        // one so reached with the nibble at nought was once said to be
+        // padded with ones.
+        let padded = again.corrected.as_ref().is_none_or(|corrected| corrected[i] & missing == missing);
+        let owes_to_ones = padded && again.doubted.get(i).is_none_or(|&doubted| doubted & missing == 0);
         if owes_to_ones && again.rank() > solve.rank() {
             again.half_padded_with_ones = true;
             solve = again;
@@ -1765,7 +2122,10 @@ fn parsed_of(layout: &SymbolLayout, stream: StreamBits) -> Parsed {
     // A stream that ends before its first segment is a message only when
     // what follows is the padding an empty message has. Under a wrong
     // mask or on a wrong placement the stream is noise, and noise begins
-    // with a terminator's zeros once in sixteen tries.
+    // with a terminator's zeros once in sixteen tries. Zeros to the end
+    // explain it too, as an encoder may pad, though the mask's own pattern
+    // reads so as well; such a read stands, and is warned of
+    // ([`DecodeReport::data_is_the_mask`]).
     let empty_unexplained = parse.segments.is_empty() && !tail_plausible;
     let stream_valid = matches!(parse.end, EndOfData::At { .. })
         && !parse.preamble_damaged
@@ -2032,20 +2392,32 @@ fn weigh_again(current: &BlockSolve, again: &BlockSolve, asked: &[Vec<u8>]) -> (
 /// The exact decode of a block, when it verifies within the standard:
 /// the first thing [`solve_block`] tries, and all a sound block needs,
 /// made alone before the hard blocks are shared over the cores, since
-/// it is microseconds and a thread is more.
-fn exact_solve(block: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: usize, reserved: usize, opts: &DecodeOptions, search_of: Search) -> Option<BlockSolve> {
-    let solution = rs_decode_reserving(block, ec_len, reserved).ok()?.among(opts.tries);
+/// it is microseconds and a thread is more. Whether it keeps the reserve
+/// is counted against `read`, the block as the reserve counts it
+/// ([`heard`]).
+fn exact_solve(
+    block: &[CwRead],
+    read: &[CwRead],
+    bit_reliability: &[[u8; 8]],
+    ec_len: usize,
+    reserved: usize,
+    opts: &DecodeOptions,
+    search_of: Search,
+) -> Option<BlockSolve> {
+    let solution = rs_decode_reserving(block, ec_len, reserved).ok()?;
+    let (own, tried) = (solution.uncharged_bits(), f64::from(solution.charge));
+    let shown = solution.clone().among(opts.tries);
     let outcome = BlockOutcome::Solved {
         method: SolveMethod::ReedSolomon,
-        errors: solution.errors,
-        erasures: solution.erasures,
-        slack: solution.slack,
-        confidence_bits: solution.confidence_bits(),
+        errors: shown.errors,
+        erasures: shown.erasures,
+        slack: shown.slack,
+        confidence_bits: shown.confidence_bits(),
         risk_bits: 0,
-        beyond_standard: !solution.within_standard(),
+        beyond_standard: !shown.within_standard(),
     };
-    let charge = search_of.charge(opts, block.iter().any(|c| c.pinned == 0xFF), Faint::of(block, bit_reliability));
-    let candidate = Candidate::new(outcome, solution.corrected, Vec::new(), solution.charge).weigh(block, bit_reliability, ec_len, charge, search_of.as_read);
+    let charges = search_of.charges(opts, block.iter().any(|c| c.pinned == 0xFF), Faint::of(block, bit_reliability));
+    let candidate = Candidate::new(outcome, solution.corrected, Vec::new(), own, tried).weigh(block, read, bit_reliability, ec_len, reserved, charges);
     candidate.verified_alone().then(|| BlockSolve::solved(candidate).framed(block, bit_reliability, &Sightings::default()))
 }
 
@@ -2055,10 +2427,17 @@ fn exact_solve(block: &[CwRead], bit_reliability: &[[u8; 8]], ec_len: usize, res
 /// among `among` ways ([`PinsPicked`]). The same reads charged otherwise
 /// are another solve, as a decode made afresh under the pins would
 /// charge them: a solve recalled from a decode under fewer ways was once
-/// shown at the risk the pins in force no longer allowed.
+/// shown at the risk the pins in force no longer allowed. And `heard`,
+/// the codewords as the reserve the standard keeps counts what was read
+/// of them ([`heard`]), which the reliabilities a round lowered do not
+/// tell: a solve is judged within the standard's limit or past it by
+/// that, and a search kept from an earlier decode of a grid whose
+/// module was read at a coin's toss then and is read now was once taken
+/// with the module counted unread.
 #[derive(Clone)]
 struct Solved {
     reads: Vec<CwRead>,
+    heard: Vec<CwRead>,
     bits: Vec<[u8; 8]>,
     laid: Option<Laid>,
     among: usize,
@@ -2066,8 +2445,8 @@ struct Solved {
 }
 
 impl Solved {
-    fn holds(&self, reads: &[CwRead], bits: &[[u8; 8]], laid: Option<&Laid>, among: usize) -> bool {
-        self.reads == reads && self.bits == bits && self.laid.as_ref() == laid && self.among == among
+    fn holds(&self, reads: &[CwRead], heard: &[CwRead], bits: &[[u8; 8]], laid: Option<&Laid>, among: usize) -> bool {
+        self.reads == reads && self.heard == heard && self.bits == bits && self.laid.as_ref() == laid && self.among == among
     }
 }
 
@@ -2078,8 +2457,8 @@ const REMEMBERED: usize = 8;
 
 /// The block as solved before from the same reads and reliabilities,
 /// searched the same way and charged for as many ways, when it was.
-fn recall(solved: &[Solved], reads: &[CwRead], bits: &[[u8; 8]], laid: Option<&Laid>, among: usize) -> Option<BlockSolve> {
-    solved.iter().find(|s| s.holds(reads, bits, laid, among)).map(|s| s.solve.clone())
+fn recall(solved: &[Solved], reads: &[CwRead], heard: &[CwRead], bits: &[[u8; 8]], laid: Option<&Laid>, among: usize) -> Option<BlockSolve> {
+    solved.iter().find(|s| s.holds(reads, heard, bits, laid, among)).map(|s| s.solve.clone())
 }
 
 fn remember(solved: &mut Vec<Solved>, entry: Solved) {
@@ -2144,19 +2523,29 @@ impl Searched {
         self.solved[b].push(entry);
     }
 
-    /// Block `b` was searched harder from `reads` and `bits`, searched as
-    /// read or with the evidence `laid` over them, charged for pins
-    /// picked among `among` ways.
-    fn holds(&self, b: usize, reads: &[CwRead], bits: &[[u8; 8]], laid: Option<&Laid>, among: usize) -> bool {
-        self.of(b).iter().any(|s| s.holds(reads, bits, laid, among))
+    /// Block `b` was searched harder from `reads`, `heard` and `bits`,
+    /// searched as read or with the evidence `laid` over them, charged
+    /// for pins picked among `among` ways.
+    fn holds(&self, b: usize, reads: &[CwRead], heard: &[CwRead], bits: &[[u8; 8]], laid: Option<&Laid>, among: usize) -> bool {
+        self.of(b).iter().any(|s| s.holds(reads, heard, bits, laid, among))
     }
 
     /// Of `solve`, the block solved under the decode's own options, and
     /// the block searched harder from the same reads, reliabilities and
     /// evidence, when it was, the better: a search at the most is charged
     /// for its many tries, and may rank below what fewer found.
-    fn better(&self, b: usize, reads: &[CwRead], bits: &[[u8; 8]], laid: Option<&Laid>, among: usize, mut solve: BlockSolve) -> BlockSolve {
-        match recall(self.of(b), reads, bits, laid, among) {
+    #[allow(clippy::too_many_arguments)]
+    fn better(
+        &self,
+        b: usize,
+        reads: &[CwRead],
+        heard: &[CwRead],
+        bits: &[[u8; 8]],
+        laid: Option<&Laid>,
+        among: usize,
+        mut solve: BlockSolve,
+    ) -> BlockSolve {
+        match recall(self.of(b), reads, heard, bits, laid, among) {
             Some(mut harder) => {
                 hold_together(&mut harder, &mut solve);
                 if harder.rank() > solve.rank() { harder } else { solve }
@@ -2165,10 +2554,10 @@ impl Searched {
         }
     }
 
-    /// Block `b` was searched harder as it reads from `reads` and `bits`,
-    /// charged for pins picked among `among` ways.
-    fn searched(&self, b: usize, reads: &[CwRead], bits: &[[u8; 8]], among: usize) -> bool {
-        self.holds(b, reads, bits, None, among)
+    /// Block `b` was searched harder as it reads from `reads`, `heard` and
+    /// `bits`, charged for pins picked among `among` ways.
+    fn searched(&self, b: usize, reads: &[CwRead], heard: &[CwRead], bits: &[[u8; 8]], among: usize) -> bool {
+        self.holds(b, reads, heard, bits, None, among)
     }
 }
 
@@ -2199,19 +2588,22 @@ struct Memo {
     propagations: Held<PropagationAsked, Vec<Propagated>>,
 }
 
-/// What a solver of codewords is given ([`Memo`]): the block, its bits'
+/// What a solver of codewords is given ([`Memo`]): the block, the block
+/// as read that the reserve is counted against ([`heard`]), its bits'
 /// reliability, its error correction and reserve, and the budget.
-type SolverAsked = (Vec<CwRead>, Vec<[u8; 8]>, usize, usize, usize);
+type SolverAsked = (Vec<CwRead>, Vec<CwRead>, Vec<[u8; 8]>, usize, usize, usize);
 /// What a solver of bits is given ([`Memo`]): the block, its bits'
 /// reliability, its error correction, and the trials it may make.
 type BitsAsked = (Vec<CwRead>, Vec<[u8; 8]>, usize, Trials);
-/// What the doubting of codewords is given ([`Memo`]): the block, its
-/// codewords' reliability, and its error correction and reserve.
-type DoubtAsked = (Vec<CwRead>, Vec<u8>, usize, usize);
-/// What the propagation is given ([`Memo`]): the block, its bits'
-/// reliability, its error correction and reserve, the rounds, the
-/// trials its doubting may make and the bits its chase flips.
-type PropagationAsked = (Vec<CwRead>, Vec<[u8; 8]>, usize, usize, usize, Trials, usize);
+/// What the doubting of codewords is given ([`Memo`]): the block, the
+/// block as read that the reserve is counted against, its codewords'
+/// reliability, and its error correction and reserve.
+type DoubtAsked = (Vec<CwRead>, Vec<CwRead>, Vec<u8>, usize, usize);
+/// What the propagation is given ([`Memo`]): the block, the block as
+/// read that the reserve is counted against, its bits' reliability, its
+/// error correction and reserve, the rounds, the trials its doubting may
+/// make and the bits its chase flips.
+type PropagationAsked = (Vec<CwRead>, Vec<CwRead>, Vec<[u8; 8]>, usize, usize, usize, Trials, usize);
 /// What a solver found, and the codewords it reached ([`Held`]).
 type Found<F> = (F, Sightings);
 
@@ -2248,24 +2640,54 @@ impl<A: Eq + std::hash::Hash, F: Clone> Held<A, F> {
 }
 
 impl Memo {
-    fn list(&self, block: &[CwRead], bits: &[[u8; 8]], ec_len: usize, reserved: usize, cost: usize, seen: &mut Sightings) -> Vec<(usize, RsSolution)> {
-        let asked = (block.to_vec(), bits.to_vec(), ec_len, reserved, cost);
-        self.lists.found(asked, seen, |seen| rs_decode_listing(block, bits, ec_len, reserved, cost, seen))
+    #[allow(clippy::too_many_arguments)]
+    fn list(
+        &self,
+        block: &[CwRead],
+        read: &[CwRead],
+        bits: &[[u8; 8]],
+        ec_len: usize,
+        reserved: usize,
+        cost: usize,
+        seen: &mut Sightings,
+    ) -> Vec<(usize, RsSolution)> {
+        let asked = (block.to_vec(), read.to_vec(), bits.to_vec(), ec_len, reserved, cost);
+        self.lists.found(asked, seen, |seen| rs_decode_listing_against(block, read, bits, ec_len, reserved, cost, seen))
     }
 
-    fn chase(&self, block: &[CwRead], bits: &[[u8; 8]], ec_len: usize, reserved: usize, flips: usize, seen: &mut Sightings) -> Vec<(Vec<u8>, RsSolution)> {
-        let asked = (block.to_vec(), bits.to_vec(), ec_len, reserved, flips);
-        self.chases.found(asked, seen, |seen| rs_decode_chasing_bits(block, bits, ec_len, reserved, flips, seen))
+    #[allow(clippy::too_many_arguments)]
+    fn chase(
+        &self,
+        block: &[CwRead],
+        read: &[CwRead],
+        bits: &[[u8; 8]],
+        ec_len: usize,
+        reserved: usize,
+        flips: usize,
+        seen: &mut Sightings,
+    ) -> Vec<(Vec<u8>, RsSolution)> {
+        let asked = (block.to_vec(), read.to_vec(), bits.to_vec(), ec_len, reserved, flips);
+        self.chases.found(asked, seen, |seen| rs_decode_chasing_bits_against(block, read, bits, ec_len, reserved, flips, seen))
     }
 
-    fn trial(&self, block: &[CwRead], bits: &[[u8; 8]], ec_len: usize, reserved: usize, sets: usize, seen: &mut Sightings) -> Vec<(Vec<usize>, RsSolution)> {
-        let asked = (block.to_vec(), bits.to_vec(), ec_len, reserved, sets);
-        self.trials.found(asked, seen, |seen| rs_decode_trying(block, bits, ec_len, reserved, sets, seen))
+    #[allow(clippy::too_many_arguments)]
+    fn trial(
+        &self,
+        block: &[CwRead],
+        read: &[CwRead],
+        bits: &[[u8; 8]],
+        ec_len: usize,
+        reserved: usize,
+        sets: usize,
+        seen: &mut Sightings,
+    ) -> Vec<(Vec<usize>, RsSolution)> {
+        let asked = (block.to_vec(), read.to_vec(), bits.to_vec(), ec_len, reserved, sets);
+        self.trials.found(asked, seen, |seen| rs_decode_trying_against(block, read, bits, ec_len, reserved, sets, seen))
     }
 
-    fn doubt(&self, block: &[CwRead], reliability: &[u8], ec_len: usize, reserved: usize, seen: &mut Sightings) -> Option<(usize, RsSolution)> {
-        let asked = (block.to_vec(), reliability.to_vec(), ec_len, reserved);
-        self.doubts.found(asked, seen, |seen| rs_decode_doubting(block, reliability, ec_len, reserved, seen))
+    fn doubt(&self, block: &[CwRead], read: &[CwRead], reliability: &[u8], ec_len: usize, reserved: usize, seen: &mut Sightings) -> Option<(usize, RsSolution)> {
+        let asked = (block.to_vec(), read.to_vec(), reliability.to_vec(), ec_len, reserved);
+        self.doubts.found(asked, seen, |seen| rs_decode_doubting_against(block, read, reliability, ec_len, reserved, seen))
     }
 
     fn doubt_bits(&self, block: &[CwRead], bits: &[[u8; 8]], ec_len: usize, trials: Trials, seen: &mut Sightings) -> Vec<BitDoubt> {
@@ -2282,6 +2704,7 @@ impl Memo {
     fn propagate(
         &self,
         block: &[CwRead],
+        read: &[CwRead],
         bits: &[[u8; 8]],
         ec_len: usize,
         reserved: usize,
@@ -2290,8 +2713,8 @@ impl Memo {
         chase: usize,
         seen: &mut Sightings,
     ) -> Vec<Propagated> {
-        let asked = (block.to_vec(), bits.to_vec(), ec_len, reserved, rounds, trials, chase);
-        self.propagations.found(asked, seen, |seen| rs_decode_propagating(block, bits, ec_len, reserved, rounds, trials, chase, seen))
+        let asked = (block.to_vec(), read.to_vec(), bits.to_vec(), ec_len, reserved, rounds, trials, chase);
+        self.propagations.found(asked, seen, |seen| rs_decode_propagating_against(block, read, bits, ec_len, reserved, rounds, trials, chase, seen))
     }
 }
 
@@ -2327,6 +2750,12 @@ fn solve_each<T: Sync>(items: &[T], solve: impl Fn(&T) -> BlockSolve + Sync) -> 
 /// from the same inputs already, and the search kept in `harder`; and
 /// of a hard one's solve and a search of it at the most from the same
 /// inputs that `harder` holds, the better is taken ([`Searched::better`]).
+/// `sampled` is what each bit was read at, before any round lowered it,
+/// which tells what the codewords the standard reserves count as read
+/// ([`heard`]): it is the grid's own however `bit_reliability` moves, and
+/// the solves `solved` remembers by their inputs, all of this grid, were
+/// made under it too. The searches `harder` keeps may be of an earlier
+/// decode of the grid as it then was, and are not told apart by it.
 /// None for the blocks not asked for.
 #[allow(clippy::too_many_arguments)]
 fn solve_blocks(
@@ -2337,53 +2766,58 @@ fn solve_blocks(
     trying: &[bool],
     pinned: &[CwRead],
     bit_reliability: &[[u8; 8]],
+    sampled: &[[u8; 8]],
     (as_read, round): (bool, usize),
     picked: &PinsPicked,
     evidence: Option<&MessageEvidence>,
     asked: &dyn Fn(usize) -> bool,
     memo: &Memo,
 ) -> Vec<Option<BlockSolve>> {
-    let inputs = |spec: &BlockSpec| -> (Vec<CwRead>, Vec<[u8; 8]>) {
-        (spec.codewords.iter().map(|&cw| pinned[cw]).collect(), spec.codewords.iter().map(|&cw| bit_reliability[cw]).collect())
+    let inputs = |spec: &BlockSpec| -> (Vec<CwRead>, Vec<CwRead>, Vec<[u8; 8]>) {
+        let reads: Vec<CwRead> = spec.codewords.iter().map(|&cw| pinned[cw]).collect();
+        let sampled_bits: Vec<[u8; 8]> = spec.codewords.iter().map(|&cw| sampled[cw]).collect();
+        let heard = heard(&reads, &sampled_bits);
+        (reads, heard, spec.codewords.iter().map(|&cw| bit_reliability[cw]).collect())
     };
     let ways_of = |b: usize| ways(layout.version()) * if trying[b] || !harder.of(b).is_empty() { 2 } else { 1 };
     let nth = if as_read { 1 } else { 2 * round };
-    let search_of: Vec<Search> = (0..layout.blocks.len()).map(|b| Search { as_read, nth, ways: ways_of(b) }).collect();
-    let guided_of: Vec<Search> = (0..layout.blocks.len()).map(|b| Search { as_read: false, nth: 2 * round + 1, ways: ways_of(b) }).collect();
     let among: Vec<usize> = (0..layout.blocks.len()).map(|b| if as_read { picked.block[b] } else { picked.all }).collect();
+    let search_of: Vec<Search> = (0..layout.blocks.len()).map(|b| Search { as_read, nth, ways: ways_of(b), picked: among[b] }).collect();
+    let guided_of: Vec<Search> =
+        (0..layout.blocks.len()).map(|b| Search { as_read: false, nth: 2 * round + 1, ways: ways_of(b), picked: among[b] }).collect();
     let opts_of: Vec<DecodeOptions> = among.iter().map(|&among| opts.one_of(among)).collect();
     let mut out: Vec<Option<BlockSolve>> = vec![None; layout.blocks.len()];
     let mut hard = Vec::new();
     for (b, spec) in layout.blocks.iter().enumerate().filter(|&(b, _)| asked(b)) {
-        let (reads, bits) = inputs(spec);
-        if let Some(solve) = recall(&solved[b], &reads, &bits, None, among[b]) {
+        let (reads, heard, bits) = inputs(spec);
+        if let Some(solve) = recall(&solved[b], &reads, &heard, &bits, None, among[b]) {
             out[b] = Some(solve);
             continue;
         }
-        match exact_solve(&reads, &bits, spec.ec_len, spec.reserved, &opts_of[b], search_of[b]) {
+        match exact_solve(&reads, &heard, &bits, spec.ec_len, spec.reserved, &opts_of[b], search_of[b]) {
             Some(solve) => {
-                remember(&mut solved[b], Solved { reads, bits, laid: None, among: among[b], solve: solve.clone() });
+                remember(&mut solved[b], Solved { reads, heard, bits, laid: None, among: among[b], solve: solve.clone() });
                 out[b] = Some(solve);
             }
             None => hard.push(b),
         }
     }
-    let solves = solve_each(&hard, |&b| solve_spec(layout, &layout.blocks[b], pinned, bit_reliability, None, &opts_of[b], search_of[b], memo));
+    let solves = solve_each(&hard, |&b| solve_spec(layout, &layout.blocks[b], pinned, bit_reliability, sampled, None, &opts_of[b], search_of[b], memo));
     let at_most: Vec<DecodeOptions> = opts_of.iter().map(|opts| opts.at_most()).collect();
     let searching = |harder: &Searched, b: usize, solve: &BlockSolve, laid: Option<&Laid>, among: usize| {
-        let (reads, bits) = inputs(&layout.blocks[b]);
-        trying[b] && !solve.rank().0 && !harder.holds(b, &reads, &bits, laid, among)
+        let (reads, heard, bits) = inputs(&layout.blocks[b]);
+        trying[b] && !solve.rank().0 && !harder.holds(b, &reads, &heard, &bits, laid, among)
     };
     let harder_of: Vec<usize> = hard.iter().zip(&solves).filter(|&(&b, solve)| searching(harder, b, solve, None, among[b])).map(|(&b, _)| b).collect();
-    let found = solve_each(&harder_of, |&b| solve_spec(layout, &layout.blocks[b], pinned, bit_reliability, None, &at_most[b], search_of[b], memo));
+    let found = solve_each(&harder_of, |&b| solve_spec(layout, &layout.blocks[b], pinned, bit_reliability, sampled, None, &at_most[b], search_of[b], memo));
     for (&b, solve) in harder_of.iter().zip(found) {
-        let (reads, bits) = inputs(&layout.blocks[b]);
-        harder.keep(b, Solved { reads, bits, laid: None, among: among[b], solve });
+        let (reads, heard, bits) = inputs(&layout.blocks[b]);
+        harder.keep(b, Solved { reads, heard, bits, laid: None, among: among[b], solve });
     }
     for (&b, solve) in hard.iter().zip(solves) {
-        let (reads, bits) = inputs(&layout.blocks[b]);
-        let solve = harder.better(b, &reads, &bits, None, among[b], solve);
-        remember(&mut solved[b], Solved { reads, bits, laid: None, among: among[b], solve: solve.clone() });
+        let (reads, heard, bits) = inputs(&layout.blocks[b]);
+        let solve = harder.better(b, &reads, &heard, &bits, None, among[b], solve);
+        remember(&mut solved[b], Solved { reads, heard, bits, laid: None, among: among[b], solve: solve.clone() });
         out[b] = Some(solve);
     }
     let Some(evidence) = evidence else { return out };
@@ -2405,15 +2839,15 @@ fn solve_blocks(
         if out[b].as_ref().is_none_or(|plain| plain.rank().0) {
             continue;
         }
-        let (reads, bits) = inputs(spec);
+        let (reads, heard, bits) = inputs(spec);
         let Some(laid) = evidence.laid(&spec.codewords, &reads, &bits, opts.reliability) else { continue };
-        match recall(&solved[b], &reads, &bits, Some(&laid), picked.all) {
+        match recall(&solved[b], &reads, &heard, &bits, Some(&laid), picked.all) {
             Some(solve) => take(&mut out, b, solve),
             None => again.push((b, laid)),
         }
     }
     let guided = |b: usize, laid: &Laid, opts: &DecodeOptions| {
-        let mut solve = solve_spec(layout, &layout.blocks[b], pinned, bit_reliability, Some(laid), opts, guided_of[b], memo);
+        let mut solve = solve_spec(layout, &layout.blocks[b], pinned, bit_reliability, sampled, Some(laid), opts, guided_of[b], memo);
         if solve.corrected.is_some() {
             solve.message_evidence = laid.moved;
         }
@@ -2425,13 +2859,13 @@ fn solve_blocks(
         again.iter().zip(&solves).filter(|&((b, laid), solve)| searching(harder, *b, solve, Some(laid), picked.all)).map(|(item, _)| item).collect();
     let found = solve_each(&harder_of, |(b, laid)| guided(*b, laid, &at_most_guided));
     for ((b, laid), solve) in harder_of.into_iter().zip(found) {
-        let (reads, bits) = inputs(&layout.blocks[*b]);
-        harder.keep(*b, Solved { reads, bits, laid: Some(laid.clone()), among: picked.all, solve });
+        let (reads, heard, bits) = inputs(&layout.blocks[*b]);
+        harder.keep(*b, Solved { reads, heard, bits, laid: Some(laid.clone()), among: picked.all, solve });
     }
     for ((b, laid), solve) in again.into_iter().zip(solves) {
-        let (reads, bits) = inputs(&layout.blocks[b]);
-        let solve = harder.better(b, &reads, &bits, Some(&laid), picked.all, solve);
-        remember(&mut solved[b], Solved { reads, bits, laid: Some(laid), among: picked.all, solve: solve.clone() });
+        let (reads, heard, bits) = inputs(&layout.blocks[b]);
+        let solve = harder.better(b, &reads, &heard, &bits, Some(&laid), picked.all, solve);
+        remember(&mut solved[b], Solved { reads, heard, bits, laid: Some(laid), among: picked.all, solve: solve.clone() });
         take(&mut out, b, solve);
     }
     out
@@ -2535,6 +2969,7 @@ impl<'a> Stage<'a> {
             &self.trying,
             &pinned,
             &self.bit_reliability,
+            &self.bit_reliability,
             (true, 0),
             &picked,
             None,
@@ -2590,6 +3025,7 @@ impl<'a> Stage<'a> {
                 &self.trying,
                 &pinned,
                 lowered_bits.as_deref().unwrap_or(&self.bit_reliability),
+                &self.bit_reliability,
                 (lowered_bits.is_none(), round),
                 &picked,
                 evidence.as_ref(),
@@ -2631,7 +3067,8 @@ impl<'a> Stage<'a> {
         for (b, (spec, block)) in layout.blocks.iter().zip(&mut blocks).enumerate() {
             let reads: Vec<CwRead> = spec.codewords.iter().map(|&cw| pinned[cw]).collect();
             let bits: Vec<[u8; 8]> = spec.codewords.iter().map(|&cw| self.bit_reliability[cw]).collect();
-            block.tried_harder = self.harder.searched(b, &reads, &bits, picked.block[b]);
+            let heard = heard(&reads, &bits);
+            block.tried_harder = self.harder.searched(b, &reads, &heard, &bits, picked.block[b]);
         }
         let Assembled { stream, parse, tail, text, stream_valid, tail_plausible } = assemble(layout, &codewords, &blocks, &pinned, opts.charset);
         let blocks_solved = blocks.iter().filter(|b| b.is_solved()).count();
@@ -3227,7 +3664,7 @@ mod tests {
             risk_bits: confidence,
             beyond_standard: false,
         };
-        Candidate { alone: confidence, held: confidence, ..Candidate::new(outcome, corrected, Vec::new(), 0) }
+        Candidate { alone: confidence, held: confidence, ..Candidate::new(outcome, corrected, Vec::new(), confidence, 0.0) }
     }
 
     /// `candidate`, the block as read lying `distance` from it.
@@ -3254,6 +3691,38 @@ mod tests {
     }
 
     #[test]
+    fn a_texture_that_runs_as_the_mask_does_is_read_and_warned_of() {
+        // Stripes a row apart, as a screen's rows of pixels make, read
+        // through mask 1: every data module the mask's own colour, so the
+        // data is the zero codeword, which its error correction confirms,
+        // and the stream ends before it begins with zeros after it. That
+        // is an empty message an encoder may have padded with zeros, and
+        // it stands, warned of.
+        let version = SymbolVersion::Qr(2);
+        let func = Arc::new(FunctionMap::new(version));
+        let layout = SymbolLayout::new(func.clone(), EcLevel::H).expect("2-H");
+        let n = version.width();
+        let stripes: Vec<bool> = (0..n * n).map(|i| crate::symbol::mask::mask_bit(version, 1, i % n, i / n)).collect();
+        let report = decode(&ModuleGrid::from_bools(n, n, &stripes), &layout, 1, &Pins::new(), &DecodeOptions::default());
+        assert!(report.is_trustworthy(), "the zero codeword is a codeword");
+        assert!(report.parse.segments.is_empty());
+        assert!(report.data_is_the_mask());
+        // An empty message padded as the standard pads it, 0xEC and 0x11
+        // in turn, is no mask's pattern, and is not warned of.
+        let symbol = qrcode_generator::qr::Encoder::new(qrcode_generator::qr::ErrorCorrection::High)
+            .version(qrcode_generator::qr::Version::new(2).unwrap())
+            .boost_error_correction(false)
+            .encode_segments(&[])
+            .unwrap();
+        let grid = ModuleGrid::from_bools(symbol.width(), symbol.height(), symbol.modules());
+        let fields = analyze(&grid, &func).format.best().cloned().expect("the format reads").fields;
+        assert_eq!(fields.ec, EcLevel::H);
+        let report = decode(&grid, &layout, fields.mask, &Pins::new(), &DecodeOptions::default());
+        assert!(report.is_trustworthy() && report.parse.segments.is_empty());
+        assert!(!report.data_is_the_mask());
+    }
+
+    #[test]
     fn a_block_searched_harder_is_never_forgotten() {
         // A decode searching a block harder searches it under each round's
         // reliabilities and evidence, and again under each set of padding
@@ -3264,12 +3733,16 @@ mod tests {
         let bits = vec![[CERTAIN; 8]];
         let reads = |i: usize| vec![CwRead::known(i as u8)];
         for i in 0..3 * REMEMBERED {
-            harder.keep(1, Solved { reads: reads(i), bits: bits.clone(), laid: None, among: 1, solve: BlockSolve::solved(candidate(vec![i as u8], 10)) });
+            let solve = BlockSolve::solved(candidate(vec![i as u8], 10));
+            harder.keep(1, Solved { reads: reads(i), heard: reads(i), bits: bits.clone(), laid: None, among: 1, solve });
         }
-        assert!((0..3 * REMEMBERED).all(|i| harder.searched(1, &reads(i), &bits, 1)));
-        assert!(!harder.searched(0, &reads(0), &bits, 1) && !harder.searched(1, &reads(3 * REMEMBERED), &bits, 1));
+        assert!((0..3 * REMEMBERED).all(|i| harder.searched(1, &reads(i), &reads(i), &bits, 1)));
+        assert!(!harder.searched(0, &reads(0), &reads(0), &bits, 1) && !harder.searched(1, &reads(3 * REMEMBERED), &reads(3 * REMEMBERED), &bits, 1));
         // Charged for pins picked among more ways, it is another search.
-        assert!(!harder.searched(1, &reads(0), &bits, 2));
+        assert!(!harder.searched(1, &reads(0), &reads(0), &bits, 2));
+        // A module read at a coin's toss then, and read now, is another
+        // search, which the reserve counts otherwise.
+        assert!(!harder.searched(1, &reads(0), &[CwRead::unknown()], &bits, 1));
     }
 
     #[test]
@@ -3401,8 +3874,8 @@ mod tests {
                                 })
                                 .collect();
                             let opts = DecodeOptions::default();
-                            let search = Search { as_read: true, nth: 1, ways: ways(SymbolVersion::Qr(5)) };
-                            let solve = solve_block(&read, &bits, None, ec_len, 0, &opts, search, &Memo::default());
+                            let search = Search { as_read: true, nth: 1, ways: ways(SymbolVersion::Qr(5)), picked: 1 };
+                            let solve = solve_block(&read, &heard(&read, &bits), &bits, None, ec_len, 0, &opts, search, &Memo::default());
                             match solve.outcome {
                                 BlockOutcome::Solved { risk_bits, method, .. } => Some((risk_bits, method)),
                                 BlockOutcome::Failed(_) => None,
@@ -3464,6 +3937,268 @@ mod tests {
         hold_against_each_other(&mut tied, &[10 + 48]);
         let rivals = rivals_among(&tied, &[10 + 48]);
         assert_eq!(rivals.iter().map(|c| (c.corrected[0], c.held)).collect::<Vec<_>>(), [(1, 6), (2, 5)]);
+    }
+
+    /// A 5-Q block of `wrong` codewords each read wrong in one faint bit,
+    /// every other bit read well, with the codeword it is.
+    fn faintly_misread(wrong: usize) -> (Vec<CwRead>, Vec<[u8; 8]>, Vec<u8>) {
+        use super::super::rs::rs_encode;
+        let mut rng = Rng(0x5EED);
+        let mut codeword: Vec<u8> = (0..15).map(|_| rng.byte()).collect();
+        codeword.extend(rs_encode(&codeword, 18));
+        let mut read: Vec<CwRead> = codeword.iter().map(|&c| CwRead::known(c)).collect();
+        let mut bits = vec![[56u8; 8]; codeword.len()];
+        for i in (0..33).step_by(3).take(wrong) {
+            let b = rng.below(8);
+            read[i].value ^= 1 << b;
+            bits[i][b] = 20;
+        }
+        (read, bits, codeword)
+    }
+
+    #[test]
+    fn a_codeword_the_block_verifies_stands_on_that_whatever_found_it() {
+        // Eleven faint bits overturned, past the nine the code corrects: a
+        // codeword the block itself verifies by the soft count many times
+        // over. Found by a solver
+        // whose own count is small and whose tries were many, it stands
+        // on what the block says of it, charged a bit for the choice
+        // between the counts and nothing for the tries or the solvers of
+        // the search; once it was charged for both, sixteen bits and five.
+        let (read, bits, codeword) = faintly_misread(11);
+        let unknown = 0;
+        let soft = soft_count_bits(&read, &bits, 8 * 18 - unknown, soft_distance(&read, &bits, &codeword));
+        assert!(soft > 60, "{soft}");
+        let chased = |errors, beyond_standard| BlockOutcome::Solved {
+            method: SolveMethod::Chase { flipped_bits: 3 },
+            errors,
+            erasures: 0,
+            slack: 0,
+            confidence_bits: 0,
+            risk_bits: 0,
+            beyond_standard,
+        };
+        let as_read = Charges { grid: 0.0, pins: 0.0, share: 4.4, judged: 0.0, as_read: true };
+        let weighed = |tried: f64, charges: Charges| {
+            let candidate = Candidate::new(chased(11, false), codeword.clone(), Vec::new(), 9, tried);
+            candidate.weigh(&read, &read, &bits, 18, 0, charges).alone
+        };
+        assert_eq!(weighed(16.0, as_read), soft - 1);
+        assert_eq!(weighed(0.0, as_read), soft - 1);
+        // Charged for the decodes of the grid, and for a search other
+        // than the block as read its share, the fourth of five, as many
+        // ways as it is made: a bit for two decodes, and four and a
+        // little, taken to the bit above once with the choice's.
+        assert_eq!(weighed(16.0, Charges { grid: 2f64.log2(), ..as_read }), soft - 2);
+        let lowered = Charges { judged: (nth_of(4, SEARCHES_MAX) * 2.0).log2(), as_read: false, ..as_read };
+        assert_eq!(weighed(16.0, lowered), soft - 1 - whole_charge(lowered.judged));
+        // Charged past verifying, the block's count still stands for what
+        // it comes to, the more of the two.
+        assert_eq!(weighed(16.0, Charges { grid: f64::from(soft - 4), ..as_read }), 3);
+        // Held to the codewords the standard reserves as the standard
+        // counts them: eleven wrong spend the one a block keeps, however
+        // rarely noise lies so near, and the count of the block stands for
+        // nothing; eight leave it unused, and the codeword is within the
+        // standard's limit, whatever its solver spent to reach it.
+        let candidate = Candidate::new(chased(11, true), codeword.clone(), Vec::new(), 9, 16.0).weigh(&read, &read, &bits, 18, 1, as_read);
+        assert!(!candidate.verified_alone());
+        let (read, bits, codeword) = faintly_misread(8);
+        let candidate = Candidate::new(chased(8, true), codeword.clone(), Vec::new(), 9, 16.0).weigh(&read, &read, &bits, 18, 1, as_read);
+        assert!(candidate.verified_alone());
+    }
+
+    #[test]
+    fn the_decode_of_the_pins_alone_is_charged_for_their_picking_and_not_the_grid() {
+        // Every codeword of its block read wrong, the decode of the pins
+        // alone stands on its own count: charged two bits for pins picked
+        // among four ways, and nothing for the decodes of the grid, which
+        // change nothing of it. It was once charged for neither.
+        let (mut read, bits, codeword) = faintly_misread(0);
+        for cw in &mut read {
+            cw.value ^= 0xFF;
+        }
+        let pinned = BlockOutcome::Solved {
+            method: SolveMethod::PinnedOnly,
+            errors: 0,
+            erasures: 18,
+            slack: 5,
+            confidence_bits: 40,
+            risk_bits: 0,
+            beyond_standard: false,
+        };
+        let charges = Charges { grid: 5.0, pins: 2.0, share: 0.0, judged: 0.0, as_read: true };
+        let candidate = Candidate::new(pinned, codeword, Vec::new(), 40, 0.0).weigh(&read, &read, &bits, 18, 0, charges);
+        assert_eq!(candidate.alone, 38);
+    }
+
+    #[test]
+    fn the_decode_of_the_pins_alone_keeps_the_reserve_and_takes_what_others_confirm_of_its_codeword() {
+        // The pins name the codeword within the standard and confirm it by
+        // three bits; a chase reaches it past the standard's limit as the
+        // block as read counts it, by twelve. The codeword stands as the
+        // pins' own, within the standard, at twelve, and is verified.
+        let (read, bits, codeword) = faintly_misread(0);
+        let solved = |method, beyond_standard| BlockOutcome::Solved {
+            method,
+            errors: 0,
+            erasures: 0,
+            slack: 0,
+            confidence_bits: 0,
+            risk_bits: 0,
+            beyond_standard,
+        };
+        let alone = |outcome, bits: u32| Candidate { alone: bits, ..Candidate::new(outcome, codeword.clone(), Vec::new(), 0, 0.0) }.at_risk(bits);
+        let pinned = alone(solved(SolveMethod::PinnedOnly, false), 3);
+        let chased = alone(solved(SolveMethod::Chase { flipped_bits: 3 }, true), 12);
+        for pool in [vec![pinned.clone(), chased.clone()], vec![chased.clone(), pinned.clone()]] {
+            let distinct = distinct_codewords(pool, &read, &bits);
+            assert_eq!(distinct.len(), 1);
+            assert!(matches!(
+                distinct[0].outcome,
+                BlockOutcome::Solved { method: SolveMethod::PinnedOnly, beyond_standard: false, risk_bits: 12, .. }
+            ));
+            assert!(distinct[0].verified_alone());
+        }
+        // Another solution within the standard is ranked against it as any.
+        let within = alone(solved(SolveMethod::Chase { flipped_bits: 3 }, false), 12);
+        let distinct = distinct_codewords(vec![pinned, within], &read, &bits);
+        assert!(matches!(distinct[0].outcome, BlockOutcome::Solved { method: SolveMethod::Chase { .. }, risk_bits: 12, .. }));
+    }
+
+    #[test]
+    fn the_reserve_is_counted_against_the_block_as_read_whatever_the_evidence_leans() {
+        // A 3-L block, fifteen codewords of error correction and one of
+        // them kept: six bytes of text unread and five codewords read
+        // wrong are past what the standard corrects, six erasures and ten
+        // for the errors against fourteen. The message's evidence leans
+        // the high three bits of each unread byte toward text, and the
+        // block a search with it is judged by takes them at their lean
+        // ([`Laid::judged`]). They were then counted as read for the
+        // reserve, and cost nothing where the solution bore them out:
+        // five eighths a byte for the bits left, 110 eighths in all with
+        // the errors, where 112 keep the reserve. Counted against the
+        // block as read they are unread, and it is spent.
+        use super::super::rs::rs_encode;
+        let mut rng = Rng(0x3E5E);
+        let mut codeword: Vec<u8> = (0..55).map(|_| 0x20 + rng.below(0x5F) as u8).collect();
+        codeword.extend(rs_encode(&codeword, 15));
+        let mut read: Vec<CwRead> = codeword.iter().map(|&c| CwRead::known(c)).collect();
+        read[..6].fill(CwRead::unknown());
+        for i in [10, 20, 30, 40, 60] {
+            read[i].value ^= 0x5A;
+        }
+        let mut bits = vec![[56u8; 8]; codeword.len()];
+        let mut judged = read.clone();
+        for i in 0..6 {
+            judged[i] = CwRead { value: codeword[i] & 0xE0, known: 0xE0, pinned: 0 };
+            bits[i] = [0, 0, 0, 0, 0, 20, 20, 20];
+        }
+        let solved = BlockOutcome::Solved {
+            method: SolveMethod::BitLevel,
+            errors: 5,
+            erasures: 6,
+            slack: 0,
+            confidence_bits: 0,
+            risk_bits: 0,
+            beyond_standard: false,
+        };
+        let charges = Charges { grid: 0.0, pins: 0.0, share: 0.0, judged: 0.0, as_read: false };
+        let beyond = |block: &[CwRead], read: &[CwRead]| {
+            let candidate = Candidate::new(solved, codeword.clone(), Vec::new(), 0, 0.0).weigh(block, read, &bits, 15, 1, charges);
+            matches!(candidate.outcome, BlockOutcome::Solved { beyond_standard: true, .. })
+        };
+        assert!(beyond(&judged, &read));
+        assert!(beyond(&read, &read));
+        assert!(!beyond(&judged, &judged), "the leaned bits taken for read keep the reserve");
+    }
+
+    #[test]
+    fn the_reserve_counts_what_was_read_however_a_round_lowered_it() {
+        // A 1-M block, ten codewords of error correction and two of them
+        // kept: five codewords read wrong, a solid bit each, are past the
+        // four the standard corrects and within the five the exact decoder
+        // reaches, spending the reserve. A round that learnt the modules
+        // beside errors to be misread lowers them, a solid one to nought
+        // where most are ([`Clustering::lowered`]). Counted from those, the
+        // five wrong bits were unread, an eighth of a codeword each, and
+        // the block kept the reserve and verified.
+        use super::super::rs::rs_encode;
+        let version = SymbolVersion::Qr(1);
+        let layout = SymbolLayout::new(Arc::new(FunctionMap::new(version)), EcLevel::M).expect("1-M");
+        let spec = &layout.blocks[0];
+        assert_eq!((spec.ec_len, spec.reserved), (10, 2));
+        let mut rng = Rng(0x10E5);
+        let mut codeword: Vec<u8> = (0..spec.data_len).map(|_| rng.byte()).collect();
+        codeword.extend(rs_encode(&codeword, spec.ec_len));
+        let mut pinned = vec![CwRead::unknown(); layout.codewords.len()];
+        let mut sampled = vec![[CERTAIN; 8]; layout.codewords.len()];
+        for (i, &cw) in spec.codewords.iter().enumerate() {
+            pinned[cw] = CwRead::known(codeword[i]);
+            sampled[cw] = [200; 8];
+        }
+        let mut lowered = sampled.clone();
+        for &i in &[0, 5, 10, 15, 20] {
+            let cw = spec.codewords[i];
+            pinned[cw].value ^= 1 << 3;
+            lowered[cw][3] = 0;
+        }
+        let opts = DecodeOptions::default();
+        let search = Search { as_read: false, nth: 2, ways: ways(version), picked: 1 };
+        let beyond = |sampled: &[[u8; 8]]| {
+            let solve = solve_spec(&layout, spec, &pinned, &lowered, sampled, None, &opts, search, &Memo::default());
+            assert_eq!(solve.corrected.as_deref(), Some(&codeword[..]));
+            matches!(solve.outcome, BlockOutcome::Solved { beyond_standard: true, .. }) && !solve.outcome.is_verified()
+        };
+        assert!(beyond(&sampled));
+        assert!(!beyond(&lowered), "counted from the lowered bits, the reserve is kept");
+        // The exact decoder's solve alone, which a sound block stops at.
+        let reads: Vec<CwRead> = spec.codewords.iter().map(|&cw| pinned[cw]).collect();
+        let bits_of = |bits: &[[u8; 8]]| -> Vec<[u8; 8]> { spec.codewords.iter().map(|&cw| bits[cw]).collect() };
+        let exact = |sampled: &[[u8; 8]]| exact_solve(&reads, &heard(&reads, &bits_of(sampled)), &bits_of(&lowered), 10, 2, &opts, search);
+        assert!(exact(&sampled).is_none());
+        assert!(exact(&lowered).is_some());
+    }
+
+    #[test]
+    fn a_codeword_reached_and_kept_back_is_a_solution_where_the_block_verifies_it() {
+        // Nothing offered, and the block's own codeword among those a
+        // solver reached: the block itself verifies it, and it is a
+        // solution of its own, where the block once failed with it in hand.
+        let (read, bits, codeword) = faintly_misread(11);
+        let as_read = Charges { grid: 0.0, pins: 0.0, share: 4.4, judged: 0.0, as_read: true };
+        let mut seen = Sightings::default();
+        seen.see(&codeword);
+        let mut distinct = Vec::new();
+        promote_reached(&mut distinct, &seen, &read, &read, &bits, 18, 0, as_read);
+        assert_eq!(distinct.len(), 1);
+        assert!(matches!(distinct[0].outcome, BlockOutcome::Solved { method: SolveMethod::Reached, .. }) && distinct[0].verified_alone());
+        assert_eq!(distinct[0].distance, soft_distance(&read, &bits, &codeword));
+        // Offered already, it is not offered twice.
+        promote_reached(&mut distinct, &seen, &read, &read, &bits, 18, 0, as_read);
+        assert_eq!(distinct.len(), 1);
+        let mut other = codeword.clone();
+        other[..15].copy_from_slice(&[0x11; 15]);
+        let ec = super::super::rs::rs_encode(&other[..15], 18);
+        other[15..].copy_from_slice(&ec);
+        // A codeword further from the block as read than one offered by
+        // the tie or more is left to hold it down, which is all it could
+        // do, though the block verifies it: the block's own, with another
+        // offered as though the tie nearer. Within the tie it is offered.
+        // This was once asked of a codeword the block does not verify,
+        // which is never offered however near, and showed nothing.
+        let near = soft_distance(&read, &bits, &codeword);
+        assert!(near >= DISTANCE_MARGIN, "{near}");
+        for (nearer_by, offered) in [(DISTANCE_MARGIN, false), (DISTANCE_MARGIN - 1, true)] {
+            let mut held = vec![Candidate { corrected: other.clone(), distance: near - nearer_by, ..distinct[0].clone() }];
+            promote_reached(&mut held, &seen, &read, &read, &bits, 18, 0, as_read);
+            assert_eq!(held.iter().any(|c| c.corrected == codeword), offered, "nearer by {nearer_by}");
+        }
+        // A codeword the block does not verify is never offered.
+        let mut far = Sightings::default();
+        far.see(&other);
+        let mut none = Vec::new();
+        promote_reached(&mut none, &far, &read, &read, &bits, 18, 0, as_read);
+        assert!(none.is_empty());
     }
 
     #[test]
@@ -3711,41 +4446,50 @@ mod tests {
 
     #[test]
     fn switching_on_the_flips_the_trials_or_the_evidence_never_loses_a_read() {
-        // Version 1-L symbols read from a photo, a few modules misread
+        // Version 2-M symbols read from a photo, a few modules misread
         // faintly, one to three solidly and a score not read. Made as one
         // decode, as a decode once was, the flips or the trials switched
-        // on lose what the others read without them: the trials lose the
-        // flips' read, the flips the trials', and each reads alone and
-        // neither with the other. The evidence once lost the flips' read
-        // in the last three and the trials' too, a solution found in the
-        // block as read being charged for the rounds of evidence that
-        // might follow it; charged for its own search's share alone
-        // ([`Search::charge`]), it keeps them even in one decode. In
-        // stages, every read made with fewer of them is made with more,
-        // and so is the brute force's.
+        // on once lost what the others read without them, every solution
+        // charged for the solvers they added, the counts that judge a
+        // codeword by the block itself among them; charged for no solver
+        // ([`Search::judged_share`]), one decode with more switched on
+        // reads what it read with fewer. The evidence once lost the
+        // flips' read and the trials' too, a solution found in the block
+        // as read being charged for the rounds of evidence that might
+        // follow it; charged for its own search's share alone
+        // ([`Search::share`]), it keeps them. In stages, every read made
+        // with fewer of them is made with more, and so is the brute
+        // force's. Of the blocks of version 1-L these were once, which
+        // reserves three codewords, none is within what the standard
+        // corrects, as it counts a solution's errors.
         let way = |flips: bool, trials: bool, evidence: bool| usize::from(flips) | usize::from(trials) << 1 | usize::from(evidence) << 2;
         let with = |i: usize| DecodeOptions { flip_bits: i & 1 != 0, erase_by_trial: i & 2 != 0, message_evidence: i & 4 != 0, ..DecodeOptions::default() };
         let more = |a: usize, b: usize| a != b && a & !b == 0;
         let (f, t) = (false, true);
-        // Each case: what one decode with more switched on loses of the
-        // read with fewer, and what it keeps.
+        // Each case: what a decode reads with one of them alone, and what
+        // it does not.
         let cases = [
-            (11, vec![(way(t, f, t), way(t, t, t))], vec![]),
-            (30, vec![(way(f, t, t), way(t, t, t))], vec![]),
-            (28, vec![(way(t, f, t), way(t, t, t)), (way(f, t, t), way(t, t, t))], vec![]),
-            (6, vec![], vec![(way(t, f, f), way(t, f, t))]),
-            (44, vec![], vec![(way(t, f, f), way(t, f, t))]),
-            (73, vec![], vec![(way(f, t, f), way(f, t, t)), (way(t, t, f), way(t, t, t))]),
+            (0, vec![way(t, f, f), way(f, t, f)], vec![way(f, f, f)]),
+            (40, vec![way(t, f, f)], vec![way(f, t, f)]),
+            (62, vec![way(f, t, f)], vec![way(t, f, f)]),
+            (22, vec![way(f, f, f)], vec![]),
         ];
-        for (seed, lost, kept) in cases {
-            let (layout, grid, mask) = damaged(1, qrcode_generator::qr::ErrorCorrection::Low, seed);
+        for (seed, read, unread) in cases {
+            let (layout, grid, mask) = damaged(2, qrcode_generator::qr::ErrorCorrection::Medium, seed);
             let pins = Pins::new();
-            let once: Vec<bool> = (0..8).map(|i| decode_stage(&grid, &layout, mask, &pins, &with(i), Searched::default(), &[], &Arc::default()).0.is_trustworthy()).collect();
-            for (fewer, with_more) in lost {
-                assert!(once[fewer] && !once[with_more], "seed {seed}: {once:?}");
+            let made: Vec<DecodeReport> = (0..8).map(|i| decode_stage(&grid, &layout, mask, &pins, &with(i), Searched::default(), &[], &Arc::default()).0).collect();
+            let once: Vec<bool> = made.iter().map(DecodeReport::is_trustworthy).collect();
+            assert!(made.iter().filter(|report| report.is_trustworthy()).all(|report| report.text.plain() == "forensics"), "seed {seed}");
+            for i in read {
+                assert!(once[i], "seed {seed}: {once:?}");
             }
-            for (fewer, with_more) in kept {
-                assert!(once[fewer] && once[with_more], "seed {seed}: {once:?}");
+            for i in unread {
+                assert!(!once[i], "seed {seed}: {once:?}");
+            }
+            for fewer in 0..8 {
+                for with_more in (0..8).filter(|&b| more(fewer, b)) {
+                    assert!(!once[fewer] || once[with_more], "seed {seed}: one decode {once:?}");
+                }
             }
             let staged: Vec<bool> = (0..8).map(|i| decode(&grid, &layout, mask, &pins, &with(i)).is_trustworthy()).collect();
             let forced: Vec<bool> =

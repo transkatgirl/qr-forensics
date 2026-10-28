@@ -366,7 +366,7 @@ impl<T: Sync, R: Send, F: Fn(&T) -> R + Sync> Spread<'_, T, R, F> {
     /// the processor's time, and a step of a few short items is done by
     /// the time a second thread would have woken.
     fn ask(&self, helpers: &Arc<Helpers>) {
-        if self.next.load(Ordering::Relaxed) < self.items.len() && self.unasked.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).is_ok() {
+        if self.next.load(Ordering::Relaxed) < self.items.len() && self.unasked.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).is_ok() {
             lend(self, helpers);
         }
     }

@@ -54,6 +54,8 @@ QR_SEARCH_BOOTSTRAP=1 cargo test --release --test search -- --ignored --nocaptur
 - `issue_3478`: after its sixteen bytes the symbol's data goes on with
   the header of a second segment that has no room for its payload, where
   a terminator should be. The message is printed as `malformed`.
+- `multiple_9_qrcodes_version7`: eight of its nine symbols read. The
+  ninth is fitted as version 6, and none of its blocks solve.
 
 ## Where the images come from
 

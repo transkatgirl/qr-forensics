@@ -62,14 +62,14 @@ fared with the symbol it holds.
 
 ```text
 flat/IMG_20191225_202803.jpg read
-random/IMG_20191229_201332.jpg found
-random/IMG_20191229_204134.jpg lead
+random/IMG_20191229_201422.jpg found
 ```
 
 - `read`: a read that is to be trusted (`read`, or `read, padding
   pinned`) gives the symbol's message.
 - `found`: a symbol was found and did not decode, or decoded without
-  confirmation.
+  confirmation, or the search fitted a symbol that nothing else
+  supported and could not read it (`fitted and not read`).
 - `lead`: the search found finder patterns standing as a symbol's and
   could fit no symbol to them.
 - `not found`: the search printed nothing.
@@ -101,9 +101,8 @@ SURF; its own correction, thin-plate splines falling back on a
 cylinder's, reads a little more of SYNT, all of FLAT and 84% of SURF.
 
 As the record stands, the search here reads every symbol of `flat`,
-`synthetic_small` and the hand-bent photos of `random`, and 29 of the 36
-wrapped round tubes and bottles; of the other seven it finds six that it
-can't decode, and the finder patterns of the last with no symbol it can
-fit to them. Five of the seven are the five photos it spends longest
-on, two to three and a half minutes each on a machine of fourteen
-cores, where the whole benchmark is searched in five minutes.
+`synthetic_small` and the hand-bent photos of `random`, and 33 of the 36
+wrapped round tubes and bottles; it finds the other three but can't
+decode them. Two of those three are also the slowest photos, about
+three minutes each on a 14-core machine, out of four and a half for the
+whole benchmark.

@@ -21,20 +21,20 @@ use qr_forensics::decode::list::{LIST_COST, hard_reach, usable_cost};
 use qr_forensics::decode::padding::{Filler, clear_padding_pins, detect_padding, pin_padding_at, recover_padding};
 use qr_forensics::decode::pipeline::{
     Attempt, BlockOutcome, BlockReport, DecodeOptions, Harder, analyze, brute_force_mirrored_whole, brute_force_whole, decode, decode_keeping,
-    decode_trying_harder, formats, orientation_of, verifying_bits,
+    decode_trying_harder, formats, judged_verifying_bits, orientation_of, verifying_bits,
 };
 use qr_forensics::decode::repair::{quiet_zone, render_rgba, render_svg, repaired_grid};
 use qr_forensics::decode::rs::{TrialReach, trial_reach};
 use qr_forensics::decode::sequence::Part;
 use qr_forensics::decode::text::Charset;
-use qr_forensics::imaging::adjust::{Adjust, Enlarge, Filter, LENS_MIN_PAIRS, estimate_k1, remap_point, straightened};
-use qr_forensics::imaging::photo::{crop_box, flatten_alpha};
+use qr_forensics::imaging::adjust::{Adjust, Backdrop, Enlarge, Filter, LENS_MIN_PAIRS, estimate_k1, remap_point, straightened};
+use qr_forensics::imaging::photo::{crop_box, flatten_alpha_onto, has_transparency};
 use qr_forensics::imaging::resize::resize;
 use qr_forensics::imaging::detect::{
     Anchor, AnchorKind, AnchorSite, Detection, Lead, SEARCH_SIDE, SearchParams, anchor_sites, decodes_as_found,
     bled_outline, bloom_of, detect_candidates, refine_anchors, refine_anchors_with, search_for_families, settle_loose_corners,
 };
-use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline, read_outline_one_of, standing_of};
+use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline, read_outline_one_of, settle_unvouched, standing_of};
 use qr_forensics::imaging::refine::{Refinement, placement_agreement, refine_corners, refine_corners_expecting};
 use qr_forensics::imaging::gpu::Shown;
 use qr_forensics::imaging::{Luma, SharedRgba};
@@ -257,6 +257,9 @@ struct PendingSearch {
     receiver: std::sync::mpsc::Receiver<Sought>,
     /// The photo's Invert setting when the search began.
     photo_inverted: bool,
+    /// The photo's adjustments when the search began, which what it read
+    /// was read under ([`App::poll_search`]).
+    adjust: Option<Adjust>,
     /// The one family searched for, when the search is not of every
     /// family.
     family: Option<Family>,
@@ -837,16 +840,21 @@ impl App {
     }
 
     fn set_photo(&mut self, ctx: &egui::Context, name: String, mut image: image::RgbaImage) {
-        // On white where it is transparent, before anything is cut or
-        // resized from it.
-        flatten_alpha(&mut image);
+        // On grey where it is transparent, before anything is cut or
+        // resized from it; and kept as it was as well, for Transparent
+        // parts to lay on another. A photo with no transparency is laid on
+        // white, which only what the lens term draws in from beyond its
+        // edges shows ([`Adjust::backdrop`]), as it always has.
+        let unflattened = has_transparency(&image).then(|| Arc::new(image.clone()));
+        let backdrop = if unflattened.is_some() { Backdrop::default() } else { Backdrop::White };
+        flatten_alpha_onto(&mut image, backdrop);
         // The outline, the anchors and the adjustments are of the photo
         // they were placed on: the new photo starts without them, and no
         // undo or redo brings another photo's back onto it. The symbol,
         // the grid and its pins, stays as it is, with its own history.
         // A small photo starts enlarged, so that its modules can be seen.
-        let adjust = Adjust::for_photo(image.width(), image.height());
-        self.show_photo(ctx, name, Arc::new(image), None, adjust);
+        let adjust = Adjust { backdrop, ..Adjust::for_photo(image.width(), image.height()) };
+        self.show_photo(ctx, name, Arc::new(image), unflattened, None, adjust);
         let Some(photo) = &self.photo else { return };
         self.doc.corners = photo.default_corners();
         self.doc.anchors.clear();
@@ -864,6 +872,14 @@ impl App {
             "). Press Search whole photo to look for the symbols in it, or drag the corners loosely around the symbol \
              and press Find in outline.",
         );
+        if photo.unflattened.is_some() {
+            let others: Vec<String> = Backdrop::ALL.into_iter().filter(|&other| other != backdrop).map(|other| other.label().to_lowercase()).collect();
+            loaded.push_str(&format!(
+                " Its transparent parts are filled with {}; Transparent parts, under Photo, switches to {}.",
+                backdrop.label().to_lowercase(),
+                others.join(" or ")
+            ));
+        }
         if width.max(height) > SEARCH_SIDE {
             loaded.push_str(&format!(
                 " A photo this large is searched whole in a copy reduced to {SEARCH_SIDE} pixels on its longer side; an \
@@ -882,8 +898,16 @@ impl App {
     /// luminance and texture made, and whatever was found or under way
     /// on the photo shown before dropped. Where the outline and anchors
     /// go is the caller's to say.
-    fn show_photo(&mut self, ctx: &egui::Context, name: String, source: Arc<image::RgbaImage>, crop: Option<Crop>, adjust: Adjust) {
-        let original = part_on_show(&source, crop);
+    fn show_photo(
+        &mut self,
+        ctx: &egui::Context,
+        name: String,
+        source: Arc<image::RgbaImage>,
+        unflattened: Option<Arc<image::RgbaImage>>,
+        crop: Option<Crop>,
+        adjust: Adjust,
+    ) {
+        let original = part_on_show(&source, crop, adjust.backdrop);
         let (own_width, own_height) = original.dimensions();
         let adjust = Adjust { enlarge: adjust.enlarge.within(own_width, own_height), ..adjust };
         let greyscale = self.view.greyscale;
@@ -895,7 +919,7 @@ impl App {
         self.doc.adjust = adjust;
         let enlargements = Enlarge::steps_for(own_width, own_height);
         let mut photo =
-            Photo { name, width, height, source, crop, original, adjust, enlargements, luma: Arc::new(luma), texture, greyscale, binarised: None };
+            Photo { name, width, height, source, unflattened, crop, original, adjust, enlargements, luma: Arc::new(luma), texture, greyscale, binarised: None };
         photo.offer(adjust.enlarge);
         self.photo = Some(photo);
         self.view.stage = Stage::Align;
@@ -937,8 +961,8 @@ impl App {
         for anchor in &mut anchors {
             anchor.anchor.center = old.to_source(anchor.anchor.center);
         }
-        let (name, source) = (old.name.clone(), old.source.clone());
-        self.show_photo(ctx, name, source, crop, adjust);
+        let (name, source, unflattened) = (old.name.clone(), old.source.clone(), old.unflattened.clone());
+        self.show_photo(ctx, name, source, unflattened, crop, adjust);
         let Some(new) = self.photo.as_ref() else { return false };
         self.doc.corners = corners.map(|c| new.to_working(c));
         for anchor in &mut anchors {
@@ -1063,6 +1087,16 @@ impl App {
         }
         let lens = photo.adjust.k1 != self.doc.adjust.k1;
         let before = (photo.width, photo.height);
+        // The photo as loaded is laid on the new backdrop, and the part
+        // on show is cut again.
+        if photo.adjust.backdrop != self.doc.adjust.backdrop
+            && let Some(unflattened) = &photo.unflattened
+        {
+            let mut source = (**unflattened).clone();
+            flatten_alpha_onto(&mut source, self.doc.adjust.backdrop);
+            photo.source = Arc::new(source);
+            photo.original = part_on_show(&photo.source, photo.crop, self.doc.adjust.backdrop);
+        }
         photo.adjust = self.doc.adjust;
         self.reapply_adjust();
         let resized = self.photo.as_ref().is_some_and(|photo| (photo.width, photo.height) != before);
@@ -1102,6 +1136,14 @@ impl App {
             proposals.found.iter_mut().for_each(carry);
             if let Some(reads) = &mut proposals.reads {
                 reads.results.iter_mut().flatten().for_each(|read| carry(&mut read.detection));
+            }
+            // What the search's reads were charged is found by the corners
+            // of the symbol read ([`Proposals::among_of`]), which go with
+            // it. Left where they were, every symbol of the list was read
+            // as one asked for once the photo was enlarged, as it is when a
+            // read made through a copy enlarged is loaded.
+            for charged in &mut proposals.charged {
+                charged.corners = charged.corners.map(|c| [c[0] * scale[0], c[1] * scale[1]]);
             }
         }
         for lead in &mut self.leads {
@@ -1315,6 +1357,18 @@ impl App {
             text.push_str(&dropped);
         }
         Some(text)
+    }
+
+    /// Set Transparent parts, for a photo that has any; true when it
+    /// changed. The caller has taken the undo point.
+    fn set_photo_backdrop(&mut self, backdrop: Backdrop) -> bool {
+        if self.photo.as_ref().is_none_or(|photo| photo.unflattened.is_none()) || self.doc.adjust.backdrop == backdrop {
+            return false;
+        }
+        self.doc.adjust.backdrop = backdrop;
+        // No lens term changes here, so there is nothing to report.
+        let _ = self.sync_adjust();
+        true
     }
 
     /// Set the Invert adjustment; true when it changed. The caller has
@@ -1584,15 +1638,16 @@ impl App {
     /// a placement the detector ranked, refining them on a thread of its
     /// own. `searched_inverted` is the Invert setting it was found under,
     /// and `what` names it for a notice. With `read`, it is read through
-    /// to its message first, as Find in outline reads what it finds, and
-    /// a read that decodes comes back with it, to be loaded.
+    /// to its message first, as Find in outline reads what it finds,
+    /// charged as one of as many as `read` says ([`Proposals::among_of`]),
+    /// and a read that decodes comes back with it, to be loaded.
     fn adopt_proposal(
         &mut self,
         ctx: &egui::Context,
         found: Detection,
         searched_inverted: bool,
         what: String,
-        read: bool,
+        read: Option<usize>,
         picked: Option<Picked>,
     ) {
         if self.job_busy() {
@@ -1610,7 +1665,7 @@ impl App {
             // it was searched: with Invert photo changed since, the
             // symbol reads the other way against the photo as it is.
             let as_it_is = Detection { inverted: found.inverted ^ (searched_inverted != photo_inverted), ..found.clone() };
-            let prepared = match read.then(|| read_detection(&luma, as_it_is, &params, &opts)).flatten() {
+            let prepared = match read.and_then(|among| read_detection(&luma, as_it_is, &params, &opts.one_of(among))) {
                 Some(result) if result.is_trustworthy() => prepared_from_read(&luma, version, result, photo_inverted, &params),
                 // A read that came to no message may have ended on
                 // another placement than the one picked: the symbol is
@@ -2026,12 +2081,12 @@ impl App {
         }
         let photo_inverted = photo.adjust.invert;
         let luma = photo.luma.clone();
-        let params = self.scan_params();
+        let (params, opts) = (self.scan_params(), self.opts);
         let search = self.view.search;
         let family = self.view.own_family_only.then(|| self.doc.version.family());
         self.start_search(ctx, photo_inverted, family, move || match family {
-            Some(family) => search_for_family(&luma, family, &params, &search),
-            None => search_for_every_family(&luma, &params, &search),
+            Some(family) => search_for_family(&luma, family, &params, &search, &opts),
+            None => search_for_every_family(&luma, &params, &search, &opts),
         });
     }
 
@@ -2059,6 +2114,7 @@ impl App {
             generation: self.photo_generation,
             receiver,
             photo_inverted,
+            adjust: self.photo.as_ref().map(|photo| photo.adjust),
             family,
             started: std::time::Instant::now(),
             cancel,
@@ -2088,24 +2144,56 @@ impl App {
         if search.generation != self.photo_generation || self.photo.is_none() {
             return;
         }
+        // What the search read, it read off the photo as it began.
+        // Inverted since, a symbol reads the other way, as is reckoned
+        // from the photo's polarity then ([`Proposals::photo_inverted`]);
+        // adjusted otherwise, whether a symbol decoded says nothing of how
+        // it reads now, and none is picked of itself for it. Picked so, a
+        // symbol was said to decode and then read off the photo as it is,
+        // where it might not.
+        let adjusted = self
+            .photo
+            .as_ref()
+            .zip(search.adjust)
+            .is_some_and(|(photo, then)| Adjust { invert: then.invert, ..photo.adjust } != then);
+        let charged = found.charged();
         self.leads = found.leads;
-        self.finish_search(ctx, found.found, search.photo_inverted, search.family);
+        let mut found = found.found;
+        if adjusted {
+            found.iter_mut().for_each(|found| found.decodes = None);
+        }
+        self.finish_search(ctx, found, charged, search.photo_inverted, search.family, adjusted);
     }
 
     /// Offer what a search of the whole photo found. `family` is the one
     /// family it looked for, when it did not look for every one. Where
     /// reads are loaded, a symbol that decodes as found is picked of
     /// itself ([`symbol_to_load`]), as a click on it in the list picks
-    /// it: read through to its message, and loaded.
-    fn finish_search(&mut self, ctx: &egui::Context, found: Vec<Detection>, photo_inverted: bool, family: Option<Family>) {
+    /// it: read through to its message, and loaded. `charged` says what
+    /// the reads the search made of some of them were charged as one of
+    /// ([`Proposals::charged`]). `adjusted` says the photo's adjustments
+    /// changed while the search ran, and none was asked whether it
+    /// decodes as the photo is now.
+    fn finish_search(
+        &mut self,
+        ctx: &egui::Context,
+        found: Vec<Detection>,
+        charged: Vec<Charged>,
+        photo_inverted: bool,
+        family: Option<Family>,
+        adjusted: bool,
+    ) {
         if found.is_empty() && !self.leads.is_empty() {
             // Nothing fitted, and finders to say so of: listed, with no
             // symbols above them.
             self.proposals = None;
             self.view.stage = Stage::Align;
             let places = if self.leads.len() == 1 { "1 place".to_owned() } else { format!("{} places", self.leads.len()) };
+            let came_to = leads_came_to(&self.leads);
             self.fail(format!(
-                "No symbol was found in the photo, but finder patterns that stand as a symbol's were, in {places}, and                  no symbol could be fitted to them. They are listed under Alignment: pick one to put the outline                  about it, set the outline right by hand if it is not, and press Find in outline."
+                "No symbol was found in the photo, but finder patterns arranged like a symbol's were found in {places}, \
+                 and {came_to}. They're listed under Alignment: pick one to place the \
+                 outline around it, correct the outline by hand if needed, and press Find in outline."
             ));
             return;
         }
@@ -2137,34 +2225,46 @@ impl App {
         let pick = (self.view.load_reads && self.job.is_none())
             .then(|| symbol_to_load(&found, adopted, &self.doc.corners, |i| found[i].decodes == Some(true)))
             .flatten();
-        self.proposals = Some(Proposals { found, photo_inverted, adopted, reads: None });
+        self.proposals = Some(Proposals { found, photo_inverted, adopted, reads: None, charged });
         self.view.stage = Stage::Align;
         let what = if count == 1 { "Found 1 symbol".to_owned() } else { format!("Found {count} symbols") };
         let how = match pick {
             Some(i) => format!(
-                "outlined on the photo. Symbol {} decodes as found, and is being read through to load it into the grid; \
-                 pick another under Alignment, or click its outline, for that one instead.",
-                i + 1
+                "outlined on the photo. Symbol {} {} and is being read into the grid; to use another, pick it under \
+                 Alignment or click its outline.",
+                i + 1,
+                // A placement read through during the search decoded so,
+                // through whatever retry it took, and not as it was found.
+                if self.proposals.as_ref().is_some_and(|proposals| proposals.read_in_search(&proposals.found[i])) {
+                    "decoded during the search"
+                } else {
+                    "decodes as found"
+                }
             ),
             None => "outlined on the photo. Pick one under Alignment, or click its outline, to place the corners on it; \
                      or press Read all to read every one through to its message."
                 .to_owned(),
         };
+        let came_to = leads_came_to(&self.leads);
         let beside = match self.leads.len() {
             0 => String::new(),
-            1 => " Finder patterns in 1 other place stand as a symbol's with none fitted to them, and are listed below the symbols."
-                .to_owned(),
-            n => format!(" Finder patterns in {n} other places stand as a symbol's with none fitted to them, and are listed below the symbols."),
+            1 => format!(" Finder patterns in 1 other place look like a symbol's, but {came_to}; they're listed below the symbols."),
+            n => format!(" Finder patterns in {n} other places look like a symbol's, but {came_to}; they're listed below the symbols."),
         };
-        self.notify(format!("{what}, {how}{beside}"));
+        let stale = if adjusted && self.view.load_reads {
+            " The photo's adjustments changed while the search ran, so none was read into the grid of itself."
+        } else {
+            ""
+        };
+        self.notify(format!("{what}, {how}{stale}{beside}"));
         if let Some(i) = pick {
             self.use_proposal(ctx, i);
         }
     }
 
     /// Read every symbol the search found through to its message, each
-    /// as the command line reads one, on a thread of their own and side
-    /// by side.
+    /// charged as the command line charges it ([`Proposals::among_of`]),
+    /// on a thread of their own and side by side.
     fn read_found(&mut self, ctx: &egui::Context) {
         if self.job_busy() {
             return;
@@ -2179,11 +2279,15 @@ impl App {
         // was searched: with Invert photo changed since, the symbol reads
         // the other way against the photo as it is.
         let flipped = proposals.photo_inverted != photo_inverted;
-        let found: Vec<Detection> = proposals.found.iter().map(|found| Detection { inverted: found.inverted ^ flipped, ..found.clone() }).collect();
+        let found: Vec<(Detection, usize)> = proposals
+            .found
+            .iter()
+            .map(|found| (Detection { inverted: found.inverted ^ flipped, ..found.clone() }, proposals.among_of(found)))
+            .collect();
         let (params, opts) = (self.scan_params(), self.opts);
         self.start_job(ctx, JobKind::ReadFound, move || {
-            let outlines = found.iter().map(|found| found.corners).collect();
-            let reads = work::map(&found, |found| read_detection(&luma, found.clone(), &params, &opts));
+            let outlines = found.iter().map(|(found, _)| found.corners).collect();
+            let reads = work::map(&found, |(found, among)| read_detection(&luma, found.clone(), &params, &opts.one_of(*among)));
             JobResult::ReadFound { outlines, reads, photo_inverted }
         });
     }
@@ -2273,8 +2377,8 @@ impl App {
     /// has not read it already, and a read that decodes is loaded: the
     /// outline, the anchors and the grid at once.
     fn use_proposal(&mut self, ctx: &egui::Context, i: usize) {
-        let proposal = self.proposals.as_ref().and_then(|p| p.found.get(i).map(|f| (f.clone(), p.photo_inverted, p.reads.is_none())));
-        let Some((found, photo_inverted, unread)) = proposal else {
+        let proposal = self.proposals.as_ref().and_then(|p| p.found.get(i).map(|f| (f.clone(), p.photo_inverted, p.reads.is_none(), p.among_of(f))));
+        let Some((found, photo_inverted, unread, among)) = proposal else {
             self.fail("That symbol is no longer in the list; press Search whole photo again.");
             return;
         };
@@ -2296,7 +2400,7 @@ impl App {
             found,
             photo_inverted,
             format!("symbol {}", i + 1),
-            self.view.load_reads && unread,
+            (self.view.load_reads && unread).then_some(among),
             Some(Picked::Proposal(i)),
         );
     }
@@ -2405,6 +2509,13 @@ impl App {
         self.preview = None;
         self.dirty = true;
         self.set_photo_invert(read_inverted ^ found.inverted);
+        // Laid on the backdrop it was read on, as it is inverted as it
+        // read: Read all's reads outlast a change to Transparent parts,
+        // and a symbol in light ink on transparency that read on grey is
+        // gone on white, for Sample and the eye alike. It was once left
+        // as it was set.
+        let backdrop = under.adjust.backdrop;
+        let backdrop_set = self.set_photo_backdrop(backdrop);
         self.doc.corners = found.corners;
         self.doc.anchors = doc_anchors(&found);
         self.detection = Some(found);
@@ -2431,6 +2542,12 @@ impl App {
              its modules as sampled, with its fixed patterns filled in (undoable).",
             version.family().label()
         );
+        if backdrop_set {
+            text.push_str(&format!(
+                " Under Photo, Transparent parts was set to {} to match the read.",
+                backdrop.label().to_lowercase()
+            ));
+        }
         if let Some(through) = through {
             text.push(' ');
             text.push_str(&through);
@@ -2950,7 +3067,7 @@ impl App {
                     found,
                     photo_inverted,
                     format!("placement {}", i + 1),
-                    self.view.load_reads,
+                    self.view.load_reads.then_some(1),
                     Some(Picked::Placement(i)),
                 );
             }
@@ -2961,16 +3078,39 @@ impl App {
                     return;
                 };
                 self.checkpoint();
+                // A placement fitted and not read is put down as fitted, at
+                // its version, to be sampled as it is or searched about: the
+                // grid was once left at whatever version it had. Another
+                // version is a new grid, which is said, as a proposal taken
+                // says it ([`new_grid_note`]): it was once started with
+                // nothing said of what went with the grid before.
+                let new_grid = lead.fitted.filter(|&version| version != self.doc.version);
+                if let Some(version) = lead.fitted {
+                    self.set_version(version);
+                }
                 self.doc.corners = lead.outline;
                 self.doc.anchors.clear();
                 self.detection = None;
                 self.view.stage = Stage::Align;
-                self.notify(format!(
-                    "The outline is about {} finder patterns the search took for a {} symbol's and could fit none to. Set it \
-                     right by hand if it is not, and press Find in outline.",
-                    lead.finders.len(),
-                    lead.family.label()
-                ));
+                self.notify(match lead.fitted {
+                    Some(version) => format!(
+                        "The outline is where the search fitted a {} {version} symbol to {} finder patterns, which nothing \
+                         else bore out and which did not read. Set it right by hand if it is not, and press Find in outline, \
+                         or sample it and work on the grid.{}",
+                        version.family().label(),
+                        lead.finders.len(),
+                        new_grid.map_or(String::new(), |version| format!(
+                            " This started a new {} {version} grid (undoable).",
+                            version.family().label()
+                        ))
+                    ),
+                    None => format!(
+                        "The outline is about {} finder patterns the search took for a {} symbol's and could fit none to. \
+                         Set it right by hand if it is not, and press Find in outline.",
+                        lead.finders.len(),
+                        lead.family.label()
+                    ),
+                });
             }
             Action::ClearProposals => {
                 self.proposals = None;
@@ -3793,19 +3933,25 @@ pub(crate) struct Reach {
     /// Constraints the largest block uses of the options' ([`usable_cost`]).
     pub list_used: usize,
     pub trials: TrialReach,
-    /// Codewords past [`Self::standard`] the trials reach leaving the
-    /// reserved codewords unused ([`TrialReach::within_standard`]): a
-    /// solution that spends them is never confirmed. Nought unless that
-    /// is past [`Self::half`], where plain Reed-Solomon finds a solution
-    /// first and the trials are not run.
+    /// Codewords past [`Self::standard`] the trials reach and confirm,
+    /// with what their solution must show to be verified to spare
+    /// ([`TrialReach::within_standard`]): nought where any codewords are
+    /// reserved, since a solution past what the standard corrects spends
+    /// them, and nought unless that is past [`Self::half`], where plain
+    /// Reed-Solomon finds a solution first and the trials are not run.
     pub trials_within: usize,
 }
 
 /// What [`Reach::of`] depends on: the version, the level, the budgets
 /// of list decoding and of the trials, and what a fallback's solution
-/// must show to be verified ([`verifying_bits`]), which the solvers
-/// switched on and the decodes the document was picked among set.
-type ReachKey = (SymbolVersion, EcLevel, usize, usize, u32);
+/// must show to be verified, as its solver counts it
+/// ([`verifying_bits`]), in the first stage and in the trials' own
+/// ([`Reach::trial_verifying_bits`]), and as the block judges it
+/// ([`judged_verifying_bits`]), which the solvers switched on and the
+/// decodes the document was picked among set. The trials' own was once
+/// left out, and solving bit by bit switched on or off, which moves it
+/// a bit where the first stage's stays, left the trials' reach as it was.
+type ReachKey = (SymbolVersion, EcLevel, usize, usize, u32, u32, u32);
 
 /// Reaches [`App::reach`] keeps, at the most, the oldest forgotten first:
 /// a level for each of a few versions, and the budgets a slider passes
@@ -3822,7 +3968,15 @@ impl App {
     /// solution must show.
     pub(crate) fn reach(&self, version: SymbolVersion, level: EcLevel) -> Option<Reach> {
         let opts = self.options_at(level);
-        let key = (version, level, opts.list_cost, opts.trial_sets, verifying_bits(version, &opts.first_stage(), false));
+        let key = (
+            version,
+            level,
+            opts.list_cost,
+            opts.trial_sets,
+            verifying_bits(version, &opts.first_stage(), false),
+            Reach::trial_verifying_bits(version, &opts),
+            judged_verifying_bits(&opts.first_stage()),
+        );
         let mut reaches = self.reaches.borrow_mut();
         if let Some((_, reach)) = reaches.iter().find(|(k, _)| *k == key) {
             return *reach;
@@ -3847,9 +4001,15 @@ impl Reach {
         // makes the fewest decodes and searches besides it
         // ([`DecodeOptions::stages`]).
         let needed = verifying_bits(version, &opts.first_stage(), false);
-        let list = |cost| hard_reach(lengths.0, ec, cost, needed).min(hard_reach(lengths.1, ec, cost, needed));
+        // Or what the block itself must show of the codeword, whatever
+        // reached it, which asks nothing of the solver's tries
+        // ([`judged_verifying_bits`]); it was once left out, and the
+        // curve said to reach a codeword less at M3-M than it confirms.
+        let judged = judged_verifying_bits(&opts.first_stage());
+        let list = |cost| hard_reach(lengths.0, ec, cost, needed.min(judged)).min(hard_reach(lengths.1, ec, cost, needed.min(judged)));
         let reserved = misdecode_protection(version, level);
         let trials = trial_reach(lengths.1, ec, opts.trial_sets);
+        let trial_needed = Self::trial_verifying_bits(version, opts);
         Some(Self {
             blocks: shape.blocks,
             lengths,
@@ -3860,8 +4020,16 @@ impl Reach {
             list_default: list(LIST_COST),
             list_used: usable_cost(lengths.1, ec, opts.list_cost),
             trials,
-            trials_within: trials.within_standard(ec, reserved),
+            trials_within: trials.within_standard(lengths.1, ec, reserved, trial_needed, judged),
         })
+    }
+
+    /// What a solution the trials of erasures found must show to be
+    /// verified, as its solver counts it ([`verifying_bits`]): the trials
+    /// run in a stage of their own, which makes the decodes of the first
+    /// and the trials' besides.
+    fn trial_verifying_bits(version: SymbolVersion, opts: &DecodeOptions) -> u32 {
+        verifying_bits(version, &DecodeOptions { erase_by_trial: true, ..opts.first_stage() }, false)
     }
 
     /// The blocks, as the notes name them: "block of 26 codewords", or
@@ -3895,19 +4063,6 @@ impl Reach {
     pub fn list_gains_within_standard(&self) -> bool {
         self.list_gains() && self.reserved == 0
     }
-
-    /// The wrong codewords, first and last, that plain Reed-Solomon
-    /// solves only by spending the reserved codewords, past the
-    /// standard's limit and up to half the distance: never confirmed,
-    /// and never tried by list decoding or the trials, which run only
-    /// where plain decoding finds nothing. None where the standard's limit
-    /// is half the distance, as at every level that reserves fewer than
-    /// two, its error correction being odd. The trials at 1-M confirm a
-    /// block six wrong, and were
-    /// once said to reach every count up to it, five among them.
-    pub fn unconfirmed(&self) -> Option<(usize, usize)> {
-        (self.half > self.standard).then_some((self.standard + 1, self.half))
-    }
 }
 
 /// A count with its thousands set apart by commas, as the hover texts
@@ -3935,12 +4090,6 @@ pub(crate) fn count_word(n: usize) -> String {
 /// codeword", "2 wrong codewords".
 pub(crate) fn wrong_codewords(n: usize) -> String {
     if n == 1 { "1 wrong codeword".to_owned() } else { format!("{n} wrong codewords") }
-}
-
-/// The counts from `first` to `last`, as the notes on reach say them:
-/// "5", or "5 to 6".
-pub(crate) fn count_run(first: usize, last: usize) -> String {
-    if first == last { first.to_string() } else { format!("{first} to {last}") }
 }
 
 /// Share of fixed modules a detection of another family must read right
@@ -4245,6 +4394,20 @@ fn list_phrase(items: &[String]) -> String {
     }
 }
 
+/// What came of the finder patterns a search lists as leads, for a
+/// notice to say after "but": no symbol fitted to them, or one fitted
+/// that didn't read ([`Lead::fitted`]), or some of each.
+fn leads_came_to(leads: &[Lead]) -> &'static str {
+    let fitted = leads.iter().filter(|lead| lead.fitted.is_some()).count();
+    if fitted == 0 {
+        "no symbol could be fitted to them"
+    } else if fitted == leads.len() {
+        "the symbols fitted to them didn't read"
+    } else {
+        "no symbol could be fitted to some of them, and those fitted to the rest didn't read"
+    }
+}
+
 /// The button under a list cut short at `limit` of its `total` rows, which
 /// shows the list whole and cuts it short again; nothing under a list no
 /// longer than that. `hint` says what the whole list holds.
@@ -4279,10 +4442,12 @@ const CREDIBLE_SCORE: f64 = 0.75;
 /// listed once under the better claim.
 ///
 /// Beside what it lists come the finder patterns the search could fit no
-/// symbol to ([`Lead`]).
-pub(crate) fn search_for_every_family(luma: &Luma, params: &SampleParams, search: &SearchParams) -> Sought {
-    let sought = search_for_families(luma, &Family::SEARCHED, params, search, &credible);
-    Sought { found: listed(luma, sought.detections, params), leads: sought.leads }
+/// symbol to ([`Lead`]). The placements the search fitted and nothing
+/// vouched for are read through first, under `opts` as a read of what is
+/// found is made, and listed when they read ([`settle_unvouched`]).
+pub(crate) fn search_for_every_family(luma: &Luma, params: &SampleParams, search: &SearchParams, opts: &DecodeOptions) -> Sought {
+    let (sought, read) = settle_unvouched(luma, search_for_families(luma, &Family::SEARCHED, params, search, &credible), params, opts);
+    Sought { found: listed(luma, sought.detections, params), leads: sought.leads, read }
 }
 
 /// What a search of the whole photo has to offer: the symbols it found,
@@ -4291,11 +4456,34 @@ pub(crate) fn search_for_every_family(luma: &Luma, params: &SampleParams, search
 pub(crate) struct Sought {
     pub found: Vec<Detection>,
     pub leads: Vec<Lead>,
+    /// The reads made of placements nothing vouched for that decoded,
+    /// each of a symbol among those found, at its corners, with what it
+    /// was charged as one of for the placements read beside it
+    /// ([`settle_unvouched`]): for the command line, which reads every
+    /// symbol found, to print as they are rather than read them again,
+    /// uncharged for the placements read beside them; and for the window,
+    /// which reads them again, to charge them the same
+    /// ([`Proposals::charged`]).
+    pub read: Vec<(ReadResult, usize)>,
+}
+
+impl Sought {
+    /// The read made already of `found`, one of the symbols found, where
+    /// the search made one ([`Self::read`]).
+    pub(crate) fn read_of(&self, found: &Detection) -> Option<&ReadResult> {
+        self.read.iter().map(|(read, _)| read).find(|read| read.detection.corners == found.corners && read.detection.version == found.version)
+    }
+
+    /// What each read the search made is charged as one of, by the
+    /// corners and version of the symbol it is of ([`Proposals::charged`]).
+    fn charged(&self) -> Vec<Charged> {
+        self.read.iter().map(|(read, among)| Charged { corners: read.detection.corners, version: read.detection.version, among: *among }).collect()
+    }
 }
 
 impl From<Vec<Detection>> for Sought {
     fn from(found: Vec<Detection>) -> Self {
-        Self { found, leads: Vec::new() }
+        Self { found, leads: Vec::new(), read: Vec::new() }
     }
 }
 
@@ -4306,16 +4494,17 @@ impl From<Vec<Detection>> for Sought {
 /// family the symbol is of, and above all for a damaged QR Code, whose
 /// leftover finders the search of every family spends most of its time
 /// taking for Micro QR and rMQR symbols.
-pub(crate) fn search_for_family(luma: &Luma, family: Family, params: &SampleParams, search: &SearchParams) -> Sought {
-    let sought = search_for_families(luma, &[family], params, search, &|_| true);
-    Sought { found: listed(luma, sought.detections, params), leads: sought.leads }
+pub(crate) fn search_for_family(luma: &Luma, family: Family, params: &SampleParams, search: &SearchParams, opts: &DecodeOptions) -> Sought {
+    let (sought, read) = settle_unvouched(luma, search_for_families(luma, &[family], params, search, &|_| true), params, opts);
+    Sought { found: listed(luma, sought.detections, params), leads: sought.leads, read }
 }
 
 /// Detections as a search lists them: the decode asked of each as found,
 /// on the photo itself, which says which of two claims on one place is
-/// the symbol and puts what needs no work at the head of the list.
+/// the symbol and puts what needs no work at the head of the list. One
+/// read through already, which decodes, is not asked again.
 fn listed(luma: &Luma, mut all: Vec<Detection>, params: &SampleParams) -> Vec<Detection> {
-    let decodes = work::map(&all, |found| !work::cancelled() && decodes_as_found(luma, found, params));
+    let decodes = work::map(&all, |found| found.decodes == Some(true) || (!work::cancelled() && decodes_as_found(luma, found, params)));
     for (found, decodes) in all.iter_mut().zip(decodes) {
         found.decodes = Some(decodes);
     }
@@ -4324,10 +4513,11 @@ fn listed(luma: &Luma, mut all: Vec<Detection>, params: &SampleParams) -> Vec<De
 
 /// The part on show at its own size: the photo as loaded, shared, or
 /// the part `crop` of it, straightened by the lens term the crop was
-/// made under, as the whole photo straightened has it there. What the
-/// adjustments are made to, but for a part so straightened, which they
-/// make from the photo as loaded about it ([`adjusted`]).
-fn part_on_show(source: &Arc<image::RgbaImage>, crop: Option<Crop>) -> Arc<image::RgbaImage> {
+/// made under, as the whole photo straightened has it there, on
+/// `backdrop` where it draws on none of the photo. What the adjustments
+/// are made to, but for a part so straightened, which they make from the
+/// photo as loaded about it ([`adjusted`]).
+fn part_on_show(source: &Arc<image::RgbaImage>, crop: Option<Crop>, backdrop: Backdrop) -> Arc<image::RgbaImage> {
     let Some(crop) = crop else { return source.clone() };
     let [x, y, w, h] = crop.rect;
     if crop.k1 == 0.0 {
@@ -4335,7 +4525,7 @@ fn part_on_show(source: &Arc<image::RgbaImage>, crop: Option<Crop>) -> Arc<image
     }
     // The outline the crop was made to lay on the photo straightened.
     let (width, height) = source.dimensions();
-    let part = straightened(source.as_raw(), width as usize, height as usize, crop.k1, [x, y, w, h].map(|side| side as usize));
+    let part = straightened(source.as_raw(), width as usize, height as usize, crop.k1, [x, y, w, h].map(|side| side as usize), backdrop.level());
     Arc::new(image::RgbaImage::from_raw(w, h, part).expect("the part straightened is the part's size"))
 }
 
@@ -4594,19 +4784,19 @@ mod tests {
         // Micro QR or rMQR symbol when those families are searched: they
         // are the QR Code's, and nothing is made of them, neither inside
         // it nor hung off its corners over the quiet zone.
-        let found = search_for_every_family(&load("zxing_qrcode-3_01.png"), &params, &SearchParams::default()).found;
+        let found = search_for_every_family(&load("zxing_qrcode-3_01.png"), &params, &SearchParams::default(), &DecodeOptions::default()).found;
         let first = found.first().expect("the QR Code is found");
         assert_eq!(first.version.family(), Family::Qr, "{:?}", found.iter().map(|f| f.version).collect::<Vec<_>>());
         assert!(first.score() > 0.95);
         assert_eq!(first.decodes, Some(true));
         assert_eq!(found.len(), 1, "{:?}", found.iter().map(|f| (f.version, f.score())).collect::<Vec<_>>());
         // A Micro QR, with QR Code selected as it would be by default.
-        let found = search_for_every_family(&load("cpp_micro_1.png"), &params, &SearchParams::default()).found;
+        let found = search_for_every_family(&load("cpp_micro_1.png"), &params, &SearchParams::default(), &DecodeOptions::default()).found;
         let first = found.first().expect("the Micro QR is found");
         assert_eq!(first.version, SymbolVersion::Micro(3));
         assert!(!first.inverted);
         // A light-on-dark rMQR: found, and known to be inverted.
-        let found = search_for_every_family(&load("cpp_rmqr_R7x43-H_inverted.png"), &params, &SearchParams::default()).found;
+        let found = search_for_every_family(&load("cpp_rmqr_R7x43-H_inverted.png"), &params, &SearchParams::default(), &DecodeOptions::default()).found;
         let first = found.first().expect("the rMQR is found");
         assert_eq!(first.version.family(), Family::Rmqr);
         assert!(first.inverted);
@@ -4615,7 +4805,7 @@ mod tests {
     #[test]
     fn detections_of_one_symbol_are_listed_once() {
         let params = SampleParams::default();
-        let found = search_for_every_family(&load("cpp_micro_1.png"), &params, &SearchParams::default()).found;
+        let found = search_for_every_family(&load("cpp_micro_1.png"), &params, &SearchParams::default(), &DecodeOptions::default()).found;
         for (i, a) in found.iter().enumerate() {
             for b in &found[i + 1..] {
                 assert!(!same_symbol(a, b), "{} and {} outline the same symbol", a.version, b.version);
@@ -5062,6 +5252,7 @@ mod tests {
             turned: 0,
             decodes: None,
             bloom: 0.0,
+            decoded_at: None,
         }
     }
 
@@ -5413,6 +5604,89 @@ mod tests {
     }
 
     #[test]
+    fn a_photo_with_transparent_parts_is_laid_on_grey_unless_another_is_chosen() {
+        use qr_forensics::imaging::adjust::Backdrop;
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        // The bench's render with its ink drawn in white on transparency,
+        // for a dark page: on white it is white on white.
+        let (w, h, pixels) = render_rgba(&painted_grid(), 10, 4);
+        let mut image = image::RgbaImage::from_raw(w as u32, h as u32, pixels).expect("a render is an image");
+        for pixel in image.pixels_mut() {
+            pixel.0 = if pixel[0] < 128 { [255, 255, 255, 255] } else { [0, 0, 0, 0] };
+        }
+        bench.app.set_photo(&ctx, "white on nothing".into(), image);
+        assert_eq!(bench.app.doc.adjust.backdrop, Backdrop::Grey);
+        assert!(bench.notice().text.contains("Its transparent parts are filled with grey"), "{}", bench.notice().text);
+        let range = |bench: &Bench| {
+            let luma = &bench.app.photo.as_ref().expect("a photo is on show").luma;
+            luma.data.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)))
+        };
+        // On grey, #808080, the ink is light on mid grey: the quiet zone
+        // in the corner is the grey.
+        let corner = bench.app.photo.as_ref().expect("a photo is on show").luma.data[0];
+        assert!((corner - 128.0 / 255.0).abs() < 0.01 && range(&bench).1 > 0.95, "{corner}, {:?}", range(&bench));
+        bench.step();
+        assert!(bench.texts().iter().any(|text| text == "Transparent parts"), "{:?}", bench.texts());
+        // Laid on black, it is light on dark.
+        bench.act(Action::SetAdjust(Adjust { backdrop: Backdrop::Black, ..bench.app.doc.adjust }));
+        let (dark, light) = range(&bench);
+        assert!(dark < 0.05 && light > 0.95, "{dark} to {light}");
+        // What a lens term draws in from beyond the photo's edges is the
+        // backdrop too, and not white wedges at its corners.
+        bench.act(Action::SetAdjust(Adjust { k1: 0.1, ..bench.app.doc.adjust }));
+        let corner = bench.app.photo.as_ref().expect("a photo is on show").luma.data[0];
+        assert!(corner < 0.05, "{corner}");
+        bench.act(Action::SetAdjust(Adjust { k1: 0.0, ..bench.app.doc.adjust }));
+        // Laid on white, there is nothing to read; undone, it is back.
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { backdrop: Backdrop::White, ..bench.app.doc.adjust }));
+        assert!(range(&bench).0 > 0.95, "{:?}", range(&bench));
+        bench.act(Action::Undo);
+        assert_eq!(bench.app.doc.adjust.backdrop, Backdrop::Black);
+        assert!(range(&bench).0 < 0.05, "{:?}", range(&bench));
+        // A photo with no transparency is the same on any, and offers no
+        // choice: it lies on white, which only what a lens term draws in
+        // from beyond its edges shows, as it always was.
+        bench.app.set_photo(&ctx, "red".into(), red_render());
+        assert!(bench.app.photo.as_ref().is_some_and(|photo| photo.unflattened.is_none()));
+        assert_eq!(bench.app.doc.adjust.backdrop, Backdrop::White);
+        bench.step();
+        assert!(!bench.texts().iter().any(|text| text == "Transparent parts"));
+    }
+
+    #[test]
+    fn a_read_loaded_lays_the_photo_on_the_backdrop_it_was_read_on() {
+        use qr_forensics::imaging::adjust::Backdrop;
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        // A symbol in white ink on transparency, read by Read all on grey;
+        // then laid on white, where there is nothing to read, and the read
+        // loaded.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/photos");
+        let mut image = image::open(dir.join("zxing_qrcode-3_01.png")).expect("photo opens").to_rgba8();
+        for pixel in image.pixels_mut() {
+            pixel.0 = if pixel[0] < 128 { [255, 255, 255, 255] } else { [0, 0, 0, 0] };
+        }
+        bench.app.set_photo(&ctx, "white on nothing".into(), image);
+        bench.app.view.load_reads = false;
+        bench.act(Action::FindSymbols);
+        bench.settle();
+        bench.act(Action::ReadFound);
+        bench.settle();
+        assert!(bench.app.read_decoded(0), "{}", bench.notice().text);
+        bench.act(Action::SetAdjust(Adjust { backdrop: Backdrop::White, ..bench.app.doc.adjust }));
+        bench.app.view.load_reads = true;
+        bench.act(Action::UseProposal(0));
+        assert_eq!(bench.app.doc.adjust.backdrop, Backdrop::Grey);
+        assert_eq!(bench.app.photo.as_ref().map(|photo| photo.adjust.backdrop), Some(Backdrop::Grey));
+        assert!(bench.notice().text.contains("Under Photo, Transparent parts was set to grey"), "{}", bench.notice().text);
+        // One undo puts back the white it was on, and the grid.
+        bench.act(Action::Undo);
+        assert_eq!(bench.app.doc.adjust.backdrop, Backdrop::White);
+    }
+
+    #[test]
     fn the_photo_and_its_binarised_view_are_laid_on_the_card_that_draws_the_window() {
         use qr_forensics::imaging::binarize::binarize;
         let mut bench = Bench::new();
@@ -5528,8 +5802,13 @@ mod tests {
         bench.app.doc.corners = STRAIGHT;
         bench.app.doc.set_anchor(finder_anchor([75.0, 75.0]), AnchorSource::Manual);
         bench.app.detection = Some(detection(SymbolVersion::Qr(2), STRAIGHT));
-        bench.app.proposals =
-            Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: Some(0), reads: None });
+        bench.app.proposals = Some(Proposals {
+            found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)],
+            photo_inverted: false,
+            adopted: Some(0),
+            reads: None,
+            charged: vec![Charged { corners: STRAIGHT, version: SymbolVersion::Qr(2), among: 3 }],
+        });
         bench.step();
         // The render is large enough to start at its own size, with the
         // steps its size allows on offer.
@@ -5559,6 +5838,8 @@ mod tests {
         let proposals = bench.app.proposals.as_ref().expect("the symbols found stay on offer");
         assert_eq!(proposals.found[0].corners, twice(STRAIGHT));
         assert_eq!(proposal_in_use(proposals, &bench.app.doc.corners), Some(0));
+        // And what its read in the search was charged, with it.
+        assert_eq!(proposals.among_of(&proposals.found[0]), 3);
         let (matching, fixed) = bench.app.preview.as_ref().expect("the outline makes a grid").fixed;
         assert_eq!(matching, fixed);
         assert!(bench.notice().text.starts_with("Loaded render"), "nothing was under way, so nothing to say: {}", bench.notice().text);
@@ -5576,6 +5857,8 @@ mod tests {
         assert_eq!((photo.width, photo.height, photo.luma.unenlarged.is_none()), (330, 330, true));
         assert_eq!(bench.app.doc.corners, STRAIGHT);
         assert_eq!(bench.app.detection.as_ref().map(|found| found.corners), Some(STRAIGHT));
+        let proposals = bench.app.proposals.as_ref().expect("the symbols found stay on offer");
+        assert_eq!(proposals.among_of(&proposals.found[0]), 3);
         assert!(bench.locate()([75.0, 75.0]).distance(on_screen) < 0.5);
         // Reduced, it keeps nothing beside it, and says so.
         bench.app.history.checkpoint(&bench.app.doc);
@@ -5609,6 +5892,13 @@ mod tests {
         for (corner, on_symbol) in carried.iter().zip(twice(STRAIGHT)) {
             assert!((corner[0] - on_symbol[0]).hypot(corner[1] - on_symbol[1]) < 1e-9, "{carried:?}");
         }
+    }
+
+    /// `adjust` as a photo with no transparency is loaded under it: on
+    /// white, which only what a lens term draws in from beyond its edges
+    /// shows ([`App::set_photo`]).
+    fn opaque(adjust: Adjust) -> Adjust {
+        Adjust { backdrop: Backdrop::White, ..adjust }
     }
 
     #[test]
@@ -5655,7 +5945,7 @@ mod tests {
         bench.step();
         let photo = bench.app.photo.as_ref().expect("the photo is loaded");
         assert_eq!(photo.enlargements.iter().map(Enlarge::to_string).collect::<Vec<_>>(), ["0.5×", "1×", "2×", "3×", "4×", "8×", "16×", "32×"]);
-        assert_eq!((photo.adjust, bench.app.doc.adjust), (Adjust::for_photo(110, 110), Adjust::for_photo(110, 110)));
+        assert_eq!((photo.adjust, bench.app.doc.adjust), (opaque(Adjust::for_photo(110, 110)), opaque(Adjust::for_photo(110, 110))));
         assert!(bench.texts().iter().any(|text| text == "3×"), "{:?}", bench.texts());
         bench.app.history.checkpoint(&bench.app.doc);
         bench.act(Action::SetAdjust(Adjust { enlarge: Enlarge::NONE, sharpen: 0.4, ..bench.app.doc.adjust }));
@@ -5664,7 +5954,7 @@ mod tests {
         assert_eq!(bench.app.photo.as_ref().map(|photo| photo.width), Some(110));
         let reset = bench.text_at("Reset adjustments");
         bench.click(reset, egui::PointerButton::Primary);
-        assert_eq!(bench.app.doc.adjust, Adjust::for_photo(110, 110));
+        assert_eq!(bench.app.doc.adjust, opaque(Adjust::for_photo(110, 110)));
         assert_eq!(bench.app.photo.as_ref().map(|photo| photo.width), Some(330));
     }
 
@@ -5674,7 +5964,7 @@ mod tests {
         let ctx = bench.ctx.clone();
         bench.app.set_photo(&ctx, "red".into(), red_render());
         bench.app.doc.corners = STRAIGHT;
-        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: None, reads: None });
+        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: None, reads: None, charged: Vec::new() });
         bench.step();
         // Ink in the middle of the first finder's stone, and paper in
         // the quiet zone.
@@ -5934,13 +6224,13 @@ mod tests {
         // Sharpen.
         let text = adjust_as_read(&mut bench.app, Enhance { enlarge: 2, sharpen: Sharpen::Off }, None, Enlarge::NONE).expect("the photo is enlarged");
         assert!(text.contains("so under Photo Enlarge was set to 2×, and Sample reads it that way.") && !text.contains("Sharpen"), "{text}");
-        assert_eq!(bench.app.doc.adjust, Adjust { enlarge: Enlarge::times(2), sharpen: -0.5, ..Adjust::default() });
+        assert_eq!(bench.app.doc.adjust, Adjust { enlarge: Enlarge::times(2), sharpen: -0.5, ..opaque(Adjust::default()) });
         assert_eq!(bench.app.photo.as_ref().map(|photo| (photo.width, photo.adjust.sharpen)), Some((660, -0.5)));
         // A copy sharpened decoded where the photo blurred did not: the
         // sharpening takes the blur's place.
         let text = adjust_as_read(&mut bench.app, Enhance { enlarge: 1, sharpen: Sharpen::Light }, None, Enlarge::times(2)).expect("the photo is sharpened");
         assert!(text.contains("so under Photo Sharpen was set to 0.50, and Sample reads it that way."), "{text}");
-        assert_eq!(bench.app.doc.adjust, Adjust { enlarge: Enlarge::times(2), sharpen: 0.5, ..Adjust::default() });
+        assert_eq!(bench.app.doc.adjust, Adjust { enlarge: Enlarge::times(2), sharpen: 0.5, ..opaque(Adjust::default()) });
         // Set so, a read through the same copy has nothing to add.
         assert_eq!(adjust_as_read(&mut bench.app, Enhance { enlarge: 1, sharpen: Sharpen::Light }, None, Enlarge::times(2)), None);
         // Nor is a sharpening the photo had kept past one a read made in
@@ -6026,7 +6316,7 @@ mod tests {
         // nothing about how this photo wants sampling, or adjusting.
         let text = bench.app.adopt_prepared(&ctx, read(false, copy));
         assert!(bench.app.view.sample == before);
-        assert_eq!(bench.app.doc.adjust, Adjust::default());
+        assert_eq!(bench.app.doc.adjust, opaque(Adjust::default()));
         assert!(!text.contains("decoded it"), "{text}");
         let text = bench.app.adopt_prepared(&ctx, read(true, Enhance::NONE));
         // The rule goes with the kernel, to the checkbox that asks for it.
@@ -6034,7 +6324,7 @@ mod tests {
         assert_eq!((sample.kernel, sample.rule(), sample.local, sample.surface), (Kernel::Centre, Rule::Surface, false, true));
         assert!(text.contains("sampling kernel decoded it"), "{text}");
         assert!(text.contains("a surface across the symbol decoded it"), "{text}");
-        assert_eq!(bench.app.doc.adjust, Adjust::default(), "read off the photo as it is");
+        assert_eq!(bench.app.doc.adjust, opaque(Adjust::default()), "read off the photo as it is");
         assert!(!text.contains("only with the photo"), "{text}");
         // A read made through a copy of the photo about the symbol,
         // enlarged and sharpened, has the whole photo so adjusted: the
@@ -6042,7 +6332,7 @@ mod tests {
         // Sampling reads it there as ever, through no copy of its own.
         let text = bench.app.adopt_prepared(&ctx, read(true, copy));
         assert!(text.contains("It decoded only with the photo enlarged 2 times and sharpened lightly, so under Photo Enlarge was set to 2× and Sharpen to 0.50"), "{text}");
-        assert_eq!(bench.app.doc.adjust, Adjust { enlarge: Enlarge::times(2), sharpen: 0.5, ..Adjust::default() });
+        assert_eq!(bench.app.doc.adjust, Adjust { enlarge: Enlarge::times(2), sharpen: 0.5, ..opaque(Adjust::default()) });
         let photo = bench.app.photo.as_ref().expect("the bench has a photo");
         assert_eq!((photo.width, photo.height, photo.adjust), (660, 660, bench.app.doc.adjust));
         let doubled = STRAIGHT.map(|[x, y]| [2.0 * x, 2.0 * y]);
@@ -6054,7 +6344,7 @@ mod tests {
         assert_eq!(matching, fixed);
         // One undo takes the adoption back, the photo's size with it.
         bench.act(Action::Undo);
-        assert_eq!((bench.app.doc.adjust, bench.app.doc.corners), (Adjust::default(), STRAIGHT));
+        assert_eq!((bench.app.doc.adjust, bench.app.doc.corners), (opaque(Adjust::default()), STRAIGHT));
         assert_eq!(bench.app.photo.as_ref().map(|photo| photo.width), Some(330));
         // A copy enlarged by a number of times that is no step of the
         // slider's is offered as one from then on.
@@ -6075,7 +6365,7 @@ mod tests {
         bench.app.set_photo(&ctx, "wide".into(), image::RgbaImage::from_pixel(1500, 300, image::Rgba([255; 4])));
         let text = bench.app.adopt_prepared(&ctx, read(true, Enhance { enlarge: 4, sharpen: Sharpen::Strong }));
         assert!(text.contains("so under Photo Sharpen was set to 1.00, and Sample reads it that way. A photo this large is not enlarged to 4× unasked"), "{text}");
-        assert_eq!(bench.app.doc.adjust, Adjust { sharpen: 1.0, ..Adjust::default() });
+        assert_eq!(bench.app.doc.adjust, Adjust { sharpen: 1.0, ..opaque(Adjust::default()) });
         assert_eq!(bench.app.doc.corners, STRAIGHT);
         let photo = bench.app.photo.as_ref().expect("the photo is loaded");
         assert_eq!(photo.enlargements.iter().map(Enlarge::to_string).collect::<Vec<_>>(), ["0.25×", "0.5×", "1×", "2×", "4×"]);
@@ -6098,13 +6388,21 @@ mod tests {
         // stones. (Out of focus by seven tenths it read through the
         // module centres once reliability was calibrated. By eight it
         // read through the copy only with its padding pinned, until the
-        // blur learnt from its fixed patterns was undone.)
+        // blur learnt from its fixed patterns was undone. Blurred by 2.35
+        // pixels, its finders read whole against the dark of their rings
+        // in a copy sharpened only lightly, and the read through that copy
+        // wants its padding pinned. Blurred by 2.4 the copy sharpened
+        // strongly read it outright, until a solution that spends the
+        // codeword a 3-L block keeps for detecting misreads was confirmed
+        // no longer; it then wanted its padding pinned too, as at 2.25
+        // and 2.5, and at 2.3 the photo as it was read it. Blurred by
+        // 2.45 the copy sharpened strongly reads it outright.)
         let message = "https://example.com/out-of-focus";
         let (w, h, pixels) = render_rgba(&symbol_of(message), 3, 4);
         let render = image::RgbaImage::from_raw(w as u32, h as u32, pixels).expect("a render is an image");
         let mut photo = image::RgbaImage::from_pixel(400, 360, image::Rgba([255; 4]));
         image::imageops::replace(&mut photo, &render, 150, 120);
-        bench.app.set_photo(&ctx, "blurred".into(), image::imageops::blur(&photo, 2.35));
+        bench.app.set_photo(&ctx, "blurred".into(), image::imageops::blur(&photo, 2.45));
         bench.app.doc.corners = square(145.0, 115.0, 121.0);
         // Find in outline reads it through a copy of the photo sharpened
         // and enlarged, and the photo is adjusted to match. The read is
@@ -6312,12 +6610,85 @@ mod tests {
     }
 
     #[test]
+    fn an_edge_point_is_set_anywhere_along_the_outline() {
+        let mut bench = Bench::new();
+        bench.app.doc.corners = STRAIGHT;
+        bench.step();
+        bench.app.view.align_view.auto_fit = false;
+        bench.app.view.align_view.scale = 2.5;
+        bench.step();
+        let locate = bench.locate();
+        let scale = f64::from(bench.app.view.align_view.scale);
+        let apart = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]);
+        let dragged = [30.0 / scale, -18.0 / scale];
+        let drag = |bench: &mut Bench, from: [f64; 2]| {
+            let mut pointer = locate(from);
+            bench.frame(vec![egui::Event::PointerMoved(pointer)]);
+            bench.step();
+            bench.button(pointer, egui::PointerButton::Primary, true);
+            for _ in 0..6 {
+                pointer += egui::vec2(5.0, -3.0);
+                bench.frame(vec![egui::Event::PointerMoved(pointer)]);
+            }
+            bench.button(pointer, egui::PointerButton::Primary, false);
+            bench.step();
+        };
+        // On the top edge between the handles along it, a photo pixel
+        // outside it: the grid lies ten pixels a module from (40, 40), so
+        // this is the outer side of the tenth border module. The edge
+        // point is set on the middle of that side, and goes as far from
+        // where the grid had it as the pointer went.
+        let sited: Vec<[f64; 2]> = qr_forensics::imaging::detect::edge_sites(&bench.app.derived.func).into_iter().map(|s| s.at).collect();
+        assert!(sited.iter().all(|at| apart(*at, [9.5, 0.0]) > 2.0), "{sited:?}");
+        let (middle, start) = ([135.0, 40.0], [133.0, 39.0]);
+        drag(&mut bench, start);
+        let anchors = bench.app.doc.anchors.clone();
+        assert_eq!(anchors.len(), 1, "{anchors:?}");
+        let edge = anchors[0];
+        assert_eq!((edge.anchor.kind, edge.anchor.at, edge.source), (AnchorKind::Edge, [9.5, 0.0], AnchorSource::Manual));
+        let end = [middle[0] + dragged[0], middle[1] + dragged[1]];
+        assert!(apart(edge.anchor.center, end) < 1e-3, "it went to {:?}, not {end:?}", edge.anchor.center);
+        // The edge bows out across itself through it, and slides along
+        // itself as it pleases.
+        let model = bench.app.model.as_ref().expect("the outline is usable");
+        let bowed = model.projection.apply(9.5, 0.0)[1];
+        assert!(bowed - 40.0 < 0.5 * dragged[1], "the edge went to {bowed}, the point to {}", end[1]);
+        // It has a handle of its own, by which it is dropped again.
+        bench.frame(vec![egui::Event::PointerMoved(locate([140.0, 34.0]))]);
+        bench.step();
+        let handles = bench.handles(4.0);
+        let own = handles.iter().find(|h| (**h - locate(edge.anchor.center)).length() < 1.0).copied().expect("a handle on it");
+        bench.click(own, egui::PointerButton::Secondary);
+        assert!(bench.app.doc.anchors.is_empty(), "{:?}", bench.app.doc.anchors);
+        // Further inside than the outline's reach, the border module
+        // itself is taken hold of, for a custom anchor on its middle.
+        drag(&mut bench, [133.0, 44.0]);
+        let anchors = bench.app.doc.anchors.clone();
+        assert_eq!(anchors.len(), 1, "{anchors:?}");
+        assert_eq!((anchors[0].anchor.kind, anchors[0].anchor.at), (AnchorKind::Custom, [9.5, 0.5]));
+        bench.act(Action::ClearAnchors);
+        // Down the left edge as well; but not beside a corner, where the
+        // map yields to the corner, nor with the grid held flat.
+        drag(&mut bench, [40.5, 197.0]);
+        let anchors = bench.app.doc.anchors.clone();
+        assert_eq!(anchors.len(), 1, "{anchors:?}");
+        assert_eq!((anchors[0].anchor.kind, anchors[0].anchor.at), (AnchorKind::Edge, [0.0, 15.5]));
+        bench.act(Action::ClearAnchors);
+        drag(&mut bench, [282.0, 290.5]);
+        assert_eq!(bench.app.doc.corners, STRAIGHT, "the press was on the corner's handle");
+        assert!(bench.app.doc.anchors.is_empty(), "{:?}", bench.app.doc.anchors);
+        bench.app.view.use_anchors = false;
+        drag(&mut bench, start);
+        assert!(bench.app.doc.anchors.is_empty(), "{:?}", bench.app.doc.anchors);
+    }
+
+    #[test]
     fn a_handle_inside_a_symbol_found_takes_its_own_clicks() {
         let mut bench = Bench::new();
         bench.app.doc.corners = STRAIGHT;
         // A symbol found that the outline happens to lie on, and has not
         // been put on from the list.
-        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: None, reads: None });
+        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: None, reads: None, charged: Vec::new() });
         bench.app.doc.set_anchor(finder_anchor([75.0, 75.0]), AnchorSource::Detected);
         bench.step();
         bench.step();
@@ -6352,7 +6723,7 @@ mod tests {
         // quarter, which the two share about (200, 200).
         let diamond = [[165.0, 40.0], [290.0, 165.0], [165.0, 290.0], [40.0, 165.0]];
         let found = vec![detection(SymbolVersion::Qr(2), diamond), detection(SymbolVersion::Micro(3), square(170.0, 170.0, 140.0))];
-        bench.app.proposals = Some(Proposals { found, photo_inverted: false, adopted: None, reads: None });
+        bench.app.proposals = Some(Proposals { found, photo_inverted: false, adopted: None, reads: None, charged: Vec::new() });
         let at = bench.locate();
         // Inside the box about the first and outside its outline, there
         // is nothing to click.
@@ -6378,7 +6749,7 @@ mod tests {
     fn the_symbol_the_outline_was_put_on_is_not_offered_again_on_the_canvas() {
         let mut bench = Bench::new();
         bench.app.doc.corners = STRAIGHT;
-        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: Some(0), reads: None });
+        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: Some(0), reads: None, charged: Vec::new() });
         let at = bench.locate();
         // A click inside the symbol, clear of the handles, is not a click
         // on the symbol found: it would put the outline back as found,
@@ -6397,7 +6768,7 @@ mod tests {
         // A search run again lists the symbol the outline lies on as the
         // one in use still.
         let again = vec![detection(SymbolVersion::Micro(3), square(170.0, 170.0, 140.0)), detection(SymbolVersion::Qr(2), STRAIGHT)];
-        bench.app.finish_search(&bench.ctx.clone(), again, false, None);
+        bench.app.finish_search(&bench.ctx.clone(), again, Vec::new(), false, None, false);
         assert_eq!(bench.app.proposals.as_ref().and_then(|p| p.adopted), Some(1));
     }
 
@@ -6564,7 +6935,7 @@ mod tests {
         let mut bench = Bench::new();
         let ctx = bench.ctx.clone();
         bench.app.doc.corners = STRAIGHT;
-        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: None, reads: None });
+        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: None, reads: None, charged: Vec::new() });
         // A search and a step that are still under way when the lens
         // changes, and would move the outline were they taken in.
         let elsewhere = || detection(SymbolVersion::Qr(2), square(0.0, 0.0, 10.0));
@@ -6583,10 +6954,55 @@ mod tests {
         bench.act(Action::UseProposal(0));
         assert_eq!(bench.app.running(), None);
         // Undo takes the lens back, and with it whatever was found since.
-        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: None, reads: None });
+        bench.app.proposals = Some(Proposals { found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)], photo_inverted: false, adopted: None, reads: None, charged: Vec::new() });
         bench.act(Action::Undo);
         assert_eq!(bench.app.doc.adjust.k1, 0.0);
         assert!(bench.app.proposals.is_none());
+    }
+
+    #[test]
+    fn a_symbol_the_search_found_decoding_is_not_picked_once_the_photo_is_adjusted_meanwhile() {
+        // Whether a symbol decoded, the search asked of the photo as it
+        // began. Adjusted while it ran, a symbol said to decode was once
+        // picked and read off the photo as it is, where it might not.
+        fn slowly<T>(result: T) -> T {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            result
+        }
+        fn taken_in(bench: &mut Bench) {
+            while bench.app.search.is_some() {
+                bench.step();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        let decoding = || Detection { decodes: Some(true), ..detection(SymbolVersion::Qr(2), STRAIGHT) };
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        assert!(bench.app.view.load_reads);
+        // Left as it was, the symbol is picked of itself and read.
+        bench.app.start_search(&ctx, false, None, move || slowly(vec![decoding()]));
+        taken_in(&mut bench);
+        assert_eq!(bench.app.running(), Some(JobKind::Adopt));
+        bench.settle();
+        // Inverted meanwhile, the symbol reads the other way, which the
+        // search's polarity accounts for: picked all the same.
+        bench.app.start_search(&ctx, false, None, move || slowly(vec![decoding()]));
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { invert: true, ..bench.app.doc.adjust }));
+        taken_in(&mut bench);
+        assert_eq!(bench.app.running(), Some(JobKind::Adopt));
+        bench.settle();
+        // Its contrast changed meanwhile: offered, but not picked, and
+        // not said to decode.
+        bench.app.start_search(&ctx, false, None, move || slowly(vec![decoding()]));
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { contrast: bench.app.doc.adjust.contrast + 0.5, ..bench.app.doc.adjust }));
+        assert!(bench.app.search.is_some(), "a change of tone leaves the search running");
+        taken_in(&mut bench);
+        assert_eq!(bench.app.running(), None);
+        let proposals = bench.app.proposals.as_ref().expect("what was found is offered");
+        assert_eq!(proposals.found.iter().map(|found| found.decodes).collect::<Vec<_>>(), [None]);
+        assert!(bench.notice().text.contains("adjustments changed while the search ran"), "{}", bench.notice().text);
     }
 
     #[test]
@@ -6764,7 +7180,7 @@ mod tests {
         let (version, corners) = (bench.app.doc.version, bench.app.doc.corners);
         bench.app.doc.set_anchor(finder_anchor([75.0, 75.0]), AnchorSource::Manual);
         let found = detection(SymbolVersion::Qr(6), STRAIGHT);
-        bench.app.proposals = Some(Proposals { found: vec![found.clone()], photo_inverted: false, adopted: None, reads: None });
+        bench.app.proposals = Some(Proposals { found: vec![found.clone()], photo_inverted: false, adopted: None, reads: None, charged: Vec::new() });
         bench.app.start_job(&ctx, JobKind::Adopt, move || JobResult::Adopt(prepared(found), String::new(), Some(Picked::Proposal(0))));
         bench.app.doc.anchors.clear();
         bench.settle();
@@ -7098,7 +7514,7 @@ mod tests {
         assert!(texts.iter().any(|text| text == "Only look for Micro QR"));
         bench.act(Action::CancelSearch);
         // Finding none of it says which family, and how to look wider.
-        bench.app.finish_search(&bench.ctx.clone(), Vec::new(), false, Some(Family::Micro));
+        bench.app.finish_search(&bench.ctx.clone(), Vec::new(), Vec::new(), false, Some(Family::Micro), false);
         let notice = bench.notice();
         assert!(notice.is_error && notice.text.starts_with("No Micro QR symbol was found"), "{}", notice.text);
         assert!(notice.text.contains("untick Only look for Micro QR"), "{}", notice.text);
@@ -7106,8 +7522,8 @@ mod tests {
         // to, says so and lists them; picking one puts the outline about
         // it, to be undone like any move of the corners.
         let outline = [[30.0, 40.0], [130.0, 42.0], [128.0, 141.0], [29.0, 139.0]];
-        bench.app.leads = vec![Lead { family: Family::Qr, outline, finders: vec![[50.0, 60.0], [110.0, 61.0]] }];
-        bench.app.finish_search(&bench.ctx.clone(), Vec::new(), false, None);
+        bench.app.leads = vec![Lead { family: Family::Qr, outline, finders: vec![[50.0, 60.0], [110.0, 61.0]], fitted: None }];
+        bench.app.finish_search(&bench.ctx.clone(), Vec::new(), Vec::new(), false, None, false);
         let notice = bench.notice();
         assert!(notice.is_error && notice.text.starts_with("No symbol was found in the photo, but finder patterns"), "{}", notice.text);
         bench.step();
@@ -7121,6 +7537,33 @@ mod tests {
         assert_eq!(bench.app.doc.corners, before);
         bench.act(Action::UseLead(3));
         assert!(bench.notice().is_error, "{}", bench.notice().text);
+        // A placement fitted and not read is put down at its own corners
+        // and version, undone in one step with the move of the corners.
+        let version = bench.app.doc.version;
+        let placed = [[31.0, 41.0], [129.0, 43.0], [127.0, 140.0], [30.0, 138.0]];
+        let fitted = SymbolVersion::Qr(if version == SymbolVersion::Qr(3) { 4 } else { 3 });
+        bench.app.leads = vec![Lead { family: Family::Qr, outline: placed, finders: vec![[50.0, 60.0], [110.0, 61.0], [50.0, 120.0]], fitted: Some(fitted) }];
+        bench.act(Action::UseLead(0));
+        assert_eq!((bench.app.doc.corners, bench.app.doc.version), (placed, fitted));
+        assert!(bench.notice().text.starts_with(&format!("The outline is where the search fitted a QR Code {fitted} symbol")), "{}", bench.notice().text);
+        // The grid it starts afresh is said, as a proposal taken says it.
+        assert!(bench.notice().text.ends_with(&format!("This started a new QR Code {fitted} grid (undoable).")), "{}", bench.notice().text);
+        bench.act(Action::Undo);
+        assert_eq!((bench.app.doc.corners, bench.app.doc.version), (before, version));
+        // At the version the grid has already, it stays, and nothing of a
+        // new grid is said. The grid's version is of the family it was
+        // last set to, and the lead's is the same: a lead of one family
+        // fitted at a version of another was once put to it here, and
+        // said as a QR Code M2 symbol.
+        let finders = vec![[50.0, 60.0], [110.0, 61.0], [50.0, 120.0]];
+        bench.app.leads = vec![Lead { family: version.family(), outline: placed, finders, fitted: Some(version) }];
+        bench.act(Action::UseLead(0));
+        assert_eq!((bench.app.doc.corners, bench.app.doc.version), (placed, version));
+        let said = format!("The outline is where the search fitted a {} {version} symbol", version.family().label());
+        assert!(bench.notice().text.starts_with(&said), "{}", bench.notice().text);
+        assert!(!bench.notice().text.contains("new"), "{}", bench.notice().text);
+        bench.act(Action::Undo);
+        assert_eq!(bench.app.doc.corners, before);
         bench.act(Action::ClearProposals);
         assert!(bench.app.leads.is_empty());
         // The render's QR Code, looked for as that and nothing else.
@@ -7130,6 +7573,45 @@ mod tests {
         bench.settle();
         let found = &bench.app.proposals.as_ref().expect("the symbol is found").found;
         assert_eq!(found.iter().map(|found| found.version).collect::<Vec<_>>(), [SymbolVersion::Qr(2)]);
+    }
+
+    #[test]
+    fn a_symbol_the_search_read_aside_is_read_again_charged_as_it_was() {
+        // A placement nothing vouched for, read during the search as one
+        // of several, is charged so ([`Proposals::charged`]); Read all
+        // and a pick from the list read it again, and charge it the same,
+        // where a symbol the search vouched for is a read asked for.
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/photos");
+        let photo = image::open(dir.join("zxing_qrcode-3_01.png")).expect("photo opens").to_rgba8();
+        bench.app.set_photo(&ctx, "photo".into(), photo);
+        bench.app.view.load_reads = false;
+        bench.act(Action::FindSymbols);
+        bench.settle();
+        let tries = |bench: &Bench| {
+            let reads = bench.app.proposals.as_ref().and_then(|proposals| proposals.reads.as_ref()).expect("the symbols were read");
+            reads.results[0].as_ref().expect("the symbol could be sampled").report.tries
+        };
+        bench.act(Action::ReadFound);
+        bench.settle();
+        let asked = tries(&bench);
+        let proposals = bench.app.proposals.as_mut().expect("the symbol is found");
+        let found = &proposals.found[0];
+        proposals.charged = vec![Charged { corners: found.corners, version: found.version, among: 3 }];
+        assert_eq!(proposals.among_of(&proposals.found[0]), 3);
+        bench.act(Action::ReadFound);
+        bench.settle();
+        assert_eq!(tries(&bench), 3 * asked);
+        // Picked from the list with reads loaded, the same.
+        bench.app.view.load_reads = true;
+        if let Some(proposals) = bench.app.proposals.as_mut() {
+            proposals.reads = None;
+        }
+        bench.act(Action::UseProposal(0));
+        bench.settle();
+        assert!(bench.notice().text.starts_with("Loaded symbol 1 as it was read"), "{}", bench.notice().text);
+        assert_eq!(bench.app.derived.report.tries, 3 * asked);
     }
 
     #[test]
@@ -7387,10 +7869,13 @@ mod tests {
         // lower sections are otherwise scrolled out of what is painted.
         bench.size = egui::vec2(1440.0, 3000.0);
         bench.act(Action::ClosePhoto);
-        // Without the trials of erasures, which reach a wrong codeword or
-        // two past the code by themselves: what pins and doubting do is
-        // the point here.
+        // Without the trials of erasures and list decoding, which reach a
+        // wrong codeword or two past the code by themselves: what pins
+        // and doubting do is the point here. List decoding once reached
+        // no further than the code here, its codewords given their
+        // multiplicities a unit at a time.
         bench.app.opts.erase_by_trial = false;
+        bench.app.opts.list_decode = false;
         let text = "https://example.com/q?id=7Q2M-XK4P-99AD";
         let clean = symbol_of(text);
         bench.hold(clean.clone());
@@ -7650,7 +8135,7 @@ mod tests {
         let photo = bench.app.photo.as_ref().expect("the photo is on show");
         assert_eq!(photo.crop, Some(Crop { rect: [2840, 440, 1120, 1060], k1: 0.0, enlarge: Enlarge::HALF }));
         assert_eq!((photo.width, photo.height, photo.scale()), (560, 530, 0.5));
-        assert_eq!(bench.app.doc.adjust, Adjust { enlarge: Enlarge::HALF, contrast: 0.25, ..Adjust::default() });
+        assert_eq!(bench.app.doc.adjust, Adjust { enlarge: Enlarge::HALF, contrast: 0.25, ..opaque(Adjust::default()) });
         assert_eq!(bench.app.doc.corners, square(80.0, 80.0, 400.0));
         assert!(bench.notice().text.contains("1120 × 1060 pixels of the photo as loaded, at 0.5× as the photo was."), "{}", bench.notice().text);
         assert!(bench.texts().iter().any(|text| text == "large · 560 × 530 · cropped from 5000 × 1500"), "{:?}", bench.texts());
@@ -7687,7 +8172,7 @@ mod tests {
         // with, and the whole photo takes its reduction back.
         bench.step();
         bench.click(bench.text_at("Reset adjustments"), egui::PointerButton::Primary);
-        assert_eq!(bench.app.doc.adjust, Adjust::for_photo(56, 56));
+        assert_eq!(bench.app.doc.adjust, opaque(Adjust::for_photo(56, 56)));
         assert_eq!(bench.app.photo.as_ref().map(|photo| (photo.width, photo.adjust.enlarge)), Some((280, Enlarge::times(5))));
         bench.act(Action::ShowWholePhoto);
         let photo = bench.app.photo.as_ref().expect("the photo is on show");
@@ -7821,21 +8306,21 @@ mod tests {
         // list says how to go on.
         bench.app.doc.corners = STRAIGHT;
         let found = vec![decoding(SymbolVersion::Micro(3), square(170.0, 170.0, 140.0)), detection(SymbolVersion::Qr(2), STRAIGHT)];
-        bench.app.finish_search(&bench.ctx.clone(), found.clone(), false, None);
+        bench.app.finish_search(&bench.ctx.clone(), found.clone(), Vec::new(), false, None, false);
         assert_eq!(bench.app.running(), None);
         assert!(bench.notice().text.contains("Pick one under Alignment"), "{}", bench.notice().text);
         // With the outline on neither, the one that decodes as found is
         // picked, and read through.
         bench.app.doc.corners = ASIDE;
-        bench.app.finish_search(&bench.ctx.clone(), found.clone(), false, None);
+        bench.app.finish_search(&bench.ctx.clone(), found.clone(), Vec::new(), false, None, false);
         assert_eq!(bench.app.running(), Some(JobKind::Adopt));
-        assert!(bench.notice().text.contains("Symbol 1 decodes as found, and is being read through"), "{}", bench.notice().text);
+        assert!(bench.notice().text.contains("Symbol 1 decodes as found and is being read into the grid"), "{}", bench.notice().text);
         bench.settle();
         assert_eq!(bench.app.proposals.as_ref().and_then(|proposals| proposals.adopted), Some(0));
         // Not with reads not loaded, nor while another step is under way.
         bench.app.doc.corners = ASIDE;
         bench.app.view.load_reads = false;
-        bench.app.finish_search(&bench.ctx.clone(), found, false, None);
+        bench.app.finish_search(&bench.ctx.clone(), found, Vec::new(), false, None, false);
         assert_eq!(bench.app.running(), None);
     }
 
@@ -8332,7 +8817,10 @@ mod tests {
         // error correction, painted by hand: a solution the curve finds
         // eleven codewords out, confirmed by twenty-five bits, has the
         // eleven a fallback's must show in the search of the block as
-        // read, and more.
+        // read, and more. What it must show is the less of what its
+        // solver's count must, and what the block's own count must, the
+        // nine of a bit for the choice and no share of the search's
+        // solvers ([`judged_verifying_bits`]).
         let (version, level) = (SymbolVersion::Qr(1), EcLevel::H);
         let mut app = App::blank();
         app.doc = Document { format: FormatSel::Manual { ec: level, mask: 0 }, ..Document::blank(version) };
@@ -8341,11 +8829,13 @@ mod tests {
         let fresh = |app: &App| Reach::of(version, level, &app.options_at(level)).expect("a level of the version").list;
         let painted = reach(&app);
         assert!(painted >= 11, "{painted}");
-        // Read from a photo as the pick of sixty-five thousand decodes: a
-        // fallback's solution must show sixteen bits more, and eleven out
-        // no longer has them. The reach was once said of the grid as
-        // though painted.
-        app.doc.grid_among = 1 << 16;
+        // Read from a photo as the pick of a hundred and thirty thousand
+        // decodes: a solution must show seventeen bits more, and eleven
+        // out no longer has them. The reach was once said of the grid as
+        // though painted. (At sixty-five thousand the block's own count
+        // still verifies eleven out, to the bit; it was once said not
+        // to, held to what the solver's count must show.)
+        app.doc.grid_among = 1 << 17;
         assert_eq!((reach(&app), fresh(&app)), (10, 10));
         // The solvers that go by reliability find nothing in a block
         // painted by hand, and switched off they charge a solution nothing
@@ -8359,7 +8849,7 @@ mod tests {
         // The pick of a quarter as many, a solution is charged two bits
         // less: eleven out is in reach again. The reach was once kept as
         // it was worked out under what was charged before.
-        app.doc.grid_among = 1 << 14;
+        app.doc.grid_among = 1 << 15;
         assert_eq!((reach(&app), fresh(&app)), (11, 11));
     }
 
@@ -8407,11 +8897,17 @@ mod tests {
         let note = starting(&bench, "In this symbol's block of 44 codewords: corrects at least ").expect("a note on list decoding");
         assert!(note.ends_with("wrong codewords, vs. 14 for plain Reed-Solomon."), "{note}");
         // A block so small has no use for the most constraints: it uses
-        // what its list lets it, reaches as far as the default, and the
-        // note under the slider says how many it uses.
+        // what its list lets it, and the note under the slider says how
+        // many it uses. Its codewords given more alike, it reaches a
+        // codeword further than at the default, eighteen to seventeen; a
+        // unit at a time, it once reached no further.
         bench.act(Action::SetDecodeOptions(DecodeOptions { list_cost: LIST_COST_MAX, ..bench.app.opts }));
         bench.step();
-        assert_eq!(starting(&bench, "In this symbol's block of 44 codewords: corrects at least ").as_ref(), Some(&note));
+        assert_eq!(note, "In this symbol's block of 44 codewords: corrects at least 17 wrong codewords, vs. 14 for plain Reed-Solomon.");
+        assert_eq!(
+            starting(&bench, "In this symbol's block of 44 codewords: corrects at least ").as_deref(),
+            Some("In this symbol's block of 44 codewords: corrects at least 18 wrong codewords, vs. 14 for plain Reed-Solomon.")
+        );
         let used = starting(&bench, "This symbol's blocks use ").expect("a note on the constraints used");
         assert!(used.contains("; more won't reach further."), "{used}");
     }
@@ -8449,17 +8945,20 @@ mod tests {
         let mut bench = Bench::new();
         bench.size = egui::vec2(1440.0, 3000.0);
         bench.act(Action::ClosePhoto);
-        // An 8-Q symbol painted by hand with its first block thirteen
-        // codewords wrong of forty: past what list decoding reaches at its
-        // usual budget, and within what it reaches at its most.
+        // An 11-Q symbol painted by hand with its first block seventeen
+        // codewords wrong of fifty: past what list decoding reaches at its
+        // usual budget, and within what it reaches at its most. An 8-Q
+        // block thirteen wrong of forty once was, its codewords given the
+        // budget a unit at a time; given it alike, the usual budget
+        // reaches it.
         let text = "it was the best of times, it was the worst of times, it was the age of wisdom, it was the age";
         let symbol = qr::Encoder::new(qr::ErrorCorrection::Quartile)
-            .version(qr::Version::new(8).unwrap())
+            .version(qr::Version::new(11).unwrap())
             .boost_error_correction(false)
             .encode_segments(&[Segment::bytes(text)])
             .unwrap();
         let clean = ModuleGrid::from_bools(symbol.width(), symbol.height(), symbol.modules());
-        bench.app.doc = Document { grid: clean.clone(), ..Document::blank(SymbolVersion::Qr(8)) };
+        bench.app.doc = Document { grid: clean.clone(), ..Document::blank(SymbolVersion::Qr(11)) };
         bench.app.dirty = true;
         bench.step();
         assert!(bench.app.derived.report.is_trustworthy());
@@ -8471,7 +8970,7 @@ mod tests {
         };
         let mut grid = clean;
         let block = &layout.blocks[0];
-        for i in 0..block.ec_len / 2 + 2 {
+        for i in 0..block.ec_len / 2 + 3 {
             wrong(&mut grid, block.codewords[i], i % 8);
         }
         bench.app.doc.grid = grid.clone();
@@ -8614,10 +9113,13 @@ mod tests {
         let mut bench = Bench::new();
         bench.size = egui::vec2(1440.0, 3000.0);
         bench.act(Action::ClosePhoto);
-        // Without the trials of erasures, which reach a wrong codeword or
-        // two past the code by themselves: what pins and doubting do is
-        // the point here.
+        // Without the trials of erasures and list decoding, which reach a
+        // wrong codeword or two past the code by themselves: what pins
+        // and doubting do is the point here. List decoding once reached
+        // no further than the code here, its codewords given their
+        // multiplicities a unit at a time.
         bench.app.opts.erase_by_trial = false;
+        bench.app.opts.list_decode = false;
         let text = "https://example.com/q?id=7Q2M-XK4P-99AD";
         let clean = symbol_of(text);
         bench.hold(clean.clone());

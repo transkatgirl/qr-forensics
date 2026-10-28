@@ -13,7 +13,8 @@
 //!                     [--hex | --escaped] [--charset name] [--corners]
 //!                     [--details] [--grid] [--metrics] [--partial]
 //!                     [--surface] [--enlarge n] [--sharpen light|strong|deblur]
-//!                     [--full-search] [--] <image>...
+//!                     [--full-search] [--transparent white|black|grey]
+//!                     [--] <image>...
 //! ```
 //!
 //! An option that takes a value takes the next argument, or what follows
@@ -45,7 +46,10 @@
 //! back each symbol's ECI and BoofCV its level, mask and encoding.
 //! If every block is confirmed but their combined risk is worse than the
 //! 1 in 2^8 each block must meet, the read still stands, and a warning
-//! is printed to standard error; the read's own line is unchanged.
+//! is printed to standard error; the read's own line is unchanged. The
+//! same goes for an empty message whose data bits are all zero: its
+//! modules are just the mask pattern, which a striped or checked texture
+//! can also produce.
 //! `--charset` names the character set to read byte data in when the
 //! symbol declares none, where it is otherwise guessed: `utf-8`,
 //! `iso-8859-1`, `windows-1252`, `shift_jis`, `gb18030`, `big5`, `euc-kr`,
@@ -55,13 +59,21 @@
 //! `--partial` prints the symbols that did not decode beside those that
 //! did, where they are otherwise printed only when none did: BoofCV
 //! returns its failures beside its detections for the same reason, that
-//! a damaged symbol among sound ones is still a symbol. With them go the
-//! finder patterns a search of the whole photo found standing as one
-//! symbol's, its format word reading outright beside them, and could fit
-//! no symbol to, a line for each set: the family they were taken for,
-//! how many, `no symbol fitted`, and the outline the search proposed
-//! about them, which `--outline` takes as it is. A read through an
-//! outline tries more than a search of the whole photo does.
+//! a damaged symbol among sound ones is still a symbol. It also prints
+//! each set of finder patterns the search took for one symbol (with a
+//! format word read cleanly beside them) but couldn't fit a symbol to,
+//! one line per set: the family, how many finder patterns, `no symbol
+//! fitted`, and the outline the search proposed, which `--outline`
+//! accepts as is. Reading through an outline tries harder than a
+//! whole-photo search. A symbol the search fitted with nothing else to
+//! support it is read during the search and listed if it decodes. If it
+//! doesn't, it's printed like those finder patterns, with the fitted
+//! version after the family, `fitted and not read` in place of `no
+//! symbol fitted`, and its corners as the outline. An image with no
+//! symbol to print gets a `no symbol found` line before these, or `no
+//! symbol read` if a symbol was fitted, or was found but couldn't be read
+//! at all. A symbol that only partly read is printed as usual, followed
+//! by these lines.
 //!
 //! `--metrics` prints read-quality figures under each symbol's line,
 //! indented two spaces, for measuring the pipeline over a corpus
@@ -85,7 +97,9 @@
 //!
 //! `--placed` takes the symbol's four corners, as you'd place them in the
 //! Align stage, and reads from them with no search. It tries the few
-//! versions that best fit the corners, then refines, samples and decodes
+//! versions that best fit the corners, the version the symbol's own
+//! version information names first where it names one, then refines,
+//! samples and decodes
 //! each as it would a placement the search found, retrying on an
 //! enlarged, sharpened copy if the modules are small, and on a deblurred
 //! copy if edges blur by a fifth of a module or more. The corners can
@@ -134,6 +148,14 @@
 //! too small to show in the copy is read through `--outline`: what is
 //! inside an outline is placed and read in the photo's own pixels,
 //! however large the photo.
+//!
+//! `--transparent` fills an image's transparent pixels with white, black
+//! or mid grey (`gray` will do too). By default, as in the window, they
+//! are filled with grey, which a symbol drawn in light or dark ink on a
+//! transparent background reads on alike; a white symbol vanishes on
+//! white, and reads on black. On grey, ink lighter than mid grey, such as
+//! orange, is the light of the symbol, and the read says `light on dark`;
+//! on white it is the dark.
 //!
 //! The outline is drawn top-left first and clockwise, in the photo's own
 //! pixels, upright as its EXIF orientation has it. A photo under 256
@@ -204,8 +226,8 @@ use qr_forensics::decode::pipeline::{DecodeOptions, VERIFIED_RISK_BITS};
 use qr_forensics::decode::sequence::{ParityCheck, Part, Sequence};
 use qr_forensics::decode::text::{Charset, escape_controls};
 use qr_forensics::imaging::Luma;
-use qr_forensics::imaging::adjust::Enlarge;
-use qr_forensics::imaging::detect::{Lead, SearchParams, search_for_families};
+use qr_forensics::imaging::adjust::{Backdrop, Enlarge};
+use qr_forensics::imaging::detect::{Lead, SearchParams};
 use qr_forensics::imaging::enhance::{Enhance, Sharpen};
 use qr_forensics::imaging::gpu;
 use qr_forensics::imaging::measure::ReadMeasures;
@@ -220,7 +242,8 @@ use qr_forensics::work;
 const USAGE: &str = "usage: qr-forensics decode [--family qr|micro|rmqr|model1] \
                      [--outline x,y,x,y,x,y,x,y | --placed x,y,x,y,x,y,x,y] \
                      [--hex | --escaped] [--charset name] [--corners] [--details] [--grid] [--metrics] [--partial] \
-                     [--surface] [--enlarge n] [--sharpen light|strong|deblur] [--full-search] [--] <image>...\n\
+                     [--surface] [--enlarge n] [--sharpen light|strong|deblur] [--full-search] \
+                     [--transparent white|black|grey] [--] <image>...\n\
                      A message is printed on its symbol's line, its control characters other than tab spelt out as \
                      <CR>, <LF> and so on; --escaped spells out every one and the unreadable mark, --hex prints the \
                      bytes.";
@@ -256,6 +279,8 @@ struct Options {
     /// Read each symbol off the photo enlarged or sharpened first.
     enhance: Enhance,
     search: SearchParams,
+    /// What the image's transparent parts are laid on.
+    backdrop: Backdrop,
     images: Vec<OsString>,
 }
 
@@ -263,12 +288,22 @@ struct Options {
 /// lists them, whatever its case and with or without its hyphens, or an
 /// ECI assignment number.
 fn charset_named(name: &str) -> Option<Charset> {
-    let plain = |text: &str| text.chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_ascii_lowercase();
+    let plain = |text: &str| {
+        text.chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>()
+            .to_ascii_lowercase()
+    };
     let wanted = plain(name);
     Charset::ALL
         .into_iter()
         .find(|c| plain(c.label()) == wanted)
-        .or_else(|| name.parse().ok().map(Charset::Eci).filter(|c| c.label() != "unsupported"))
+        .or_else(|| {
+            name.parse()
+                .ok()
+                .map(Charset::Eci)
+                .filter(|c| c.label() != "unsupported")
+        })
 }
 
 /// Why a command line is not run: it asked for the usage, or it is wrong,
@@ -304,6 +339,7 @@ fn parse_options(args: &[OsString]) -> Result<Option<Options>, String> {
         surface: false,
         enhance: Enhance::NONE,
         search: SearchParams::default(),
+        backdrop: Backdrop::default(),
         images: Vec::new(),
     };
     let mut args = args.iter();
@@ -322,10 +358,19 @@ fn parse_options(args: &[OsString]) -> Result<Option<Options>, String> {
         let mut value = |what: &str| -> Result<String, String> {
             match inline {
                 Some(value) => Ok(value.to_owned()),
-                None => args.next().map(|a| a.to_string_lossy().into_owned()).ok_or_else(|| format!("{name} needs {what}")),
+                None => args
+                    .next()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .ok_or_else(|| format!("{name} needs {what}")),
             }
         };
-        let flag = || if inline.is_some() { Err(format!("{name} takes no value")) } else { Ok(()) };
+        let flag = || {
+            if inline.is_some() {
+                Err(format!("{name} takes no value"))
+            } else {
+                Ok(())
+            }
+        };
         match name {
             "--family" => {
                 let value = value("a value")?;
@@ -346,20 +391,27 @@ fn parse_options(args: &[OsString]) -> Result<Option<Options>, String> {
             "--hex" => {
                 flag()?;
                 if options.show == Show::Escaped {
-                    return Err("--hex and --escaped each print the message one way; give one of them".to_owned());
+                    return Err(
+                        "--hex and --escaped each print the message one way; give one of them"
+                            .to_owned(),
+                    );
                 }
                 options.show = Show::Hex;
             }
             "--escaped" => {
                 flag()?;
                 if options.show == Show::Hex {
-                    return Err("--hex and --escaped each print the message one way; give one of them".to_owned());
+                    return Err(
+                        "--hex and --escaped each print the message one way; give one of them"
+                            .to_owned(),
+                    );
                 }
                 options.show = Show::Escaped;
             }
             "--charset" => {
                 let value = value("a character set")?;
-                options.charset = charset_named(&value).ok_or_else(|| format!("unknown character set {value:?}"))?;
+                options.charset = charset_named(&value)
+                    .ok_or_else(|| format!("unknown character set {value:?}"))?;
             }
             "--corners" => {
                 flag()?;
@@ -389,7 +441,12 @@ fn parse_options(args: &[OsString]) -> Result<Option<Options>, String> {
                 let value = value("a factor")?;
                 options.enhance.enlarge = match value.parse() {
                     Ok(factor) if (1..=Enhance::MAX_ENLARGE).contains(&factor) => factor,
-                    _ => return Err(format!("--enlarge takes a factor from 1 to {}, not {value}", Enhance::MAX_ENLARGE)),
+                    _ => {
+                        return Err(format!(
+                            "--enlarge takes a factor from 1 to {}, not {value}",
+                            Enhance::MAX_ENLARGE
+                        ));
+                    }
                 };
             }
             "--sharpen" => {
@@ -399,12 +456,29 @@ fn parse_options(args: &[OsString]) -> Result<Option<Options>, String> {
                     "light" => Sharpen::Light,
                     "strong" => Sharpen::Strong,
                     "deblur" => Sharpen::Deblur,
-                    other => return Err(format!("--sharpen takes light, strong or deblur, not {other}")),
+                    other => {
+                        return Err(format!(
+                            "--sharpen takes light, strong or deblur, not {other}"
+                        ));
+                    }
                 };
             }
             "--full-search" => {
                 flag()?;
                 options.search.coarse_to_fine = false;
+            }
+            "--transparent" => {
+                let value = value("white, black or grey")?;
+                options.backdrop = match value.as_str() {
+                    "white" => Backdrop::White,
+                    "black" => Backdrop::Black,
+                    "grey" | "gray" => Backdrop::Grey,
+                    other => {
+                        return Err(format!(
+                            "--transparent takes white, black or grey, not {other}"
+                        ));
+                    }
+                };
             }
             "--help" | "-h" => return Ok(None),
             other if other.starts_with("--") => return Err(format!("unknown option {other}")),
@@ -424,9 +498,19 @@ fn parse_options(args: &[OsString]) -> Result<Option<Options>, String> {
 /// them: eight numbers with commas between, `x` before `y`. `what` names
 /// them in what is said of a bad one, after `article`.
 fn four_points(article: &str, what: &str, value: &str) -> Result<[[f64; 2]; 4], String> {
-    let numbers: Vec<f64> = value.split(',').map(|v| v.trim().parse::<f64>().map_err(|e| format!("{what} {value:?}: {e}"))).collect::<Result<_, _>>()?;
+    let numbers: Vec<f64> = value
+        .split(',')
+        .map(|v| {
+            v.trim()
+                .parse::<f64>()
+                .map_err(|e| format!("{what} {value:?}: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
     let [x0, y0, x1, y1, x2, y2, x3, y3] = numbers[..] else {
-        return Err(format!("{article} {what} is eight numbers, not {}", numbers.len()));
+        return Err(format!(
+            "{article} {what} is eight numbers, not {}",
+            numbers.len()
+        ));
     };
     if let Some(bad) = numbers.iter().find(|n| !n.is_finite()) {
         return Err(format!("{what} {value:?}: {bad} is no pixel position"));
@@ -436,11 +520,12 @@ fn four_points(article: &str, what: &str, value: &str) -> Result<[[f64; 2]; 4], 
 
 /// A photo as the app loads it: the file's pixels, enlarged when the
 /// photo is small and never shrunk, as luminance, with the default tone
-/// adjustments; and how many times its own size it was loaded at.
-fn load(path: &Path) -> Result<(Luma, f64), String> {
+/// adjustments and its transparent parts on `backdrop`; and how many
+/// times its own size it was loaded at.
+fn load(path: &Path, backdrop: Backdrop) -> Result<(Luma, f64), String> {
     let image = photo::open(path).map_err(|e| e.to_string())?;
     let times = Enlarge::for_photo(image.width(), image.height()).factor();
-    Ok((photo::luma_as_loaded(image), times))
+    Ok((photo::luma_as_loaded_on(image, backdrop), times))
 }
 
 /// Four points of a photo worked on at `times` its own size, as
@@ -451,8 +536,16 @@ fn load(path: &Path) -> Result<(Luma, f64), String> {
 /// of a module there, and a tenth of the photo's own pixel is a tenth of
 /// a module of it.
 fn at(points: &[[f64; 2]; 4], times: f64) -> String {
-    let places = 1 + if times > 1.0 { (times.log10().ceil() as usize).max(1) } else { 0 };
-    let at: Vec<String> = points.iter().flat_map(|p| [p[0], p[1]]).map(|v| format!("{:.places$}", v / times)).collect();
+    let places = 1 + if times > 1.0 {
+        (times.log10().ceil() as usize).max(1)
+    } else {
+        0
+    };
+    let at: Vec<String> = points
+        .iter()
+        .flat_map(|p| [p[0], p[1]])
+        .map(|v| format!("{:.places$}", v / times))
+        .collect();
     at.join(",")
 }
 
@@ -476,11 +569,17 @@ pub(crate) fn standing(result: &ReadResult) -> String {
     } else if result.is_trustworthy() {
         "read".to_owned()
     } else if report.is_complete() && report.score.stream_valid {
-        format!("unconfirmed, {} of {blocks} blocks confirmed", report.blocks_verified())
+        format!(
+            "unconfirmed, {} of {blocks} blocks confirmed",
+            report.blocks_verified()
+        )
     } else if report.blocks_verified() == blocks {
         format!("malformed, {blocks} of {blocks} blocks solved")
     } else {
-        format!("partial, {} of {blocks} blocks solved", report.blocks_solved())
+        format!(
+            "partial, {} of {blocks} blocks solved",
+            report.blocks_solved()
+        )
     }
 }
 
@@ -548,6 +647,20 @@ fn risk_warning(path: &Path, result: &ReadResult) -> Option<String> {
     ))
 }
 
+/// The warning for a read of an empty message with nothing but zeros
+/// after it, the mask's own pattern ([`DecodeReport::data_is_the_mask`]):
+/// printed to standard error as [`risk_warning`] is. None for any other
+/// read.
+fn mask_warning(path: &Path, result: &ReadResult) -> Option<String> {
+    (result.is_trustworthy() && result.report.data_is_the_mask()).then(|| {
+        format!(
+            "{}: warning: the message is empty and every data bit is zero, so the modules are just the mask \
+             pattern, which a striped or checked texture can also produce",
+            path.display()
+        )
+    })
+}
+
 /// The message as the default output prints it: as it is, but for its
 /// control characters other than tab, spelt out as `--escaped` spells
 /// them, so that a line break inside a message, as a vCard or an
@@ -557,7 +670,13 @@ fn risk_warning(path: &Path, result: &ReadResult) -> Option<String> {
 /// which `--escaped` alone spells out.
 fn one_line(text: &str) -> String {
     text.chars()
-        .map(|ch| if ch.is_control() && ch != '\t' { escape_controls(ch.encode_utf8(&mut [0; 4])) } else { ch.to_string() })
+        .map(|ch| {
+            if ch.is_control() && ch != '\t' {
+                escape_controls(ch.encode_utf8(&mut [0; 4]))
+            } else {
+                ch.to_string()
+            }
+        })
         .collect()
 }
 
@@ -589,12 +708,41 @@ fn describe(path: &Path, result: &ReadResult, options: &Options, times: f64) -> 
     format!("{line}: {message}")
 }
 
+/// The line for an image of which no symbol was read: `no symbol found`,
+/// or `no symbol read` where the search fitted a symbol that did not read
+/// ([`Lead::fitted`]), which the lines after it name, or where it `found`
+/// symbols and none of them could be read at all. It once said none was
+/// found, and then named the version one was fitted at; and said none
+/// was found of a symbol found that nothing could be sampled of.
+fn nothing_read(path: &Path, found: bool, leads: &[Lead]) -> String {
+    let what = if found || leads.iter().any(|lead| lead.fitted.is_some()) {
+        "read"
+    } else {
+        "found"
+    };
+    format!("{}: no symbol {what}", path.display())
+}
+
 /// A line for finder patterns the search could fit no symbol to: the
 /// family they were taken for, how many there are, and the outline the
 /// search proposed about them, always, since where they lie is all there
-/// is to say of them, in the form `--outline` takes it back.
+/// is to say of them, in the form `--outline` takes it back. Finders a
+/// placement was fitted to that nothing vouched for, and that did not
+/// read, are said with the version fitted, as `fitted and not read`.
 fn describe_lead(path: &Path, lead: &Lead, times: f64) -> String {
-    format!("{}: {}: {} finder patterns, no symbol fitted: at {}", path.display(), lead.family.label(), lead.finders.len(), at(&lead.outline, times))
+    let (what, standing) = match lead.fitted {
+        Some(version) => (
+            format!("{} {version}", lead.family.label()),
+            "fitted and not read",
+        ),
+        None => (lead.family.label().to_owned(), "no symbol fitted"),
+    };
+    format!(
+        "{}: {what}: {} finder patterns, {standing}: at {}",
+        path.display(),
+        lead.finders.len(),
+        at(&lead.outline, times)
+    )
 }
 
 /// The messages the parts make up, one sequence for each count and
@@ -626,8 +774,12 @@ fn describe_sequence(path: &Path, sequence: &Sequence, show: Show, details: bool
     let total = sequence.header().map_or(0, |h| h.0);
     let found = format!("structured append, {} of {total} parts", sequence.len());
     let parity = match sequence.check() {
-        ParityCheck::Complete { computed, claimed } if computed == claimed => ", parity verified".to_owned(),
-        ParityCheck::Complete { computed, claimed } => format!(", parity {computed:02X} where the parts claim {claimed:02X}"),
+        ParityCheck::Complete { computed, claimed } if computed == claimed => {
+            ", parity verified".to_owned()
+        }
+        ParityCheck::Complete { computed, claimed } => {
+            format!(", parity {computed:02X} where the parts claim {claimed:02X}")
+        }
         ParityCheck::Unreadable => ", parity unreadable".to_owned(),
         ParityCheck::Inconsistent => ", parts disagree".to_owned(),
         ParityCheck::Empty | ParityCheck::Incomplete { .. } => String::new(),
@@ -651,7 +803,18 @@ fn grid_lines(result: &ReadResult) -> Vec<String> {
         .grid
         .to_text()
         .lines()
-        .map(|row| format!("  {}", row.chars().map(|c| match c { '1' => '#', '0' => '.', other => other }).collect::<String>()))
+        .map(|row| {
+            format!(
+                "  {}",
+                row.chars()
+                    .map(|c| match c {
+                        '1' => '#',
+                        '0' => '.',
+                        other => other,
+                    })
+                    .collect::<String>()
+            )
+        })
         .collect()
 }
 
@@ -691,13 +854,24 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
         warn(&message);
         return 2;
     }
-    let asked = SampleParams { enhance: options.enhance, ..SampleParams::default() };
-    let params = if options.surface { asked.under(Rule::Surface) } else { asked };
-    let opts = DecodeOptions { charset: options.charset, derive_pins: true, ..DecodeOptions::default() };
+    let asked = SampleParams {
+        enhance: options.enhance,
+        ..SampleParams::default()
+    };
+    let params = if options.surface {
+        asked.under(Rule::Surface)
+    } else {
+        asked
+    };
+    let opts = DecodeOptions {
+        charset: options.charset,
+        derive_pins: true,
+        ..DecodeOptions::default()
+    };
     let mut status = 0;
     for image in &options.images {
         let path = Path::new(image);
-        let (luma, times) = match load(path) {
+        let (luma, times) = match load(path, options.backdrop) {
             Ok(loaded) => loaded,
             Err(message) => {
                 warn(&format!("{}: {message}", path.display()));
@@ -705,49 +879,90 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
                 continue;
             }
         };
-        // The finder patterns a search fitted no symbol to: an outline
-        // given is read, and nothing is searched for.
+        // The finder patterns a search fitted no symbol to, or fitted one
+        // to that did not read ([`Lead::fitted`]), and whether it found
+        // any symbol: an outline given is read, and nothing is searched
+        // for.
         let mut leads: Vec<Lead> = Vec::new();
+        let mut found = false;
         // An outline is given in the photo's own pixels, and read in
         // those the photo was loaded at; so is a placement.
-        let placed = options.placed.map(|corners| corners.map(|[x, y]| [x * times, y * times]));
-        let results: Vec<ReadResult> = match options.outline.map(|outline| outline.map(|[x, y]| [x * times, y * times])) {
+        let placed = options
+            .placed
+            .map(|corners| corners.map(|[x, y]| [x * times, y * times]));
+        let results: Vec<ReadResult> = match options
+            .outline
+            .map(|outline| outline.map(|[x, y]| [x * times, y * times]))
+        {
             // A placement is read as the family named, or as a QR Code,
             // and nothing is searched for.
-            _ if placed.is_some() => {
-                read_placed(&luma, options.family.unwrap_or(Family::Qr), placed.expect("a placement"), &params, &opts).into_iter().collect()
-            }
+            _ if placed.is_some() => read_placed(
+                &luma,
+                options.family.unwrap_or(Family::Qr),
+                placed.expect("a placement"),
+                &params,
+                &opts,
+            )
+            .into_iter()
+            .collect(),
             // A family named is the one family the outline is read as;
             // with none named it is read as Find in outline reads one, as a
             // QR Code and then as the other families.
             Some(outline) => match options.family {
-                Some(family) => read_outline(&luma, start_version(family), outline, &params, &opts).into_iter().collect(),
-                None => crate::app::read_outline_of_any_family(&luma, start_version(Family::Qr), outline, &params, &opts)
+                Some(family) => read_outline(&luma, start_version(family), outline, &params, &opts)
                     .into_iter()
-                    .map(|(read, _)| read)
                     .collect(),
+                None => crate::app::read_outline_of_any_family(
+                    &luma,
+                    start_version(Family::Qr),
+                    outline,
+                    &params,
+                    &opts,
+                )
+                .into_iter()
+                .map(|(read, _)| read)
+                .collect(),
             },
             None => {
-                let found = match options.family {
-                    Some(family) => {
-                        let sought = search_for_families(&luma, &[family], &params, &options.search, &|_| true);
-                        leads = sought.leads;
-                        sought.detections
-                    }
-                    None => {
-                        let sought = crate::app::search_for_every_family(&luma, &params, &options.search);
-                        leads = sought.leads;
-                        sought.found
-                    }
+                // Listed as Search whole photo lists what it finds, one
+                // family or every one: two placements kept aside for a
+                // read may read as one symbol, or as one found already,
+                // and the list has each symbol once. A family named once
+                // went unlisted, and could print a symbol twice.
+                let sought = match options.family {
+                    Some(family) => crate::app::search_for_family(
+                        &luma,
+                        family,
+                        &params,
+                        &options.search,
+                        &opts,
+                    ),
+                    None => crate::app::search_for_every_family(
+                        &luma,
+                        &params,
+                        &options.search,
+                        &opts,
+                    ),
                 };
                 // Each symbol found read side by side on the cores to
-                // spare, as Read all reads them, and kept in its order.
-                work::map(&found, |detection| read_detection(&luma, detection.clone(), &params, &opts)).into_iter().flatten().collect()
+                // spare, as Read all reads them, and kept in its order. A
+                // placement the search read already, nothing else vouching
+                // for it, is printed as that read found it, charged for
+                // the placements read beside it: read again, it was read
+                // as a symbol the search vouched for, uncharged, and
+                // twice for nothing.
+                let read = work::map(&sought.found, |detection| match sought.read_of(detection) {
+                    Some(read) => Some(read.clone()),
+                    None => read_detection(&luma, detection.clone(), &params, &opts),
+                });
+                found = !sought.found.is_empty();
+                leads = sought.leads;
+                read.into_iter().flatten().collect()
             }
         };
         if results.is_empty() {
             status = status.max(1);
-            if writeln!(out, "{}: no symbol found", path.display()).is_err() {
+            if writeln!(out, "{}", nothing_read(path, found, &leads)).is_err() {
                 return status;
             }
             for lead in &leads {
@@ -761,11 +976,14 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
         if !any_read {
             status = status.max(1);
         }
-        for result in results.iter().filter(|r| r.is_trustworthy() || !any_read || options.partial) {
+        for result in results
+            .iter()
+            .filter(|r| r.is_trustworthy() || !any_read || options.partial)
+        {
             if writeln!(out, "{}", describe(path, result, &options, times)).is_err() {
                 return status;
             }
-            if let Some(warning) = risk_warning(path, result) {
+            for warning in [risk_warning(path, result), mask_warning(path, result)].into_iter().flatten() {
                 warn(&warning);
             }
             if options.grid {
@@ -782,8 +1000,9 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
                 return status;
             }
         }
-        // What the search found the finders of and fitted no symbol to
-        // goes with the symbols that did not decode.
+        // What the search found the finders of and fitted no symbol to,
+        // or fitted one to that did not read, goes with the symbols that
+        // did not decode.
         for lead in leads.iter().filter(|_| !any_read || options.partial) {
             if writeln!(out, "{}", describe_lead(path, lead, times)).is_err() {
                 return status;
@@ -791,9 +1010,18 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
         }
         // The parts of a message spread over several symbols, joined: of
         // the reads that are to be believed, whose headers are.
-        let parts = results.iter().filter(|r| r.is_trustworthy()).filter_map(|r| Part::from_report(&r.report, String::new()));
+        let parts = results
+            .iter()
+            .filter(|r| r.is_trustworthy())
+            .filter_map(|r| Part::from_report(&r.report, String::new()));
         for sequence in sequences(parts.collect()) {
-            if writeln!(out, "{}", describe_sequence(path, &sequence, options.show, options.details)).is_err() {
+            if writeln!(
+                out,
+                "{}",
+                describe_sequence(path, &sequence, options.show, options.details)
+            )
+            .is_err()
+            {
                 return status;
             }
         }
@@ -807,93 +1035,236 @@ mod tests {
 
     #[test]
     fn arguments_are_parsed() {
-        let args: Vec<OsString> = ["--family", "rmqr", "--outline", "1,2, 3,4,5,6,7,8", "--hex", "a.png", "b.jpg"].iter().map(OsString::from).collect();
+        let args: Vec<OsString> = [
+            "--family",
+            "rmqr",
+            "--outline",
+            "1,2, 3,4,5,6,7,8",
+            "--hex",
+            "a.png",
+            "b.jpg",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
         let options = parse(&args).unwrap();
         assert_eq!(options.family, Some(Family::Rmqr));
-        assert_eq!(options.outline, Some([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]));
+        assert_eq!(
+            options.outline,
+            Some([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
+        );
         assert_eq!(options.show, Show::Hex);
         assert!(options.search.coarse_to_fine);
-        assert_eq!(options.images, [OsString::from("a.png"), OsString::from("b.jpg")]);
+        assert_eq!(
+            options.images,
+            [OsString::from("a.png"), OsString::from("b.jpg")]
+        );
         assert!(!options.corners && !options.grid);
-        let full: Vec<OsString> = ["--full-search", "a.png"].iter().map(OsString::from).collect();
+        let full: Vec<OsString> = ["--full-search", "a.png"]
+            .iter()
+            .map(OsString::from)
+            .collect();
         assert!(!parse(&full).unwrap().search.coarse_to_fine);
         // A value after an equals sign, and flags that take none.
-        let joined: Vec<OsString> =
-            ["--family=micro", "--outline=1,2,3,4,5,6,7,8", "--corners", "--grid", "a.png"].iter().map(OsString::from).collect();
+        let joined: Vec<OsString> = [
+            "--family=micro",
+            "--outline=1,2,3,4,5,6,7,8",
+            "--corners",
+            "--grid",
+            "a.png",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
         let options = parse(&joined).unwrap();
         assert_eq!(options.family, Some(Family::Micro));
-        assert_eq!(options.outline, Some([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]));
+        assert_eq!(
+            options.outline,
+            Some([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
+        );
         assert!(options.corners && options.grid);
-        assert_eq!((options.charset, options.details, options.partial, options.surface), (Charset::Auto, false, false, false));
-        let more: Vec<OsString> =
-            ["--charset", "Shift_JIS", "--details", "--partial", "--surface", "a.png"].iter().map(OsString::from).collect();
+        assert_eq!(
+            (
+                options.charset,
+                options.details,
+                options.partial,
+                options.surface
+            ),
+            (Charset::Auto, false, false, false)
+        );
+        let more: Vec<OsString> = [
+            "--charset",
+            "Shift_JIS",
+            "--details",
+            "--partial",
+            "--surface",
+            "a.png",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
         let options = parse(&more).unwrap();
-        assert_eq!((options.charset, options.details, options.partial, options.surface), (Charset::ShiftJis, true, true, true));
+        assert_eq!(
+            (
+                options.charset,
+                options.details,
+                options.partial,
+                options.surface
+            ),
+            (Charset::ShiftJis, true, true, true)
+        );
         assert!(parse(&[OsString::from("--charset=klingon"), OsString::from("a.png")]).is_err());
         assert!(parse(&[OsString::from("--details=yes"), OsString::from("a.png")]).is_err());
         assert!(parse(&[OsString::from("--hex=1"), OsString::from("a.png")]).is_err());
         assert!(parse(&[OsString::from("--family")]).is_err());
-        assert!(parse(&[OsString::from("--outline"), OsString::from("1,2,3"), OsString::from("a.png")]).is_err());
+        assert!(
+            parse(&[
+                OsString::from("--outline"),
+                OsString::from("1,2,3"),
+                OsString::from("a.png")
+            ])
+            .is_err()
+        );
         assert!(parse(&[OsString::from("--what"), OsString::from("a.png")]).is_err());
         // `--` ends the options: an image may be named as an option is.
-        let ended: Vec<OsString> = ["--corners", "a.png", "--", "--hex", "--", "-b.png"].iter().map(OsString::from).collect();
+        let ended: Vec<OsString> = ["--corners", "a.png", "--", "--hex", "--", "-b.png"]
+            .iter()
+            .map(OsString::from)
+            .collect();
         let options = parse(&ended).unwrap();
-        assert_eq!(options.images, ["a.png", "--hex", "--", "-b.png"].map(OsString::from));
+        assert_eq!(
+            options.images,
+            ["a.png", "--hex", "--", "-b.png"].map(OsString::from)
+        );
         assert!(options.corners && options.show == Show::Text);
         assert!(parse(&[OsString::from("--")]).is_err());
         // A placement is read through, an outline looked inside: not both.
-        let placed: Vec<OsString> = ["--placed=1,2,3,4,5,6,7,8", "--metrics", "a.png"].iter().map(OsString::from).collect();
+        let placed: Vec<OsString> = ["--placed=1,2,3,4,5,6,7,8", "--metrics", "a.png"]
+            .iter()
+            .map(OsString::from)
+            .collect();
         let options = parse(&placed).unwrap();
-        assert_eq!(options.placed, Some([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]));
+        assert_eq!(
+            options.placed,
+            Some([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
+        );
         assert!(options.metrics && options.outline.is_none());
-        assert!(parse(&[OsString::from("--placed=1,2,3,4,5,6,7,8"), OsString::from("--outline=1,2,3,4,5,6,7,8"), OsString::from("a.png")]).is_err());
+        assert!(
+            parse(&[
+                OsString::from("--placed=1,2,3,4,5,6,7,8"),
+                OsString::from("--outline=1,2,3,4,5,6,7,8"),
+                OsString::from("a.png")
+            ])
+            .is_err()
+        );
         assert!(parse(&[OsString::from("--placed=1,2,3"), OsString::from("a.png")]).is_err());
         assert!(parse(&[OsString::from("--metrics=yes"), OsString::from("a.png")]).is_err());
         // The photo enlarged and sharpened, each on its own or both.
         assert_eq!(options.enhance, Enhance::NONE);
-        let enhanced: Vec<OsString> = ["--enlarge", "3", "--sharpen=strong", "a.png"].iter().map(OsString::from).collect();
-        assert_eq!(parse(&enhanced).unwrap().enhance, Enhance { enlarge: 3, sharpen: Sharpen::Strong });
-        let sharpened = parse(&[OsString::from("--sharpen"), OsString::from("light"), OsString::from("a.png")]).unwrap();
-        assert_eq!(sharpened.enhance, Enhance { enlarge: 1, sharpen: Sharpen::Light });
-        for bad in ["--enlarge=5", "--enlarge=0", "--enlarge=two", "--sharpen=very"] {
-            assert!(parse(&[OsString::from(bad), OsString::from("a.png")]).is_err(), "{bad}");
+        let enhanced: Vec<OsString> = ["--enlarge", "3", "--sharpen=strong", "a.png"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(
+            parse(&enhanced).unwrap().enhance,
+            Enhance {
+                enlarge: 3,
+                sharpen: Sharpen::Strong
+            }
+        );
+        let sharpened = parse(&[
+            OsString::from("--sharpen"),
+            OsString::from("light"),
+            OsString::from("a.png"),
+        ])
+        .unwrap();
+        assert_eq!(
+            sharpened.enhance,
+            Enhance {
+                enlarge: 1,
+                sharpen: Sharpen::Light
+            }
+        );
+        for bad in [
+            "--enlarge=5",
+            "--enlarge=0",
+            "--enlarge=two",
+            "--sharpen=very",
+        ] {
+            assert!(
+                parse(&[OsString::from(bad), OsString::from("a.png")]).is_err(),
+                "{bad}"
+            );
         }
         assert!(parse(&[OsString::from("--sharpen")]).is_err());
         assert!(parse(&[]).is_err());
         // The usage asked for is printed as output, and is no error; a
         // bad command line is one, and says what is bad.
-        assert!(matches!(parse(&[OsString::from("--help")]), Err(Unparsed::Help)));
-        assert!(matches!(parse(&[OsString::from("-h"), OsString::from("a.png")]), Err(Unparsed::Help)));
+        assert!(matches!(
+            parse(&[OsString::from("--help")]),
+            Err(Unparsed::Help)
+        ));
+        assert!(matches!(
+            parse(&[OsString::from("-h"), OsString::from("a.png")]),
+            Err(Unparsed::Help)
+        ));
         let mut out = Vec::new();
         assert_eq!(run_to(&[OsString::from("--help")], &mut out), 0);
         assert_eq!(String::from_utf8(out).unwrap(), format!("{USAGE}\n"));
         assert_eq!(run(&[OsString::from("/nowhere/at/all.png")]), 2);
-        assert!(matches!(parse(&[OsString::from("--what"), OsString::from("a.png")]), Err(Unparsed::Bad(message)) if message.contains("--what")));
+        assert!(
+            matches!(parse(&[OsString::from("--what"), OsString::from("a.png")]), Err(Unparsed::Bad(message)) if message.contains("--what"))
+        );
         // One way of printing the message at a time.
         for both in [["--hex", "--escaped"], ["--escaped", "--hex"]] {
             let args: Vec<OsString> = both.iter().chain(&["a.png"]).map(OsString::from).collect();
-            assert!(matches!(parse(&args), Err(Unparsed::Bad(message)) if message.contains("one of them")), "{both:?}");
+            assert!(
+                matches!(parse(&args), Err(Unparsed::Bad(message)) if message.contains("one of them")),
+                "{both:?}"
+            );
         }
-        let twice: Vec<OsString> = ["--hex", "--hex", "a.png"].iter().map(OsString::from).collect();
+        let twice: Vec<OsString> = ["--hex", "--hex", "a.png"]
+            .iter()
+            .map(OsString::from)
+            .collect();
         assert_eq!(parse(&twice).unwrap().show, Show::Hex);
         // An outline is made of pixel positions, which are finite.
-        for bad in ["nan,2,3,4,5,6,7,8", "1,2,3,4,inf,6,7,8", "1,2,3,4,5,6,7,-inf"] {
-            let args = [OsString::from(format!("--outline={bad}")), OsString::from("a.png")];
-            assert!(matches!(parse(&args), Err(Unparsed::Bad(message)) if message.contains("no pixel position")), "{bad}");
+        for bad in [
+            "nan,2,3,4,5,6,7,8",
+            "1,2,3,4,inf,6,7,8",
+            "1,2,3,4,5,6,7,-inf",
+        ] {
+            let args = [
+                OsString::from(format!("--outline={bad}")),
+                OsString::from("a.png"),
+            ];
+            assert!(
+                matches!(parse(&args), Err(Unparsed::Bad(message)) if message.contains("no pixel position")),
+                "{bad}"
+            );
         }
         // Model 1 is searched for by name as any family is: a search of
         // the whole photo for it alone finds a Model 1 symbol by its
         // finders, which are those of a QR Code, and fits it as Model 1.
-        let model1: Vec<OsString> = ["--family", "model1", "a.png"].iter().map(OsString::from).collect();
+        let model1: Vec<OsString> = ["--family", "model1", "a.png"]
+            .iter()
+            .map(OsString::from)
+            .collect();
         let options = parse(&model1).unwrap();
-        assert_eq!((options.family, options.outline), (Some(Family::Model1), None));
+        assert_eq!(
+            (options.family, options.outline),
+            (Some(Family::Model1), None)
+        );
     }
 
     #[test]
     fn the_default_output_keeps_a_message_to_its_line() {
         // A line break, a group separator and an escape are spelt out;
         // a tab, the unreadable mark and everything printable stay.
-        assert_eq!(one_line("BEGIN:VCARD\r\nN:A\tB\u{1D}\u{1B}\u{FFFD}é"), "BEGIN:VCARD<CR><LF>N:A\tB<GS><ESC>\u{FFFD}é");
+        assert_eq!(
+            one_line("BEGIN:VCARD\r\nN:A\tB\u{1D}\u{1B}\u{FFFD}é"),
+            "BEGIN:VCARD<CR><LF>N:A\tB<GS><ESC>\u{FFFD}é"
+        );
         assert_eq!(one_line("plain"), "plain");
         assert_eq!(one_line(""), "");
     }
@@ -908,11 +1279,21 @@ mod tests {
         assert_eq!(charset_named("auto"), Some(Charset::Auto));
         // Any set the ECI table names, by its name or its number.
         for charset in Charset::ALL {
-            assert_eq!(charset_named(charset.label()).map(Charset::label), Some(charset.label()));
+            assert_eq!(
+                charset_named(charset.label()).map(Charset::label),
+                Some(charset.label())
+            );
         }
-        assert_eq!(charset_named("17").map(Charset::label), Some(Charset::Eci(17).label()));
+        assert_eq!(
+            charset_named("17").map(Charset::label),
+            Some(Charset::Eci(17).label())
+        );
         assert_eq!(charset_named("klingon"), None);
-        assert_eq!(charset_named("14"), None, "an assignment the table leaves empty");
+        assert_eq!(
+            charset_named("14"),
+            None,
+            "an assignment the table leaves empty"
+        );
     }
 
     /// A part of a structured append message as a decode would make it.
@@ -920,12 +1301,22 @@ mod tests {
         use qr_forensics::decode::bitstream::Certainty;
         use qr_forensics::decode::text::{TextReport, TextSpan};
         let report = TextReport {
-            spans: vec![TextSpan { text: text.to_owned(), certainty: Certainty::Verified }],
+            spans: vec![TextSpan {
+                text: text.to_owned(),
+                certainty: Certainty::Verified,
+            }],
             parity: Some(text.bytes().fold(0, |a, b| a ^ b)),
             bytes: text.bytes().map(Some).collect(),
             ..TextReport::default()
         };
-        Part { index, total, parity, label: String::new(), text: report, risk_bits: None }
+        Part {
+            index,
+            total,
+            parity,
+            label: String::new(),
+            text: report,
+            risk_bits: None,
+        }
     }
 
     #[test]
@@ -952,16 +1343,31 @@ mod tests {
             "sheet.png: structured append, 1 of 2 parts: another [part 2 missing]"
         );
         // Every part in and a byte of one misread: the parity says so.
-        let wrong = sequences(vec![part(1, 2, parity, &message[..20]), part(2, 2, parity, &message[20..].replace('z', "s"))]);
+        let wrong = sequences(vec![
+            part(1, 2, parity, &message[..20]),
+            part(2, 2, parity, &message[20..].replace('z', "s")),
+        ]);
         let line = describe_sequence(path, &wrong[0], Show::Text, false);
         assert!(line.starts_with(&format!("sheet.png: structured append, 2 of 2 parts, parity {:02X} where the parts claim {parity:02X}: ", parity ^ b'z' ^ b's')), "{line}");
     }
 
     #[test]
     fn details_say_what_the_decode_settled() {
-        let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/photos/cpp_micro_M3-Mixed.png").into_os_string();
+        let image = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/photos/cpp_micro_M3-Mixed.png")
+            .into_os_string();
         let mut out = Vec::new();
-        assert_eq!(run_to(&[OsString::from("--details"), OsString::from("--corners"), image], &mut out), 0);
+        assert_eq!(
+            run_to(
+                &[
+                    OsString::from("--details"),
+                    OsString::from("--corners"),
+                    image
+                ],
+                &mut out
+            ),
+            0
+        );
         let text = String::from_utf8(out).unwrap();
         let (fields, _) = fields_and_grid(&text);
         assert_eq!(fields.len(), 6, "{text}");
@@ -969,19 +1375,38 @@ mod tests {
         // The level and the mask, and no character set: the symbol holds
         // no byte data.
         let settled: Vec<&str> = fields[3].split(", ").collect();
-        assert!(settled.len() >= 2 && settled[0].starts_with("EC ") && settled[1].starts_with("mask "), "{fields:?}");
+        assert!(
+            settled.len() >= 2 && settled[0].starts_with("EC ") && settled[1].starts_with("mask "),
+            "{fields:?}"
+        );
         assert!(!settled.contains(&"threshold surface"), "{fields:?}");
         assert!(fields[4].starts_with("at "));
         assert_eq!(fields[5], "1234 ABCD");
         // Read against the threshold surface, as `--surface` asks first,
         // the details say so, and say what would read it so again.
-        let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/photos/cpp_micro_M3-Mixed.png").into_os_string();
+        let image = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/photos/cpp_micro_M3-Mixed.png")
+            .into_os_string();
         let mut out = Vec::new();
-        assert_eq!(run_to(&[OsString::from("--details"), OsString::from("--surface"), image], &mut out), 0);
+        assert_eq!(
+            run_to(
+                &[
+                    OsString::from("--details"),
+                    OsString::from("--surface"),
+                    image
+                ],
+                &mut out
+            ),
+            0
+        );
         let text = String::from_utf8(out).unwrap();
         let (fields, _) = fields_and_grid(&text);
         assert_eq!(fields.len(), 5, "{text}");
-        assert_eq!(fields[3].split(", ").last(), Some("threshold surface"), "{fields:?}");
+        assert_eq!(
+            fields[3].split(", ").last(),
+            Some("threshold surface"),
+            "{fields:?}"
+        );
         assert_eq!(fields[4], "1234 ABCD");
     }
 
@@ -1002,8 +1427,16 @@ mod tests {
     /// the grid printed below it.
     fn fields_and_grid(text: &str) -> (Vec<String>, Vec<String>) {
         let mut lines = text.lines();
-        let fields = lines.next().unwrap().split(": ").map(str::to_owned).collect();
-        let grid = lines.take_while(|l| l.starts_with("  ")).map(|l| l.trim().to_owned()).collect();
+        let fields = lines
+            .next()
+            .unwrap()
+            .split(": ")
+            .map(str::to_owned)
+            .collect();
+        let grid = lines
+            .take_while(|l| l.starts_with("  "))
+            .map(|l| l.trim().to_owned())
+            .collect();
         (fields, grid)
     }
 
@@ -1013,17 +1446,34 @@ mod tests {
         // printed, given back as the outline, read the same symbol: as
         // the symbol is, and mirrored, when the corners run the other
         // way round the photo.
-        let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/photos/cpp_micro_M3-Mixed.png");
-        let mirrored = std::env::temp_dir().join(format!("qr-forensics-mirrored-{}.png", std::process::id()));
-        image::open(&image).unwrap().fliph().save(&mirrored).unwrap();
+        let image =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/photos/cpp_micro_M3-Mixed.png");
+        let mirrored =
+            std::env::temp_dir().join(format!("qr-forensics-mirrored-{}.png", std::process::id()));
+        image::open(&image)
+            .unwrap()
+            .fliph()
+            .save(&mirrored)
+            .unwrap();
         for (path, expect_mirrored) in [(image, false), (mirrored.clone(), true)] {
             let mut out = Vec::new();
-            let args = [OsString::from("--corners"), OsString::from("--grid"), path.clone().into_os_string()];
+            let args = [
+                OsString::from("--corners"),
+                OsString::from("--grid"),
+                path.clone().into_os_string(),
+            ];
             assert_eq!(run_to(&args, &mut out), 0);
             let text = String::from_utf8(out).unwrap();
             let (fields, grid) = fields_and_grid(&text);
             assert_eq!(fields.len(), 5, "{text}");
-            assert_eq!(fields[1], if expect_mirrored { "Micro QR M3, mirrored" } else { "Micro QR M3" });
+            assert_eq!(
+                fields[1],
+                if expect_mirrored {
+                    "Micro QR M3, mirrored"
+                } else {
+                    "Micro QR M3"
+                }
+            );
             assert_eq!(fields[2], "read");
             assert_eq!(fields[4], "1234 ABCD");
             let at = fields[3].strip_prefix("at ").unwrap();
@@ -1033,11 +1483,23 @@ mod tests {
             // hundredth of one.
             let numbers: Vec<f64> = at.split(',').map(|n| n.parse().unwrap()).collect();
             assert!(numbers.iter().all(|n| (0.0..=34.0).contains(n)), "{at}");
-            assert!(at.split(',').all(|n| n.split_once('.').is_some_and(|(_, places)| places.len() == 2)), "{at}");
+            assert!(
+                at.split(',').all(|n| n
+                    .split_once('.')
+                    .is_some_and(|(_, places)| places.len() == 2)),
+                "{at}"
+            );
             // Fifteen rows of fifteen modules, every one read.
             assert_eq!(grid.len(), 15, "{text}");
-            assert!(grid.iter().all(|row| row.len() == 15 && row.chars().all(|c| c == '#' || c == '.')), "{grid:?}");
-            let again = [OsString::from(format!("--outline={at}")), path.into_os_string()];
+            assert!(
+                grid.iter()
+                    .all(|row| row.len() == 15 && row.chars().all(|c| c == '#' || c == '.')),
+                "{grid:?}"
+            );
+            let again = [
+                OsString::from(format!("--outline={at}")),
+                path.into_os_string(),
+            ];
             let mut out = Vec::new();
             assert_eq!(run_to(&again, &mut out), 0);
             let (fields, _) = fields_and_grid(&String::from_utf8(out).unwrap());
@@ -1052,13 +1514,24 @@ mod tests {
         // and the one placement it keeps solves nothing; the outline of
         // that placement, drawn a little wide and read as a hand-drawn
         // one is, with every placement the detector offers, reads.
-        let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/blackbox/cpp_qrcode-4_wrinkle1-05x.webp");
+        let image = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/blackbox/cpp_qrcode-4_wrinkle1-05x.webp");
         let expected = std::fs::read_to_string(image.with_extension("txt")).unwrap();
         let mut out = Vec::new();
-        assert_eq!(run_to(&[OsString::from("--family=qr"), image.into_os_string()], &mut out), 0);
+        assert_eq!(
+            run_to(
+                &[OsString::from("--family=qr"), image.into_os_string()],
+                &mut out
+            ),
+            0
+        );
         let text = String::from_utf8(out).unwrap();
         let (fields, _) = fields_and_grid(&text);
-        assert_eq!(&fields[1..], ["QR Code 3", "read", expected.trim_end()], "{text}");
+        assert_eq!(
+            &fields[1..],
+            ["QR Code 3", "read", expected.trim_end()],
+            "{text}"
+        );
     }
 
     #[test]
@@ -1087,32 +1560,72 @@ mod tests {
         // its data codewords pinned into a blank grid, zeros from the
         // first of the padding on, and the grid error correction makes
         // of them written out.
-        let layout = SymbolLayout::new(Arc::new(FunctionMap::new(SymbolVersion::Qr(10))), EcLevel::M).unwrap();
+        let layout = SymbolLayout::new(
+            Arc::new(FunctionMap::new(SymbolVersion::Qr(10))),
+            EcLevel::M,
+        )
+        .unwrap();
         let (opts, none) = (DecodeOptions::default(), Pins::new());
         let read = decode(&standard, &layout, mask, &none, &opts);
-        let EndOfData::At { bit, .. } = read.parse.end else { panic!("{:?}", read.parse.end) };
+        let EndOfData::At { bit, .. } = read.parse.end else {
+            panic!("{:?}", read.parse.end)
+        };
         let first_pad = pad_tail(&layout, bit).first_pad_codeword;
         let pins: Pins = layout
             .data_stream
             .iter()
             .enumerate()
-            .map(|(j, &cw)| (cw, Pin::full(if j < first_pad { read.codewords[cw].final_value.unwrap() } else { 0 }, PinSource::Manual)))
+            .map(|(j, &cw)| {
+                (
+                    cw,
+                    Pin::full(
+                        if j < first_pad {
+                            read.codewords[cw].final_value.unwrap()
+                        } else {
+                            0
+                        },
+                        PinSource::Manual,
+                    ),
+                )
+            })
             .collect();
         let blank = layout.func.blank_grid();
-        let zero_filled = repaired_grid(&blank, &layout, mask, &decode(&blank, &layout, mask, &pins, &opts));
+        let zero_filled = repaired_grid(
+            &blank,
+            &layout,
+            mask,
+            &decode(&blank, &layout, mask, &pins, &opts),
+        );
         assert!(decode(&zero_filled, &layout, mask, &none, &opts).is_trustworthy());
 
-        for (mut grid, pinned) in [(standard, " padding codewords pinned"), (zero_filled, " padding codewords pinned as zeros")] {
+        for (mut grid, pinned) in [
+            (standard, " padding codewords pinned"),
+            (zero_filled, " padding codewords pinned as zeros"),
+        ] {
             for y in 0..grid.height() {
                 for x in 12..32 {
                     grid.set(x, y, Module::Light);
                 }
             }
             let (width, height, pixels) = render_rgba(&grid, 8, 4);
-            let path = std::env::temp_dir().join(format!("qr-forensics-taped-{}-{}.png", std::process::id(), pinned.len()));
-            image::save_buffer(&path, &pixels, width as u32, height as u32, image::ExtendedColorType::Rgba8).unwrap();
+            let path = std::env::temp_dir().join(format!(
+                "qr-forensics-taped-{}-{}.png",
+                std::process::id(),
+                pinned.len()
+            ));
+            image::save_buffer(
+                &path,
+                &pixels,
+                width as u32,
+                height as u32,
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
             let mut out = Vec::new();
-            let status = run_to(&[OsString::from("--details"), path.clone().into_os_string()], &mut out);
+            let status = run_to(
+                &[OsString::from("--details"), path.clone().into_os_string()],
+                &mut out,
+            );
             let _ = std::fs::remove_file(&path);
             let text = String::from_utf8(out).unwrap();
             let (fields, _) = fields_and_grid(&text);
@@ -1120,10 +1633,155 @@ mod tests {
             // stands and what it took: the padding pinned, and as what
             // when it is not the standard's.
             assert_eq!(status, 0, "{text}");
-            assert_eq!(&fields[1..3], ["QR Code 10", "read, padding pinned"], "{text}");
+            assert_eq!(
+                &fields[1..3],
+                ["QR Code 10", "read, padding pinned"],
+                "{text}"
+            );
             assert!(fields[3].ends_with(pinned), "{text}");
             assert_eq!(fields.last().map(String::as_str), Some(message), "{text}");
         }
+    }
+
+    #[test]
+    fn the_backdrop_of_transparent_parts_is_parsed() {
+        let parsed =
+            |args: &[&str]| parse(&args.iter().map(OsString::from).collect::<Vec<_>>()).unwrap();
+        // Grey, as in the window, unless another is named.
+        assert_eq!(parsed(&["a.png"]).backdrop, Backdrop::Grey);
+        assert_eq!(
+            parsed(&["--transparent", "black", "a.png"]).backdrop,
+            Backdrop::Black
+        );
+        assert_eq!(
+            parsed(&["--transparent=white", "a.png"]).backdrop,
+            Backdrop::White
+        );
+        assert_eq!(
+            parsed(&["--transparent=grey", "a.png"]).backdrop,
+            Backdrop::Grey
+        );
+        assert_eq!(
+            parsed(&["--transparent=gray", "a.png"]).backdrop,
+            Backdrop::Grey
+        );
+        assert!(
+            parse(&[
+                OsString::from("--transparent=blue"),
+                OsString::from("a.png")
+            ])
+            .is_err()
+        );
+        // Named with nothing after it, it asks for its value; any error at
+        // all would pass for that, an image unnamed among them.
+        assert!(matches!(
+            parse(&[OsString::from("--transparent")]),
+            Err(Unparsed::Bad(message)) if message == "--transparent needs white, black or grey"
+        ));
+    }
+
+    #[test]
+    fn a_lead_is_said_with_the_version_a_fit_that_did_not_read_was_fitted_as() {
+        let outline = [[10.0, 20.0], [110.0, 20.0], [110.0, 120.0], [10.0, 120.0]];
+        let unfitted = Lead {
+            family: Family::Qr,
+            outline,
+            finders: vec![[30.0, 40.0], [90.0, 40.0]],
+            fitted: None,
+        };
+        assert_eq!(
+            describe_lead(Path::new("a.png"), &unfitted, 1.0),
+            "a.png: QR Code: 2 finder patterns, no symbol fitted: at 10.0,20.0,110.0,20.0,110.0,120.0,10.0,120.0"
+        );
+        let fitted = Lead {
+            finders: vec![[30.0, 40.0], [90.0, 40.0], [30.0, 100.0]],
+            fitted: Some(SymbolVersion::Qr(1)),
+            ..unfitted
+        };
+        assert_eq!(
+            describe_lead(Path::new("a.png"), &fitted, 1.0),
+            "a.png: QR Code 1: 3 finder patterns, fitted and not read: at 10.0,20.0,110.0,20.0,110.0,120.0,10.0,120.0"
+        );
+        // Nothing read: found, where nothing was fitted, and read where
+        // one was, which the lead's line goes on to name, or where the
+        // search found a symbol it could make no read of.
+        let path = Path::new("a.png");
+        assert_eq!(nothing_read(path, false, &[]), "a.png: no symbol found");
+        assert_eq!(nothing_read(path, true, &[]), "a.png: no symbol read");
+        assert_eq!(
+            nothing_read(path, false, std::slice::from_ref(&unfitted)),
+            "a.png: no symbol found"
+        );
+        assert_eq!(
+            nothing_read(path, false, &[unfitted, fitted]),
+            "a.png: no symbol read"
+        );
+    }
+
+    #[test]
+    fn a_symbol_drawn_light_on_transparency_is_read_laid_on_grey_or_black() {
+        use qr_forensics::decode::repair::render_rgba;
+        use qr_forensics::symbol::grid::ModuleGrid;
+        // The symbol's ink drawn in white on transparency that is black
+        // underneath, as qrencode draws it for a dark page: laid on grey,
+        // as it is unless another is named, it is light on mid grey, and
+        // reads; laid on black it reads too; laid on white it is white on
+        // white, and nothing is found.
+        let symbol = qrcode_generator::qr::Encoder::new(qrcode_generator::qr::ErrorCorrection::Low)
+            .version(qrcode_generator::qr::Version::new(2).unwrap())
+            .encode_segments(&[qrcode_generator::Segment::bytes("white on nothing")])
+            .unwrap();
+        let grid = ModuleGrid::from_bools(symbol.width(), symbol.height(), symbol.modules());
+        let (width, height, mut pixels) = render_rgba(&grid, 8, 4);
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            *pixel = if pixel[0] < 128 {
+                [255, 255, 255, 255]
+            } else {
+                [0, 0, 0, 0]
+            };
+        }
+        let path = std::env::temp_dir().join(format!(
+            "qr-forensics-transparent-{}.png",
+            std::process::id()
+        ));
+        image::save_buffer(
+            &path,
+            &pixels,
+            width as u32,
+            height as u32,
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+        let read = |args: &[&str]| {
+            let mut all: Vec<OsString> = args.iter().map(OsString::from).collect();
+            all.push(path.clone().into_os_string());
+            let mut out = Vec::new();
+            let status = run_to(&all, &mut out);
+            (status, String::from_utf8(out).unwrap())
+        };
+        let (by_default, on_black, on_white) = (
+            read(&[]),
+            read(&["--transparent=black"]),
+            read(&["--transparent=white"]),
+        );
+        let on_grey = read(&["--transparent=grey"]);
+        let _ = std::fs::remove_file(&path);
+        for (status, text) in [&by_default, &on_black, &on_grey] {
+            let (fields, _) = fields_and_grid(text);
+            assert_eq!(*status, 0, "{text}");
+            assert_eq!(
+                &fields[1..3],
+                ["QR Code 2, light on dark", "read"],
+                "{text}"
+            );
+            assert_eq!(
+                fields.last().map(String::as_str),
+                Some("white on nothing"),
+                "{text}"
+            );
+        }
+        assert_eq!(on_white.0, 1, "{}", on_white.1);
+        assert!(on_white.1.ends_with("no symbol found\n"), "{}", on_white.1);
     }
 
     #[test]
@@ -1137,21 +1795,45 @@ mod tests {
         // block is confirmed, and its message does not parse so far as
         // its first segment. It stood as `partial`, with one block of
         // one solved, which a symbol with nothing left to solve is not.
-        let layout = SymbolLayout::new(Arc::new(FunctionMap::new(SymbolVersion::Qr(1))), EcLevel::L).unwrap();
+        let layout =
+            SymbolLayout::new(Arc::new(FunctionMap::new(SymbolVersion::Qr(1))), EcLevel::L)
+                .unwrap();
         let (opts, mask) = (DecodeOptions::default(), 0);
         let pins: Pins = layout
             .data_stream
             .iter()
             .enumerate()
-            .map(|(j, &cw)| (cw, Pin::full(if j == 0 { 0x7E } else { 0x00 }, PinSource::Manual)))
+            .map(|(j, &cw)| {
+                (
+                    cw,
+                    Pin::full(if j == 0 { 0x7E } else { 0x00 }, PinSource::Manual),
+                )
+            })
             .collect();
         let blank = layout.func.blank_grid();
-        let grid = repaired_grid(&blank, &layout, mask, &decode(&blank, &layout, mask, &pins, &opts));
+        let grid = repaired_grid(
+            &blank,
+            &layout,
+            mask,
+            &decode(&blank, &layout, mask, &pins, &opts),
+        );
         let read = decode(&grid, &layout, mask, &Pins::new(), &opts);
-        assert!(read.blocks[0].is_verified() && read.parse.segments.is_empty() && !read.score.stream_valid);
+        assert!(
+            read.blocks[0].is_verified()
+                && read.parse.segments.is_empty()
+                && !read.score.stream_valid
+        );
         let (width, height, pixels) = render_rgba(&grid, 8, 4);
-        let path = std::env::temp_dir().join(format!("qr-forensics-malformed-{}.png", std::process::id()));
-        image::save_buffer(&path, &pixels, width as u32, height as u32, image::ExtendedColorType::Rgba8).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("qr-forensics-malformed-{}.png", std::process::id()));
+        image::save_buffer(
+            &path,
+            &pixels,
+            width as u32,
+            height as u32,
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
         let mut out = Vec::new();
         let status = run_to(&[path.clone().into_os_string()], &mut out);
         let _ = std::fs::remove_file(&path);
@@ -1159,7 +1841,11 @@ mod tests {
         let (fields, _) = fields_and_grid(&text);
         // No read, by the status, and the line says why not.
         assert_eq!(status, 1, "{text}");
-        assert_eq!(&fields[1..3], ["QR Code 1", "malformed, 1 of 1 blocks solved"], "{text}");
+        assert_eq!(
+            &fields[1..3],
+            ["QR Code 1", "malformed, 1 of 1 blocks solved"],
+            "{text}"
+        );
     }
 
     #[test]
@@ -1167,7 +1853,9 @@ mod tests {
         // OpenCV's symbol declares UTF-8 with an ECI designator: with
         // another set named or with none, it is read in the set it
         // declares.
-        let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/opencv/encode_version1_mode7.png").into_os_string();
+        let image = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/opencv/encode_version1_mode7.png")
+            .into_os_string();
         let mut lines = Vec::new();
         for charset in [None, Some("--charset=shift_jis")] {
             let mut args: Vec<OsString> = charset.into_iter().map(OsString::from).collect();
@@ -1185,7 +1873,9 @@ mod tests {
 
     #[test]
     fn a_closed_output_ends_the_run_quietly() {
-        let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/photos/cpp_micro_M3-Mixed.png").into_os_string();
+        let image = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/photos/cpp_micro_M3-Mixed.png")
+            .into_os_string();
         let args = [image, OsString::from("/nowhere/at/all.png")];
         let mut out = Vec::new();
         assert_eq!(run_to(&args, &mut out), 2, "the second image does not load");

@@ -44,6 +44,9 @@ const DOUBTED: Color32 = Color32::from_rgb(190, 110, 255);
 const MARGIN: i32 = 2;
 /// Half-size of an anchor handle's hit area, in screen points.
 const ANCHOR_HIT: f32 = 9.0;
+/// How near the grid's outline, in screen points, a drag takes hold of
+/// the edge there to set an edge point, and not of the module inside it.
+const EDGE_HIT: f32 = 5.0;
 /// Half-size of a corner handle's hit area, in screen points.
 const CORNER_HIT: f32 = 13.0;
 /// Radius of a corner handle's ring, in screen points.
@@ -444,21 +447,63 @@ fn align_stage(
                 let at = pz.to_world(canvas, p);
                 [at.x as f64, at.y as f64]
             };
+            // The grid's outline may be taken hold of anywhere along it
+            // too, to set an edge point where the handles along each edge
+            // are too few for a side that bows between them: a drag begun
+            // within [`EDGE_HIT`] of the outline as drawn, inside or out,
+            // sets one on the outline at the middle of the border module's
+            // outer side there, the point a traced edge point stands for
+            // ([`super::state::Grasp::at`]), and it goes as an
+            // anchor set on a module does. Nearer a corner than
+            // [`CORNER_CLEARANCE`] the map yields to the corner, and none
+            // is set.
+            let edge_at = |p: Pos2| -> Option<[f64; 2]> {
+                let (w, h) = (gw as f64, gh as f64);
+                let mut nearest: Option<(f32, [f64; 2])> = None;
+                // Top, right, bottom and left, each a stretch of the
+                // outline at a time from one module corner to the next.
+                for edge in 0..4 {
+                    let lattice = |k: usize| match edge {
+                        0 => (k, 0),
+                        1 => (gw, k),
+                        2 => (k, gh),
+                        _ => (0, k),
+                    };
+                    for k in 0..if edge % 2 == 0 { gw } else { gh } {
+                        let ((x0, y0), (x1, y1)) = (lattice(k), lattice(k + 1));
+                        let (a, b) = (corner(x0, y0), corner(x1, y1));
+                        let along = b - a;
+                        let t = ((p - a).dot(along) / along.length_sq().max(1e-6)).clamp(0.0, 1.0);
+                        let off = p.distance(a + along * t);
+                        if nearest.is_none_or(|(least, _)| off < least) {
+                            let s = k as f64 + 0.5;
+                            nearest = Some((off, [[s, 0.0], [w, s], [s, h], [0.0, s]][edge]));
+                        }
+                    }
+                }
+                let (off, at) = nearest?;
+                let near_corner = [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]].iter().any(|c| (c[0] - at[0]).hypot(c[1] - at[1]) < CORNER_CLEARANCE);
+                (off <= EDGE_HIT && !near_corner).then_some(at)
+            };
+            // What a press at `p` takes hold of: the edge there, and
+            // whether it is one, or else the module.
+            let grasp_at = |p: Pos2| edge_at(p).map(|at| (true, at)).or_else(|| graspable(world(p)).map(|at| (false, at)));
             if view.use_anchors && !panning {
                 if response.drag_started_by(egui::PointerButton::Primary)
                     && let Some(pressed) = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos())
-                    && let Some(at) = graspable(world(pressed))
+                    && let Some((on_edge, at)) = grasp_at(pressed)
                 {
                     history.checkpoint(doc);
                     let existing = doc.anchor_at(at).map(|a| a.anchor);
                     let site = sites.iter().find(|s| (s.at[0] - at[0]).abs() < 1e-6 && (s.at[1] - at[1]).abs() < 1e-6);
-                    let kind = site.map(|s| s.kind).or(existing.map(|a| a.kind)).unwrap_or(AnchorKind::Custom);
+                    let fresh = if on_edge { AnchorKind::Edge } else { AnchorKind::Custom };
+                    let kind = site.map(|s| s.kind).or(existing.map(|a| a.kind)).unwrap_or(fresh);
                     let from = existing.map_or_else(|| model.projection.apply(at[0], at[1]), |a| a.center);
                     let pressed = world(pressed);
                     let lead = [from[0] - pressed[0], from[1] - pressed[1]];
                     view.grasped = Some(Grasp { kind, at, partial: existing.is_some_and(|a| a.partial), lead });
                 }
-                if response.hovered() && pointer.is_some_and(|p| graspable(world(p)).is_some()) {
+                if response.hovered() && pointer.is_some_and(|p| grasp_at(p).is_some()) {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
                 }
             }
@@ -477,9 +522,9 @@ fn align_stage(
             let mut profile = None;
             // The sites the version has; the places along each edge where
             // an edge point may be set by hand, to bow the outline there,
-            // less any an edge point already traced by a detection sits
-            // on; and those traced edge points, which have no site of
-            // their own.
+            // less any an edge point already set sits on; and the edge
+            // points set, traced by a detection or taken hold of anywhere
+            // along the outline, which have no site of their own.
             let mut handles: Vec<(AnchorKind, [f64; 2])> = sites.iter().map(|s| (s.kind, s.at)).collect();
             let traced: Vec<[f64; 2]> =
                 doc.anchors.iter().filter(|a| a.anchor.kind == AnchorKind::Edge).map(|a| a.anchor.at).collect();
@@ -624,7 +669,11 @@ fn align_stage(
                 actions.push(Action::UseProposal(i));
             }
             let polarity = if found.inverted { ", light on dark" } else { "" };
-            let decodes = if found.decodes == Some(true) { ", and it decodes as found" } else { "" };
+            let decodes = match found.decodes {
+                Some(true) if proposals.read_in_search(found) => ", and it decoded during the search",
+                Some(true) => ", and it decodes as found",
+                _ => "",
+            };
             // Read through to a message by Read all, it is loaded as it
             // was read, where reads are; not read yet, it is read then.
             let read = proposals.reads.as_ref().and_then(|reads| reads.results.get(i)?.as_ref());

@@ -1469,9 +1469,10 @@ pub(crate) enum Step {
     /// The lens taken out ([`straightened`]): the part `size` of the frame
     /// beginning at `out_at` in it, read from the image so far as the
     /// photo as shot, which begins at `place[0]` in the frame and lies
-    /// `place[1]` of its pixels apart, and white where that falls off the
-    /// frame.
-    Straightened { place: [[f32; 2]; 2], lens: Lens, out_at: [f32; 2], size: (usize, usize) },
+    /// `place[1]` of its pixels apart, and `fill` in every colour where
+    /// that falls off the frame: what the photo is laid on
+    /// ([`super::adjust::Backdrop::level`]).
+    Straightened { place: [[f32; 2]; 2], lens: Lens, out_at: [f32; 2], size: (usize, usize), fill: u8 },
     /// Under an unsharp mask of `weights` and `amount`, in its colours
     /// ([`unsharp`]).
     Sharpened { weights: Vec<f32>, amount: f32 },
@@ -1617,7 +1618,9 @@ fn adjusted_within(most: usize, source: &Source<'_>, steps: &[Step], table: &[u8
             // Bytes, as a step made alone hands on.
             image = match step {
                 Step::Resized { across, down } => resized_on(client, &image, [0, 0, w, h], 3, across, down, [0, 0, to_w, to_h], true),
-                Step::Straightened { place, lens, out_at, .. } => straightened_on(client, &image, [0, 0, w, h], (w, h), 3, *place, lens, *out_at, [0, 0, to_w, to_h], &[255.0; 3], true),
+                Step::Straightened { place, lens, out_at, fill, .. } => {
+                    straightened_on(client, &image, [0, 0, w, h], (w, h), 3, *place, lens, *out_at, [0, 0, to_w, to_h], &[f32::from(*fill); 3], true)
+                }
                 Step::Sharpened { weights, amount } => unsharp_on(client, &image, (w, h), 3, weights, *amount, true),
             };
         }
@@ -1644,9 +1647,15 @@ fn stepped_within(most: usize, source: &Source<'_>, steps: &[Step], table: &[u8;
                 size = (across.first.len(), down.first.len());
                 made
             }
-            Step::Straightened { place, lens, out_at, size: part } => {
-                // A part that draws on none of the photo is white throughout.
-                let made = if size.0 == 0 || size.1 == 0 { Made::Bytes([255; 4].repeat(part.0 * part.1)) } else { straightened_within(most, Samples::Bytes(&image), size, 4, *place, lens, *out_at, *part, &[255.0; 4], true) };
+            Step::Straightened { place, lens, out_at, size: part, fill } => {
+                // A part that draws on none of the photo is the fill
+                // throughout.
+                let made = if size.0 == 0 || size.1 == 0 {
+                    Made::Bytes([*fill, *fill, *fill, 255].repeat(part.0 * part.1))
+                } else {
+                    let fill = f32::from(*fill);
+                    straightened_within(most, Samples::Bytes(&image), size, 4, *place, lens, *out_at, *part, &[fill, fill, fill, 255.0], true)
+                };
                 size = *part;
                 made
             }
@@ -2289,7 +2298,7 @@ mod tests {
             let lens = |frame: [f32; 2]| Lens { frame, k1: -0.15, slope: 0.55 };
             let resized = || Step::Resized { across: Taps::new(width, 2 * width), down: Taps::new(height, 2 * height) };
             let reduced = || Step::Resized { across: Taps::new(width, width / 2), down: Taps::new(height, height / 2) };
-            let bent = |size: (usize, usize), scale: f32| Step::Straightened { place: [[0.0; 2], [scale; 2]], lens: lens([size.0 as f32 * scale, size.1 as f32 * scale]), out_at: [4.0, 3.0], size };
+            let bent = |size: (usize, usize), scale: f32| Step::Straightened { place: [[0.0; 2], [scale; 2]], lens: lens([size.0 as f32 * scale, size.1 as f32 * scale]), out_at: [4.0, 3.0], size, fill: 128 };
             let sharpened = || Step::Sharpened { weights: gaussian(1.4), amount: 1.1 };
             let blurred = || Step::Sharpened { weights: gaussian(0.9), amount: -1.0 };
             vec![

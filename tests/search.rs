@@ -125,7 +125,11 @@ fn search(case: &Case) -> Searched {
         let (Some(what), Some(standing), Some(message)) = (fields.next(), fields.next(), fields.next()) else {
             continue;
         };
-        if what.starts_with("structured append") || standing != "read" {
+        // A read to be trusted is `read`, or `read, ` and what it stood on
+        // besides (the padding pinned), as `tests/boofcv.rs` counts one;
+        // counted as `read` alone, a symbol that came to need its padding
+        // pinned was scored as unread.
+        if what.starts_with("structured append") || !(standing == "read" || standing.starts_with("read, ")) {
             continue;
         }
         match left.iter().position(|m| m == message) {

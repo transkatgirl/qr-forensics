@@ -143,10 +143,11 @@ When detection fails or lands slightly off, place the grid yourself.
 - **Anchors.** An anchor pins a fixed pattern to its place in the photo, and
   the grid bends through it, which is how a symbol on a curved or creased
   surface is followed. There is a handle on every fixed pattern, and three
-  along each edge. Drag a hollow handle onto its pattern to set it, or drag
-  any other module of the grid to set a custom anchor there. Right-click a handle to remove it. Hovering one shows the
-  luminance profile through it, so you can see whether it sits on the middle
-  of its pattern.
+  along each edge. Drag a hollow handle onto its pattern to set it. Drag
+  the grid's outline to add an edge point anywhere along it, or drag any
+  other module to set a custom anchor on it. Right-click a handle to
+  remove it. Hovering one shows the luminance profile through it, so you
+  can see whether it sits on the middle of its pattern.
 - **Checking the fit.** Alignment reports how many fixed-pattern modules
   the photo shows in the right colour. The **Show** buttons above the canvas
   switch between the fixed patterns, a preview of what sampling would read
@@ -167,6 +168,15 @@ the order they are applied:
 5. **Contrast**, **Brightness** and **Channel**.
 6. **Filter**, run last on the enlarged photo: median, dot-closing, or
    **Deblur**.
+
+A photo with transparency also has **Transparent parts**, which fills
+transparent pixels with white, black or mid grey before any other
+adjustment. The default, grey, works for both dark and light ink; a
+white symbol on a transparent background (made for dark pages) vanishes
+on white. **Lens** fills whatever it pulls in from beyond the photo's
+edges with the same colour (white for a photo without transparency).
+Loading a read made under a different setting switches back to that
+setting.
 
 **Deblur** measures the blur's width and direction from edges in the
 photo and deconvolves it, for a photo that is out of focus or shaken.
@@ -291,7 +301,11 @@ Overlays colour the grid by what the decoder knows:
   the blocks' own chances, since one wrong block makes the message
   wrong. If many blocks each only just pass, the sum can be worse than
   the 1 in 256 each block must meet, and Result warns about that even
-  though every block is confirmed.
+  though every block is confirmed. It also warns when the message is
+  empty and every data bit is zero: the modules are then just the mask
+  pattern, which an encoder can produce, but so can a striped or checked
+  texture such as a screen or fabric, with every block confirmed. The
+  command line prints both warnings to stderr.
 - **Format and version.** Each copy of the format bits as read, the
   closest valid format words, and the EC level and mask in effect.
   Words are ranked by the bits they disagree on across both copies,
@@ -300,7 +314,11 @@ Overlays colour the grid by what the decoder knows:
   the two copies, so it shows whether the damage is within what the
   format code corrects. The format bits settle on a word only if it's
   at least 256 times likelier than the runner-up, the same bar a block
-  must clear. When no block verifies under any word, the data is also
+  must clear. A few encoders leave out the format mask, so unmasked
+  words are considered too, but only within one bit of the read, and one
+  must be 256 × 256 times likelier than every masked word: a damaged
+  read lands near some unmasked word too often for less to mean
+  anything. When no block verifies under any word, the data is also
   considered: under the right level and mask it tends to look like text
   or padding rather than noise, and how much it does is weighed along
   with the format bits. Choose the level and mask from the format bits
@@ -388,14 +406,16 @@ The second group runs in order, and stops once the block is confirmed:
   one.
 - **List decoding** (soft-decision, Koetter–Vardy) finds every valid
   codeword close enough to the block as read, weighting each codeword by
-  its reliability. It gains more at higher levels: up to 11 wrong
-  codewords in a 1-H block instead of 8, and 19 in a 40-H block instead
-  of 15. At level L it gains nothing.
+  its reliability. It gains more at higher levels: up to 19 wrong
+  codewords in a 40-H block instead of 15. At level L it gains nothing.
+  In symbols that reserve codewords for error detection (below), it
+  can't confirm more wrong codewords than plain Reed-Solomon can.
 - **Erase codewords by trial** erases every set of codewords of the
   smallest size that gets past plain Reed-Solomon, then the next size
   up, regardless of reliability. It reaches a hand-painted block with
   one codeword too many wrong (two in a small block), or a block whose
-  unknown bits solve except for a stain over a few codewords.
+  unknown bits solve except for a stain over a few codewords, in
+  symbols that reserve no codewords for error detection.
 
 List decoding and erasing by trial run only when plain Reed-Solomon
 finds no solution at all.
@@ -421,23 +441,47 @@ until you change something else.
 A solution is confirmed by how rarely random data would pass the same
 tests: the redundancy it left unused, the errors it located, and, for a
 solution that only flipped faint modules, how few other sets of modules
-would be as cheap to flip, however many modules that is. In the
-smallest symbols the standard reserves some error correction codewords
-for detecting misreads rather than correcting them. A solution that
-uses them is marked as beyond the standard and is never confirmed,
-whichever solver found it, and each fallback prefers a solution that
-leaves them unused if it finds one. This is why list decoding and
-erasing by trial gain less, or nothing, at some small levels such as
-1-H and 2-L. The capacity line under the EC level counts only what can
-be confirmed, and the notes under Decoding point out reach that can't
-be.
+would be as cheap to flip, however many modules that is. This applies
+to every codeword a solver comes across, including ones it passed over
+without offering: if the block alone confirms one, it becomes a
+solution in its own right, and Blocks says so.
+
+In the smallest symbols (some levels of versions 1 to 3 and of Micro
+QR) the standard reserves some error correction codewords for detecting
+misreads rather than correcting them. A solution that uses them is
+marked as beyond the standard and is never confirmed, whichever solver
+found it, and each fallback prefers a solution that leaves them unused.
+
+Every solution's use of error correction is measured against the block
+as read. Each changed codeword that had a module read costs two
+codewords, and each unknown module filled in costs an eighth of one.
+A module sampled right on the threshold says nothing either way and
+counts as unknown. Doubted codewords count as read, since doubting
+only chooses after the fact which modules to treat as unknown. Modules
+filled in by **Use the message as a prior** count as unknown. So in
+these symbols, no solver can confirm more wrong codewords than plain
+Reed-Solomon corrects without the reserve. The one exception is a
+block with enough codewords pinned whole to be solved from its pins
+alone: that decode reads none of the block's other modules, so it is
+measured against its pins, with every other codeword unknown. The
+other solvers can still add confirmation to such a solution, and
+solving scattered unknown modules bit by bit costs far less than
+erasing their whole codewords.
+Anything further is an unconfirmed last resort. The capacity line
+under the EC level counts only what can be confirmed, and the notes
+under Decoding flag what can't be.
 
 Every attempt is another chance for random data to pass, so a solution
 needs one more bit of confirmation for each doubling of the attempts
 that could have produced it. The decoder counts:
 
 - **The solver's own tries:** patterns flipped, sets erased, rounds
-  run, and bits doubted.
+  run, and bits doubted. These are charged against the solver's own
+  evidence. Separately, how close a solution lies to the block as read
+  says how many codewords lie that close to random noise at all. That
+  doesn't depend on which solver found it or how many tries it took, so
+  it's charged only for whole-grid decodes, pins and the search (below).
+  A solution is judged by whichever of the two is stronger.
 - **Other solvers and retries on the same block:** message prior and
   error clustering rounds, the retry with a four-bit codeword padded
   with ones, and **Try harder**. Solvers that work from module
@@ -448,7 +492,35 @@ that could have produced it. The decoder counts:
   are on, and one found late needs more.
 - **Other decodes of the whole grid:** each level and mask in a brute
   force, each placement, sampling and retry in a photo read, and each
-  symbol type an outline is read as.
+  symbol type an outline is read as. A photo read tries its placements,
+  samplings and retries in a fixed order and charges each by its
+  position: half the budget is split by position (1/2 to the first, 1/6
+  to the second, 1/(k(k+1)) to the kth, and to the last of n whatever
+  the others leave, 1/n) and half evenly. So the retries tried first,
+  which read the most symbols, need less than an even split would ask
+  (the first never more than two bits, however many there are, where
+  an even split of 42 asks five and a half), and none needs more than a
+  bit over it at any one level. A retry nested inside others, such as one sampling of
+  one placement in an enhanced copy of the photo, can pay that bit at
+  each level. A read from hand-placed corners (the command line's
+  `--placed`) splits evenly across the versions and orientations it
+  tries and the copies of the photo it reads each through, and charges
+  the samplings and retries within each by position, as above.
+  Placements the search fitted with nothing else to support them are
+  charged by position among themselves, as above, whether they're read
+  by the search, by **Read all**, or by picking one from the list. A
+  placement supported only by a trial decode the search made of it is
+  charged, wherever it's read, by that decode's position among every
+  trial decode the search made, in its fixed order: the kth as one of
+  k(k+1), a bit for the first and about 2 log2 k bits for the kth, so
+  that all of them together pass no more often than one read would.
+  Those are the decodes that decide whether a placement is a symbol at
+  all. A symbol the search first finds in a reduced copy of the photo
+  is fitted again at full size, and where nothing else supports the
+  refit, a decode of it chooses between the refit and the copy's
+  placement scaled up. The symbol is kept either way, so that decode
+  isn't counted among them or charged, and the placement keeps the
+  charge it had.
 - **Other pins tried:** padding recovery passes and common beginnings.
   Each pin carries the count of the search that placed it. A block is
   charged for the pins it holds, and the searches that draw on the
@@ -462,6 +534,9 @@ removed. A few things are exempt:
 - The plain Reed-Solomon decode of a block as read, which any reader
   makes, is charged only for other decodes of the whole grid and for
   the pins its block holds.
+- The decode of a block from its pins alone, which reads nothing of
+  the grid, isn't charged for other decodes of the whole grid, though
+  it is for the pins its block holds.
 - In a photo read, the detector's first placement, sampled with your
   settings, isn't charged for the search's other reads (or, when an
   outline is read as each symbol type, only as the type you chose).
@@ -549,6 +624,7 @@ Ctrl is ⌘ on macOS. Shortcuts are off while a text field has the keyboard.
 | Right button | Paint the other of dark and light; with Doubtful, make modules certain |
 | Shift while painting | Paint unknown |
 | Arrow keys, pointer over the Align canvas | Nudge the last corner touched one pixel; ten with Shift, a tenth with Alt |
+| Drag the grid's outline in the Align stage | Set an edge point there |
 | Right-click an anchor handle | Remove the anchor |
 | Esc | Clear the selected codeword and any outlined block, character or segment |
 

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader, ImageResult, RgbaImage};
 
-use super::adjust::Adjust;
+use super::adjust::{Adjust, Backdrop};
 use super::{Luma, SharedRgba};
 
 /// A photo from a file, as a viewer shows it: its format told by its
@@ -56,35 +56,42 @@ pub const EXTENSIONS: &[&str] = &[
     "webp",
 ];
 
-/// Lay the photo on white paper wherever it is transparent, leaving it
-/// opaque. An encoder that draws a symbol's dark modules on a transparent
-/// background leaves the colour under the transparency at whatever it
-/// was, most often black, and read without its alpha such a symbol is a
-/// black rectangle; a browser or a viewer shows it on white, and so does
-/// this.
-pub fn flatten_alpha(image: &mut RgbaImage) {
+/// Lay the photo on `backdrop` wherever it is transparent, leaving it
+/// opaque. An encoder that draws a symbol on a transparent background
+/// leaves the colour under the transparency at whatever it was, most
+/// often black, and read without its alpha a symbol drawn in dark ink is
+/// a black rectangle; laid on mid grey, the default, ink of either kind
+/// stands out against it.
+pub fn flatten_alpha_onto(image: &mut RgbaImage, backdrop: Backdrop) {
+    let under = u32::from(backdrop.level());
     for pixel in image.pixels_mut() {
         let alpha = u32::from(pixel[3]);
         if alpha == 255 {
             continue;
         }
         for channel in &mut pixel.0[..3] {
-            *channel = ((u32::from(*channel) * alpha + 255 * (255 - alpha) + 127) / 255) as u8;
+            *channel = ((u32::from(*channel) * alpha + under * (255 - alpha) + 127) / 255) as u8;
         }
         pixel[3] = 255;
     }
 }
 
+/// Whether any of the photo is less than opaque, so that what it is laid
+/// on changes what is read of it.
+pub fn has_transparency(image: &RgbaImage) -> bool {
+    image.pixels().any(|pixel| pixel[3] < 255)
+}
+
 /// The luminance the pipeline reads a photo by, under `adjust`: that of
-/// the photo on white paper where it was transparent (see
-/// [`flatten_alpha`]), at the size `adjust` has it. A photo as it is
+/// the photo on the backdrop `adjust` names where it was transparent (see
+/// [`flatten_alpha_onto`]), at the size `adjust` has it. A photo as it is
 /// first loaded is read under [`Adjust::for_photo`], which enlarges a
 /// small one; the luminance then keeps that of the photo at its own size
 /// beside it ([`Luma::unenlarged`]).
 pub fn luma(mut image: RgbaImage, adjust: &Adjust) -> Luma {
     // Before any resampling, which would otherwise bleed the hidden
     // colour of transparent pixels into the edges of opaque ones.
-    flatten_alpha(&mut image);
+    flatten_alpha_onto(&mut image, adjust.backdrop);
     let (width, height) = (image.width() as usize, image.height() as usize);
     // Held to be shared, the bytes are what the luminance keeps of the
     // photo as loaded, where it keeps any, rather than a copy of them; and
@@ -95,9 +102,15 @@ pub fn luma(mut image: RgbaImage, adjust: &Adjust) -> Luma {
 }
 
 /// [`luma`] of a photo as it is first loaded: under no adjustment but
-/// the enlargement a small one starts with.
+/// the enlargement a small one starts with, and its transparent parts on
+/// the default backdrop, mid grey.
 pub fn luma_as_loaded(image: RgbaImage) -> Luma {
-    let adjust = Adjust::for_photo(image.width(), image.height());
+    luma_as_loaded_on(image, Backdrop::default())
+}
+
+/// [`luma_as_loaded`], its transparent parts laid on `backdrop`.
+pub fn luma_as_loaded_on(image: RgbaImage, backdrop: Backdrop) -> Luma {
+    let adjust = Adjust { backdrop, ..Adjust::for_photo(image.width(), image.height()) };
     luma(image, &adjust)
 }
 
@@ -168,14 +181,14 @@ mod tests {
 
     #[test]
     fn a_small_photo_is_read_enlarged_with_its_own_pixels_beside_it() {
-        // Opaque ink in squares on transparent black, 100 by 60.
-        let small = RgbaImage::from_fn(100, 60, |x, y| image::Rgba([0, 0, 0, if (x / 10 + y / 10) % 2 == 0 { 255 } else { 0 }]));
+        // Ink in squares on white paper, 100 by 60.
+        let small = RgbaImage::from_fn(100, 60, |x, y| image::Rgba(if (x / 10 + y / 10) % 2 == 0 { [0, 0, 0, 255] } else { [255; 4] }));
         let read = luma_as_loaded(small.clone());
         assert_eq!((read.width, read.height), (500, 300));
         let own = read.unenlarged.as_ref().expect("a photo enlarged keeps its own pixels");
         assert_eq!((own.width, own.height), (100, 60));
-        // Its own pixels, on white where they were transparent, each
-        // ink or paper; enlarged, the edges between them are ramps.
+        // Its own pixels, each ink or paper; enlarged, the edges between
+        // them are ramps.
         assert!((own.data[0] - 0.0).abs() < 1e-6 && (own.data[10] - 1.0).abs() < 1e-6);
         assert!(own.data.iter().all(|&v| !(1e-6..=1.0 - 1e-6).contains(&v)));
         assert!(read.data.iter().any(|&v| (0.3..=0.7).contains(&v)));
@@ -186,7 +199,7 @@ mod tests {
         // A photo that needs no enlarging is read as it is.
         let fine = luma_as_loaded(RgbaImage::new(640, 480));
         assert_eq!((fine.width, fine.height, fine.unenlarged.is_none()), (640, 480, true));
-        assert!(fine.data.iter().all(|&v| (v - 1.0).abs() < 1e-6), "transparent, so white");
+        assert!(fine.data.iter().all(|&v| (v - 128.0 / 255.0).abs() < 1e-6), "transparent, so grey");
     }
 
     #[test]
@@ -284,25 +297,60 @@ mod tests {
     }
 
     #[test]
-    fn transparency_shows_white_paper() {
+    fn transparency_shows_the_backdrop() {
         // Dark modules drawn opaque on a background that is transparent
         // black, as a canvas exports them; a half-transparent edge; and a
-        // colour that is opaque already.
+        // colour that is opaque already, laid on white.
         let mut image = RgbaImage::from_fn(300, 300, |x, _| match x {
             0..100 => image::Rgba([0, 0, 0, 255]),
             100..200 => image::Rgba([0, 0, 0, 0]),
             200..250 => image::Rgba([0, 0, 0, 128]),
             _ => image::Rgba([10, 200, 30, 255]),
         });
-        flatten_alpha(&mut image);
+        flatten_alpha_onto(&mut image, Backdrop::White);
         assert_eq!(image.get_pixel(50, 7), &image::Rgba([0, 0, 0, 255]));
         assert_eq!(image.get_pixel(150, 7), &image::Rgba([255, 255, 255, 255]));
         assert_eq!(image.get_pixel(225, 7), &image::Rgba([127, 127, 127, 255]));
         assert_eq!(image.get_pixel(275, 7), &image::Rgba([10, 200, 30, 255]));
         // The luminance is read off the photo flattened, at any size:
-        // enlarged, no hidden black bleeds into the white.
-        let loaded = luma_as_loaded(RgbaImage::from_pixel(100, 100, image::Rgba([0, 0, 0, 0])));
+        // enlarged, no hidden black bleeds into the grey it is laid on
+        // unless another is chosen, nor into white.
+        let clear = || RgbaImage::from_pixel(100, 100, image::Rgba([0, 0, 0, 0]));
+        let loaded = luma_as_loaded(clear());
         assert_eq!((loaded.width, loaded.height), (300, 300));
-        assert!(loaded.data.iter().all(|&v| (v - 1.0).abs() < 1e-6));
+        assert!(loaded.data.iter().all(|&v| (v - 128.0 / 255.0).abs() < 1e-6));
+        let on_white = luma_as_loaded_on(clear(), Backdrop::White);
+        assert!(on_white.data.iter().all(|&v| (v - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn transparency_is_laid_on_grey_unless_another_is_chosen() {
+        // Modules drawn opaque on transparency that is black underneath,
+        // as qrencode writes them: light ones, for a dark page, and dark
+        // ones, for a light page.
+        let drawn = |ink: u8| {
+            RgbaImage::from_fn(300, 300, |x, y| if (x / 30 + y / 30) % 2 == 0 { image::Rgba([ink, ink, ink, 255]) } else { image::Rgba([0, 0, 0, 0]) })
+        };
+        // Either stands out against mid grey, as each is loaded.
+        let grey = 128.0 / 255.0;
+        for (ink, level) in [(255, 1.0), (0, 0.0)] {
+            let loaded = luma_as_loaded(drawn(ink));
+            assert!((loaded.data[15 * 300 + 15] - level).abs() < 1e-6 && (loaded.data[15 * 300 + 45] - grey).abs() < 1e-6, "{ink}");
+        }
+        // Light modules chosen to lie on black read light on dark; on
+        // white they are white on white.
+        let on_black = luma_as_loaded_on(drawn(255), Backdrop::Black);
+        assert!((on_black.data[15 * 300 + 15] - 1.0).abs() < 1e-6 && on_black.data[15 * 300 + 45].abs() < 1e-6);
+        let on_white = luma_as_loaded_on(drawn(255), Backdrop::White);
+        assert!(on_white.data.iter().all(|&v| (v - 1.0).abs() < 1e-6));
+        assert!(!has_transparency(&RgbaImage::from_pixel(10, 10, image::Rgba([255; 4]))));
+        // Half transparent, half laid on black.
+        let mut half = RgbaImage::from_pixel(2, 1, image::Rgba([200, 100, 0, 128]));
+        flatten_alpha_onto(&mut half, Backdrop::Black);
+        assert_eq!(half.get_pixel(0, 0), &image::Rgba([100, 50, 0, 255]));
+        // Wholly transparent, laid on grey: #808080.
+        let mut clear = RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+        flatten_alpha_onto(&mut clear, Backdrop::Grey);
+        assert_eq!(clear.get_pixel(0, 0), &image::Rgba([128, 128, 128, 255]));
     }
 }

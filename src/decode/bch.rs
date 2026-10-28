@@ -62,6 +62,29 @@ pub const MIN_INFO_BITS: u32 = 8;
 /// not the bits of likelihood it said it was.
 pub const WEIGHT_MARGIN: u32 = 64;
 
+/// Bits a word painted without its XOR mask may lie from the read, at
+/// the most, and still be the format decoded under: one. The words so
+/// painted are as many as the standard's and as far apart, so a read
+/// damaged past correction as the standard paints it lies within three
+/// bits of one of them more than half the time, four bits wrong or five
+/// as often as not, and settled on it, the symbol was decoded under a
+/// level and mask the bits never named and the search of every format
+/// was never made. Within one bit, a read so damaged lies one time in
+/// fifty, and a word of the grid's own size painted the standard way is
+/// five bits from every word painted without the mask, so a symbol whose
+/// encoder left it out reads within one of its word and four or more
+/// from every standard one.
+pub const QUIRK_REACH: u32 = 1;
+
+/// What a word painted otherwise than the standard paints it weighs
+/// against it before any bit is read, in the eighths of a bit the
+/// weights are counted in ([`FormatCandidate::prior_weight`]): eight bits
+/// of likelihood, an encoder in two hundred and fifty-six leaving the
+/// mask out. Weighed against every word painted the standard way, a
+/// word painted without the mask must so lie a byte clear of the
+/// likeliest of them and a byte more, two solid bits, to be settled on.
+pub const QUIRK_PRIOR: u32 = WEIGHT_MARGIN;
+
 /// Remainder of `data · x^degree` divided by `generator`.
 pub fn bch_remainder(data: u32, generator: u32, degree: u32) -> u32 {
     let mut value = data << degree;
@@ -255,14 +278,25 @@ pub struct FormatCandidate {
 }
 
 impl FormatCandidate {
-    /// The assembled read lies beyond what the code can correct. A reading
-    /// under the other model's mask is always doubtful as a format to
-    /// decode under: the grid's model lays its data out otherwise, and a
-    /// damaged word of the grid's own model lies near some word of the
-    /// other too often for the reading to decide anything. It serves as a
-    /// warning, through [`FormatAnalysis::other_model_hint`].
+    /// The assembled read lies beyond what the code can correct, or, for
+    /// a word painted without the mask, further than [`QUIRK_REACH`]. A
+    /// reading under the other model's mask is always doubtful as a
+    /// format to decode under: the grid's model lays its data out
+    /// otherwise, and a damaged word of the grid's own model lies near
+    /// some word of the other too often for the reading to decide
+    /// anything. It serves as a warning, through
+    /// [`FormatAnalysis::other_model_hint`].
     fn doubtful(&self) -> bool {
-        self.other_model || self.best_mismatches > CORRECTABLE
+        self.other_model || self.best_mismatches > if self.unmasked { QUIRK_REACH } else { CORRECTABLE }
+    }
+
+    /// What the bits say against the word, over every copy ([`Self::weight`]),
+    /// and what its painting says against it before any bit is read: the
+    /// [`QUIRK_PRIOR`] for each step it lies from the standard
+    /// ([`Self::quirk_rank`]). The words painted either way are weighed
+    /// against each other by this.
+    pub fn prior_weight(&self) -> u32 {
+        self.weight + QUIRK_PRIOR * u32::from(self.quirk_rank())
     }
 
     /// Painted as the standard paints it for the grid's family, with the
@@ -282,9 +316,12 @@ impl FormatCandidate {
 pub struct FormatAnalysis {
     pub copies: Vec<InfoRead>,
     /// Best first. Candidates that fit the grid sort ahead of those that do
-    /// not; then those within correction range, as painted the standard way
-    /// before the unmasked quirk; then the least summed weight of the bits
-    /// disagreeing over every copy, and fewer assembled mismatches.
+    /// not; then those within range ([`FormatCandidate::doubtful`]), by
+    /// the least summed weight of the bits disagreeing over every copy
+    /// with what their painting weighs besides
+    /// ([`FormatCandidate::prior_weight`]), and those out of range as
+    /// painted the standard way first, by the weight of the bits alone;
+    /// then fewer assembled mismatches.
     pub candidates: Vec<FormatCandidate>,
 }
 
@@ -322,20 +359,41 @@ impl FormatAnalysis {
 
     /// How much more the bits the runner-up overturns weigh, over every
     /// copy, than those `first` overturns, among candidates that pass
-    /// `admit`: what tells the two apart, by the likelihood of the read
-    /// under each. `u32::MAX` when no such candidate exists.
+    /// `admit`, each with what its painting weighs besides
+    /// ([`FormatCandidate::prior_weight`]): what tells the two apart, by
+    /// the likelihood of the read under each. `u32::MAX` when no such
+    /// candidate exists.
     fn weight_margin_among(&self, first: &FormatCandidate, admit: impl Fn(&FormatCandidate) -> bool) -> u32 {
         self.candidates
             .iter()
             .filter(|c| admit(c) && c.fields != first.fields)
-            .map(|c| c.weight)
+            .map(FormatCandidate::prior_weight)
             .min()
-            .map_or(u32::MAX, |w| w.saturating_sub(first.weight))
+            .map_or(u32::MAX, |w| w.saturating_sub(first.prior_weight()))
     }
 
+    /// The words the best one's mismatches are counted against: those of
+    /// the grid's size painted as it is.
     fn rivals(best: &FormatCandidate) -> impl Fn(&FormatCandidate) -> bool {
         let rank = best.quirk_rank();
         move |c| c.fits_grid && c.quirk_rank() == rank
+    }
+
+    /// The words the best one is weighed against for the bits to settle
+    /// on it: those of the grid's size painted the standard way, and
+    /// those painted without the mask that lie within [`QUIRK_REACH`] of
+    /// the read, as far as such a word is ever taken for the format; or,
+    /// for a reading under the other model's mask, the other model's. A
+    /// word painted without the mask was once weighed against the others
+    /// so painted alone, and a read damaged past correction, which lies
+    /// within three bits of one of them more often than not, settled on
+    /// it however much likelier the standard words were. One two or three
+    /// bits off is no rival of a standard word in range, which lies five
+    /// from it: the read is that standard word with a bit or three wrong,
+    /// as often as a symbol painted without the mask is that.
+    fn contenders(best: &FormatCandidate) -> impl Fn(&FormatCandidate) -> bool {
+        let other_model = best.other_model;
+        move |c| c.fits_grid && if other_model { c.other_model } else { c.is_standard() || (c.unmasked && !c.doubtful()) }
     }
 
     /// How many more mismatches the runner-up has than the best candidate.
@@ -348,10 +406,12 @@ impl FormatAnalysis {
     }
 
     /// How much more the runner-up's overturned bits weigh, over every
-    /// copy, than the best candidate's.
+    /// copy, than the best candidate's, the runner-up painted either way
+    /// and each weighed with what its painting weighs besides
+    /// ([`Self::contenders`]).
     pub fn weight_margin(&self) -> u32 {
         match self.best() {
-            Some(best) => self.weight_margin_among(best, Self::rivals(best)),
+            Some(best) => self.weight_margin_among(best, Self::contenders(best)),
             None => u32::MAX,
         }
     }
@@ -374,13 +434,18 @@ impl FormatAnalysis {
     }
 
     /// True when the best candidate differs from the bits read by more than
-    /// the code can correct, so the bits do not support it.
+    /// the code can correct, or, painted without the mask, by more than
+    /// [`QUIRK_REACH`], so the bits do not support it.
     pub fn is_doubtful(&self) -> bool {
-        self.best().is_some_and(|b| b.best_mismatches > self.correctable())
+        self.best().is_some_and(FormatCandidate::doubtful)
     }
 
     /// The format bits settle the EC level and mask: a candidate fits the
-    /// grid, nothing else comes as close, and it is within correction range.
+    /// grid, nothing else comes as close, painted either way, and it is
+    /// within range. A word painted without the mask is settled on only
+    /// within a bit of the read and a byte clear of every word painted the
+    /// standard way besides what its painting weighs ([`QUIRK_PRIOR`]);
+    /// short of that the search of every format decides.
     pub fn is_reliable(&self) -> bool {
         self.best().is_some() && !self.is_ambiguous() && !self.is_doubtful()
     }
@@ -526,8 +591,13 @@ pub fn analyze_format_reads(version: SymbolVersion, copies: Vec<InfoRead>) -> Fo
             });
         }
     }
+    // Of the words within range, the likeliest, a word's painting weighed
+    // with the bits; of those out of range, the standard painting's first,
+    // as the noise the read then is.
     candidates.sort_by_key(|c| {
-        (!c.fits_grid, c.doubtful(), c.quirk_rank(), c.weight, c.best_mismatches, c.best_weight, c.mismatches)
+        let doubtful = c.doubtful();
+        let (rank, weight) = if doubtful { (c.quirk_rank(), c.weight) } else { (0, c.prior_weight()) };
+        (!c.fits_grid, doubtful, rank, weight, c.quirk_rank(), c.best_mismatches, c.best_weight, c.mismatches)
     });
     FormatAnalysis { copies: read, candidates }
 }
@@ -745,14 +815,49 @@ mod tests {
         let analysis = analyze_format_reads(version, vec![read(0, 0, 0x5412), read(0, 0, 0x5412)]);
         assert_eq!(analysis.verdict(), None);
         assert_eq!(analysis.correctable(), 0);
-        // Painted without the XOR mask: recognised, flagged, and ranked
-        // behind any standard word within range.
+        // Painted without the XOR mask: recognised, flagged, and settled
+        // on, every standard word lying five bits off and more.
         let quirk = read(word ^ 0x5412 ^ 0x5412, all, 0x5412);
         let analysis = analyze_format_reads(version, vec![quirk, quirk]);
         let best = analysis.best().unwrap();
         assert!(best.unmasked && best.word == word && best.best_mismatches == 0);
         assert!(analysis.is_reliable());
         assert_eq!(analysis.verdict(), Some(false), "as a standard read it is noise");
+    }
+
+    #[test]
+    fn a_read_past_correction_is_not_settled_on_a_word_painted_without_the_mask() {
+        use crate::symbol::Pos;
+        let version = SymbolVersion::Qr(3);
+        let words: Vec<u32> = format_words(version).iter().map(|w| w.1).collect();
+        let copy = InfoCopy { bits: (0..15).map(|i| Pos::new(i, 0)).collect(), xor: 0x5412 };
+        // The copy read as `bits` once its mask is taken off.
+        let read = |bits: u32, known: u32| info_read_from(&copy, |i| (known >> i & 1 != 0).then(|| (bits ^ 0x5412) >> i & 1 != 0));
+        let nearest = |bits: u32, xor: u32| words.iter().map(|w| (w ^ xor ^ bits).count_ones()).min().unwrap();
+        // One copy unread, the other four bits wrong: no standard word
+        // within three of it, and a word painted without the mask two or
+        // three off, which the read was once settled on, every block then
+        // decoded under a level and mask the bits never named.
+        let word = words[11];
+        let wrong = (0..1u32 << 15)
+            .filter(|e| e.count_ones() == 4)
+            .find(|&e| nearest(word ^ e, 0) >= 4 && (2..=3).contains(&nearest(word ^ e, 0x5412)))
+            .expect("some four wrong bits read as a word painted without the mask");
+        let analysis = analyze_format_reads(version, vec![read(word ^ wrong, 0x7FFF), read(0, 0)]);
+        assert!(!analysis.is_reliable() && !analysis.unmasked_in_use());
+        assert!(analysis.best().unwrap().is_standard() && analysis.is_doubtful());
+        // A word painted without the mask read a bit wrong is still
+        // settled on, every standard word lying four off at the least; and
+        // a word painted the standard way never loses to one so painted
+        // that the bits favour by less than its painting weighs.
+        let unmasked = word ^ 0x5412;
+        let analysis = analyze_format_reads(version, vec![read(unmasked ^ 1, 0x7FFF), read(0, 0)]);
+        let best = analysis.best().unwrap();
+        assert!(best.unmasked && best.word == word && analysis.is_reliable());
+        for (_, standard) in format_words(version) {
+            let analysis = analyze_format_reads(version, vec![read(standard, 0x7FFF), read(standard, 0x7FFF)]);
+            assert!(analysis.best().unwrap().is_standard() && analysis.is_reliable());
+        }
     }
 
     #[test]

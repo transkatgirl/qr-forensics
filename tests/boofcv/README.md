@@ -60,15 +60,16 @@ symbol's place among those its label file marks, counted from nothing,
 and how the search fared with it.
 
 ```text
-bright_spots/image026.jpg 0 read
-bright_spots/image026.jpg 1 read
-bright_spots/image026.jpg 2 not found
+blurred/image005.jpg 0 read
+blurred/image005.jpg 1 not found
+blurred/image005.jpg 2 not found
 ```
 
 - `read`: a read that is to be trusted (`read`, or `read, padding
   pinned`) lies on the symbol.
 - `found`: a symbol was found there and did not decode, or decoded
-  without confirmation.
+  without confirmation, or the search fitted a symbol there that nothing
+  else supported and could not read it (`fitted and not read`).
 - `lead`: the search found finder patterns there standing as a symbol's
   and could fit no symbol to them.
 - `not found`: nothing the search printed lies there.
@@ -137,13 +138,24 @@ QR_BOOFCV_METRICS=1 QR_BOOFCV_ORACLE=1 QR_BOOFCV_REPORT=after.tsv cargo test --r
 
 BoofCV 1.5.0, with its detector configured by
 `FactoryFiducial.qrcode(null, GrayU8.class)`, reads 923 of the 1232
-symbols. As the record stands, the search here reads 1210, finds 11 more
-that it can't decode, and doesn't find 11.
+symbols. As the record stands, the search here reads 1216, finds 11 more
+that it can't decode, and doesn't find 5. Two of the 11 found aren't QR
+Codes: `nominal/image043.jpg` and `image044.jpg` mark a pictogram on a
+sign drawn to look like one (6-module finders around a 2-module stone,
+no timing patterns), so any read of it would be a misread. And
+`curved/image017.jpg` symbol 0, a 1-M symbol, used to read only through
+a solution that spent the two codewords its block reserves for error
+detection; it is now found but not confirmed.
 
-Read through their hand-marked corners (`QR_BOOFCV_ORACLE`), 8 of the
-11 not found read and the other 3 are found, but none of the 11 found
-and not decoded reads. So every symbol still within reach is being lost
-in the search.
+Read through their hand-marked corners (`QR_BOOFCV_ORACLE`), 1 of the 5
+missed symbols reads and the other 4 are found, and 1 of the 11 found
+but not decoded reads. The missed one is `perspective/image016.jpg`,
+seen so steeply that its far finder is barely a pixel per module. The
+found one is `glare/image019.jpg`, which reads only through the marks
+exactly as given, not rounded to 0.1 px. Every other symbol missed is
+lost in the reading, not the search: the damaged ones are crumpled
+receipts beyond their error correction, and the blurred ones are too
+blurred to read even through their own corners.
 
 BoofCV takes a third of a second on a twelve-megapixel photo where this
 search takes tens of seconds, and when it finds a symbol's position

@@ -2,6 +2,7 @@
 name = "qr-forensics"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.97"
 description = "Manual decoder for QR codes too damaged for a camera-based reader"
 
 [dependencies]

@@ -54,8 +54,9 @@
 //! The benchmark gives no messages, only where each symbol lies, so what
 //! is held to account is how far the search got with each symbol marked:
 //! `read`, when a read that is to be trusted lies on it; `found`, when a
-//! symbol that did not decode does; `lead`, when the search found its
-//! finder patterns and could fit no symbol to them; and `not found`.
+//! symbol that did not decode does, or a placement the search fitted and
+//! could not read (`fitted and not read`); `lead`, when the search found
+//! its finder patterns and could fit no symbol to them; and `not found`.
 //! `tests/boofcv/expected.txt` records that for every symbol, and the
 //! test fails where a symbol now fares worse than recorded, or better
 //! without the record saying so. With `QR_BOOFCV_BOOTSTRAP` set it
@@ -304,9 +305,11 @@ fn read_photo(case: &Case, extra: &[String]) -> Vec<Printed> {
         if what.starts_with("structured append") || numbers.len() != 8 {
             continue;
         }
+        // A placement fitted and not read is a symbol found that did not
+        // decode, and only finders with nothing fitted to them a lead.
         let fared = if standing.ends_with("no symbol fitted") {
             Fared::Lead
-        } else if standing == "read" || standing == "read, padding pinned" {
+        } else if standing == "read" || standing.starts_with("read, ") {
             Fared::Read
         } else {
             Fared::Found

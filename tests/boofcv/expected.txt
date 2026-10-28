@@ -56,7 +56,7 @@ blurred/image032.jpg 0 read
 blurred/image033.jpg 0 read
 blurred/image034.jpg 0 read
 blurred/image035.jpg 0 read
-blurred/image036.jpg 0 found
+blurred/image036.jpg 0 read
 blurred/image037.jpg 0 read
 blurred/image038.jpg 0 read
 blurred/image039.jpg 0 read
@@ -144,7 +144,7 @@ bright_spots/image025.jpg 1 read
 bright_spots/image025.jpg 2 read
 bright_spots/image026.jpg 0 read
 bright_spots/image026.jpg 1 read
-bright_spots/image026.jpg 2 not found
+bright_spots/image026.jpg 2 read
 bright_spots/image027.jpg 0 read
 bright_spots/image027.jpg 1 read
 bright_spots/image027.jpg 2 read
@@ -199,7 +199,7 @@ brightness/image011.jpg 1 read
 brightness/image011.jpg 2 read
 brightness/image012.jpg 0 read
 brightness/image012.jpg 1 read
-brightness/image012.jpg 2 not found
+brightness/image012.jpg 2 read
 brightness/image013.jpg 0 read
 brightness/image013.jpg 1 read
 brightness/image013.jpg 2 read
@@ -306,7 +306,7 @@ curved/image015.jpg 0 read
 curved/image015.jpg 1 read
 curved/image016.jpg 0 read
 curved/image016.jpg 1 read
-curved/image017.jpg 0 read
+curved/image017.jpg 0 found
 curved/image017.jpg 1 read
 curved/image018.jpg 0 read
 curved/image018.jpg 1 read
@@ -416,7 +416,7 @@ glare/image019.jpg 0 found
 glare/image020.jpg 0 read
 glare/image021.jpg 0 read
 glare/image022.jpg 0 read
-glare/image023.jpg 0 not found
+glare/image023.jpg 0 read
 glare/image024.jpg 0 read
 glare/image025.jpg 0 read
 glare/image026.jpg 0 read
@@ -476,7 +476,7 @@ high_version/image028.jpg 0 read
 high_version/image029.jpg 0 read
 high_version/image029.jpg 1 read
 high_version/image029.jpg 2 read
-high_version/image030.jpg 0 not found
+high_version/image030.jpg 0 read
 high_version/image030.jpg 1 read
 high_version/image030.jpg 2 read
 high_version/image031.jpg 0 read
@@ -1030,8 +1030,8 @@ pathological/image005.png 0 read
 pathological/image006.png 0 read
 pathological/image007.png 0 read
 pathological/image008.png 0 read
-pathological/image009.png 0 not found
-pathological/image010.png 0 not found
+pathological/image009.png 0 read
+pathological/image010.png 0 read
 pathological/image011.png 0 read
 pathological/image012.png 0 read
 pathological/image013.png 0 read

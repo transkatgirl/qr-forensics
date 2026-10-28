@@ -58,13 +58,14 @@ impl DocAnchor {
 }
 
 /// A hold taken of the grid itself in the Align stage, on a module of it
-/// and not on a handle: the anchor that module's middle is, or is to be,
-/// and how far it lies from the pointer in the photo, which it keeps
-/// while the pointer moves.
+/// or on its outline, and not on a handle: the anchor that module's
+/// middle, or that point of the edge, is or is to be, and how far it lies
+/// from the pointer in the photo, which it keeps while the pointer moves.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Grasp {
     pub kind: AnchorKind,
-    /// The middle of the module, in module coordinates.
+    /// The middle of the module, or of the border module's outer side for
+    /// an edge point, in module coordinates.
     pub at: [f64; 2],
     /// The anchor was set already, and partly damaged.
     pub partial: bool,
@@ -91,6 +92,38 @@ pub struct Proposals {
     /// list then says how its read stands, and one that decoded is
     /// loaded into the grid when it is picked, while reads are loaded.
     pub reads: Option<FoundReads>,
+    /// What the reads the search made of some of them were charged as one
+    /// of: a placement nothing vouched for but its fit, read during the
+    /// search by its place among those ([`super::Sought::read`]). A read
+    /// of it here, by Read all or on picking it, is charged the same: it
+    /// was once read again as a symbol the search vouched for, uncharged,
+    /// where the command line kept the charge.
+    pub charged: Vec<Charged>,
+}
+
+/// What a read of one of the symbols a search found is charged as one of
+/// ([`DecodeOptions::one_of`]), by the corners and version it was found
+/// at ([`Proposals::charged`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Charged {
+    pub corners: [[f64; 2]; 4],
+    pub version: SymbolVersion,
+    pub among: usize,
+}
+
+impl Proposals {
+    /// What a read of `found`, one of them, is charged as one of: one
+    /// for a symbol the search vouched for ([`Self::charged`]).
+    pub fn among_of(&self, found: &Detection) -> usize {
+        self.charged.iter().find(|c| c.corners == found.corners && c.version == found.version).map_or(1, |c| c.among)
+    }
+
+    /// `found`, one of them, is a placement nothing vouched for but its
+    /// fit, that decoded when the search read it through
+    /// ([`Self::charged`]), rather than decoding as found.
+    pub fn read_in_search(&self, found: &Detection) -> bool {
+        self.charged.iter().any(|c| c.corners == found.corners && c.version == found.version)
+    }
 }
 
 /// What reading every symbol a search found made of them.
@@ -482,9 +515,14 @@ pub struct Photo {
     pub name: String,
     pub width: usize,
     pub height: usize,
-    /// The photo as loaded, with its transparency laid on white: what a
-    /// crop is cut from.
+    /// The photo as loaded, with its transparency laid on the backdrop
+    /// its adjustments name ([`Adjust::backdrop`]): what a crop is cut
+    /// from.
     pub source: Arc<image::RgbaImage>,
+    /// The photo as loaded, its transparency not yet laid on anything,
+    /// for a change of backdrop to lay it on another: `None` for a photo
+    /// with no transparency, which is the same on any.
+    pub unflattened: Option<Arc<image::RgbaImage>>,
     /// The part of `source` on show, when it is not the whole.
     pub crop: Option<Crop>,
     /// RGBA of the part on show, at its own size: the photo as loaded

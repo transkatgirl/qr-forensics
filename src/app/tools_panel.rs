@@ -5,7 +5,7 @@ use qr_forensics::decode::abp::{ABP_ROUNDS_LEAST, ABP_ROUNDS_MAX, round_tries};
 use qr_forensics::decode::list::{LIST_COST, LIST_COST_MAX, LIST_COST_MIN};
 use qr_forensics::decode::pipeline::DecodeOptions;
 use qr_forensics::decode::rs::{CHASE_MAX_BITS, TRIAL_SETS_MAX, TRIAL_SETS_MIN, tries_charge};
-use qr_forensics::imaging::adjust::{Adjust, Channel, Enlarge, Filter, K1_RANGE, LENS_MIN_PAIRS, MAX_ENLARGED_SIDE, STRENGTH_RANGE};
+use qr_forensics::imaging::adjust::{Adjust, Backdrop, Channel, Enlarge, Filter, K1_RANGE, LENS_MIN_PAIRS, MAX_ENLARGED_SIDE, STRENGTH_RANGE};
 use qr_forensics::imaging::deblur::{self, Spread};
 use qr_forensics::imaging::binarize::{BinarizeParams, WINDOW_RADII};
 use qr_forensics::imaging::detect::{AnchorKind, Detection, anchor_sites};
@@ -20,7 +20,7 @@ use qr_forensics::symbol::{EcLevel, Family, SymbolVersion};
 
 use super::canvas::one_in;
 use super::state::*;
-use super::{Action, App, JobKind, Reach, Transform, count_run, count_word, grouped, list_phrase, wrong_codewords};
+use super::{Action, App, JobKind, Reach, Transform, count_word, grouped, list_phrase, wrong_codewords};
 
 /// Why a button is disabled while a job runs.
 const BUSY_HINT: &str = "Wait for the step under way to finish";
@@ -177,8 +177,10 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
     let cropped = photo.crop.is_some();
     let deblurred = photo.luma.deblurred;
     // What the photo starts with, which Reset goes back to: no
-    // adjustment but the enlargement a small photo is given.
-    let fresh = Adjust::for_photo(photo.original.width(), photo.original.height());
+    // adjustment but the enlargement a small photo is given, its
+    // transparent parts staying on the backdrop they are on.
+    let fresh = Adjust { backdrop: app.doc.adjust.backdrop, ..Adjust::for_photo(photo.original.width(), photo.original.height()) };
+    let transparent = photo.unflattened.is_some();
     let enlargements = photo.enlargements.clone();
     ui.horizontal_wrapped(|ui| {
         if ui
@@ -217,9 +219,27 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         }
     };
     // The adjustments in the order the photo is put through them
-    // ([`Adjust::apply`]): its size and shape, its sharpness, the one
-    // curve of its tone, and what is read of it.
+    // ([`Adjust::apply`]): what its transparent parts are filled with, its
+    // size and shape, its sharpness, the one curve of its tone, and what
+    // is read of it.
     egui::Grid::new("adjust").num_columns(2).show(ui, |ui| {
+        if transparent {
+            ui.label("Transparent parts");
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                for backdrop in Backdrop::ALL {
+                    changed |= ui.selectable_value(&mut adjust.backdrop, backdrop, backdrop.label()).changed();
+                }
+            })
+            .response
+            .on_hover_text(
+                "What transparent pixels are filled with before the photo is read: grey unless you choose another. \
+                 A light symbol on a transparent background (made for dark pages) vanishes on white but reads on \
+                 black; grey works for either.",
+            );
+            note(changed);
+            ui.end_row();
+        }
         ui.label("Enlarge");
         // The slider goes from step to step of those on offer for this
         // photo: each twice the last, with what the photo started at,
@@ -514,8 +534,8 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
     );
     ui.weak(
         "Anchors pin the fixed patterns to the photo, and the grid bends through them. Drag a hollow handle onto \
-         its pattern to set one, or drag any other module of the grid to set a custom anchor on its middle; \
-         right-click a handle to remove it.",
+         its pattern to set one, drag the grid's outline to add an edge point, or drag any other module to set a \
+         custom anchor on its middle. Right-click a handle to remove it.",
     );
     if let Some(preview) = &app.preview {
         let (matching, known) = preview.fixed;
@@ -576,8 +596,9 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
             ui.checkbox(&mut app.view.show_anchors, "Show anchor handles").on_hover_text(
                 "A handle on every fixed pattern and three along each edge. Drag one to where its pattern or edge \
                  really lies and the grid bends through it. Edge handles suit a symbol on a bottle or curled paper, \
-                 whose sides bow. Drag any other module of the grid to set a custom anchor on its middle and bend \
-                 the grid by it where it has no pattern.",
+                 whose sides bow; if three per edge aren't enough, drag the outline to add more. Drag any other \
+                 module of the grid to set a custom anchor on its middle and bend the grid by it where it has no \
+                 pattern.",
             );
             if ui.add_enabled(!app.doc.anchors.is_empty(), egui::Button::new("Clear anchors")).clicked() {
                 actions.push(Action::ClearAnchors);
@@ -647,12 +668,11 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
         } else if ui
             .button("Search whole photo")
             .on_hover_text(
-                "Search the whole photo for symbols and list what is found, those that decode as found first. Takes \
-                 a few seconds, and longer on a damaged symbol, whose finder patterns are tried every way; it can be \
-                 stopped. A photo over 4096 pixels on a side is searched in a copy reduced to that, and what is found \
-                 is placed and read in the photo's own pixels; a symbol too small to show in the copy is found by \
-                 Find in outline, which looks at the photo itself. While Load reads that decode is ticked, a symbol \
-                 that decodes as found is read through and written into the grid.",
+                "Search the whole photo for symbols and list them, those that decode first. Takes a few seconds, \
+                 longer for a damaged symbol; it can be stopped. A photo over 4096 px on a side is searched at \
+                 reduced size, but symbols are placed and read at full size; for a symbol too small to show at \
+                 reduced size, use Find in outline. With Load reads that decode ticked, a symbol that decodes is \
+                 read into the grid.",
             )
             .clicked()
         {
@@ -784,20 +804,32 @@ fn alignment_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>
         });
     }
     if !app.leads.is_empty() {
-        ui.label(format!("Finder patterns with no symbol fitted ({}):", app.leads.len()));
+        let read = if app.leads.iter().any(|lead| lead.fitted.is_some()) { "read" } else { "fitted" };
+        ui.label(format!("Finder patterns with no symbol {read} ({}):", app.leads.len()));
         for (i, lead) in app.leads.iter().enumerate() {
-            let text = format!("{}. {}, {} finder patterns", i + 1, lead.family.label(), lead.finders.len());
-            if ui
-                .add_enabled(!busy, egui::Button::new(text))
-                .on_hover_text(
-                    "The search found these finder patterns standing as one symbol's, with a format word reading outright \
-                     beside them, and could fit no symbol to them. Put the outline about them, as the search proposed it; \
-                     set it right by hand if it is not, and press Find in outline, which tries more than a search of the \
-                     whole photo does.",
-                )
-                .on_disabled_hover_text(BUSY_HINT)
-                .clicked()
-            {
+            let (text, hint) = match lead.fitted {
+                Some(version) => (
+                    format!("{}. {} {version} fitted, not read", i + 1, lead.family.label()),
+                    format!(
+                        "The search fitted a symbol of this version here with its fixed patterns nearly right, but nothing \
+                         else supported it and it didn't decode. Place the outline on it and press Find in outline, which \
+                         tries more than a whole-photo search, or sample it and work on the grid.{}",
+                        if version == app.doc.version {
+                            String::new()
+                        } else {
+                            format!(" This starts a new {} {version} grid (undoable).", version.family().label())
+                        }
+                    ),
+                ),
+                None => (
+                    format!("{}. {}, {} finder patterns", i + 1, lead.family.label(), lead.finders.len()),
+                    "The search found these finder patterns arranged like one symbol's, with a clean format word beside \
+                     them, but couldn't fit a symbol to them. Place the outline the search proposed, correct it by hand \
+                     if needed, and press Find in outline, which tries more than a whole-photo search."
+                        .to_owned(),
+                ),
+            };
+            if ui.add_enabled(!busy, egui::Button::new(text)).on_hover_text(hint).on_disabled_hover_text(BUSY_HINT).clicked() {
                 actions.push(Action::UseLead(i));
             }
         }
@@ -1287,8 +1319,8 @@ fn list_note(reach: &Reach, version: SymbolVersion, level: EcLevel, cost: usize)
     }
     if reach.reserved > 0 && reach.list.max(reach.list_default) > standard {
         text.push_str(&format!(
-            " With every module certain, going past {standard} uses the reserved error-detection codewords, so the \
-             result is never confirmed."
+            " With every module certain, anything past {standard} uses the reserved error-detection codewords and is \
+             never confirmed."
         ));
     }
     text
@@ -1317,7 +1349,7 @@ fn joined(items: &[String]) -> String {
 /// budget set, and how far past the code that reaches within the
 /// standard's limit and past what plain decoding reaches, said below its
 /// slider, and what the next size of set would take ([`Reach::trials`],
-/// [`Reach::trials_within`], [`Reach::unconfirmed`]).
+/// [`Reach::trials_within`]).
 fn trial_note(reach: &Reach) -> String {
     let trials = reach.trials;
     let (blocks, standard) = (reach.blocks_phrase(), reach.standard);
@@ -1331,26 +1363,20 @@ fn trial_note(reach: &Reach) -> String {
         (past, _) => {
             let sizes: Vec<String> = (0..past).map(|i| every_set(trials.first_size + 2 * i)).collect();
             let tried = format!("In this symbol's {blocks}: tries {} ({} sets)", joined(&sizes), grouped(trials.sets));
-            // Where the standard keeps an odd number of codewords, the
-            // smallest sets reach past the code only by spending them; and
-            // where it keeps two or more, the sets may reach within its
-            // limit no further than plain decoding does by spending them,
-            // or past counts plain decoding solves first, unconfirmed.
-            match (reach.trials_within, reach.unconfirmed()) {
-                (0, _) => format!(
+            // Where the standard keeps any codewords, what the sets reach
+            // past it spends them, as the standard counts a solution's
+            // errors; and where it keeps none, in a small block what the
+            // sets reach may leave too little redundancy to confirm it,
+            // even as the block itself judges it, uncharged for the sets.
+            // It was once said to fall short for the sets' cost alone,
+            // where the block's own count confirmed it.
+            match reach.trials_within {
+                0 if reach.reserved > 0 => format!(
                     "{tried}, but these only beat plain Reed-Solomon by using the reserved error-detection codewords, \
                      so they are never confirmed."
                 ),
-                (within, None) => {
-                    format!("{tried}, correcting up to {}, vs. {standard} for plain Reed-Solomon.", wrong_codewords(standard + within))
-                }
-                (within, Some((first, last))) => format!(
-                    "{tried}, correcting {} wrong codewords, vs. {standard} for plain Reed-Solomon. Not {}: plain \
-                     Reed-Solomon solves that first, using the reserved error-detection codewords, so it's never \
-                     confirmed.",
-                    count_run(reach.half + 1, standard + within),
-                    count_run(first, last)
-                ),
+                0 => format!("{tried}, but anything they find past plain Reed-Solomon leaves too little redundancy to confirm it."),
+                within => format!("{tried}, correcting up to {}, vs. {standard} for plain Reed-Solomon.", wrong_codewords(standard + within)),
             }
         }
     };
@@ -1604,32 +1630,35 @@ mod tests {
     #[test]
     fn the_notes_on_reach_say_what_spends_the_codewords_the_standard_keeps() {
         let opts = super::super::default_decode_options();
-        // 1-H keeps one codeword: list decoding reaches past the code only
-        // by spending it, and of the trials, only the triples go past it
-        // within the standard's limit.
+        // 1-H keeps one codeword: list decoding and the trials reach past
+        // the code only by spending it, the codewords the trials erase
+        // being read and wrong as the standard counts a solution's errors.
+        // The triples were once said to reach nine within it.
         let reach = Reach::of(SymbolVersion::Qr(1), EcLevel::H, &opts).unwrap();
         assert_eq!(
             list_note(&reach, SymbolVersion::Qr(1), EcLevel::H, opts.list_cost),
             "In this symbol's block of 26 codewords: corrects at least 11 wrong codewords, vs. 8 for plain \
-             Reed-Solomon. With every module certain, going past 8 uses the reserved error-detection codewords, so the \
-             result is never confirmed."
+             Reed-Solomon. With every module certain, anything past 8 uses the reserved error-detection codewords and \
+             is never confirmed."
         );
-        // 1-M keeps two: list decoding reaches half the distance, five,
-        // and no further, which plain decoding reaches as well by spending
-        // them. It was once said to correct five where plain decoding
-        // corrects four.
+        // 1-M keeps two: list decoding reaches six, a codeword past half
+        // the distance, its codewords given a multiplicity of ten alike,
+        // but past four spends them. It was once said to correct five
+        // where plain decoding corrects four; and then, its codewords
+        // given the budget a unit at a time, to reach no further than
+        // half the distance, which plain decoding reaches too.
         let one_m = Reach::of(SymbolVersion::Qr(1), EcLevel::M, &opts).unwrap();
         assert_eq!(
             list_note(&one_m, SymbolVersion::Qr(1), EcLevel::M, opts.list_cost),
-            "No gain at level M: in this symbol's block of 26 codewords, it's guaranteed to correct 5 wrong codewords, \
-             the same as plain Reed-Solomon. Past 4, both use the reserved error-detection codewords, so neither is \
+            "In this symbol's block of 26 codewords: corrects at least 6 wrong codewords, vs. 4 for plain Reed-Solomon. \
+             With every module certain, anything past 4 uses the reserved error-detection codewords and is never \
              confirmed."
         );
         assert_eq!(
             trial_note(&reach),
-            "In this symbol's block of 26 codewords: tries every single codeword and every triple (2,626 sets), \
-             correcting up to 9 wrong codewords, vs. 8 for plain Reed-Solomon. Adding every set of five would need a \
-             budget of 68,406."
+            "In this symbol's block of 26 codewords: tries every single codeword and every triple (2,626 sets), but \
+             these only beat plain Reed-Solomon by using the reserved error-detection codewords, so they are never \
+             confirmed. Adding every set of five would need a budget of 68,406."
         );
         // 3-L at the least budget tries the single codewords alone.
         let least = DecodeOptions { trial_sets: TRIAL_SETS_MIN, ..opts };
@@ -1644,16 +1673,18 @@ mod tests {
         // Reed-Solomon only by spending them.
         let reach = Reach::of(SymbolVersion::Micro(2), EcLevel::L, &opts).unwrap();
         assert!(trial_note(&reach).ends_with("so they are never confirmed."), "{}", trial_note(&reach));
-        // The curve reaches half the distance with what a fallback needs
-        // to be verified, as plain decoding does, and both spend the
-        // reserve past the one the standard corrects. Said once against
-        // three codewords' worth, it reached the one, as "1 wrong
-        // codewords".
+        // The curve reaches three wrong, a codeword past half the
+        // distance, with what the block itself must show of a codeword
+        // to be verified, and a decode finds them there; but past the
+        // one the standard corrects it spends the reserve. Said once
+        // against three codewords' worth, it reached the one, as "1 wrong
+        // codewords"; and then, held to what a fallback's own count must
+        // show, the two plain decoding reaches.
         assert_eq!(
             list_note(&reach, SymbolVersion::Micro(2), EcLevel::L, opts.list_cost),
-            "No gain at level L: in this symbol's block of 10 codewords, it's guaranteed to correct 2 wrong codewords, \
-             the same as plain Reed-Solomon. Past 1, both use the reserved error-detection codewords, so neither is \
-             confirmed."
+            "In this symbol's block of 10 codewords: corrects at least 3 wrong codewords, vs. 1 for plain \
+             Reed-Solomon. With every module certain, anything past 1 uses the reserved error-detection codewords and \
+             is never confirmed."
         );
         // 2-L keeps two of ten: the pairs reach five within the standard's
         // limit, where plain decoding goes first by spending them, and six
@@ -1665,15 +1696,15 @@ mod tests {
              Reed-Solomon by using the reserved error-detection codewords, so they are never confirmed. Adding every \
              set of four would need a budget of 136,697."
         );
-        // 1-M keeps two of ten too: the sets of four reach six, but a block
-        // five wrong is plain decoding's, and never confirmed. It was once
-        // said to correct up to six.
+        // 1-M keeps two of ten too: the sets of four reach six, but past
+        // the four the standard corrects, as it counts a solution's
+        // errors, the codewords erased among them. It was once said to
+        // correct up to six, and then to correct six.
         assert_eq!(
             trial_note(&one_m),
-            "In this symbol's block of 26 codewords: tries every pair and every set of four (15,275 sets), correcting \
-             6 wrong codewords, vs. 4 for plain Reed-Solomon. Not 5: plain Reed-Solomon solves that first, using the \
-             reserved error-detection codewords, so it's never confirmed. Adding every set of six would need a budget \
-             of 245,505."
+            "In this symbol's block of 26 codewords: tries every pair and every set of four (15,275 sets), but these \
+             only beat plain Reed-Solomon by using the reserved error-detection codewords, so they are never \
+             confirmed. Adding every set of six would need a budget of 245,505."
         );
     }
 }

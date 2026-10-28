@@ -17,7 +17,7 @@ use qr_forensics::symbol::layout::{CodewordSpan, CwId};
 use qr_forensics::symbol::tables::{Mode, block_shape, misdecode_protection};
 
 use super::state::*;
-use super::{Action, App, ExportFormat, JobKind, Reach, Transform, count_run, ec_name, grouped, wrong_codewords};
+use super::{Action, App, ExportFormat, JobKind, Reach, Transform, ec_name, grouped, wrong_codewords};
 
 const GOOD: Color32 = Color32::from_rgb(40, 170, 80);
 /// How many of the readings of the format bits, and of the attempts of a
@@ -112,6 +112,14 @@ fn result_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         } else {
             ui.weak(format!("At most a 1 in 2^{bits} chance the message is wrong, summed over {total} blocks."));
         }
+    }
+    if report.is_trustworthy() && report.data_is_the_mask() {
+        ui.colored_label(
+            visuals.warn_fg_color,
+            "The message is empty and every data bit is zero, so the modules are just the mask pattern. An \
+             encoder can produce this, but so can a striped or checked texture such as a screen or fabric. Check \
+             that there really is a symbol here.",
+        );
     }
     if app.derived.analysis.inverted {
         ui.colored_label(
@@ -657,22 +665,9 @@ fn level_capacity(version: SymbolVersion, level: EcLevel, opts: &DecodeOptions, 
             && reach.list_gains()
         {
             details.push_str(&format!(
-                " List decoding corrects at least {} wrong, but with every module certain, past {} it uses the \
+                " List decoding corrects at least {} wrong, but with every module certain, anything past {} uses the \
                  reserved ones.",
                 reach.list, reach.standard
-            ));
-        }
-        // Where the trials confirm a block past counts that plain
-        // decoding solves only so, the summary says which they leave, and
-        // why here.
-        if let Some(reach) = reach
-            && opts.erase_by_trial
-            && reach.trials_within > 0
-            && let Some((first, last)) = reach.unconfirmed()
-        {
-            details.push_str(&format!(
-                " A block {} wrong is never confirmed: plain Reed-Solomon solves it first, using the reserved ones.",
-                count_run(first, last)
             ));
         }
     }
@@ -686,14 +681,10 @@ fn level_capacity(version: SymbolVersion, level: EcLevel, opts: &DecodeOptions, 
         if opts.list_decode && reach.list_gains_within_standard() {
             further.push(format!("with list decoding, at least {} wrong", reach.list));
         }
+        // Nothing where any codewords are reserved: what the sets reach
+        // past plain decoding spends them ([`Reach::trials_within`]).
         if opts.erase_by_trial && reach.trials_within > 0 {
-            let most = reach.standard + reach.trials_within;
-            further.push(match reach.unconfirmed() {
-                None => format!("with erasing by trial, up to {most} wrong"),
-                Some((first, last)) => {
-                    format!("with erasing by trial, {} wrong too, but not {}", count_run(reach.half + 1, most), count_run(first, last))
-                }
-            });
+            further.push(format!("with erasing by trial, up to {} wrong", reach.standard + reach.trials_within));
         }
     }
     if let Some(first) = further.first_mut() {
@@ -1029,6 +1020,10 @@ fn outcome_text(block: &BlockReport) -> (String, bool) {
                 ),
                 SolveMethod::BeliefPropagation { rounds, flipped_bits } => format!(
                     "solved by belief propagation ({rounds} rounds, {flipped_bits} bits flipped): {errors} wrong, \
+                     {erasures} unknown, {confidence_bits} checks"
+                ),
+                SolveMethod::Reached => format!(
+                    "solved by a codeword a solver passed over, confirmed by the block alone: {errors} wrong, \
                      {erasures} unknown, {confidence_bits} checks"
                 ),
                 SolveMethod::PinnedOnly => "solved from pins alone".to_owned(),
@@ -1752,17 +1747,19 @@ mod tests {
         let capacity = |version, level, opts: &DecodeOptions| level_capacity(version, level, opts, Reach::of(version, level, opts).as_ref());
         // 1-H: 17 of error correction in one block, 1 of them kept. List
         // decoding reaches 11 wrong only by spending it, and is said in
-        // the hover alone; the single codewords the trials erase reach
-        // past the code only so too, and the triples one past it within
-        // the standard's limit. Both were once said in the summary as
-        // reaching 11 and two past the code, which no solution confirmed.
+        // the hover alone; the trials reach past the code only so too,
+        // the codewords they erase being read and wrong as the standard
+        // counts a solution's errors. Both were once said in the summary
+        // as reaching 11 and two past the code, which no solution
+        // confirmed, and the trials then as reaching one past it.
         let Capacity { summary, details } = capacity(SymbolVersion::Qr(1), EcLevel::H, &opts);
-        assert_eq!(summary, "Corrects up to 8 wrong codewords or 16 unknown. With erasing by trial, up to 9 wrong.");
+        assert_eq!(summary, "Corrects up to 8 wrong codewords or 16 unknown.");
         assert!(details.starts_with("17 of the 26 codewords are error correction. A wrong codeword costs as much as two"), "{details}");
         assert!(
             details.ends_with(
                 "The standard reserves 1 of them for error detection; a solution that uses them is never confirmed. List \
-                 decoding corrects at least 11 wrong, but with every module certain, past 8 it uses the reserved ones."
+                 decoding corrects at least 11 wrong, but with every module certain, anything past 8 uses the reserved \
+                 ones."
             ),
             "{details}"
         );
@@ -1791,14 +1788,21 @@ mod tests {
         // limit, but plain decoding reaches five first, spending them, and
         // the trials never see such a block. 1-M keeps two of ten too, and
         // its sets of four reach six, but not five, which plain decoding
-        // solves first. Both were once said to reach every count up to
-        // what the sets reach, and no solution confirmed five.
+        // solves first, and a solution of them is one of thirty thousand
+        // sets, which eat what it has to spare. Both were once said to
+        // reach every count up to what the sets reach, and no solution
+        // confirmed five; and 1-M to correct six, which none confirms.
+        // List decoding reaches six too, its codewords given one
+        // multiplicity alike, and is said to only in the details, as it
+        // spends the two.
         assert_eq!(capacity(SymbolVersion::Qr(2), EcLevel::L, &opts).summary, "Corrects up to 4 wrong codewords or 8 unknown.");
         let Capacity { summary, details } = capacity(SymbolVersion::Qr(1), EcLevel::M, &opts);
-        assert_eq!(summary, "Corrects up to 4 wrong codewords or 8 unknown. With erasing by trial, 6 wrong too, but not 5.");
+        assert_eq!(summary, "Corrects up to 4 wrong codewords or 8 unknown.");
         assert!(
             details.ends_with(
-                "A block 5 wrong is never confirmed: plain Reed-Solomon solves it first, using the reserved ones."
+                "The standard reserves 2 of them for error detection; a solution that uses them is never confirmed. List \
+                 decoding corrects at least 6 wrong, but with every module certain, anything past 4 uses the reserved \
+                 ones."
             ),
             "{details}"
         );

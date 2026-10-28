@@ -35,6 +35,45 @@ pub enum Channel {
     Blue,
 }
 
+/// What the transparent parts of a photo are laid on before anything is
+/// read of it: mid grey, #808080, unless another is chosen, which ink of
+/// either kind stands out against; white, as a viewer shows them; or
+/// black, for a symbol drawn in light ink on nothing, to be shown on a
+/// dark page, which on white is light on light and no symbol at all. The
+/// photo as loaded is flattened onto it
+/// ([`super::photo::flatten_alpha_onto`]), and what the lens pulls in
+/// from beyond the photo's edges is filled with it too ([`Adjust::k1`]).
+/// So a photo with no transparency is the same on any but there, and
+/// the app lays such a photo on white.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Backdrop {
+    White,
+    Black,
+    #[default]
+    Grey,
+}
+
+impl Backdrop {
+    pub const ALL: [Backdrop; 3] = [Backdrop::White, Backdrop::Black, Backdrop::Grey];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Backdrop::White => "White",
+            Backdrop::Black => "Black",
+            Backdrop::Grey => "Grey",
+        }
+    }
+
+    /// What a channel of a pixel wholly transparent comes to on it.
+    pub fn level(self) -> u8 {
+        match self {
+            Backdrop::White => 255,
+            Backdrop::Black => 0,
+            Backdrop::Grey => 128,
+        }
+    }
+}
+
 impl Channel {
     pub const ALL: [Channel; 4] = [Channel::Color, Channel::Red, Channel::Green, Channel::Blue];
 
@@ -380,6 +419,14 @@ pub struct Adjust {
     /// many times as wide, from nought, which leaves the photo as it is,
     /// past 1.0, as measured, to [`STRENGTH_RANGE`]'s end.
     pub strength: f32,
+    /// What the photo's transparent parts are laid on. The photo is
+    /// flattened onto it as it is loaded, before every other adjustment,
+    /// which are made to the photo so flattened: whoever holds the photo
+    /// hands them the pixels on this backdrop. What the lens term draws in
+    /// from beyond the photo's edges shows it too: those were once white
+    /// whatever it was, wedges at the corners of a photo laid on grey or
+    /// black that stood out as hard as any edge of the symbol.
+    pub backdrop: Backdrop,
 }
 
 /// What is shown of a part of the photo and what is read of it, filtered
@@ -424,6 +471,7 @@ impl Default for Adjust {
             sharpen: 0.0,
             kernel: None,
             strength: 1.0,
+            backdrop: Backdrop::Grey,
         }
     }
 }
@@ -607,20 +655,21 @@ pub fn estimate_k1(width: usize, height: usize, current_k1: f32, pairs: &[([f64;
 /// same ray from the centre, bilinearly, and white where that falls off
 /// the photo. Inverse mapping leaves no holes.
 pub fn undistort(rgba: &[u8], width: usize, height: usize, k1: f32) -> Vec<u8> {
-    straightened(rgba, width, height, k1, [0, 0, width, height])
+    straightened(rgba, width, height, k1, [0, 0, width, height], 255)
 }
 
 /// The part `[x, y, w, h]` of the photo with its radial distortion taken
 /// out about the whole photo's centre, as [`undistort`] takes it out of
 /// the whole and pixel for pixel the same, read from no more of the
-/// photo than the part draws on.
-pub fn straightened(rgba: &[u8], width: usize, height: usize, k1: f32, [x, y, w, h]: [usize; 4]) -> Vec<u8> {
+/// photo than the part draws on, and `fill` in every colour where that
+/// falls off the photo: what it is laid on ([`Backdrop::level`]).
+pub fn straightened(rgba: &[u8], width: usize, height: usize, k1: f32, [x, y, w, h]: [usize; 4], fill: u8) -> Vec<u8> {
     assert_eq!(rgba.len(), width * height * 4);
     let frame = [width as f32, height as f32];
     let [x0, y0, x1, y1] = shot_about(frame, k1, [x as f32, y as f32], (w, h), [1.0; 2], [width, height]);
     let region = if [x0, y0, x1, y1] == [0, 0, width, height] { Cow::Borrowed(rgba) } else { Cow::Owned(cut(rgba, width, 4, [x0, y0, x1, y1])) };
     let shot = Shot { pixels: &region, width: x1 - x0, height: y1 - y0, channels: 4, at: [x0 as f32, y0 as f32], step: [1.0; 2] };
-    straighten(&shot, frame, k1, [x as f32, y as f32], (w, h), &[255; 4])
+    straighten(&shot, frame, k1, [x as f32, y as f32], (w, h), &[fill, fill, fill, 255])
 }
 
 /// Pixels of a photo as loaded, RGBA, that a part of it is adjusted
@@ -956,7 +1005,7 @@ impl Adjust {
             let region = aligned(shot_about(frame, self.k1, out_at, (to_width, to_height), scale, from.photo), steps, held);
             let (gw, gh) = (region[2] - region[0], region[3] - region[1]);
             // A part that draws on none of the photo has nothing to resize,
-            // and is white throughout.
+            // and is the backdrop throughout.
             let (rw, rh) = if gw == 0 || gh == 0 {
                 (0, 0)
             } else {
@@ -968,7 +1017,7 @@ impl Adjust {
             let at = [region[0] as f32 * scale[0], region[1] as f32 * scale[1]];
             let step = [gw as f32 * scale[0] / rw.max(1) as f32, gh as f32 * scale[1] / rh.max(1) as f32];
             let lens = Lens { frame, k1: self.k1, slope: edge_slope(f64::from(self.k1)) as f32 };
-            chain.push(Step::Straightened { place: [at, step], lens, out_at, size: (to_width, to_height) });
+            chain.push(Step::Straightened { place: [at, step], lens, out_at, size: (to_width, to_height), fill: self.backdrop.level() });
             region
         };
         if let Some((sigma, amount)) = mask {
@@ -1914,7 +1963,8 @@ mod tests {
         // straightened at its own size and enlarged after.
         let (w, h) = (48, 36);
         let photo = pixels(w, h, |x, y| [((x * 37 + y * 11) % 256) as u8, ((x * 13 + y * 29) % 256) as u8, (((x / 3 + y / 2) % 2) * 255) as u8]);
-        let lens = Adjust { k1: 0.12, enlarge: Enlarge::times(2), ..Default::default() };
+        // On white, as [`undistort`] lays what falls off the photo.
+        let lens = Adjust { k1: 0.12, enlarge: Enlarge::times(2), backdrop: Backdrop::White, ..Default::default() };
         let (display, luma) = lens.apply(&photo, w, h);
         let enlarged = resize(&photo, w, h, 4, 2 * w, 2 * h);
         assert_eq!(display, undistort(&enlarged, 2 * w, 2 * h, 0.12));
@@ -1976,12 +2026,12 @@ mod tests {
         let photo = pixels(w, h, |x, y| [((x * 37 + y * 11) % 256) as u8, ((x * 13 + y * 29) % 256) as u8, (((x / 3 + y / 2) % 2) * 255) as u8]);
         // A strip along the right edge of a photo whose lens term
         // straightens pincushion reads every one of its pixels from past
-        // that edge: it draws on none of the photo, and is white, as the
-        // whole photo so straightened is there, at its own size and
-        // enlarged.
+        // that edge: it draws on none of the photo, and is the backdrop,
+        // as the whole photo so straightened is there, at its own size
+        // and enlarged.
         for part @ [x, y, pw, ph] in [[390, 140, 10, 20], [395, 0, 5, 300], [380, 0, 20, 300]] {
             let whole = undistort(&photo, w, h, 0.3);
-            assert!(straightened(&photo, w, h, 0.3, part) == cut(&whole, w, 4, [x, y, x + pw, y + ph]), "{part:?}");
+            assert!(straightened(&photo, w, h, 0.3, part, 255) == cut(&whole, w, 4, [x, y, x + pw, y + ph]), "{part:?}");
             for enlarge in [1, 2] {
                 let adjust = Adjust { k1: 0.3, enlarge: Enlarge::times(enlarge), ..Default::default() };
                 let e = usize::from(enlarge);
@@ -2025,8 +2075,8 @@ mod tests {
             assert_eq!((luma.width, luma.height), (part[2] * e, part[3] * e));
             assert!(display == there, "{k1}, {enlarge} times");
             if e == 1 {
-                assert!(display == straightened(&photo, w, h, k1, part), "{k1}");
-                assert!(straightened(&photo, w, h, k1, part) == cut(&undistort(&photo, w, h, k1), w, 4, [5, 30, 27, 44]));
+                assert!(display == straightened(&photo, w, h, k1, part, adjust.backdrop.level()), "{k1}");
+                assert!(straightened(&photo, w, h, k1, part, 255) == cut(&undistort(&photo, w, h, k1), w, 4, [5, 30, 27, 44]));
             }
             let shot = luma.as_shot.as_ref().expect("a straightened part keeps the photo as loaded about it");
             assert!(shot.width < w && shot.height < h, "{k1}: no more of the photo than the part draws on");
@@ -2225,11 +2275,16 @@ mod tests {
         let expected = (sx - 0.5).round() as u8;
         assert_eq!(out[(y * w + x) * 4], expected);
         assert!(expected > x as u8, "a positive k1 reads from further out");
-        // The far corners fall off the photo and come back white.
+        // The far corners fall off the photo and come back white; under
+        // the adjustments, the backdrop the photo is laid on, as its
+        // transparent parts are.
         assert_eq!(&out[..4], &[255, 255, 255, 255]);
-        let (display, luma) = Adjust { k1: 0.1, ..Default::default() }.apply(&ramp, w, h);
-        assert_eq!(display[(y * w + x) * 4], expected);
-        assert!((luma.data[0] - 1.0).abs() < 1e-5);
+        for backdrop in Backdrop::ALL {
+            let (display, luma) = Adjust { k1: 0.1, backdrop, ..Default::default() }.apply(&ramp, w, h);
+            assert_eq!(display[(y * w + x) * 4], expected);
+            assert_eq!(&display[..4], &[backdrop.level(), backdrop.level(), backdrop.level(), 255], "{backdrop:?}");
+            assert!((luma.data[0] - f32::from(backdrop.level()) / 255.0).abs() < 1e-5, "{backdrop:?}: {}", luma.data[0]);
+        }
     }
 
     #[test]
