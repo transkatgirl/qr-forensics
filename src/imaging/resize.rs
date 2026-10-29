@@ -20,8 +20,12 @@
 //! result covers what the source covers: result pixel `i` is centred on
 //! the source at `(i + 1/2) / ratio - 1/2`.
 //!
-//! The values are resized as they are stored, as the rest of the
-//! pipeline weighs them, and not in linear light.
+//! The values are resized as they are given: a photo is resized as it
+//! is stored, as the rest of the pipeline weighs it, or as the light it
+//! stands for, where it is worked in linear light
+//! ([`super::adjust::Adjust::light`]), its values converted before they
+//! are handed here and stored again after ([`super::gpu::adjusted`],
+//! [`super::Luma::resized`]).
 //!
 //! The weights are worked out here, and the resizing on the graphics
 //! card ([`super::gpu::resized`]): a photo enlarged four times is sixteen

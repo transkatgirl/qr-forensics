@@ -10,6 +10,14 @@
 //! grey; a read that does not decode still makes itself such copies,
 //! and what it read through one the photo so adjusted shows again.
 //!
+//! The size, the lens and the sharpness mix the photo's pixels: as they
+//! are stored, or, where [`Adjust::light`] asks, as the light they stand
+//! for, which is stored again before the tone. A lens mixes light, and
+//! sRGB stores it on a curve that spends its levels on the darks: fine
+//! ink on paper reduced as stored comes out darker than the light that
+//! fell there, a pixel half black and half white at 128 where its light
+//! stores as 188.
+//!
 //! Every adjustment is worked on the graphics card ([`super::gpu`]); what
 //! is worked out here is what it is asked to do and where: the weights of
 //! a resize, the box of the photo a part draws on, the curve of the tone.
@@ -22,6 +30,7 @@ use super::enhance::{gaussian, mask_for};
 use super::deblur::{self, Spread};
 use super::gpu::{Lens, Shown, Step};
 use super::resize::{Sample, Taps};
+use super::sample::{Light, encoded_light, linear_light};
 use super::detect::most_shrunk;
 use super::{AsShot, Luma, SharedRgba, gpu};
 
@@ -137,9 +146,9 @@ impl Filter {
             Filter::Median => "Removes specks and dropouts a pixel or two across while keeping edges sharp",
             Filter::Close => "Joins the dots of a dot-matrix or inkjet print into solid dark modules",
             Filter::Deblur => {
-                "Measures the blur's width and direction from edges in the photo (or inside the outline) and \
-                 deconvolves it, for a photo so out of focus or motion-blurred that the finder patterns' rings have \
-                 run into their centres"
+                "Estimates the blur from edges in the photo (or inside the outline) and deconvolves it, for a photo \
+                 so out of focus or shaken that the finder patterns' rings run into their centres. Works in linear \
+                 light when Work in linear light is on"
             }
         }
     }
@@ -149,18 +158,20 @@ impl Filter {
         matches!(self, Filter::Median | Filter::Close)
     }
 
-    /// The filter over a `width` × `height` luminance image, with a
-    /// neighbourhood `radius` pixels either side of each pixel. The
-    /// median's cost grows with the square of the radius, so it is held
-    /// to two. Worked on the graphics card ([`super::gpu`]), the image's
-    /// edges repeated beyond it.
-    pub fn apply(self, data: &[f32], width: usize, height: usize, radius: usize) -> Vec<f32> {
+    /// The filter over a `width` × `height` luminance image worked in
+    /// `light`, with a neighbourhood `radius` pixels either side of each
+    /// pixel. The median's cost grows with the square of the radius, so
+    /// it is held to two. Worked on the graphics card ([`super::gpu`]),
+    /// the image's edges repeated beyond it. Only Deblur asks the light:
+    /// the median and closing pick one of the values about a pixel, which
+    /// is the same value in either.
+    pub fn apply(self, data: &[f32], width: usize, height: usize, radius: usize, light: Light) -> Vec<f32> {
         let radius = radius.max(1);
         match self {
             Filter::None => data.to_vec(),
             Filter::Median => super::gpu::median(data, width, height, radius.min(2)),
             Filter::Close => super::gpu::closed(data, width, height, radius),
-            Filter::Deblur => super::deblur::undone(data, width, height),
+            Filter::Deblur => super::deblur::undone(data, width, height, light),
         }
     }
 }
@@ -387,8 +398,13 @@ pub struct Adjust {
     pub channel: Channel,
     /// For light-on-dark symbols.
     pub invert: bool,
-    /// -1.0 to 1.0, added after contrast.
-    pub brightness: f32,
+    /// Stops the photo's exposure is moved by, within
+    /// [`EXPOSURE_RANGE`]: the light each value stands for
+    /// ([`linear_light`]) twice as much for each stop up, and half for
+    /// each down, stored again and held at white. Made in light whatever
+    /// light the photo is worked in ([`Self::light`]), after invert and
+    /// before contrast, whose threshold it moves the photo across.
+    pub exposure: f32,
     /// -1.0 (flat grey) to 1.0 (hard threshold at mid grey).
     pub contrast: f32,
     /// Neighbourhood filter applied last.
@@ -427,6 +443,22 @@ pub struct Adjust {
     /// whatever it was, wedges at the corners of a photo laid on grey or
     /// black that stood out as hard as any edge of the symbol.
     pub backdrop: Backdrop,
+    /// What the photo's pixels are mixed as where it is resized,
+    /// straightened and sharpened or blurred: as they are stored, or as
+    /// the light they stand for ([`Light`]), as a lens mixed them, and
+    /// stored again before the tone. A photo made in light is searched and
+    /// read in it besides: every copy of it is made again from the photo as
+    /// loaded in light ([`Luma::as_shot`]), what it is reduced to for a
+    /// search of the whole of it is reduced in light ([`Luma::resized`]),
+    /// and its modules are read as light ([`Luma::light`]). The tone is a
+    /// curve of what is stored either way. The median and the closing pick
+    /// one of the values about each pixel, whose order a curve keeps, and
+    /// are what they are either way; Deblur measures and undoes the blur
+    /// in this light too, after the tone, so that a photo inverted or toned
+    /// for contrast, whose values are off sRGB's curve, is deblurred as
+    /// stored where it is worked so. Deblur once worked in light always,
+    /// and undid an inverted photo's blur as if its paper were its ink.
+    pub light: Light,
 }
 
 /// What is shown of a part of the photo and what is read of it, filtered
@@ -454,6 +486,9 @@ impl Show {
     }
 }
 
+/// How far the exposure goes, in stops ([`Adjust::exposure`]).
+pub const EXPOSURE_RANGE: std::ops::RangeInclusive<f32> = -4.0..=4.0;
+
 /// How far the Deblur filter's strength goes ([`Adjust::strength`]).
 pub const STRENGTH_RANGE: std::ops::RangeInclusive<f32> = 0.0..=2.0;
 
@@ -462,7 +497,7 @@ impl Default for Adjust {
         Self {
             channel: Channel::Color,
             invert: false,
-            brightness: 0.0,
+            exposure: 0.0,
             contrast: 0.0,
             filter: Filter::None,
             radius: 1,
@@ -472,6 +507,7 @@ impl Default for Adjust {
             kernel: None,
             strength: 1.0,
             backdrop: Backdrop::Grey,
+            light: Light::Encoded,
         }
     }
 }
@@ -839,12 +875,16 @@ impl Adjust {
 
     fn lookup_table(&self) -> [u8; 256] {
         let gain = ((self.contrast.clamp(-1.0, 0.999) + 1.0) * std::f32::consts::FRAC_PI_4).tan();
+        let exposure = self.exposure.exp2();
         std::array::from_fn(|i| {
             let mut value = i as f32 / 255.0;
             if self.invert {
                 value = 1.0 - value;
             }
-            value = (value - 0.5) * gain + 0.5 + self.brightness;
+            if self.exposure != 0.0 {
+                value = encoded_light(linear_light(value) * exposure);
+            }
+            value = (value - 0.5) * gain + 0.5;
             (value.clamp(0.0, 1.0) * 255.0).round() as u8
         })
     }
@@ -876,9 +916,11 @@ impl Adjust {
     /// mask is as wide in the photo's own pixels as Sharpen says, or in
     /// those a reduction leaves, and on the photo enlarged as many times
     /// as wide, as wide as what a lens blurred however large the photo
-    /// is drawn. The tone comes after, a curve for each pixel alone, and
-    /// the filter last, whose neighbourhood is measured in the pixels
-    /// the photo is worked on at.
+    /// is drawn. These three mix the photo's pixels as stored, or as the
+    /// light they stand for ([`Self::light`]), stored again after them.
+    /// The tone comes after, a curve for each pixel alone, and the filter
+    /// last, whose neighbourhood is measured in the pixels the photo is
+    /// worked on at.
     ///
     /// The luminance of a photo enlarged keeps that of the photo at its
     /// own size beside it ([`Luma::unenlarged`]), made as the photo
@@ -933,36 +975,37 @@ impl Adjust {
         assert_eq!(rgba.len(), width * height * 4);
         assert!(x + w <= width && y + h <= height, "the part [{x}, {y}, {w}, {h}] lies within the photo, {width} by {height}");
         if w == 0 || h == 0 {
-            let (display, luma) = self.filtered(Vec::new(), Vec::new(), w, h, 1.0, 0);
+            let (display, mut luma) = self.filtered(Vec::new(), Vec::new(), w, h, 1.0, (0, 0));
+            luma.light = self.light;
             return (Shown::Bytes(display), luma);
         }
         let enlarge = self.enlarge.within(w as u32, h as u32);
         let photo = Loaded { rgba, width, height, at: [0, 0], photo: [width, height], shared };
         let size = enlarge.size(w, h);
-        Adjust { enlarge, ..*self }.made_as(photo, [x, y, w, h], size, size.0 * size.1, show, true)
+        Adjust { enlarge, ..*self }.made_as(photo, [x, y, w, h], size, size, show, true)
     }
 
     /// Whether the tone is the photo's own: a copy made of the photo's
     /// luminance and toned no further is the copy toned.
     fn plain_tone(&self) -> bool {
-        self.channel == Channel::Color && !self.invert && self.brightness == 0.0 && self.contrast == 0.0
+        self.channel == Channel::Color && !self.invert && self.exposure == 0.0 && self.contrast == 0.0
     }
 
     /// The part `[x, y, w, h]` of a photo, made from what of it `from`
     /// holds as loaded, `to_width` by `to_height`, by every adjustment
     /// in its turn ([`Self::apply_to`]) but the size, which `to_width`
     /// and `to_height` give: what the whole photo so adjusted would show
-    /// there, at that size. `whole_pixels` is how many pixels that whole
-    /// comes to at that size, which the Deblur filter is reduced for as the
-    /// whole is ([`deblur::undone_within`]). The RGBA image to display is
+    /// there, at that size. `whole` is that whole's width and height at
+    /// that size, which the Deblur filter is reduced for as the whole is
+    /// ([`deblur::undone_within`]). The RGBA image to display is
     /// made where it is `shown`, and is otherwise empty, and never taken off
     /// the graphics card: a copy made for a read is read and not shown.
     /// With `keep`, the luminance keeps the part made at its own size
     /// beside it, when it is made a whole number of times larger, and the
     /// photo as loaded, when it is adjusted more than that.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn made(&self, from: Loaded<'_>, part: [usize; 4], size: (usize, usize), whole_pixels: usize, shown: bool, keep: bool) -> (Vec<u8>, Luma) {
-        let (display, luma) = self.made_as(from, part, size, whole_pixels, Show::of(shown), keep);
+    pub(crate) fn made(&self, from: Loaded<'_>, part: [usize; 4], size: (usize, usize), whole: (usize, usize), shown: bool, keep: bool) -> (Vec<u8>, Luma) {
+        let (display, luma) = self.made_as(from, part, size, whole, Show::of(shown), keep);
         (display.into_bytes(), luma)
     }
 
@@ -970,7 +1013,7 @@ impl Adjust {
     /// left on the graphics card where it says so and it was made there
     /// whole.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn made_as(&self, from: Loaded<'_>, [x, y, w, h]: [usize; 4], (to_width, to_height): (usize, usize), whole_pixels: usize, show: Show, keep: bool) -> (Shown, Luma) {
+    pub(crate) fn made_as(&self, from: Loaded<'_>, [x, y, w, h]: [usize; 4], (to_width, to_height): (usize, usize), whole: (usize, usize), show: Show, keep: bool) -> (Shown, Luma) {
         let [ax, ay] = from.at;
         let held = [ax, ay, ax + from.width, ay + from.height];
         // Unbent, the part is read where it lies. Bent, it is read from
@@ -1028,7 +1071,7 @@ impl Adjust {
         // step at a time, and filtered after.
         let source = gpu::Source { rgba: from.rgba, width: from.width, part: [drawn[0] - ax, drawn[1] - ay, drawn[2] - ax, drawn[3] - ay], shared: from.shared };
         let table = self.lookup_table();
-        let on_card = gpu::adjusted(&source, &chain, &table, self.pick(), self.tone(show)).map(|toned| self.filtered_on(toned, scale[0], whole_pixels, show));
+        let on_card = gpu::adjusted(&source, &chain, &table, self.pick(), self.tone(show), self.light).map(|toned| self.filtered_on(toned, scale[0], whole, show));
         let (display, mut luma) = match on_card {
             Some((display, toned, deblurred)) => {
                 let mut luma = Luma::new(to_width, to_height, toned);
@@ -1036,12 +1079,13 @@ impl Adjust {
                 (display, luma)
             }
             None => {
-                let (display, toned) = gpu::stepped(&source, &chain, &table, self.pick(), matches!(show, Show::Bytes | Show::Card));
-                let (display, luma) = self.filtered(display, toned, to_width, to_height, scale[0], whole_pixels);
+                let (display, toned) = gpu::stepped(&source, &chain, &table, self.pick(), matches!(show, Show::Bytes | Show::Card), self.light);
+                let (display, luma) = self.filtered(display, toned, to_width, to_height, scale[0], whole);
                 let display = if show == Show::Grey { luma.to_rgba() } else { display };
                 (Shown::Bytes(display), luma)
             }
         };
+        luma.light = self.light;
         if !keep {
             return (display, luma);
         }
@@ -1054,9 +1098,14 @@ impl Adjust {
             // pixel either way of each of them would take out every
             // module that stands alone, and a finder pattern's ring.
             let unfiltered = Adjust { filter: Filter::None, ..*self };
-            luma.unenlarged = Some(Arc::new(unfiltered.made(from, [x, y, w, h], (w, h), w * h, false, false).1));
+            luma.unenlarged = Some(Arc::new(unfiltered.made(from, [x, y, w, h], (w, h), (w, h), false, false).1));
         }
-        if !whole || self.k1 != 0.0 || mask.is_some() || self.filter != Filter::None || !self.plain_tone() {
+        // Made in light, a copy of the part is made again from the photo as
+        // loaded whatever else the part was made by: the part mixed the
+        // light of each colour, and a copy made of its luminance would mix
+        // the light of its grey, which of a coloured photo is not the grey
+        // of that.
+        if !whole || self.k1 != 0.0 || mask.is_some() || self.filter != Filter::None || !self.plain_tone() || self.light == Light::Linear {
             // As much of the photo as a copy of the part at any size
             // draws on straightened: what the part draws on at its own
             // size, and as far again as what a copy draws on beyond a
@@ -1128,7 +1177,7 @@ impl Adjust {
     /// values: what is shown, where `show` asks for it, left on the card
     /// where it asks that, and what is read taken off the card after the
     /// filter, with the blur the Deblur filter undid.
-    fn filtered_on(&self, toned: gpu::Toned, scale: f32, whole: usize, show: Show) -> Filtered {
+    fn filtered_on(&self, toned: gpu::Toned, scale: f32, whole: (usize, usize), show: Show) -> Filtered {
         let radius = usize::from(self.radius.clamp(1, Filter::MAX_RADIUS));
         let (filtered, deblurred) = match self.filter {
             Filter::None => (None, None),
@@ -1136,7 +1185,7 @@ impl Adjust {
             Filter::Close => (Some(toned.luma.closed(radius)), None),
             Filter::Deblur => {
                 let kernel = self.kernel.map(|kernel| kernel.scaled(f64::from(scale)));
-                let (sharp, spread) = deblur::undone_on(&toned.luma, kernel, f64::from(self.strength), whole);
+                let (sharp, spread) = deblur::undone_on(&toned.luma, kernel, f64::from(self.strength), whole, self.light);
                 (Some(sharp), spread)
             }
         };
@@ -1158,21 +1207,21 @@ impl Adjust {
     /// the RGBA image to display, made of those pixels where they stand,
     /// and the luminance to sample from. A photo enlarged is many times
     /// the photo, and is not held a second time to be filtered. The
-    /// pixels are a part of a whole of `whole` pixels at this size, which
-    /// the Deblur filter is reduced for ([`Self::made`]). Pixels not shown
-    /// come empty, and stay so.
-    fn filtered(&self, mut rgba: Vec<u8>, mut luma: Vec<f32>, width: usize, height: usize, scale: f32, whole: usize) -> (Vec<u8>, Luma) {
+    /// pixels are a part of a whole `whole` pixels across and down at
+    /// this size, which the Deblur filter is reduced for ([`Self::made`]).
+    /// Pixels not shown come empty, and stay so.
+    fn filtered(&self, mut rgba: Vec<u8>, mut luma: Vec<f32>, width: usize, height: usize, scale: f32, whole: (usize, usize)) -> (Vec<u8>, Luma) {
         let mut deblurred = None;
         if self.filter != Filter::None && width > 0 && height > 0 {
             luma = if self.filter == Filter::Deblur {
                 // By the kernel set, carried to the pixels the photo is
                 // worked on at, or by the blur it shows there.
                 let kernel = self.kernel.map(|kernel| kernel.scaled(f64::from(scale)));
-                let (sharp, spread) = deblur::undone_within(&luma, width, height, kernel, f64::from(self.strength), whole);
+                let (sharp, spread) = deblur::undone_within(&luma, width, height, kernel, f64::from(self.strength), whole, self.light);
                 deblurred = spread;
                 sharp
             } else {
-                self.filter.apply(&luma, width, height, self.radius.clamp(1, Filter::MAX_RADIUS) as usize)
+                self.filter.apply(&luma, width, height, self.radius.clamp(1, Filter::MAX_RADIUS) as usize, self.light)
             };
             if !rgba.is_empty() {
                 super::greyed(&luma, &mut rgba);
@@ -1188,6 +1237,19 @@ impl Adjust {
 mod tests {
     use super::*;
     use crate::imaging::resize::resize;
+
+    /// `data`, `width` by `height`, blurred by a Gaussian `sigma` pixels
+    /// wide in the light its values stand for, as a lens blurs what it
+    /// photographs, and stored again as opaque grey pixels: what the
+    /// Deblur filter is for.
+    fn photographed(data: &[f32], width: usize, height: usize, sigma: f64) -> Vec<u8> {
+        use crate::imaging::sample::{encoded_light, linear_light};
+        let light: Vec<f32> = data.iter().map(|&v| linear_light(v)).collect();
+        crate::imaging::enhance::unsharp(&light, width, height, 1, sigma, -1.0)
+            .iter()
+            .flat_map(|&v| [(encoded_light(v) * 255.0).round() as u8; 3].into_iter().chain([255]))
+            .collect()
+    }
 
     #[test]
     fn neutral_settings_change_nothing() {
@@ -1472,6 +1534,50 @@ mod tests {
     }
 
     #[test]
+    fn a_photo_is_resized_and_blurred_in_light_where_it_is_asked_to_be() {
+        let lit = Adjust { light: Light::Linear, ..Default::default() };
+        // Stripes a pixel wide of black ink and light grey paper, reduced
+        // to half: as stored, each pixel clear of the photo's edges is the
+        // stored values' midway, 100, and in light it is the light midway
+        // between theirs, stored again, which is lighter.
+        let stripes = pixels(16, 8, |x, _| if x % 2 == 0 { [0; 3] } else { [200; 3] });
+        let half = |adjust: Adjust| Adjust { enlarge: Enlarge::HALF, ..adjust }.apply(&stripes, 16, 8);
+        let within = |display: &[u8]| (0..4).flat_map(|y| (2..6).map(move |x| display[(y * 8 + x) * 4])).collect::<Vec<u8>>();
+        let (stored, light) = (half(Adjust::default()), half(lit));
+        assert!(within(&stored.0).iter().all(|&v| v == 100), "{:?}", within(&stored.0));
+        assert!(within(&light.0).iter().all(|&v| v == 146), "{:?}", within(&light.0));
+        // What is read is the luminance of what is shown, and says what
+        // light it was made in.
+        assert_eq!(light.1.data, Adjust::default().apply(&light.0, 8, 4).1.data);
+        assert_eq!((stored.1.light, light.1.light), (Light::Encoded, Light::Linear));
+        // So is an image made in light resized, as a search reduces one.
+        let grey: Vec<f32> = (0..16 * 8).map(|i| if i % 2 == 0 { 0.0 } else { 200.0 / 255.0 }).collect();
+        let reduced = Luma::new_in(16, 8, grey.clone(), Light::Linear).resized(8, 4);
+        let midway = crate::imaging::sample::encoded_light(crate::imaging::sample::linear_light(200.0 / 255.0) / 2.0);
+        assert!(reduced.light == Light::Linear && (0..4).all(|y| (2..6).all(|x| (reduced.data[y * 8 + x] - midway).abs() < 1e-4)), "{:?}", reduced.data);
+        assert!((Luma::new(16, 8, grey).resized(8, 4).data[2] - 100.0 / 255.0).abs() < 1e-4);
+        // A line of ink a pixel wide blurred by a pixel: in light the
+        // paper's light spreads over the line as a lens spreads it, and
+        // the line reads lighter than its stored values blurred.
+        let line = pixels(40, 12, |x, _| if x == 20 { [40; 3] } else { [220; 3] });
+        let blurred = |adjust: Adjust| Adjust { sharpen: -0.5, ..adjust }.apply(&line, 40, 12).0[(5 * 40 + 20) * 4];
+        assert_eq!((blurred(Adjust::default()), blurred(lit)), (148, 177));
+        // Enlarged in light, the photo keeps its own pixels beside it made
+        // in light too, and the photo as loaded for its copies to be made
+        // again from.
+        let (_, twice) = Adjust { enlarge: Enlarge::times(2), ..lit }.apply(&line, 40, 12);
+        assert_eq!(twice.unenlarged.as_ref().map(|own| own.light), Some(Light::Linear));
+        assert!(twice.as_shot.is_some() && Adjust { enlarge: Enlarge::times(2), ..Default::default() }.apply(&line, 40, 12).1.as_shot.is_none());
+        // With nothing that mixes its pixels, the photo is the same in
+        // either light: the tone is a curve of what is stored, and the
+        // median picks one of the values about each pixel.
+        let photo = pixels(30, 20, |x, y| [((x * 37 + y * 11) % 256) as u8, ((x * 13 + y * 29) % 256) as u8, (((x / 3 + y / 2) % 2) * 255) as u8]);
+        let toned = Adjust { invert: true, contrast: 0.4, filter: Filter::Median, ..Default::default() };
+        let (stored, light) = (toned.apply(&photo, 30, 20), Adjust { light: Light::Linear, ..toned }.apply(&photo, 30, 20));
+        assert!(stored.0 == light.0 && stored.1.data == light.1.data);
+    }
+
+    #[test]
     fn a_photo_sharpened_and_enlarged_reads_as_a_copy_of_it_made_for_a_read() {
         use crate::imaging::enhance::{Enhance, Enhanced, Sharpen};
         // Busy grey pixels. What a read sees through a copy of the photo
@@ -1600,19 +1706,26 @@ mod tests {
             let there = cut(&whole.data, whole.width, 1, [x, y, x + copy.luma.width, y + copy.luma.height]);
             assert!(copy.luma.data == there, "{what}: the copy is not the photo so adjusted at ({x}, {y})");
         };
+        // In light as well: a photo made in it is copied from the photo as
+        // loaded however little else it is adjusted, its own size and tone
+        // among them.
         let tones = [
             Adjust::default(),
-            Adjust { contrast: 0.6, brightness: -0.1, ..Default::default() },
+            Adjust { contrast: 0.6, exposure: -0.5, ..Default::default() },
             Adjust { invert: true, channel: Channel::Green, contrast: 0.3, ..Default::default() },
+            Adjust { light: Light::Linear, ..Default::default() },
+            Adjust { light: Light::Linear, contrast: 0.6, exposure: -0.5, ..Default::default() },
         ];
         for tone in tones {
             for (k1, sharpen, filter) in [(0.0, 0.3, Filter::None), (0.12, 0.0, Filter::Median), (-0.2, -0.6, Filter::Close), (0.0, 0.0, Filter::None)] {
                 for base in [Enlarge::NONE, Enlarge::times(2), Enlarge::HALF] {
                     let adjust = Adjust { k1, sharpen, filter, radius: 1, enlarge: base, ..tone };
                     let plain = adjust.apply(&photo, w, h).1;
+                    assert_eq!(plain.light, adjust.light);
                     // A photo adjusted no more than enlarged is copied from
                     // its luminance, as the test above has it.
                     if plain.as_shot.is_none() {
+                        assert_eq!(adjust.light, Light::Encoded, "{adjust:?}: made in light, and kept nothing to be made again from");
                         continue;
                     }
                     for (read, enlarge) in [(Sharpen::Light, 2u8), (Sharpen::Strong, 1), (Sharpen::Off, 3)] {
@@ -1621,6 +1734,7 @@ mod tests {
                         for window in [[0, 0, plain.width, plain.height], [5, 3, plain.width / 2 + 3, plain.height - 4]] {
                             let copy = Enhanced::window(&plain, window, Enhance { enlarge, sharpen: read }).unwrap();
                             same(&format!("{adjust:?}, read {read:?} {enlarge} times through {window:?}"), &copy, &whole);
+                            assert_eq!(copy.luma.light, adjust.light, "{adjust:?}: the copy is in the light the photo was made in");
                         }
                     }
                 }
@@ -1630,9 +1744,9 @@ mod tests {
         // search looks at the photo through, shrunk, or closed in place of
         // its own filter.
         let part = [8, 4, 32, 28];
-        for (k1, sharpen, contrast) in [(0.0, 0.3, 0.4), (0.12, -0.6, 0.0)] {
+        for (k1, sharpen, contrast, light) in [(0.0, 0.3, 0.4, Light::Encoded), (0.12, -0.6, 0.0, Light::Encoded), (0.0, 0.3, 0.4, Light::Linear), (0.12, -0.6, 0.0, Light::Linear)] {
             for (base, half) in [(Enlarge::NONE, Enlarge::HALF), (Enlarge::times(2), Enlarge::NONE), (Enlarge::HALF, Enlarge::QUARTER)] {
-                let adjust = Adjust { k1, sharpen, contrast, filter: Filter::Median, radius: 1, enlarge: base, ..Default::default() };
+                let adjust = Adjust { k1, sharpen, contrast, filter: Filter::Median, radius: 1, enlarge: base, light, ..Default::default() };
                 let what = format!("{adjust:?}");
                 let plain = adjust.apply_to(&photo, w, h, part).1;
                 let copy = Enhanced::window(&plain, [2, 2, plain.width - 1, plain.height - 3], Enhance { enlarge: 2, sharpen: Sharpen::Light }).unwrap();
@@ -1707,11 +1821,10 @@ mod tests {
 
     #[test]
     fn the_deblur_filter_undoes_its_kernel_where_the_photo_is_worked_on() {
-        use crate::imaging::enhance::unsharp;
         // Squares blurred by eight tenths of a pixel.
         let (w, h) = (60, 48);
         let squares: Vec<f32> = (0..w * h).map(|i| if ((i % w) / 6 + (i / w) / 6) % 2 == 0 { 0.1 } else { 0.9 }).collect();
-        let photo: Vec<u8> = unsharp(&squares, w, h, 1, 0.8, -1.0).iter().flat_map(|&v| [(v * 255.0).round() as u8; 3].into_iter().chain([255])).collect();
+        let photo: Vec<u8> = photographed(&squares, w, h, 0.8);
         // A kernel set in the photo's own pixels is carried to those it
         // is worked on at, and undone there as far as the strength asks,
         // after everything else.
@@ -1722,7 +1835,7 @@ mod tests {
             let carried = kernel.scaled(f64::from(enlarge));
             assert_eq!(luma.deblurred, Some(carried), "{enlarge} times");
             let unfiltered = Adjust { filter: Filter::None, ..adjust }.apply(&photo, w, h).1;
-            assert!(luma.data == deblur::undone_by(&unfiltered.data, luma.width, luma.height, Some(carried), f64::from(strength)).0, "{enlarge} times, {strength}");
+            assert!(luma.data == deblur::undone_by(&unfiltered.data, luma.width, luma.height, Some(carried), f64::from(strength), luma.light).0, "{enlarge} times, {strength}");
         }
         // With none set, the blur measured over the whole photo is undone,
         // however little, and said.
@@ -1739,42 +1852,48 @@ mod tests {
 
     #[test]
     fn a_copy_is_deblurred_after_it_is_enlarged() {
-        use crate::imaging::enhance::{Enhance, Enhanced, Sharpen, unsharp};
+        use crate::imaging::enhance::{Enhance, Enhanced, Sharpen};
         // Squares six pixels a side, blurred by eight tenths of a pixel:
         // too little to be worth undoing at the photo's own size, and as
         // much again once it is enlarged twice.
         let (w, h) = (60, 48);
         let squares: Vec<f32> = (0..w * h).map(|i| if ((i % w) / 6 + (i / w) / 6) % 2 == 0 { 0.1 } else { 0.9 }).collect();
-        let photo: Vec<u8> = unsharp(&squares, w, h, 1, 0.8, -1.0).iter().flat_map(|&v| [(v * 255.0).round() as u8; 3].into_iter().chain([255])).collect();
+        let photo: Vec<u8> = photographed(&squares, w, h, 0.8);
         let deblurred = Enhance { enlarge: 1, sharpen: Sharpen::Deblur };
-        let own = Adjust::default().apply(&photo, w, h).1;
-        assert!(Enhanced::window(&own, [0, 0, w, h], deblurred).is_none(), "nothing worth undoing at its own size");
-        // Deblurred among the pixels it was enlarged to, a copy of the
-        // photo is what the photo enlarged so shows under its Deblur
-        // filter, bent by a lens or not: enlarged by the copy itself, as
-        // a read that decoded only so sets Enlarge and Filter, and as
-        // the photo was enlarged before.
-        for k1 in [0.0, 0.12] {
-            let twice = Adjust { k1, enlarge: Enlarge::times(2), ..Default::default() };
-            let filtered = Adjust { filter: Filter::Deblur, ..twice }.apply(&photo, w, h).1;
-            let copies = [
-                Enhanced::window(&Adjust { k1, ..Default::default() }.apply(&photo, w, h).1, [0, 0, w, h], Enhance { enlarge: 2, ..deblurred }),
-                Enhanced::window(&twice.apply(&photo, w, h).1, [0, 0, 2 * w, 2 * h], deblurred),
-            ];
-            for (copy, how) in copies.into_iter().zip(["by the copy", "before"]) {
-                let copy = copy.unwrap_or_else(|| panic!("{k1}, enlarged {how}: the blur is worth undoing"));
-                assert_eq!((copy.luma.width, copy.luma.height, copy.factor), (2 * w, 2 * h, [if how == "before" { 1.0 } else { 2.0 }; 2]));
-                let differences: Vec<f32> = copy.luma.data.iter().zip(&filtered.data).map(|(a, b)| (a - b).abs()).collect();
-                let worst = differences.iter().copied().fold(0.0f32, f32::max);
-                let mean = differences.iter().sum::<f32>() / differences.len() as f32;
-                assert!(worst < 0.02 && mean < 0.003, "{k1}, enlarged {how}: {worst} at the most, {mean} on the whole");
+        // Worked as light, as the lens blurred it, and as stored, which
+        // measures that blur over the copy and over the photo a little
+        // less alike.
+        for (light, most_mean) in [(Light::Linear, 0.003), (Light::Encoded, 0.004)] {
+            let plain = Adjust { light, ..Default::default() };
+            let own = plain.apply(&photo, w, h).1;
+            assert!(Enhanced::window(&own, [0, 0, w, h], deblurred).is_none(), "{light:?}: nothing worth undoing at its own size");
+            // Deblurred among the pixels it was enlarged to, a copy of the
+            // photo is what the photo enlarged so shows under its Deblur
+            // filter, bent by a lens or not: enlarged by the copy itself,
+            // as a read that decoded only so sets Enlarge and Filter, and
+            // as the photo was enlarged before.
+            for k1 in [0.0, 0.12] {
+                let twice = Adjust { k1, enlarge: Enlarge::times(2), ..plain };
+                let filtered = Adjust { filter: Filter::Deblur, ..twice }.apply(&photo, w, h).1;
+                let copies = [
+                    Enhanced::window(&Adjust { k1, ..plain }.apply(&photo, w, h).1, [0, 0, w, h], Enhance { enlarge: 2, ..deblurred }),
+                    Enhanced::window(&twice.apply(&photo, w, h).1, [0, 0, 2 * w, 2 * h], deblurred),
+                ];
+                for (copy, how) in copies.into_iter().zip(["by the copy", "before"]) {
+                    let copy = copy.unwrap_or_else(|| panic!("{light:?} {k1}, enlarged {how}: the blur is worth undoing"));
+                    assert_eq!((copy.luma.width, copy.luma.height, copy.factor), (2 * w, 2 * h, [if how == "before" { 1.0 } else { 2.0 }; 2]));
+                    let differences: Vec<f32> = copy.luma.data.iter().zip(&filtered.data).map(|(a, b)| (a - b).abs()).collect();
+                    let worst = differences.iter().copied().fold(0.0f32, f32::max);
+                    let mean = differences.iter().sum::<f32>() / differences.len() as f32;
+                    assert!(worst < 0.02 && mean < most_mean, "{light:?} {k1}, enlarged {how}: {worst} at the most, {mean} on the whole");
+                }
             }
         }
     }
 
     #[test]
     fn a_photo_larger_than_the_search_deblurs_is_deblurred_as_a_read_copy_of_it_is() {
-        use crate::imaging::enhance::{Enhance, Enhanced, Sharpen, unsharp};
+        use crate::imaging::enhance::{Enhance, Enhanced, Sharpen};
         // A photograph larger than the copies the search deblurs, with a
         // patch of squares four pixels a side blurred by two and a fifth:
         // under the Deblur filter set to the blur a read's copy of the
@@ -1791,7 +1910,7 @@ mod tests {
                 if inside && ((x / 4) * 7 + (y / 4) * 13 + (x / 4) * (y / 4)) % 3 == 0 { 0.1 } else { 0.9 }
             })
             .collect();
-        let photo: Vec<u8> = unsharp(&sharp, w, h, 1, 2.2, -1.0).iter().flat_map(|&v| [(v * 255.0).round() as u8; 3].into_iter().chain([255])).collect();
+        let photo: Vec<u8> = photographed(&sharp, w, h, 2.2);
         let plain = Adjust::default().apply(&photo, w, h).1;
         let window = [280, 280, 440, 440];
         let copy = Enhanced::window(&plain, window, Enhance { enlarge: 1, sharpen: Sharpen::Deblur }).expect("a blur worth undoing");
@@ -1804,7 +1923,7 @@ mod tests {
 
     #[test]
     fn a_window_of_a_photo_deblurred_is_the_photo_made_again_there() {
-        use crate::imaging::enhance::{Enhance, Enhanced, Sharpen, unsharp};
+        use crate::imaging::enhance::{Enhance, Enhanced, Sharpen};
         // Squares blurred, under a Deblur filter whose kernel, carried to
         // the copy's pixels, is wider than a deconvolution works at, and
         // narrower: a copy of a window of the photo is reduced as the
@@ -1815,7 +1934,7 @@ mod tests {
         // contrast.
         let (w, h) = (150, 120);
         let squares: Vec<f32> = (0..w * h).map(|i| if ((i % w) / 7 + (i / w) / 7 + (i % w) / 21) % 3 == 0 { 0.1 } else { 0.9 }).collect();
-        let photo: Vec<u8> = unsharp(&squares, w, h, 1, 1.3, -1.0).iter().flat_map(|&v| [(v * 255.0).round() as u8; 3].into_iter().chain([255])).collect();
+        let photo: Vec<u8> = photographed(&squares, w, h, 1.3);
         let mut reduced = 0;
         for (kernel, strength) in [(Spread::round(1.2), 1.0), (Spread { xx: 1.6, xy: 0.4, yy: 0.7 }, 1.4), (Spread::round(0.6), 0.8)] {
             let adjust = Adjust { filter: Filter::Deblur, kernel: Some(kernel), strength, contrast: 0.2, ..Default::default() };
@@ -1839,7 +1958,7 @@ mod tests {
 
     #[test]
     fn a_photo_deblurred_and_turned_is_made_again_as_it_lay_and_turned() {
-        use crate::imaging::enhance::{Enhance, Enhanced, Sharpen, unsharp};
+        use crate::imaging::enhance::{Enhance, Enhanced, Sharpen};
         // Squares blurred, a photo whose height the deconvolution's
         // reduction does not divide, under a Deblur filter with a kernel
         // set wide enough to be reduced for, and bent by a lens with the
@@ -1852,7 +1971,7 @@ mod tests {
         // quarter of the way from black to white along its edges.
         let (w, h) = (300, 241);
         let squares: Vec<f32> = (0..w * h).map(|i| if ((i % w) / 9 + (i / w) / 9 + (i % w) / 27) % 3 == 0 { 0.1 } else { 0.9 }).collect();
-        let photo: Vec<u8> = unsharp(&squares, w, h, 1, 2.5, -1.0).iter().flat_map(|&v| [(v * 255.0).round() as u8; 3].into_iter().chain([255])).collect();
+        let photo: Vec<u8> = photographed(&squares, w, h, 2.5);
         let kernel = Spread { xx: 12.0, xy: 2.0, yy: 7.0 };
         assert!(deblur::Reduction::for_blur(kernel.extremes().0, w * h, deblur::MOST_READ_PIXELS, 1.0) != deblur::Reduction::NONE);
         for adjust in [Adjust { filter: Filter::Deblur, kernel: Some(kernel), ..Default::default() }, Adjust { filter: Filter::Deblur, k1: 0.1, contrast: 0.2, ..Default::default() }] {
@@ -2129,8 +2248,23 @@ mod tests {
         assert_eq!(inverted.apply(&rgba, 1, 1).0, [55, 215, 165, 255]);
         let hard = Adjust { contrast: 1.0, ..Default::default() };
         assert_eq!(hard.apply(&rgba, 1, 1).0, [255, 0, 0, 255]);
-        let bright = Adjust { brightness: 0.5, ..Default::default() };
-        assert_eq!(bright.apply(&[0, 128, 255, 255], 1, 1).0[..3], [128, 255, 255]);
+        // A stop up doubles the light, and a stop down halves it: white
+        // comes to 188, which stores half its light, and 128 to 176, which
+        // stores twice its.
+        let up = Adjust { exposure: 1.0, ..Default::default() };
+        assert_eq!(up.apply(&[0, 128, 255, 255], 1, 1).0[..3], [0, 176, 255]);
+        let down = Adjust { exposure: -1.0, ..Default::default() };
+        assert_eq!(down.apply(&[0, 176, 255, 255], 1, 1).0[..3], [0, 128, 188]);
+        // In light, whatever light the photo is worked in; and after the
+        // photo is inverted, so that up is lighter either way.
+        assert_eq!(Adjust { light: Light::Linear, ..up }.apply(&[0, 128, 255, 255], 1, 1).0[..3], [0, 176, 255]);
+        assert_eq!(Adjust { invert: true, ..up }.apply(&[255, 127, 0, 255], 1, 1).0[..3], [0, 176, 255]);
+        // Before the contrast: a hard threshold at mid grey cuts the photo
+        // where the exposure moved it to, a stop up taking 100 to light.
+        assert_eq!(Adjust { contrast: 1.0, ..up }.apply(&[100, 100, 100, 255], 1, 1).0[..3], [255; 3]);
+        assert_eq!(hard.apply(&[100, 100, 100, 255], 1, 1).0[..3], [0; 3]);
+        // None is the photo as it is, value for value.
+        assert!(Adjust::default().lookup_table().iter().enumerate().all(|(i, &v)| usize::from(v) == i));
     }
 
     #[test]
@@ -2139,16 +2273,16 @@ mod tests {
         let (w, h) = (7, 7);
         let mut speck = vec![1.0f32; w * h];
         speck[3 * w + 3] = 0.0;
-        let out = Filter::Median.apply(&speck, w, h, 1);
+        let out = Filter::Median.apply(&speck, w, h, 1, Light::Encoded);
         assert!(out.iter().all(|&v| v == 1.0), "the median removes a lone speck");
         // A dark module printed as a dotted grid: every other pixel dark.
         let dotted: Vec<f32> = (0..w * h).map(|i| if (i % w) % 2 == 0 && (i / w) % 2 == 0 { 0.0 } else { 1.0 }).collect();
-        let closed = Filter::Close.apply(&dotted, w, h, 1);
+        let closed = Filter::Close.apply(&dotted, w, h, 1, Light::Encoded);
         assert!(closed.iter().all(|&v| v == 0.0), "closing joins the dots into solid dark: {closed:?}");
         // Closing a solid light field leaves it alone. A light gap three
         // pixels wide survives a radius of one, where one of two pixels is
         // closed: the darkest-of-three pass reaches one pixel each way.
-        assert!(Filter::Close.apply(&vec![1.0f32; w * h], w, h, 1).iter().all(|&v| v == 1.0));
+        assert!(Filter::Close.apply(&vec![1.0f32; w * h], w, h, 1, Light::Encoded).iter().all(|&v| v == 1.0));
         let mut gap = vec![0.0f32; w * h];
         let mut narrow = vec![0.0f32; w * h];
         for y in 0..h {
@@ -2158,10 +2292,10 @@ mod tests {
             narrow[y * w + 3] = 1.0;
             narrow[y * w + 4] = 1.0;
         }
-        let closed = Filter::Close.apply(&gap, w, h, 1);
+        let closed = Filter::Close.apply(&gap, w, h, 1, Light::Encoded);
         assert!(closed.contains(&1.0), "{closed:?}");
-        assert!(Filter::Close.apply(&narrow, w, h, 1).iter().all(|&v| v == 0.0));
-        assert_eq!(Filter::None.apply(&speck, w, h, 2), speck);
+        assert!(Filter::Close.apply(&narrow, w, h, 1, Light::Encoded).iter().all(|&v| v == 0.0));
+        assert_eq!(Filter::None.apply(&speck, w, h, 2, Light::Encoded), speck);
         // Through the adjustments the display turns grey and follows the
         // filtered luminance.
         let rgba: Vec<u8> = speck.iter().flat_map(|&v| [(v * 255.0) as u8, 0, 0, 255]).collect();

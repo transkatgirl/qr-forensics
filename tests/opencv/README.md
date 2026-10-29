@@ -23,7 +23,7 @@ https://en.wikipedia.org/wiki/Computer_vision
 Lines beginning `;` are headers, and those the harness does not know are
 ignored. `from` is where the image lies in OpenCV's test data. `reads`
 says how many of the messages the search is expected to read, as
-`; reads: 0` in `err_correct_2L.search`, and is left out when it reads them
+`; reads: 0` in `issue_3478.search`, and is left out when it reads them
 all; an image it cannot read whole is kept with what it does read, so
 that a change which reads more is noticed as much as one which reads
 less. `quick` marks the images the test that runs
@@ -46,16 +46,9 @@ QR_SEARCH_BOOTSTRAP=1 cargo test --release --test search -- --ignored --nocaptur
 
 ## What the search does not read
 
-- `err_correct_2L`: five of the symbol's codewords are wrong, which is
-  all its ten error correction codewords can correct and two more than
-  the standard allows a 2-L symbol, whose last two are for detecting a
-  misdecode. The message is right and is printed as `unconfirmed`.
-  OpenCV's own decoder spends every codeword and reads it.
 - `issue_3478`: after its sixteen bytes the symbol's data goes on with
   the header of a second segment that has no room for its payload, where
   a terminator should be. The message is printed as `malformed`.
-- `multiple_9_qrcodes_version7`: eight of its nine symbols read. The
-  ninth is fitted as version 6, and none of its blocks solve.
 
 ## Where the images come from
 

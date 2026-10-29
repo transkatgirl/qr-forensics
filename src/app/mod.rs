@@ -21,10 +21,10 @@ use qr_forensics::decode::list::{LIST_COST, hard_reach, usable_cost};
 use qr_forensics::decode::padding::{Filler, clear_padding_pins, detect_padding, pin_padding_at, recover_padding};
 use qr_forensics::decode::pipeline::{
     Attempt, BlockOutcome, BlockReport, DecodeOptions, Harder, analyze, brute_force_mirrored_whole, brute_force_whole, decode, decode_keeping,
-    decode_trying_harder, formats, judged_verifying_bits, orientation_of, verifying_bits,
+    decode_trying_harder, formats, judged_verifying_bits, orientation_of, plain_verifying_bits, verifying_bits,
 };
-use qr_forensics::decode::repair::{quiet_zone, render_rgba, render_svg, repaired_grid};
-use qr_forensics::decode::rs::{TrialReach, trial_reach};
+use qr_forensics::decode::repair::{quiet_zone, render_rgba, render_svg, repaired_grid, written_back};
+use qr_forensics::decode::rs::{TrialReach, located_error_bits, trial_reach};
 use qr_forensics::decode::sequence::Part;
 use qr_forensics::decode::text::Charset;
 use qr_forensics::imaging::adjust::{Adjust, Backdrop, Enlarge, Filter, LENS_MIN_PAIRS, estimate_k1, remap_point, straightened};
@@ -41,7 +41,7 @@ use qr_forensics::imaging::{Luma, SharedRgba};
 use qr_forensics::imaging::deblur;
 use qr_forensics::imaging::enhance::{Enhance, Enhanced, Sharpen};
 use qr_forensics::imaging::sample::{
-    Classified, Kernel, Rule, SampleParams, VersionGuess, read_modules, suggest_versions,
+    Classified, Kernel, Light, Rule, SampleParams, VersionGuess, read_modules, suggest_versions,
 };
 use qr_forensics::symbol::function_map::{FunctionMap, looks_inverted};
 use qr_forensics::symbol::grid::{CERTAIN, Mirror, Module, ModuleGrid, Symmetry};
@@ -858,6 +858,7 @@ impl App {
         let Some(photo) = &self.photo else { return };
         self.doc.corners = photo.default_corners();
         self.doc.anchors.clear();
+        self.doc.kernel_outline = None;
         let (width, height) = (photo.width, photo.height);
         let mut loaded = format!("Loaded {} ({width} × {height}", photo.name);
         if photo.scale() > 1.0 {
@@ -957,6 +958,7 @@ impl App {
         let enlarge = if crop.is_some() { self.doc.adjust.enlarge } else { whole };
         let adjust = Adjust { k1: if crop.is_some() { 0.0 } else { lens }, enlarge, ..self.doc.adjust };
         let corners = self.doc.corners.map(|c| old.to_source(c));
+        let kernel_outline = self.doc.kernel_outline.map(|outline| outline.map(|c| old.to_source(c)));
         let mut anchors = self.doc.anchors.clone();
         for anchor in &mut anchors {
             anchor.anchor.center = old.to_source(anchor.anchor.center);
@@ -965,6 +967,7 @@ impl App {
         self.show_photo(ctx, name, source, unflattened, crop, adjust);
         let Some(new) = self.photo.as_ref() else { return false };
         self.doc.corners = corners.map(|c| new.to_working(c));
+        self.doc.kernel_outline = kernel_outline.map(|outline| outline.map(|c| new.to_working(c)));
         for anchor in &mut anchors {
             anchor.anchor.center = new.to_working(anchor.anchor.center);
         }
@@ -1052,11 +1055,36 @@ impl App {
 
     /// Change how the photo is read, and bring the photo up to it. An
     /// enlargement moves every point of the photo with it, and the
-    /// outline and the anchors go with the points they were on. The
+    /// outline, the anchors and the outline a blur was measured inside go
+    /// with the points they were on. A change of Work in linear light has
+    /// the blur set for the Deblur filter measured again
+    /// ([`Self::remeasure_deblur`]), unless the blur is set with it. The
     /// caller has taken the undo point. Returns what to tell the user,
-    /// when what was found or under way in the photo as it was had to
-    /// be dropped.
-    fn set_adjust(&mut self, mut adjust: Adjust) -> Option<String> {
+    /// when what was found or under way in the photo as it was had to be
+    /// dropped, or the blur was measured again. A blur set otherwise than
+    /// it was is taken as measured inside the outline as it lies
+    /// ([`Self::set_adjust_measured_in`]).
+    fn set_adjust(&mut self, adjust: Adjust) -> Option<String> {
+        self.set_adjust_measured_in(adjust, Some(self.doc.corners))
+    }
+
+    /// [`Self::set_adjust`], a blur for the Deblur filter set otherwise
+    /// than it was taken as measured inside `outline`, in the photo's
+    /// pixels before the change, or over the whole photo where `None`
+    /// ([`Document::kernel_outline`]).
+    fn set_adjust_measured_in(&mut self, adjust: Adjust, outline: Option<[[f64; 2]; 4]>) -> Option<String> {
+        let relit = adjust.light != self.doc.adjust.light && adjust.kernel.is_some() && adjust.kernel == self.doc.adjust.kernel;
+        let dropped = self.set_adjust_as_given(adjust, outline);
+        let remeasured = if relit { self.remeasure_deblur() } else { None };
+        match (dropped, remeasured) {
+            (Some(dropped), Some(remeasured)) => Some(format!("{dropped} {remeasured}")),
+            (dropped, remeasured) => dropped.or(remeasured),
+        }
+    }
+
+    /// [`Self::set_adjust_measured_in`], the blur set for the Deblur
+    /// filter left as `adjust` has it.
+    fn set_adjust_as_given(&mut self, mut adjust: Adjust, mut outline: Option<[[f64; 2]; 4]>) -> Option<String> {
         if let Some(photo) = &self.photo {
             let (own_width, own_height) = photo.original.dimensions();
             adjust.enlarge = adjust.enlarge.within(own_width, own_height);
@@ -1064,11 +1092,18 @@ impl App {
             let scale = [width as f64 / photo.width as f64, height as f64 / photo.height as f64];
             if scale != [1.0, 1.0] {
                 self.doc.corners = self.doc.corners.map(|c| [c[0] * scale[0], c[1] * scale[1]]);
+                self.doc.kernel_outline = self.doc.kernel_outline.map(|outline| outline.map(|c| [c[0] * scale[0], c[1] * scale[1]]));
+                outline = outline.map(|outline| outline.map(|c| [c[0] * scale[0], c[1] * scale[1]]));
                 for anchor in &mut self.doc.anchors {
                     let center = anchor.anchor.center;
                     anchor.anchor.center = [center[0] * scale[0], center[1] * scale[1]];
                 }
             }
+        }
+        // A blur set otherwise than it was is taken as measured where the
+        // caller says; none set, there is nowhere it was measured.
+        if adjust.kernel != self.doc.adjust.kernel {
+            self.doc.kernel_outline = adjust.kernel.and(outline);
         }
         self.doc.adjust = adjust;
         self.sync_adjust()
@@ -1136,6 +1171,10 @@ impl App {
             proposals.found.iter_mut().for_each(carry);
             if let Some(reads) = &mut proposals.reads {
                 reads.results.iter_mut().flatten().for_each(|read| carry(&mut read.detection));
+                // As the outline a blur set then was measured inside, which
+                // a read that sets that blur back sets back with it.
+                let outline = &mut reads.under.kernel_outline;
+                *outline = outline.map(|outline| outline.map(|c| [c[0] * scale[0], c[1] * scale[1]]));
             }
             // What the search's reads were charged is found by the corners
             // of the symbol read ([`Proposals::among_of`]), which go with
@@ -1292,6 +1331,19 @@ impl App {
             kernel: kernel.or(held.flatten()).or(was.kernel),
             ..before
         };
+        // Where the blur set was measured ([`Document::kernel_outline`]):
+        // the blur the copy undid, about the symbol, inside the outline
+        // on it; the blur the filter measured, over the whole photo; and
+        // the blur the read was made under, where it was measured then.
+        // Each was once taken as measured inside the outline on the
+        // symbol.
+        let outline = if kernel.is_some() {
+            Some(self.doc.corners)
+        } else if held.flatten().is_some() {
+            None
+        } else {
+            under.kernel_outline
+        };
         // What was set, the first said as set and the rest after it.
         let mut set = String::new();
         let mut say = |first: String, later: String, joined: &str| {
@@ -1352,7 +1404,7 @@ impl App {
                  memory, or crop to the outline and find the symbol again, to sample it so.",
             ));
         }
-        if let Some(dropped) = self.set_adjust(adjust) {
+        if let Some(dropped) = self.set_adjust_measured_in(adjust, outline) {
             text.push(' ');
             text.push_str(&dropped);
         }
@@ -1366,6 +1418,18 @@ impl App {
             return false;
         }
         self.doc.adjust.backdrop = backdrop;
+        // No lens term changes here, so there is nothing to report.
+        let _ = self.sync_adjust();
+        true
+    }
+
+    /// Set Work in linear light, for a photo there is; true when it
+    /// changed. The caller has taken the undo point.
+    fn set_photo_light(&mut self, light: Light) -> bool {
+        if self.photo.is_none() || self.doc.adjust.light == light {
+            return false;
+        }
+        self.doc.adjust.light = light;
         // No lens term changes here, so there is nothing to report.
         let _ = self.sync_adjust();
         true
@@ -1489,35 +1553,22 @@ impl App {
     /// as its adjustments make it there but for its filter, and have the
     /// Deblur filter undo that, in the photo's own pixels, in place of
     /// the blur the whole photo shows. Never of its own accord: the user
-    /// asks, with the outline on the symbol.
+    /// asks, with the outline on the symbol. The outline is kept with the
+    /// blur, and only a change of Work in linear light measures it again,
+    /// inside that outline and not wherever the outline is then
+    /// ([`Self::remeasure_deblur`]).
     fn measure_deblur(&mut self) {
-        let Some(photo) = &self.photo else {
-            self.fail("Load a photo first.");
-            return;
-        };
-        let corners = self.doc.corners;
-        let (x0, x1) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), c| (lo.min(c[0]), hi.max(c[0])));
-        let (y0, y1) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), c| (lo.min(c[1]), hi.max(c[1])));
-        if !(x1 > x0 && y1 > y0) {
-            self.fail("The outline has no area: drag its corners apart, around the symbol, first.");
-            return;
-        }
-        let window = [x0.floor().max(0.0) as usize, y0.floor().max(0.0) as usize, x1.ceil().max(0.0) as usize, y1.ceil().max(0.0) as usize];
-        let Some(view) = Enhanced::unfiltered(&photo.luma, window) else {
-            self.fail("The outline is off the photo: drag its corners onto the symbol first.");
-            return;
-        };
-        let Some(spread) = deblur::spread_of(&view.luma.data, view.luma.width, view.luma.height) else {
-            self.fail(
-                "No blur found inside the outline: the symbol is sharp or has too few edges to measure. If it looks \
-                 blurred, check that the outline is around the symbol.",
-            );
-            return;
+        let (spread, own) = match self.blur_in_outline(self.doc.corners) {
+            Ok(measured) => measured,
+            Err(why) => {
+                self.fail(why);
+                return;
+            }
         };
         let (widest, narrowest) = spread.extremes();
-        let own = spread.scaled(1.0 / photo.scale());
         self.checkpoint();
         self.doc.adjust.kernel = Some(own);
+        self.doc.kernel_outline = Some(self.doc.corners);
         let mut text = format!(
             "Measured the blur inside the outline: σ {widest:.1} × {narrowest:.1} px at {:.0}°. Deblur now undoes this instead \
              of the whole photo's blur.",
@@ -1528,6 +1579,86 @@ impl App {
             text.push_str(&dropped);
         }
         self.notify(text);
+    }
+
+    /// The blur the photo shows inside the outline `corners`, off the
+    /// photo as its adjustments make it there but for its filter, in the
+    /// light it is worked in ([`deblur::spread_of`]): as measured, in the
+    /// pixels the photo is worked at, and in the photo's own. What to tell
+    /// the user where there is none to measure.
+    fn blur_in_outline(&self, corners: [[f64; 2]; 4]) -> Result<(deblur::Spread, deblur::Spread), &'static str> {
+        let photo = self.photo.as_ref().ok_or("Load a photo first.")?;
+        let (x0, x1) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), c| (lo.min(c[0]), hi.max(c[0])));
+        let (y0, y1) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), c| (lo.min(c[1]), hi.max(c[1])));
+        if !(x1 > x0 && y1 > y0) {
+            return Err("The outline has no area: drag its corners apart, around the symbol, first.");
+        }
+        let window = [x0.floor().max(0.0) as usize, y0.floor().max(0.0) as usize, x1.ceil().max(0.0) as usize, y1.ceil().max(0.0) as usize];
+        let view = Enhanced::unfiltered(&photo.luma, window).ok_or("The outline is off the photo: drag its corners onto the symbol first.")?;
+        let spread = deblur::spread_of(&view.luma.data, view.luma.width, view.luma.height, view.luma.light).ok_or(
+            "No blur found inside the outline: the symbol is sharp or has too few edges to measure. If it looks \
+             blurred, check that the outline is around the symbol.",
+        )?;
+        Ok((spread, spread.scaled(1.0 / photo.scale())))
+    }
+
+    /// Measure again the blur set for the Deblur filter, once Work in
+    /// linear light has changed: an edge spreads otherwise as stored
+    /// values than in light, and a blur measured in the light the photo
+    /// was worked in before is not the one it shows now. Measured inside
+    /// the outline it was measured in ([`Document::kernel_outline`]), as
+    /// Measure in outline measured it there ([`Self::blur_in_outline`]),
+    /// wherever the outline has moved since: it was once measured inside
+    /// the outline as it then lay, which a symbol other than the one
+    /// measured could be under. A blur measured over the whole photo is
+    /// measured over it again, and held to. Where nothing can be measured,
+    /// the filter goes back to the blur it measures over the whole photo.
+    /// Nothing where no blur is set. It was once kept, and a camera's blur
+    /// measured as stored, an eighth wider than it is, undone in light,
+    /// which left the symbol ringing. The caller has taken the undo point.
+    /// Returns what to tell the user.
+    fn remeasure_deblur(&mut self) -> Option<String> {
+        self.doc.adjust.kernel?;
+        let worked = match self.doc.adjust.light {
+            Light::Linear => "linear light",
+            Light::Encoded => "sRGB",
+        };
+        let over = if self.doc.kernel_outline.is_some() { "inside its original outline" } else { "over the whole photo" };
+        let measured = match self.doc.kernel_outline.or_else(|| self.photo.as_ref().map(Photo::bounds)) {
+            Some(outline) => self.blur_in_outline(outline),
+            None => Err("Load a photo first."),
+        };
+        self.doc.adjust.kernel = measured.ok().map(|(_, own)| own);
+        self.doc.kernel_outline = self.doc.kernel_outline.filter(|_| measured.is_ok());
+        // A blur kept for the Deblur filter while another is chosen is
+        // measured again all the same, for when Deblur is chosen again,
+        // and told as kept: it was once told as Deblur's while no Deblur
+        // was in use, and sent the user to Measure in outline, which is
+        // shown only under Deblur.
+        let deblurring = self.doc.adjust.filter == Filter::Deblur;
+        let blur = if deblurring { "Deblur's blur" } else { "the blur saved for Deblur" };
+        let mut text = match measured {
+            Ok((spread, _)) => {
+                let (widest, narrowest) = spread.extremes();
+                format!(
+                    "Re-measured {blur} {over}, now in {worked}: σ {widest:.1} × {narrowest:.1} px at {:.0}°.",
+                    spread.angle()
+                )
+            }
+            Err(_) => {
+                let instead = if deblurring {
+                    "so Deblur now uses the whole photo's blur. Press Measure in outline to set it again."
+                } else {
+                    "so it was dropped. Deblur will use the whole photo's blur."
+                };
+                format!("Couldn't re-measure {blur} {over} in {worked}, {instead}")
+            }
+        };
+        if let Some(dropped) = self.sync_adjust() {
+            text.push(' ');
+            text.push_str(&dropped);
+        }
+        Some(text)
     }
 
     /// Estimate the radial lens term from the corners and anchors, and
@@ -1564,6 +1695,7 @@ impl App {
             Some(estimate) => {
                 self.checkpoint();
                 self.doc.corners = self.doc.corners.map(|c| remap_point(c, width, height, from, estimate.k1));
+                self.doc.kernel_outline = self.doc.kernel_outline.map(|outline| outline.map(|c| remap_point(c, width, height, from, estimate.k1)));
                 for anchor in &mut self.doc.anchors {
                     anchor.anchor.center = remap_point(anchor.anchor.center, width, height, from, estimate.k1);
                 }
@@ -1596,7 +1728,7 @@ impl App {
         let read = prepared.result.take().filter(|read| self.view.load_reads && read.is_trustworthy());
         // The photo is still adjusted as it was when the read was made: a
         // job outlives no change of that ([`Self::poll_job`]).
-        let under = self.photo.as_ref().map(ReadUnder::of);
+        let under = self.photo.as_ref().map(|photo| ReadUnder::of(photo, &self.doc));
         match (read, under) {
             (Some(read), Some(under)) => self.load_read_result(*read, prepared.searched_inverted, under, what),
             _ => self.adopt_prepared(ctx, prepared),
@@ -2316,7 +2448,7 @@ impl App {
             .enumerate()
             .filter_map(|(i, read)| {
                 let read = read.as_ref().filter(|read| read.is_trustworthy())?;
-                Part::from_report(&read.report, format!("{name}, symbol {}", i + 1)).map(|part| (i, part))
+                Part::from_report_in(&read.report, format!("{name}, symbol {}", i + 1), self.opts.charset).map(|part| (i, part))
             })
             .collect();
         let left_out = self.view.sequence.add_all(found.iter().map(|(_, part)| part.clone()).collect());
@@ -2325,7 +2457,7 @@ impl App {
         let total = reads.len();
         // As the photo is adjusted now, which is as it was when the reads
         // were made: a change meanwhile dropped them ([`Self::poll_job`]).
-        let Some(under) = self.photo.as_ref().map(ReadUnder::of) else { return };
+        let Some(under) = self.photo.as_ref().map(|photo| ReadUnder::of(photo, &self.doc)) else { return };
         let decodes = |i: usize| reads.get(i).and_then(Option::as_ref).is_some_and(ReadResult::is_trustworthy);
         let load = symbol_to_load(&proposals.found, proposals.adopted, &self.doc.corners, decodes).filter(|_| self.view.load_reads);
         proposals.reads = Some(FoundReads { results: reads, photo_inverted, under });
@@ -2516,6 +2648,10 @@ impl App {
         // as it was set.
         let backdrop = under.adjust.backdrop;
         let backdrop_set = self.set_photo_backdrop(backdrop);
+        // Worked in the light it was read in, whose copies of the photo
+        // were made in it and whose modules were read in it.
+        let kernel = self.doc.adjust.kernel;
+        let light_set = self.set_photo_light(under.adjust.light);
         self.doc.corners = found.corners;
         self.doc.anchors = doc_anchors(&found);
         self.detection = Some(found);
@@ -2530,6 +2666,11 @@ impl App {
             self.view.sample = SampleParams { kernel: read.kernel, sharpen_modules, band, ..self.view.sample.under(read.rule) };
             through = self.adjust_as_read(read.enhance, read.deblurred, under);
         }
+        // A blur set for the Deblur filter was measured in the light the
+        // photo was worked in before, and is measured again where it was
+        // measured, unless the read set one of its own or set back the
+        // one it was made under, measured in the light it was read in.
+        let remeasured = if light_set && self.doc.adjust.kernel == kernel { self.remeasure_deblur() } else { None };
         // The stage is left as it is: a read loaded from the Align stage
         // is looked over there, on the photo, and the grid is a click away.
         let how = match (decoded, padding_pinned) {
@@ -2547,6 +2688,16 @@ impl App {
                 " Under Photo, Transparent parts was set to {} to match the read.",
                 backdrop.label().to_lowercase()
             ));
+        }
+        if light_set {
+            text.push_str(match under.adjust.light {
+                Light::Linear => " Under Photo, Work in linear light was turned on to match the read.",
+                Light::Encoded => " Under Photo, Work in linear light was turned off to match the read.",
+            });
+        }
+        if let Some(remeasured) = remeasured {
+            text.push(' ');
+            text.push_str(&remeasured);
         }
         if let Some(through) = through {
             text.push(' ');
@@ -2576,7 +2727,7 @@ impl App {
         let decoded = read.as_ref().is_some_and(|r| r.trustworthy);
         // What a read that decoded was made through, of the photo as it
         // is adjusted now.
-        let through = read.as_ref().filter(|read| read.trustworthy).map(|read| (read.enhance, read.deblurred, ReadUnder::of(photo)));
+        let through = read.as_ref().filter(|read| read.trustworthy).map(|read| (read.enhance, read.deblurred, ReadUnder::of(photo, &self.doc)));
         let adopt = adopts_version(&found, self.doc.version, decoded);
         let suggest = found.version != self.doc.version && !adopt;
         let family = self.doc.version.family();
@@ -3284,11 +3435,16 @@ impl App {
                 let changed = repaired.cells().iter().zip(self.doc.grid.cells()).filter(|(a, b)| a != b).count();
                 self.begin_edit();
                 self.doc.grid = repaired;
-                let unsolved = self.derived.report.blocks.len() - self.derived.report.blocks_solved();
-                let rest = if unsolved > 0 {
-                    format!(" The modules of {unsolved} unsolved blocks are as they were.")
-                } else {
-                    String::new()
+                let (layout, report) = (&self.derived.layout, &self.derived.report);
+                let left = (0..report.blocks.len()).filter(|&b| !written_back(layout, report, b)).count();
+                let unconfirmed = (0..report.blocks.len()).filter(|&b| report.blocks[b].is_solved() && !written_back(layout, report, b)).count();
+                let rest = match (left, unconfirmed) {
+                    (0, _) => String::new(),
+                    (left, 0) => format!(" {left} unsolved blocks were left unchanged."),
+                    (left, unconfirmed) => format!(
+                        " {left} blocks were left unchanged, including {unconfirmed} solved but unconfirmed, since writing \
+                         those in would make them look confirmed."
+                    ),
                 };
                 self.notify(format!("Applied corrections: {changed} modules changed.{rest}"));
             }
@@ -3306,7 +3462,7 @@ impl App {
             }
             Action::AddToSequence => {
                 let label = self.photo.as_ref().map_or_else(|| "grid".to_owned(), |p| p.name.clone());
-                match Part::from_report(&self.derived.report, label) {
+                match Part::from_report_in(&self.derived.report, label, self.opts.charset) {
                     Some(part) => {
                         let (index, total) = (part.index, part.total);
                         let replaced = self.view.sequence.add(part);
@@ -3477,9 +3633,9 @@ impl App {
     }
 
     /// Save the grid as error correction leaves it as an image at `path`,
-    /// and say what was saved: a symbol whose every block solved is the
-    /// repaired one, which an ordinary reader can scan, and anything
-    /// short of that is said to be.
+    /// and say what was saved: a symbol whose every block is written back
+    /// ([`written_back`]) is the repaired one, which an ordinary reader
+    /// can scan, and anything short of that is said to be.
     fn export_image(&mut self, path: &Path, format: ExportFormat) {
         let repaired = repaired_grid(&self.doc.grid, &self.derived.layout, self.derived.mask, &self.derived.report);
         let quiet = quiet_zone(self.doc.version);
@@ -3499,11 +3655,13 @@ impl App {
             Ok(()) => {
                 let unknown = repaired.count(Module::Unknown);
                 let mut note = if unknown > 0 { format!(" {unknown} unknown modules are grey.") } else { String::new() };
-                let (solved, total) = (self.derived.report.blocks_solved(), self.derived.report.blocks.len());
-                if solved < total {
+                let (layout, report) = (&self.derived.layout, &self.derived.report);
+                let total = report.blocks.len();
+                let written = (0..total).filter(|&b| written_back(layout, report, b)).count();
+                if written < total {
                     note.push_str(&format!(
-                        " Not every block is solved ({solved} of {total}), and the modules of the rest are as painted: \
-                         this is not yet the repaired symbol, and a reader may well not scan it."
+                        " Not every block is confirmed or pinned by hand ({written} of {total}); the rest are as painted, so \
+                         this isn't the repaired symbol yet and a reader may not scan it."
                     ));
                 }
                 self.notify(format!("Saved {} ({w} × {h}).{note}", path.display()));
@@ -3908,24 +4066,37 @@ pub(crate) fn ec_name(version: SymbolVersion, ec: EcLevel) -> &'static str {
 
 /// How far error correction reaches in the blocks of a version at a
 /// level, in wrong codewords of a block read whole, for the notes that
-/// say so: by the standard, and by list decoding and the trials of
-/// erasures at the budgets the decode options give them. Where the
-/// blocks differ in length, list decoding is of the one it reaches
-/// least far in, and the trials of the longest, which takes the most
-/// sets.
+/// say so: by the standard, by plain Reed-Solomon, and by list decoding
+/// and the trials of erasures at the budgets the decode options give
+/// them. Where the blocks differ in length, list decoding is of the one
+/// it reaches least far in, and the trials of the longest, which takes
+/// the most sets.
 #[derive(Clone, Copy)]
 pub(crate) struct Reach {
     pub blocks: usize,
     /// Codewords of the shortest block and of the longest.
     pub lengths: (usize, usize),
     /// What the standard corrects, keeping the codewords it reserves for
-    /// detecting misreads ([`misdecode_protection`]).
+    /// detecting misreads ([`misdecode_protection`]). Past it a solution
+    /// is marked beyond the standard, and confirmed as any other is.
     pub standard: usize,
     pub reserved: usize,
-    /// What plain Reed-Solomon reaches spending the reserved codewords
-    /// too, half the code's distance: past [`Self::standard`], never
-    /// confirmed.
+    /// What plain Reed-Solomon reaches, half the code's distance, the
+    /// reserved codewords spent past [`Self::standard`].
     pub half: usize,
+    /// Of [`Self::half`], what plain Reed-Solomon confirms with every
+    /// module certain, by the slack it leaves and the errors it locates
+    /// ([`plain_verifying_bits`]): all of it in every block but M1's,
+    /// whose one wrong codeword noise shows once in fifty blocks. Counted
+    /// by codewords: a block's risk is counted by its modules, and M1's
+    /// one wrong codeword with a single module of it wrong is confirmed
+    /// all the same (tests/damage.rs). It was once [`Self::standard`], a
+    /// solution past that never being confirmed.
+    pub plain: usize,
+    /// Of the block's error correction codewords, how many unknown plain
+    /// Reed-Solomon confirms with every module read certain, by the slack
+    /// filling them in leaves: never all of them, which leave none.
+    pub unknown: usize,
     /// What list decoding is sure to reach at the options' constraints
     /// ([`hard_reach`]), and at the default's.
     pub list: usize,
@@ -3933,13 +4104,12 @@ pub(crate) struct Reach {
     /// Constraints the largest block uses of the options' ([`usable_cost`]).
     pub list_used: usize,
     pub trials: TrialReach,
-    /// Codewords past [`Self::standard`] the trials reach and confirm,
-    /// with what their solution must show to be verified to spare
-    /// ([`TrialReach::within_standard`]): nought where any codewords are
-    /// reserved, since a solution past what the standard corrects spends
-    /// them, and nought unless that is past [`Self::half`], where plain
-    /// Reed-Solomon finds a solution first and the trials are not run.
-    pub trials_within: usize,
+    /// Codewords past [`Self::half`] the trials reach and confirm, with
+    /// what their solution must show to be verified to spare
+    /// ([`TrialReach::confirmed`]): nought unless that is past
+    /// [`Self::half`], where plain Reed-Solomon finds a solution first
+    /// and the trials are not run.
+    pub trials_past: usize,
 }
 
 /// What [`Reach::of`] depends on: the version, the level, the budgets
@@ -4010,17 +4180,28 @@ impl Reach {
         let reserved = misdecode_protection(version, level);
         let trials = trial_reach(lengths.1, ec, opts.trial_sets);
         let trial_needed = Self::trial_verifying_bits(version, opts);
+        // The plain decode stands on its own count, charged for the
+        // decodes of the grid alone; the errors it locates in the longest
+        // block, among the most codewords, confirm the least.
+        let plain_needed = plain_verifying_bits(&opts.first_stage());
+        let plain = (0..=ec / 2)
+            .rev()
+            .find(|&errors| 8 * (ec - 2 * errors) as u32 + located_error_bits(lengths.1, errors) >= plain_needed)
+            .unwrap_or(0);
+        let unknown = (0..=ec).rev().find(|&erased| 8 * (ec - erased) as u32 >= plain_needed).unwrap_or(0);
         Some(Self {
             blocks: shape.blocks,
             lengths,
             standard: ec.saturating_sub(reserved) / 2,
             reserved,
             half: ec / 2,
+            plain,
+            unknown,
             list: list(opts.list_cost),
             list_default: list(LIST_COST),
             list_used: usable_cost(lengths.1, ec, opts.list_cost),
             trials,
-            trials_within: trials.within_standard(lengths.1, ec, reserved, trial_needed, judged),
+            trials_past: trials.confirmed(lengths.1, ec, trial_needed, judged),
         })
     }
 
@@ -4054,14 +4235,6 @@ impl Reach {
     /// [`Self::list_gains`] at the default's constraints.
     pub fn list_default_gains(&self) -> bool {
         self.list_default > self.half
-    }
-
-    /// List decoding is sure to reach further than the code alone with
-    /// the reserved codewords unused, so that what it reaches may be
-    /// confirmed: only where none are, since a block read certain spends
-    /// them past half the distance ([`hard_reach`]).
-    pub fn list_gains_within_standard(&self) -> bool {
-        self.list_gains() && self.reserved == 0
     }
 }
 
@@ -5194,7 +5367,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let notice = &app.message.as_ref().expect("a notice").text;
         assert!(notice.starts_with("Saved "), "{notice}");
-        assert!(notice.contains("Not every block is solved (0 of 1)"), "{notice}");
+        assert!(notice.contains("Not every block is confirmed or pinned by hand (0 of 1)"), "{notice}");
         // As a drawing, the same symbol at the same size, and the same
         // word about it.
         let path = path.with_extension("svg");
@@ -5203,7 +5376,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(drawing.starts_with("<svg ") && drawing.contains("viewBox=\"0 0 33 33\" width=\"330\" height=\"330\""), "{drawing}");
         let notice = &app.message.as_ref().expect("a notice").text;
-        assert!(notice.contains("(330 × 330)") && notice.contains("Not every block is solved (0 of 1)"), "{notice}");
+        assert!(notice.contains("(330 × 330)") && notice.contains("Not every block is confirmed or pinned by hand (0 of 1)"), "{notice}");
     }
 
     // The tests from here on show the window, frame by frame, to an egui
@@ -5253,6 +5426,7 @@ mod tests {
             decodes: None,
             bloom: 0.0,
             decoded_at: None,
+            picked_among: 1,
         }
     }
 
@@ -5588,7 +5762,7 @@ mod tests {
     /// as the bench has it adjusted now, but enlarged `base` times.
     fn adjust_as_read(app: &mut App, enhance: Enhance, deblurred: Option<deblur::Spread>, base: Enlarge) -> Option<String> {
         let photo = app.photo.as_ref().expect("the bench has a photo");
-        let under = ReadUnder { adjust: Adjust { enlarge: base, ..photo.adjust }, measured: photo.luma.deblurred };
+        let under = ReadUnder { adjust: Adjust { enlarge: base, ..photo.adjust }, measured: photo.luma.deblurred, kernel_outline: app.doc.kernel_outline };
         app.adjust_as_read(enhance, deblurred, under)
     }
 
@@ -5684,6 +5858,48 @@ mod tests {
         // One undo puts back the white it was on, and the grid.
         bench.act(Action::Undo);
         assert_eq!(bench.app.doc.adjust.backdrop, Backdrop::White);
+    }
+
+    #[test]
+    fn a_read_loaded_works_the_photo_in_the_light_it_was_read_in() {
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        // A photo worked in linear light and read by Read all; then worked
+        // as stored, and the read loaded.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/photos");
+        let image = image::open(dir.join("zxing_qrcode-3_01.png")).expect("photo opens").to_rgba8();
+        bench.app.set_photo(&ctx, "in light".into(), image);
+        bench.act(Action::SetAdjust(Adjust { light: Light::Linear, ..bench.app.doc.adjust }));
+        bench.settle();
+        assert_eq!(bench.app.photo.as_ref().map(|photo| photo.luma.light), Some(Light::Linear));
+        bench.app.view.load_reads = false;
+        bench.act(Action::FindSymbols);
+        bench.settle();
+        bench.act(Action::ReadFound);
+        bench.settle();
+        assert!(bench.app.read_decoded(0), "{}", bench.notice().text);
+        // Worked as stored, under the Deblur filter with a blur set for
+        // it inside the outline as it lies, which the light the read is
+        // loaded in measures again there, and not inside the outline the
+        // read then lays on its symbol.
+        let stale = deblur::Spread::round(1.4);
+        bench.act(Action::SetAdjust(Adjust { light: Light::Encoded, filter: Filter::Deblur, kernel: Some(stale), ..bench.app.doc.adjust }));
+        let outline = bench.app.doc.corners;
+        assert_eq!(bench.app.doc.kernel_outline, Some(outline));
+        bench.app.view.load_reads = true;
+        bench.act(Action::UseProposal(0));
+        bench.settle();
+        assert_eq!(bench.app.doc.adjust.light, Light::Linear);
+        assert_eq!(bench.app.photo.as_ref().map(|photo| photo.luma.light), Some(Light::Linear));
+        let text = &bench.notice().text;
+        assert!(text.contains("Under Photo, Work in linear light was turned on"), "{text}");
+        assert!(text.contains("Re-measured Deblur's blur inside its original outline, now in linear light"), "{text}");
+        assert!(bench.app.doc.adjust.kernel.is_some_and(|kernel| kernel != stale), "{:?}", bench.app.doc.adjust.kernel);
+        assert_ne!(bench.app.doc.corners, outline);
+        assert_eq!(bench.app.doc.kernel_outline, Some(outline));
+        // One undo puts back the photo as stored, and the blur set.
+        bench.act(Action::Undo);
+        assert_eq!((bench.app.doc.adjust.light, bench.app.doc.adjust.kernel), (Light::Encoded, Some(stale)));
     }
 
     #[test]
@@ -5802,11 +6018,16 @@ mod tests {
         bench.app.doc.corners = STRAIGHT;
         bench.app.doc.set_anchor(finder_anchor([75.0, 75.0]), AnchorSource::Manual);
         bench.app.detection = Some(detection(SymbolVersion::Qr(2), STRAIGHT));
+        let under = ReadUnder {
+            adjust: Adjust { filter: Filter::Deblur, kernel: Some(deblur::Spread::round(1.0)), ..bench.app.doc.adjust },
+            measured: None,
+            kernel_outline: Some(STRAIGHT),
+        };
         bench.app.proposals = Some(Proposals {
             found: vec![detection(SymbolVersion::Qr(2), STRAIGHT)],
             photo_inverted: false,
             adopted: Some(0),
-            reads: None,
+            reads: Some(FoundReads { results: vec![None], photo_inverted: false, under }),
             charged: vec![Charged { corners: STRAIGHT, version: SymbolVersion::Qr(2), among: 3 }],
         });
         bench.step();
@@ -5838,8 +6059,10 @@ mod tests {
         let proposals = bench.app.proposals.as_ref().expect("the symbols found stay on offer");
         assert_eq!(proposals.found[0].corners, twice(STRAIGHT));
         assert_eq!(proposal_in_use(proposals, &bench.app.doc.corners), Some(0));
-        // And what its read in the search was charged, with it.
+        // And what its read in the search was charged, with it, and where
+        // the blur its reads were made under was measured.
         assert_eq!(proposals.among_of(&proposals.found[0]), 3);
+        assert_eq!(proposals.reads.as_ref().map(|reads| reads.under.kernel_outline), Some(Some(twice(STRAIGHT))));
         let (matching, fixed) = bench.app.preview.as_ref().expect("the outline makes a grid").fixed;
         assert_eq!(matching, fixed);
         assert!(bench.notice().text.starts_with("Loaded render"), "nothing was under way, so nothing to say: {}", bench.notice().text);
@@ -5859,6 +6082,7 @@ mod tests {
         assert_eq!(bench.app.detection.as_ref().map(|found| found.corners), Some(STRAIGHT));
         let proposals = bench.app.proposals.as_ref().expect("the symbols found stay on offer");
         assert_eq!(proposals.among_of(&proposals.found[0]), 3);
+        assert_eq!(proposals.reads.as_ref().map(|reads| reads.under.kernel_outline), Some(Some(STRAIGHT)));
         assert!(bench.locate()([75.0, 75.0]).distance(on_screen) < 0.5);
         // Reduced, it keeps nothing beside it, and says so.
         bench.app.history.checkpoint(&bench.app.doc);
@@ -5999,6 +6223,114 @@ mod tests {
     }
 
     #[test]
+    fn a_blur_measured_in_the_outline_is_measured_again_there_when_the_light_changes() {
+        let mut bench = Bench::new();
+        let ctx = bench.ctx.clone();
+        bench.app.set_photo(&ctx, "blurred".into(), image::imageops::blur(&red_render(), 1.6));
+        bench.app.doc.corners = STRAIGHT;
+        bench.step();
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { filter: Filter::Deblur, ..bench.app.doc.adjust }));
+        bench.act(Action::MeasureDeblur);
+        let stored = bench.app.doc.adjust.kernel.expect("the blur is set");
+        assert_eq!(bench.app.doc.kernel_outline, Some(STRAIGHT));
+        // Worked in linear light, the blur is measured again inside the
+        // outline it was measured in, as Measure in outline measures it
+        // there, and undone so, wherever the outline has moved since. It
+        // was once kept, measured as stored, and undone in light; and then
+        // measured inside the outline as it lay, on whatever was under it.
+        let off = [[-50.0, -50.0], [-10.0, -50.0], [-10.0, -10.0], [-50.0, -10.0]];
+        bench.app.doc.corners = off;
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { light: Light::Linear, ..bench.app.doc.adjust }));
+        let text = &bench.notice().text;
+        assert!(
+            text.starts_with("Re-measured Deblur's blur inside its original outline, now in linear light"),
+            "{text}"
+        );
+        let lit = bench.app.doc.adjust.kernel.expect("the blur is measured again");
+        assert_ne!(lit, stored);
+        assert_eq!(bench.app.doc.kernel_outline, Some(STRAIGHT));
+        let photo = bench.app.photo.as_ref().expect("the photo is loaded");
+        assert_eq!(photo.luma.deblurred, Some(lit.scaled(photo.scale())));
+        // One undo takes back the light and the blur together.
+        bench.act(Action::Undo);
+        let doc = &bench.app.doc;
+        assert_eq!((doc.adjust.light, doc.adjust.kernel, doc.kernel_outline), (Light::Encoded, Some(stored), Some(STRAIGHT)));
+        bench.app.doc.corners = STRAIGHT;
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { light: Light::Linear, ..bench.app.doc.adjust }));
+        bench.act(Action::MeasureDeblur);
+        assert_eq!(bench.app.doc.adjust.kernel, Some(lit), "measured again as Measure in outline measures it");
+        // Enlarged, the outline it was measured in goes with the photo, as
+        // the outline does.
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { enlarge: Enlarge::times(2), ..bench.app.doc.adjust }));
+        let on = bench.app.doc.corners;
+        assert_ne!(on, STRAIGHT);
+        assert_eq!(bench.app.doc.kernel_outline, Some(on));
+        // A blur set otherwise, as a read sets one, is taken as measured
+        // inside the outline it is set under. With nothing to measure
+        // there, the filter goes back to the blur it measures over the
+        // whole photo, and says so.
+        let given = deblur::Spread::round(1.2);
+        let set_off = |bench: &mut Bench| {
+            bench.app.doc.corners = off;
+            bench.app.history.checkpoint(&bench.app.doc);
+            bench.act(Action::SetAdjust(Adjust { kernel: Some(given), ..bench.app.doc.adjust }));
+            assert_eq!(bench.app.doc.kernel_outline, Some(off));
+            bench.app.doc.corners = on;
+        };
+        set_off(&mut bench);
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { light: Light::Encoded, ..bench.app.doc.adjust }));
+        let text = &bench.notice().text;
+        assert!(
+            !bench.notice().is_error
+                && text.starts_with(
+                    "Couldn't re-measure Deblur's blur inside its original outline in sRGB, so Deblur now uses the whole \
+                     photo's blur."
+                ),
+            "{text}"
+        );
+        assert_eq!((bench.app.doc.adjust.kernel, bench.app.doc.kernel_outline), (None, None));
+        assert!(bench.app.photo.as_ref().is_some_and(|photo| photo.luma.deblurred.is_some()));
+        // Kept for the Deblur filter while another is chosen, the blur is
+        // measured again all the same, and told as kept: it was once told
+        // as Deblur's, and the user sent to Measure in outline, which only
+        // Deblur shows.
+        bench.act(Action::MeasureDeblur);
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { filter: Filter::None, ..bench.app.doc.adjust }));
+        assert_eq!(bench.app.doc.kernel_outline, Some(on));
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { light: Light::Linear, ..bench.app.doc.adjust }));
+        let text = &bench.notice().text;
+        assert!(
+            text.starts_with("Re-measured the blur saved for Deblur inside its original outline, now in linear light"),
+            "{text}"
+        );
+        assert!(bench.app.doc.adjust.kernel.is_some());
+        set_off(&mut bench);
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { light: Light::Encoded, ..bench.app.doc.adjust }));
+        let text = &bench.notice().text;
+        assert!(text.ends_with("so it was dropped. Deblur will use the whole photo's blur."), "{text}");
+        assert!(!text.contains("Measure in outline"), "{text}");
+        assert_eq!((bench.app.doc.adjust.kernel, bench.app.doc.kernel_outline), (None, None));
+        // A blur set with the light is the one set, and nothing is said of
+        // it; nor is anything where none was set.
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.app.message = None;
+        bench.act(Action::SetAdjust(Adjust { light: Light::Linear, kernel: Some(given), ..bench.app.doc.adjust }));
+        assert_eq!(bench.app.doc.adjust.kernel, Some(given));
+        assert!(bench.app.message.is_none(), "{:?}", bench.app.message.as_ref().map(|notice| &notice.text));
+        bench.act(Action::SetAdjust(Adjust { kernel: None, ..bench.app.doc.adjust }));
+        bench.act(Action::SetAdjust(Adjust { light: Light::Encoded, ..bench.app.doc.adjust }));
+        assert!(bench.app.message.is_none(), "{:?}", bench.app.message.as_ref().map(|notice| &notice.text));
+    }
+
+    #[test]
     fn the_blur_the_deblur_filter_undoes_is_measured_inside_the_outline_when_asked() {
         let mut bench = Bench::new();
         let ctx = bench.ctx.clone();
@@ -6055,6 +6387,7 @@ mod tests {
         assert!(text.contains("Filter was set to Deblur at full strength, undoing the blur measured around the symbol"), "{text}");
         let adjust = bench.app.doc.adjust;
         assert_eq!((adjust.filter, adjust.strength, adjust.kernel), (Filter::Deblur, 1.0, Some(undid)));
+        assert_eq!(bench.app.doc.kernel_outline, Some(bench.app.doc.corners), "measured inside the outline on the symbol");
         // Read in the photo enlarged, the blur is carried back to the
         // photo's own pixels.
         bench.act(Action::SetAdjust(Adjust { enlarge: Enlarge::times(2), ..bench.app.doc.adjust }));
@@ -6089,7 +6422,7 @@ mod tests {
         // A read Read all made under a median filter, loaded after the user
         // took the filter off: its copy was made of the photo filtered, and
         // the filter is set back, and said, with Sharpen as the copy had it.
-        let under = ReadUnder { adjust: Adjust { filter: Filter::Median, radius: 2, ..bench.app.doc.adjust }, measured: None };
+        let under = ReadUnder { adjust: Adjust { filter: Filter::Median, radius: 2, ..bench.app.doc.adjust }, measured: None, kernel_outline: None };
         let text = bench.app.adjust_as_read(Enhance { enlarge: 1, sharpen: Sharpen::Light }, None, under).expect("the photo is set");
         assert!(text.contains("Sharpen was set to 0.50, and Filter to Median 2 px either side, as it was when the symbol was read"), "{text}");
         assert_eq!((bench.app.doc.adjust.filter, bench.app.doc.adjust.radius, bench.app.doc.adjust.sharpen), (Filter::Median, 2, 0.5));
@@ -6098,11 +6431,34 @@ mod tests {
         // the blur it measured over the whole photo then, carried to the
         // photo's own pixels, whatever the photo shows now.
         let measured = deblur::Spread::round(1.4);
-        let under = ReadUnder { adjust: Adjust { filter: Filter::Deblur, sharpen: 0.0, ..Adjust::default() }, measured: Some(measured) };
+        let under = ReadUnder { adjust: Adjust { filter: Filter::Deblur, sharpen: 0.0, ..Adjust::default() }, measured: Some(measured), kernel_outline: None };
         let text = bench.app.adjust_as_read(Enhance { enlarge: 2, sharpen: Sharpen::Off }, None, under).expect("the photo is set");
         assert!(text.contains("Enlarge was set to 2× and Sharpen to 0.00, and Filter to Deblur, undoing the blur it had measured"), "{text}");
         let adjust = bench.app.doc.adjust;
         assert_eq!((adjust.enlarge, adjust.filter, adjust.kernel), (Enlarge::times(2), Filter::Deblur, Some(measured)));
+        // Measured over the whole photo, that blur is measured again over
+        // the whole photo when the light changes, and held to. It was once
+        // taken as measured inside the outline on the symbol, and measured
+        // again there.
+        assert_eq!(bench.app.doc.kernel_outline, None);
+        bench.app.history.checkpoint(&bench.app.doc);
+        bench.act(Action::SetAdjust(Adjust { light: Light::Linear, ..bench.app.doc.adjust }));
+        let text = &bench.notice().text;
+        assert!(text.starts_with("Re-measured Deblur's blur over the whole photo, now in linear light"), "{text}");
+        let doc = &bench.app.doc;
+        assert!(doc.adjust.kernel.is_some_and(|kernel| kernel != measured) && doc.kernel_outline.is_none(), "{:?}", doc.adjust.kernel);
+        // And one made under a blur set for the filter sets it back with
+        // where it was measured then, in the photo's pixels as the read
+        // was made, carried to them as the read enlarges it. It was once
+        // taken as measured inside the outline on the symbol.
+        let set = deblur::Spread::round(1.1);
+        let then = [[20.0, 20.0], [120.0, 20.0], [120.0, 120.0], [20.0, 120.0]];
+        let adjust = Adjust { filter: Filter::Deblur, kernel: Some(set), ..bench.app.doc.adjust };
+        let under = ReadUnder { adjust, measured: None, kernel_outline: Some(then) };
+        bench.app.adjust_as_read(Enhance { enlarge: 2, sharpen: Sharpen::Off }, None, under).expect("the photo is enlarged");
+        let doc = &bench.app.doc;
+        assert_eq!((doc.adjust.enlarge, doc.adjust.kernel), (Enlarge::times(4), Some(set)));
+        assert_eq!(doc.kernel_outline, Some(then.map(|[x, y]| [2.0 * x, 2.0 * y])));
     }
 
     #[test]
@@ -6395,14 +6751,18 @@ mod tests {
         // strongly read it outright, until a solution that spends the
         // codeword a 3-L block keeps for detecting misreads was confirmed
         // no longer; it then wanted its padding pinned too, as at 2.25
-        // and 2.5, and at 2.3 the photo as it was read it. Blurred by
-        // 2.45 the copy sharpened strongly reads it outright.)
+        // and 2.5, and at 2.3 the photo as it was read it, and at 2.45
+        // the copy sharpened strongly read it outright. Such a solution
+        // is confirmed by its risk again, and at 2.4 the copy sharpened
+        // strongly reads it outright once more, as at 2.5; at 2.45 the
+        // read through that copy settles on a sampling that wants its
+        // padding pinned, though Sample then reads it outright.)
         let message = "https://example.com/out-of-focus";
         let (w, h, pixels) = render_rgba(&symbol_of(message), 3, 4);
         let render = image::RgbaImage::from_raw(w as u32, h as u32, pixels).expect("a render is an image");
         let mut photo = image::RgbaImage::from_pixel(400, 360, image::Rgba([255; 4]));
         image::imageops::replace(&mut photo, &render, 150, 120);
-        bench.app.set_photo(&ctx, "blurred".into(), image::imageops::blur(&photo, 2.45));
+        bench.app.set_photo(&ctx, "blurred".into(), image::imageops::blur(&photo, 2.4));
         bench.app.doc.corners = square(145.0, 115.0, 121.0);
         // Find in outline reads it through a copy of the photo sharpened
         // and enlarged, and the photo is adjusted to match. The read is
@@ -8863,19 +9223,20 @@ mod tests {
         // correction, 2 of them kept for detecting misreads.
         bench.act(Action::SetFormat(FormatSel::Manual { ec: EcLevel::L, mask: 0 }));
         bench.step();
-        // Under the format, what the level in effect corrects, and nothing
-        // past that: the pairs erased by trial reach five within the
-        // standard's limit, which plain decoding reaches first by spending
-        // the two, and the trials never see such a block. It was once said
-        // that they reach five. The curve reaches five as plain decoding
-        // does, spending the two as well.
-        assert!(painted(&bench, "Corrects up to 4 wrong codewords or 8 unknown."), "{:?}", bench.texts());
+        // Under the format, what the level in effect corrects: the five
+        // plain decoding reaches spending the two, and the six the pairs
+        // erased by trial reach past it, which the block itself confirms.
+        // It was once said that they reach five; and then the four the
+        // standard corrects alone, a solution that spent the two never
+        // being confirmed. The curve reaches five as plain decoding does,
+        // spending the two as well.
+        assert!(painted(&bench, "Corrects up to 5 wrong codewords or 10 unknown. With erasing by trial, up to 6 wrong."), "{:?}", bench.texts());
         assert!(
             painted(
                 &bench,
                 "No gain at level L: in this symbol's block of 44 codewords, it's guaranteed to correct 5 wrong \
-                 codewords, the same as plain Reed-Solomon. Past 4, both use the reserved error-detection codewords, \
-                 so neither is confirmed."
+                 codewords, the same as plain Reed-Solomon. Past 4, both use the reserved error-detection codewords \
+                 and are marked beyond the standard."
             ),
             "{:?}",
             bench.texts()
@@ -8883,9 +9244,9 @@ mod tests {
         assert!(
             painted(
                 &bench,
-                "In this symbol's block of 44 codewords: tries every pair (946 sets), but these only beat plain \
-                 Reed-Solomon by using the reserved error-detection codewords, so they are never confirmed. Adding every \
-                 set of four would need a budget of 136,697."
+                "In this symbol's block of 44 codewords: tries every pair (946 sets), correcting up to 6 wrong codewords, \
+                 vs. 5 for plain Reed-Solomon. Anything past 4 uses the reserved error-detection codewords and is marked \
+                 beyond the standard. Adding every set of four would need a budget of 136,697."
             ),
             "{:?}",
             bench.texts()
@@ -9218,6 +9579,11 @@ mod tests {
         for guess in [false, true] {
             bench.app.view.paint_reliability = if guess { 0 } else { CERTAIN };
             bench.app.view.ink = Ink::Module(Module::Unknown);
+            // The slider says the painted reliability in words as wide as
+            // they are, and the tools panel widens to hold them: the grid
+            // is laid out again, smaller, before the press lands on it.
+            bench.step();
+            let cell = bench.cells();
             bench.click(cell(x, y), egui::PointerButton::Primary);
             assert!(bench.app.doc == before, "guess {guess}");
             assert_eq!(bench.app.doc.grid.reliability(x, y), 40, "guess {guess}");

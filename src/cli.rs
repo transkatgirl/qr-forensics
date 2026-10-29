@@ -14,7 +14,7 @@
 //!                     [--details] [--grid] [--metrics] [--partial]
 //!                     [--surface] [--enlarge n] [--sharpen light|strong|deblur]
 //!                     [--full-search] [--transparent white|black|grey]
-//!                     [--] <image>...
+//!                     [--linear-light] [--] <image>...
 //! ```
 //!
 //! An option that takes a value takes the next argument, or what follows
@@ -33,17 +33,24 @@
 //! not be read, as OpenCV hands back the straightened symbol; a
 //! light-on-dark symbol's grid is dark where the symbol prints dark.
 //!
-//! `--details` adds what the decode settled on the way to the message:
-//! the error correction level and mask, `risk 1 in 2^n` once every block
-//! is solved (an upper bound on the chance the message is wrong: the
-//! blocks' chances added up), the character set the bytes were read in,
-//! the symbology identifier, the symbol's place in a structured append
-//! sequence when it has one, and how many codewords of padding were
-//! pinned when the read took that, and as what when the padding is not
-//! the standard's, and what the photo was read through when that was not
-//! the photo as it is, enlarged or sharpened, and `threshold surface`
-//! when its modules were read against one, as OpenCV's detector hands
-//! back each symbol's ECI and BoofCV its level, mask and encoding.
+//! `--details` adds what the decode settled on, much as OpenCV's
+//! detector returns each symbol's ECI and BoofCV its level, mask and
+//! encoding:
+//!
+//! - the error correction level and mask;
+//! - `risk 1 in 2^n` once every block is solved: an upper bound on the
+//!   chance the message is wrong (the sum of the blocks' chances);
+//! - `beyond the standard` when a block's solution used error correction
+//!   codewords the standard reserves for error detection;
+//! - the character set, the symbology identifier, and the symbol's
+//!   position in a structured append sequence;
+//! - how many padding codewords were pinned, if any, and the filler when
+//!   it isn't the standard's;
+//! - what the photo was read through when it was enlarged or sharpened;
+//! - `threshold surface` when the modules were sampled against one, and
+//!   `unsure modules kept` when the read only stands with its unsure
+//!   modules kept at the colour they fell on.
+//!
 //! If every block is confirmed but their combined risk is worse than the
 //! 1 in 2^8 each block must meet, the read still stands, and a warning
 //! is printed to standard error; the read's own line is unchanged. The
@@ -157,6 +164,14 @@
 //! orange, is the light of the symbol, and the read says `light on dark`;
 //! on white it is the dark.
 //!
+//! `--linear-light` is the window's Work in linear light (under Photo):
+//! the photo and every enlarged, reduced, sharpened or deblurred copy of
+//! it are processed in linear light (converted from sRGB and back), the
+//! way a lens blends light, and modules are sampled in linear light. Use
+//! it for camera photos of fine print, small modules or blur. Leave it
+//! off for screenshots and symbols rendered or resized in software,
+//! which were blended in sRGB. Reads never retry with the other setting.
+//!
 //! The outline is drawn top-left first and clockwise, in the photo's own
 //! pixels, upright as its EXIF orientation has it. A photo under 256
 //! pixels on its shorter side is worked on enlarged by a whole factor,
@@ -196,7 +211,8 @@
 //! can be confirmed even when it corrected as many as it can. Each
 //! doubling of the decodes tried, and a photo read tries many, costs a
 //! bit. In the smallest symbols, a solution that uses the codewords the
-//! standard reserves for detecting misdecodes is never trusted. A read
+//! standard reserves for error detection is judged the same way, and
+//! `--details` marks it `beyond the standard`. A read
 //! is `malformed` when every block is confirmed and the message does
 //! not parse to its end, and `partial` otherwise, with the blocks that
 //! solved.
@@ -226,14 +242,14 @@ use qr_forensics::decode::pipeline::{DecodeOptions, VERIFIED_RISK_BITS};
 use qr_forensics::decode::sequence::{ParityCheck, Part, Sequence};
 use qr_forensics::decode::text::{Charset, escape_controls};
 use qr_forensics::imaging::Luma;
-use qr_forensics::imaging::adjust::{Backdrop, Enlarge};
+use qr_forensics::imaging::adjust::{Adjust, Backdrop};
 use qr_forensics::imaging::detect::{Lead, SearchParams};
 use qr_forensics::imaging::enhance::{Enhance, Sharpen};
 use qr_forensics::imaging::gpu;
 use qr_forensics::imaging::measure::ReadMeasures;
 use qr_forensics::imaging::photo;
 use qr_forensics::imaging::read::{ReadResult, read_detection, read_outline, read_placed};
-use qr_forensics::imaging::sample::{Rule, SampleParams};
+use qr_forensics::imaging::sample::{Light, Rule, SampleParams};
 use qr_forensics::symbol::function_map::FunctionMap;
 use qr_forensics::symbol::layout::SymbolLayout;
 use qr_forensics::symbol::{Family, SymbolVersion};
@@ -243,7 +259,7 @@ const USAGE: &str = "usage: qr-forensics decode [--family qr|micro|rmqr|model1] 
                      [--outline x,y,x,y,x,y,x,y | --placed x,y,x,y,x,y,x,y] \
                      [--hex | --escaped] [--charset name] [--corners] [--details] [--grid] [--metrics] [--partial] \
                      [--surface] [--enlarge n] [--sharpen light|strong|deblur] [--full-search] \
-                     [--transparent white|black|grey] [--] <image>...\n\
+                     [--transparent white|black|grey] [--linear-light] [--] <image>...\n\
                      A message is printed on its symbol's line, its control characters other than tab spelt out as \
                      <CR>, <LF> and so on; --escaped spells out every one and the unreadable mark, --hex prints the \
                      bytes.";
@@ -281,6 +297,8 @@ struct Options {
     search: SearchParams,
     /// What the image's transparent parts are laid on.
     backdrop: Backdrop,
+    /// The light the photo is worked in.
+    light: Light,
     images: Vec<OsString>,
 }
 
@@ -340,6 +358,7 @@ fn parse_options(args: &[OsString]) -> Result<Option<Options>, String> {
         enhance: Enhance::NONE,
         search: SearchParams::default(),
         backdrop: Backdrop::default(),
+        light: Light::Encoded,
         images: Vec::new(),
     };
     let mut args = args.iter();
@@ -480,6 +499,10 @@ fn parse_options(args: &[OsString]) -> Result<Option<Options>, String> {
                     }
                 };
             }
+            "--linear-light" => {
+                flag()?;
+                options.light = Light::Linear;
+            }
             "--help" | "-h" => return Ok(None),
             other if other.starts_with("--") => return Err(format!("unknown option {other}")),
             _ => options.images.push(arg.clone()),
@@ -520,12 +543,16 @@ fn four_points(article: &str, what: &str, value: &str) -> Result<[[f64; 2]; 4], 
 
 /// A photo as the app loads it: the file's pixels, enlarged when the
 /// photo is small and never shrunk, as luminance, with the default tone
-/// adjustments and its transparent parts on `backdrop`; and how many
-/// times its own size it was loaded at.
-fn load(path: &Path, backdrop: Backdrop) -> Result<(Luma, f64), String> {
+/// adjustments, its transparent parts on `backdrop`, and worked in
+/// `light`; and how many times its own size it was loaded at.
+fn load(path: &Path, backdrop: Backdrop, light: Light) -> Result<(Luma, f64), String> {
     let image = photo::open(path).map_err(|e| e.to_string())?;
-    let times = Enlarge::for_photo(image.width(), image.height()).factor();
-    Ok((photo::luma_as_loaded_on(image, backdrop), times))
+    let adjust = Adjust {
+        backdrop,
+        light,
+        ..Adjust::for_photo(image.width(), image.height())
+    };
+    Ok((photo::luma(image, &adjust), adjust.enlarge.factor()))
 }
 
 /// Four points of a photo worked on at `times` its own size, as
@@ -591,8 +618,10 @@ pub(crate) fn standing(result: &ReadResult) -> String {
 /// again at the first try, and `unsure modules kept` when the read
 /// stands only with the modules its unsure band would leave unknown
 /// kept at the colour they fell on, which the window reads again with
-/// the band at nought. The standard's filler goes without saying, and
-/// another is named.
+/// the band at nought, and `beyond the standard` when a block's solution
+/// spent the codewords the standard reserves for detecting misdecodes,
+/// which says nothing of whether it is trusted: its risk says that. The
+/// standard's filler goes without saying, and another is named.
 fn details(result: &ReadResult) -> String {
     let (version, report) = (result.version(), &result.report);
     let mut parts = vec![format!("EC {}", version.ec_label(report.ec))];
@@ -601,6 +630,9 @@ fn details(result: &ReadResult) -> String {
     }
     if let Some(bits) = report.message_risk_bits() {
         parts.push(format!("risk 1 in 2^{bits}"));
+    }
+    if report.blocks.iter().any(|block| block.is_beyond_standard()) {
+        parts.push("beyond the standard".to_owned());
     }
     parts.extend(report.text.encoding.clone());
     parts.extend(report.text.symbology.clone());
@@ -871,7 +903,7 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
     let mut status = 0;
     for image in &options.images {
         let path = Path::new(image);
-        let (luma, times) = match load(path, options.backdrop) {
+        let (luma, times) = match load(path, options.backdrop, options.light) {
             Ok(loaded) => loaded,
             Err(message) => {
                 warn(&format!("{}: {message}", path.display()));
@@ -1013,7 +1045,7 @@ fn run_to(args: &[OsString], out: &mut impl Write) -> i32 {
         let parts = results
             .iter()
             .filter(|r| r.is_trustworthy())
-            .filter_map(|r| Part::from_report(&r.report, String::new()));
+            .filter_map(|r| Part::from_report_in(&r.report, String::new(), options.charset));
         for sequence in sequences(parts.collect()) {
             if writeln!(
                 out,
@@ -1316,6 +1348,9 @@ mod tests {
             label: String::new(),
             text: report,
             risk_bits: None,
+            segments: Vec::new(),
+            charset: qr_forensics::decode::text::Charset::Auto,
+            whole: true,
         }
     }
 
@@ -1644,6 +1679,18 @@ mod tests {
     }
 
     #[test]
+    fn linear_light_is_parsed() {
+        let parsed =
+            |args: &[&str]| parse(&args.iter().map(OsString::from).collect::<Vec<_>>());
+        assert_eq!(parsed(&["a.png"]).unwrap().light, Light::Encoded);
+        assert_eq!(
+            parsed(&["--linear-light", "a.png"]).unwrap().light,
+            Light::Linear
+        );
+        assert!(parsed(&["--linear-light=yes", "a.png"]).is_err());
+    }
+
+    #[test]
     fn the_backdrop_of_transparent_parts_is_parsed() {
         let parsed =
             |args: &[&str]| parse(&args.iter().map(OsString::from).collect::<Vec<_>>()).unwrap();
@@ -1782,6 +1829,46 @@ mod tests {
         }
         assert_eq!(on_white.0, 1, "{}", on_white.1);
         assert!(on_white.1.ends_with("no symbol found\n"), "{}", on_white.1);
+    }
+
+    #[test]
+    fn a_photo_worked_in_linear_light_is_read_in_it() {
+        use qr_forensics::decode::repair::render_rgba;
+        use qr_forensics::symbol::grid::ModuleGrid;
+        // A symbol drawn two pixels a module, which is enlarged as it is
+        // loaded: in linear light it reads as it does without.
+        let symbol = qrcode_generator::qr::Encoder::new(qrcode_generator::qr::ErrorCorrection::Low)
+            .version(qrcode_generator::qr::Version::new(2).unwrap())
+            .encode_segments(&[qrcode_generator::Segment::bytes("in the light")])
+            .unwrap();
+        let grid = ModuleGrid::from_bools(symbol.width(), symbol.height(), symbol.modules());
+        let (width, height, pixels) = render_rgba(&grid, 2, 4);
+        let path = std::env::temp_dir().join(format!(
+            "qr-forensics-linear-light-{}.png",
+            std::process::id()
+        ));
+        image::save_buffer(
+            &path,
+            &pixels,
+            width as u32,
+            height as u32,
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+        let read = |args: &[&str]| {
+            let mut all: Vec<OsString> = args.iter().map(OsString::from).collect();
+            all.push(path.clone().into_os_string());
+            let mut out = Vec::new();
+            let status = run_to(&all, &mut out);
+            (status, String::from_utf8(out).unwrap())
+        };
+        let (stored, light) = (read(&[]), read(&["--linear-light"]));
+        let _ = std::fs::remove_file(&path);
+        for (status, text) in [&stored, &light] {
+            let (fields, _) = fields_and_grid(text);
+            assert_eq!(*status, 0, "{text}");
+            assert_eq!(fields.last().map(String::as_str), Some("in the light"), "{text}");
+        }
     }
 
     #[test]

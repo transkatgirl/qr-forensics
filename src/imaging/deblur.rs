@@ -22,17 +22,23 @@
 //! the steepness is the edge's width, which for a Gaussian blur of
 //! spread `σ` comes to `σ√(2π)`, and does not depend on how dark the
 //! ink or how light the paper. Edges that lie close together, as the
-//! modules of a symbol blurred by half a module and more do, read
-//! narrower than the blur: a band of ink a spread or two wide never
-//! reaches its full dark, and its step falls further than its
-//! steepness, to some nine tenths of what an edge alone gives. So the
-//! middle width of each direction's edges is taken, and a blur reads a
-//! little under what it is, which undoes a little less than it might,
-//! where reading it over would ring. A hand that moved spreads the edges across its
-//! path more than those along it, and the widths of the edges of each
-//! direction are fitted by the spread a Gaussian of any shape gives
-//! them, turned and stretched as the photo was: one number each way
-//! for a lens out of focus, and a long narrow one for a shake.
+//! modules of a symbol blurred by a third of a module and more do, read
+//! narrower than that: a band of ink a spread or two wide never reaches
+//! its full dark, and the step across its edge falls short where the
+//! steepness at the edge barely falls. Read so, symbols blurred in light
+//! by from three to six tenths of a module came a tenth to a quarter
+//! under their blur. So the light across each edge is read outwards as
+//! far as it turns back, where the next edge begins, and the width the
+//! edge would have alone is solved for from where it turned ([`alone`]),
+//! which brings the same symbols to within about a twentieth; an edge
+//! whose neighbours lie so near that the edges beyond them count too is
+//! left out. The middle width of each direction's edges is taken: a
+//! blur read over would ring where it is undone. A hand that moved
+//! spreads the edges across its path more than those along it, and the
+//! widths of the edges of each direction are fitted by the spread a
+//! Gaussian of any shape gives them, turned and stretched as the photo
+//! was: one number each way for a lens out of focus, and a long narrow
+//! one for a shake.
 //!
 //! How a shake is turned is told by edges that run every way, as print
 //! and text about a symbol do. A symbol's own modules have their edges
@@ -59,6 +65,34 @@
 //! inverse filter raises the noise everywhere. A shake is not a
 //! Gaussian, and one fitted to it undoes the most of it that one can:
 //! enough to give a finder pattern back its rings.
+//!
+//! All of it is done in the light the photo is worked in ([`Light`]),
+//! as the photo's other adjustments are. A lens spreads the light from a
+//! point, and a photo stores that light blurred on sRGB's curve, which is
+//! no blur of anything it stores: worked as light, its values are taken
+//! as the light they stand for before the blur is measured
+//! ([`gpu::edges`]) or undone, the photo reduced and enlarged back in
+//! light with it, and the light undone is stored again ([`gpu::in_light`],
+//! [`gpu::encoded`]), for all that comes after to read as it reads any
+//! photo. Worked as stored, the default, it is measured and undone as
+//! stored, which is how a program blurs an image, and how a photo
+//! inverted or toned for contrast before it is filtered stores what it
+//! shows: its values are no longer on sRGB's curve, and taken as light
+//! they spread the blur's edges unevenly, further than as stored. Always
+//! worked as light, an inverted photo's edges read a blur's middle at a
+//! ninth of the way from ink to paper, where as stored they had read it
+//! at a third. Measured as stored,
+//! an edge from ink at 0.16 to paper at 0.94 blurred by a spread `σ` came
+//! to 2.8`σ` wide rather than 2.5, its steepest change two thirds of a
+//! spread into the ink, and how much too wide went with how dark the ink
+//! was. That had all but cancelled the shortfall of edges close together,
+//! which measured in light was left whole: until it was solved for, the
+//! search of BoofCV's blurred photographs lost a symbol it had read and
+//! one it had found. And a band of ink a spread wide, which reaches 38%
+//! of the way to the ink as light, reaches 23% as stored, so that undone
+//! as stored, a thin dark module had less of its ink given back than a
+//! thin light one had of its paper. An image a program blurred, which
+//! mixed what it stores, is blurred as stored, and is undone so.
 //!
 //! A blur many pixels wide would take a kernel of hundreds of pixels to
 //! undo where it lies. The photo is reduced first, until the blur is no
@@ -95,6 +129,7 @@ use std::borrow::Cow;
 
 use super::gpu::{self, scan::Values};
 use super::resize::resize;
+use super::sample::Light;
 
 /// The spread of the light from a point in a photo, as a Gaussian of any
 /// shape: its covariance, in square pixels, across (`xx`), down (`yy`)
@@ -182,6 +217,9 @@ const PART_SIDE: usize = 512;
 const PART_MARGIN: usize = 56;
 /// Rounds of the deconvolution.
 pub(crate) const ROUNDS: usize = 25;
+/// The furthest, in pixels, a step across an edge is read either side
+/// of it ([`measured_over`]).
+const MOST_REACH: f64 = 48.0;
 /// Directions the edges are sorted into, over half a turn.
 const DIRECTIONS: usize = 12;
 /// Fewest edges a direction must have to be fitted on.
@@ -219,26 +257,92 @@ const STEP_SHARE: f32 = 0.5;
 /// The share of each direction's edges, narrowest first, at which the
 /// blur is read off them: the middle one.
 const NARROWEST: f64 = 0.5;
-/// Lowest light the deconvolution divides by.
-pub(crate) const FLOOR: f32 = 0.01;
+/// The share of the step across an edge's window by which the light must
+/// turn back, from its lightest beyond the edge or its darkest before it,
+/// for a neighbouring edge to be taken to begin there ([`alone`]): more
+/// than grain moves it.
+const TURN_SHARE: f32 = 0.05;
+/// The variance, in square pixels, that the gradient's three pixels add to
+/// an edge's steepness beyond what the light read across it has
+/// ([`alone`]): of what the measure gives an edge drawn sharp
+/// ([`OWN_VARIANCE`]), all but the smoothing's and the pixel's own twelfth.
+const GRADIENT_OWN: f64 = OWN_VARIANCE - SMOOTHING * SMOOTHING - 1.0 / 12.0;
+/// The most of an edge's steepness its neighbours may take for its width to
+/// be read ([`alone`]). Nearer, the step and the steepness both turn on
+/// the edges beyond the neighbours, which the model of an edge between two
+/// does not hold: over symbols blurred by eight tenths of a module, the
+/// edges whose neighbours took up to half their steepness read the blur a
+/// fifth over, and those that took a tenth, a twentieth.
+const MOST_TAKEN: f64 = 0.1;
+/// Lowest light the deconvolution divides by: what a hundredth stored
+/// stands for ([`super::sample::linear_light`]), the floor it has where
+/// it works on stored values ([`STORED_FLOOR`]). A hundredth of light is a tenth stored, which
+/// would have held the ink of a dark photo off black.
+pub(crate) const FLOOR: f32 = 0.01 / 12.92;
+/// Lowest value the deconvolution divides by where it works on values as
+/// stored ([`Light::Encoded`]).
+const STORED_FLOOR: f32 = 0.01;
 
-/// How far the photo `width` by `height` spreads an edge, measured from
-/// the edges it shows, as the module describes. `None` when it shows too
+/// The lowest value the deconvolution divides by, worked in `light`.
+fn floor_in(light: Light) -> f32 {
+    match light {
+        Light::Linear => FLOOR,
+        Light::Encoded => STORED_FLOOR,
+    }
+}
+
+/// `data`, `width` by `height`, stored as a photo stores it, in `light`:
+/// as the light it stands for, or as it is.
+fn into_light(data: &[f32], width: usize, height: usize, light: Light) -> Cow<'_, [f32]> {
+    match light {
+        Light::Linear => Cow::Owned(gpu::in_light(data, width, height)),
+        Light::Encoded => Cow::Borrowed(data),
+    }
+}
+
+/// `data`, `width` by `height`, in `light`, stored again as a photo
+/// stores it ([`into_light`]).
+fn stored(data: Vec<f32>, width: usize, height: usize, light: Light) -> Vec<f32> {
+    match light {
+        Light::Linear => gpu::encoded(&data, width, height),
+        Light::Encoded => data,
+    }
+}
+
+/// [`into_light`] of an image on the graphics card.
+fn image_into_light(image: &gpu::Image, light: Light) -> gpu::Image {
+    match light {
+        Light::Linear => image.in_light(),
+        Light::Encoded => image.clone(),
+    }
+}
+
+/// [`stored`] of an image on the graphics card.
+fn image_stored(image: gpu::Image, light: Light) -> gpu::Image {
+    match light {
+        Light::Linear => image.encoded(),
+        Light::Encoded => image,
+    }
+}
+
+/// How far the photo `width` by `height`, its values stored as a photo
+/// stores them, spreads an edge, measured from the edges it shows in
+/// `light`, as the module describes. `None` when it shows too
 /// few edges to say ([`LEAST_EDGES`]), or no spread at all, none so wide
 /// as the narrowest kernel undone ([`KERNEL_LEAST`]): so a photo drawn
 /// sharp to the pixel, and one of a single grey, whose rounding leaves
 /// differences of a few millionths between its pixels that the gradient
 /// takes for edges of no width.
-pub fn measure(data: &[f32], width: usize, height: usize) -> Option<Spread> {
-    measure_of(Values::Cores(data), width, height)
+pub fn measure(data: &[f32], width: usize, height: usize, light: Light) -> Option<Spread> {
+    measure_of(Values::Cores(data), width, height, light)
 }
 
 /// [`measure`] of an image on the graphics card, or held by the cores.
-fn measure_of(image: Values<'_>, width: usize, height: usize) -> Option<Spread> {
+fn measure_of(image: Values<'_>, width: usize, height: usize, light: Light) -> Option<Spread> {
     if width < 8 || height < 8 {
         return None;
     }
-    measured_over(image, width, height, &[[0, 0, width, height]])
+    measured_over(image, width, height, &[[0, 0, width, height]], light)
 }
 
 /// How far the image `width` by `height` spreads an edge, as the module
@@ -248,9 +352,10 @@ fn measure_of(image: Values<'_>, width: usize, height: usize) -> Option<Spread> 
 /// image would read them, and the steepest change and the contrast that
 /// an edge is judged against taken over them all. The edges are read on
 /// the graphics card ([`gpu::edges`]), from the image it holds or from
-/// the parts of it handed it, and only their widths taken off it.
-fn measured_over(image: Values<'_>, width: usize, height: usize, parts: &[[usize; 4]]) -> Option<Spread> {
-    let edges = gpu::edges::Edges::of(image, (width, height), parts, PART_MARGIN, &kernel(&Spread::round(SMOOTHING)));
+/// the parts of it handed it, in `light`, and only their widths taken
+/// off it.
+fn measured_over(image: Values<'_>, width: usize, height: usize, parts: &[[usize; 4]], light: Light) -> Option<Spread> {
+    let edges = gpu::edges::Edges::of(image, (width, height), parts, PART_MARGIN, &kernel(&Spread::round(SMOOTHING)), light == Light::Linear);
     let (changing, ranked) = edges.ranked(|n| (n * 99 / 100).min(n.saturating_sub(1)), |m| m / 50, |m| m * 49 / 50);
     if changing < LEAST_EDGES {
         return None;
@@ -259,19 +364,40 @@ fn measured_over(image: Values<'_>, width: usize, height: usize, parts: &[[usize
     let floor = EDGE_SHARE * steepest;
     let least_step = STEP_SHARE * (lightest - darkest);
     // Each edge's width and the direction across it, measured with the
-    // step read `reach` pixels either side, in no order.
+    // step read `reach` pixels either side, in no order. The step is read
+    // over twice the reach at the most, and an edge that ramps the whole
+    // of the widest reach is that wide; one measured wider is no edge,
+    // but a step taken from whatever lies about a pixel barely steeper
+    // than its neighbours, as a grey dithered to pixel-sized checks is
+    // once smoothed, where widths of a hundred thousand pixels were read.
+    // Held to the reach of the look that measured them, the first look's
+    // few pixels lost the wide edges that say to look further, and a
+    // photograph blurred by many pixels was measured as barely blurred.
+    // Each read as wide as it would be alone ([`alone`]).
     let widths = |reach: f64| -> Vec<(f64, f64)> {
-        let measured = edges.widths(reach, floor, least_step);
-        measured.into_iter().map(|(w, ux, uy)| (f64::from(w), f64::from(uy).atan2(f64::from(ux)).rem_euclid(std::f64::consts::PI))).collect()
+        let measured = edges.widths(reach, floor, least_step, TURN_SHARE);
+        let chunks: Vec<&[gpu::edges::Crossing]> = measured.chunks(4096).collect();
+        crate::work::map(&chunks, |chunk| {
+            chunk
+                .iter()
+                .filter_map(|crossing| {
+                    let w = alone(crossing).filter(|&w| w <= 2.0 * MOST_REACH + 2.0)?;
+                    let [ux, uy] = crossing.across.map(f64::from);
+                    Some((w, uy.atan2(ux).rem_euclid(std::f64::consts::PI)))
+                })
+                .collect::<Vec<_>>()
+        })
+        .concat()
     };
     // A first look with a reach of a few pixels says how wide the edges
     // are; the next reads each step over as far as such an edge reaches,
+    // with room for the light to turn back where a neighbouring edge lies,
     // and again while that moves the reach.
     let mut reach = 8.0;
     let mut measured = widths(reach);
     for _ in 0..2 {
         let typical = narrowest_share(measured.iter().map(|w| w.0).collect(), 0.5)?;
-        let wider = (1.3 * typical).clamp(4.0, 48.0);
+        let wider = (1.5 * typical).clamp(4.0, MOST_REACH);
         if (wider - reach).abs() < 1.0 {
             break;
         }
@@ -308,13 +434,17 @@ fn measured_over(image: Values<'_>, width: usize, height: usize, parts: &[[usize
     let round_again = rows.first().zip(rows.last()).map(|(first, last)| DIRECTIONS + first.0 - last.0);
     let fan = gaps.chain(round_again).max().map_or(0, |widest| DIRECTIONS - widest);
     let some = |spread: Spread| (spread.extremes().0 >= KERNEL_LEAST).then_some(spread);
-    if rows.len() < 3 || fan < LEAST_FAN {
-        // Too few directions, or too narrow a fan of them, to tell a
-        // shape: the same every way.
+    // The same every way, from every edge.
+    let round = || {
         let all: Vec<f64> = measured.iter().map(|w| w.0).collect();
         let w = narrowest_share(all, NARROWEST)?;
         let variance = w * w / (2.0 * std::f64::consts::PI) - OWN_VARIANCE;
-        return (variance > 0.0).then(|| Spread::round(variance.sqrt())).and_then(some);
+        (variance > 0.0).then(|| Spread::round(variance.sqrt())).and_then(some)
+    };
+    if rows.len() < 3 || fan < LEAST_FAN {
+        // Too few directions, or too narrow a fan of them, to tell a
+        // shape.
+        return round();
     }
     // Least squares, each direction weighed by its edges.
     let mut a = [[0.0f64; 3]; 3];
@@ -336,10 +466,123 @@ fn measured_over(image: Values<'_>, width: usize, height: usize, parts: &[[usize
     if big <= 0.0 {
         return None;
     }
+    // The spread along any way is the covariance's between its widest and
+    // its narrowest, and over a fan of a quarter turn and more one of the
+    // directions measured lies within an eighth of a turn of the widest,
+    // where it reads at least half of it: a fit wider than twice the
+    // widest direction measured is the least squares running off where
+    // the directions say nothing, as over a field of pixel-sized checks,
+    // whose edges every way are of no width at all. One such once put a
+    // blur of a hundred thousand pixels on a dithered grey, and the
+    // reduction it called for asked the card for forty gigabytes. Twice is
+    // the bound exactly where the fan is a quarter turn, the widest way
+    // midway across the quarter it leaves, and the blur a line, and the
+    // widths read are only so near: a narrow shake so lain can read past
+    // it, and such a fit is taken as no shape at all, the same every way,
+    // as a fan too narrow is. It was once taken as no blur.
+    let widest_measured = rows.iter().map(|row| row.2).fold(0.0, f64::max);
+    if big > 2.0 * widest_measured {
+        return round();
+    }
     // The eigenvalues held at nought and above, the axes kept.
     let angle = 0.5 * (2.0 * spread.xy).atan2(spread.xx - spread.yy);
     let (c, s) = (angle.cos(), angle.sin());
     some(Spread { xx: big * c * c + small * s * s, xy: (big - small) * c * s, yy: big * s * s + small * c * c })
+}
+
+/// The width an edge would read at alone, `σ√(2π)` of the spread `σ` of
+/// its steepness, from what is read across it ([`gpu::edges::Crossing`]).
+/// Where the light turned back beyond the edge, a band of the other colour
+/// lies there, and its far edge about twice as far out, as the turn lies
+/// midway between two edges of a blur; where it turned before it,
+/// likewise. Between two such edges the band never reaches its full
+/// light or dark, and the step read falls short, where the steepness at
+/// the edge barely falls: the step over the steepness of an edge between
+/// two others at those places, as a Gaussian of spread `σ` blurs them, is
+/// solved for `σ`. Over symbols blurred in light by from three to eight
+/// tenths of a module, the middle of the widths so read came within a
+/// twentieth of the blur, where the step itself over the steepness read
+/// from a tenth to a quarter under it. `None` where no spread gives what
+/// was read, or the neighbours take more than [`MOST_TAKEN`] of the
+/// steepness.
+fn alone(crossing: &gpu::edges::Crossing) -> Option<f64> {
+    let read = f64::from(crossing.width);
+    let [beyond, before] = crossing.out.map(f64::from);
+    let neighbour = |out: f64, turned: bool| turned.then_some(2.0 * out);
+    let (far, near) = (neighbour(beyond, crossing.turned[0]), neighbour(before, crossing.turned[1]));
+    let taken = |s: f64| (far.map_or(0.0, |d| normal_pdf(d / s)) + near.map_or(0.0, |d| normal_pdf(d / s))) / normal_pdf(0.0);
+    // The step over the steepness of an edge whose steepness spreads `s`,
+    // the light itself less by what the gradient adds.
+    let modelled = |s: f64| -> f64 {
+        let light = (s * s - GRADIENT_OWN).max(1e-4).sqrt();
+        let at = |x: f64| {
+            normal_cdf(x / light) + 1.0 - far.map_or(0.0, |d| normal_cdf((x - d) / light)) - near.map_or(1.0, |d| normal_cdf((x + d) / light))
+        };
+        s * (at(beyond) - at(-before)) / (normal_pdf(0.0) * (1.0 - taken(s)))
+    };
+    // A spread past which either neighbour alone takes more than is let is
+    // no answer.
+    let nearest = (-2.0 * MOST_TAKEN.ln()).sqrt();
+    let mut high = 4.0 * beyond.max(before).max(1.0);
+    for d in [far, near].into_iter().flatten() {
+        high = high.min(d / nearest);
+    }
+    let low = GRADIENT_OWN.sqrt();
+    let (above, below) = (modelled(high) - read, modelled(low) - read);
+    if high <= low || above < 0.0 {
+        return None;
+    }
+    let s = if below >= 0.0 { low } else { root_between((low, below), (high, above), |s| modelled(s) - read) };
+    (taken(s) <= MOST_TAKEN).then(|| s * (2.0 * std::f64::consts::PI).sqrt())
+}
+
+/// Where `f`, rising, crosses nought between `low`, where it is below,
+/// and `high`, where it is above, each given with `f` there, to within a
+/// millionth of a pixel: by false position, the Illinois way, which
+/// halves what is kept of an end that holds twice running. Halving the
+/// span forty times, the widths of a photo of a megapixel and a half took
+/// twice as long to solve for as to read on the card.
+fn root_between((mut low, mut f_low): (f64, f64), (mut high, mut f_high): (f64, f64), f: impl Fn(f64) -> f64) -> f64 {
+    let mut kept = 0i8;
+    for _ in 0..60 {
+        if high - low < 1e-6 {
+            break;
+        }
+        let at = (low * f_high - high * f_low) / (f_high - f_low);
+        let f_at = f(at);
+        if f_at < 0.0 {
+            (low, f_low) = (at, f_at);
+            if kept < 0 {
+                f_high /= 2.0;
+            }
+            kept = -1;
+        } else {
+            (high, f_high) = (at, f_at);
+            if kept > 0 {
+                f_low /= 2.0;
+            }
+            kept = 1;
+        }
+    }
+    (low + high) / 2.0
+}
+
+/// The standard normal's density at `x`.
+fn normal_pdf(x: f64) -> f64 {
+    (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt()
+}
+
+/// The standard normal's distribution below `x`.
+fn normal_cdf(x: f64) -> f64 {
+    0.5 * (1.0 + erf(x / std::f64::consts::SQRT_2))
+}
+
+/// The error function, to within two ten-millionths: Abramowitz and
+/// Stegun's 7.1.26.
+fn erf(x: f64) -> f64 {
+    let t = 1.0 / (1.0 + 0.327_591_1 * x.abs());
+    let polynomial = ((((1.061_405_429 * t - 1.453_152_027) * t + 1.421_413_741) * t - 0.284_496_736) * t + 0.254_829_592) * t;
+    (1.0 - polynomial * (-x * x).exp()).copysign(x)
 }
 
 /// The value below which `share` of `values` lie; `None` for none.
@@ -461,12 +704,20 @@ fn blurred(data: &[f32], width: usize, height: usize, taps: &[(isize, isize, f32
     .concat()
 }
 
-/// `data`, `width` by `height`, with the blur `spread` undone by
+/// `data`, `width` by `height`, light, with the blur `spread` undone by
 /// Richardson and Lucy's deconvolution, as the module describes, held
 /// to black and white: on the graphics card ([`super::gpu`]), held to
 /// [`FLOOR`] and above there, fewer rounds where the work is called off.
+/// What a photo stores is undone by [`deconvolved_stored`].
 pub fn deconvolve(data: &[f32], width: usize, height: usize, spread: &Spread) -> Vec<f32> {
     super::gpu::deconvolved(data, width, height, &kernel(spread), ROUNDS, FLOOR)
+}
+
+/// `data`, `width` by `height`, stored as a photo stores it, with the blur
+/// `spread` undone in `light` ([`deconvolve`]), and stored again.
+fn deconvolved_stored(data: &[f32], width: usize, height: usize, spread: &Spread, light: Light) -> Vec<f32> {
+    let lit = into_light(data, width, height, light);
+    stored(super::gpu::deconvolved(&lit, width, height, &kernel(spread), ROUNDS, floor_in(light)), width, height, light)
 }
 
 /// How far a deconvolution reduces an image before it undoes the blur in
@@ -486,6 +737,13 @@ pub struct Reduction {
 /// Most of an image's pixels a step of a reduction spans, short of a
 /// reduction further than one in so many ([`Reduction::for_blur`]).
 const MOST_STEP: usize = 8;
+/// Fewest pixels along its shorter side an image reduced to undo its blur
+/// may come to ([`Reduction::keeps`]): a blur so wide that undoing it would
+/// leave fewer is wider than anything in the image a read could use, and
+/// the image is carried to a whole number of the reduction's steps first,
+/// so that a reduction of one in a hundred thousand once carried a copy
+/// three hundred pixels a side to a hundred thousand a side.
+const LEAST_REDUCED_SIDE: usize = 16;
 
 impl Reduction {
     /// No reduction: the blur is undone where it lies.
@@ -522,6 +780,12 @@ impl Reduction {
     /// The copy's pixels to one of the image's.
     pub fn factor(self) -> f64 {
         self.p as f64 / self.q as f64
+    }
+
+    /// Whether an image `width` by `height` reduced so keeps
+    /// [`LEAST_REDUCED_SIDE`] pixels along its shorter side.
+    fn keeps(self, width: usize, height: usize) -> bool {
+        width.min(height).saturating_mul(self.p) >= LEAST_REDUCED_SIDE.saturating_mul(self.q)
     }
 
     /// The size an image `width` by `height` is carried to before it is
@@ -568,22 +832,26 @@ fn restored(sharp: &[f32], (rw, rh): (usize, usize), reduction: Reduction, (widt
     }
 }
 
-/// `data`, `width` by `height`, reduced by `reduction` ([`reduced`]) and
-/// the blur `at_size`, the blur at the reduced size, undone in it: a step
-/// at a time, each handed the graphics card and taken off it in turn. With
+/// `data`, `width` by `height`, in the light it is worked in, reduced by
+/// `reduction` ([`reduced`]) and the blur `at_size`, the blur at the
+/// reduced size, undone in it, held to `floor` ([`floor_in`]): a step at
+/// a time, each handed the graphics card and taken off it in turn. With
 /// the size it comes to.
-fn reduced_deconvolved(data: &[f32], width: usize, height: usize, at_size: &Spread, reduction: Reduction) -> (Vec<f32>, usize, usize) {
+fn reduced_deconvolved(data: &[f32], width: usize, height: usize, at_size: &Spread, reduction: Reduction, floor: f32) -> (Vec<f32>, usize, usize) {
     let (small, rw, rh) = reduced(data, width, height, reduction);
-    (deconvolve(&small, rw, rh, at_size), rw, rh)
+    (super::gpu::deconvolved(&small, rw, rh, &kernel(at_size), ROUNDS, floor), rw, rh)
 }
 
 /// [`reduced_deconvolved`] of an image on the graphics card, left there:
 /// carried and resized as [`reduced`] carries and resizes it, and
-/// deconvolved as [`deconvolve`] deconvolves it, to the same values.
-fn reduced_deconvolved_on(image: &gpu::Image, at_size: &Spread, reduction: Reduction) -> gpu::Image {
+/// deconvolved as [`reduced_deconvolved`] deconvolves it, down to the
+/// same `floor`, to the same values. Not as [`deconvolve`] deconvolves
+/// an image, which always floors it as light does ([`FLOOR`]): an image
+/// as stored is floored at [`STORED_FLOOR`].
+fn reduced_deconvolved_on(image: &gpu::Image, at_size: &Spread, reduction: Reduction, floor: f32) -> gpu::Image {
     let Reduction { p, q } = reduction;
     let (ew, eh) = reduction.carried(image.width, image.height);
-    image.carried(ew, eh).resized(ew / q * p, eh / q * p).deconvolved(&kernel(at_size), ROUNDS, FLOOR)
+    image.carried(ew, eh).resized(ew / q * p, eh / q * p).deconvolved(&kernel(at_size), ROUNDS, floor)
 }
 
 /// How many of the deconvolution's kernels a part of an image must reach
@@ -610,50 +878,61 @@ pub fn reach(spread: &Spread, strength: f64, reduction: Reduction) -> f64 {
 /// The image `width` by `height`, deblurred: its blur measured, and, when
 /// it is worth undoing ([`LEAST_SPREAD`]), undone at a size that holds it
 /// to [`MOST_SPREAD`] pixels and the copy to `most_pixels`, but never
-/// larger than the image's own size ([`Reduction`]). The copy, covering
+/// larger than the image's own size ([`Reduction`]); in `light`, and the
+/// copy stored again, as the module describes. The copy, covering
 /// what the image covers, with how many times the image's size it is,
 /// and the blur measured carried to that size; `None` where the image
-/// shows no blur worth undoing, or too few edges to measure one.
-pub fn deblurred(data: &[f32], width: usize, height: usize, most_pixels: usize) -> Option<(Vec<f32>, usize, usize, f64, Spread)> {
-    let spread = spread_of(data, width, height)?;
+/// shows no blur worth undoing, or too few edges to measure one, or is
+/// too small to keep [`LEAST_REDUCED_SIDE`] pixels a side reduced as far
+/// as its blur asks.
+pub fn deblurred(data: &[f32], width: usize, height: usize, most_pixels: usize, light: Light) -> Option<(Vec<f32>, usize, usize, f64, Spread)> {
+    let spread = spread_of(data, width, height, light)?;
     let (widest, _) = spread.extremes();
     if widest < LEAST_SPREAD {
         return None;
     }
     let reduction = Reduction::for_blur(widest, width * height, most_pixels, 1.0);
     if reduction == Reduction::NONE {
-        return Some((deconvolve(data, width, height, &spread), width, height, 1.0, spread));
+        return Some((deconvolved_stored(data, width, height, &spread, light), width, height, 1.0, spread));
+    }
+    if !reduction.keeps(width, height) {
+        return None;
     }
     let at_size = spread.scaled(reduction.factor());
-    // As far as the image itself reaches: reduced, undone and cut on the
-    // card, handed it once and taken off it once, where it holds the image
-    // whole; and otherwise a step at a time.
+    let floor = floor_in(light);
+    // As far as the image itself reaches: made light, reduced, undone, cut
+    // and stored again on the card, handed it once and taken off it once,
+    // where it holds the image whole; and otherwise a step at a time.
     let (w, h) = ((width * reduction.p).div_ceil(reduction.q), (height * reduction.p).div_ceil(reduction.q));
-    let sharp = gpu::through(data, (width, height), reduction.carried(width, height), |image| reduced_deconvolved_on(&image, &at_size, reduction).carried(w, h)).unwrap_or_else(|| {
-        let (sharp, rw, _) = reduced_deconvolved(data, width, height, &at_size, reduction);
-        (0..h).flat_map(|y| sharp[y * rw..y * rw + w].iter().copied()).collect()
+    let sharp = gpu::through(data, (width, height), reduction.carried(width, height), |image| {
+        image_stored(reduced_deconvolved_on(&image_into_light(&image, light), &at_size, reduction, floor).carried(w, h), light)
+    })
+    .unwrap_or_else(|| {
+        let (sharp, rw, _) = reduced_deconvolved(&into_light(data, width, height, light), width, height, &at_size, reduction, floor);
+        let cut: Vec<f32> = (0..h).flat_map(|y| sharp[y * rw..y * rw + w].iter().copied()).collect();
+        stored(cut, w, h, light)
     });
     Some((sharp, w, h, reduction.factor(), at_size))
 }
 
 /// How far the image `width` by `height` spreads an edge, in its own
-/// pixels ([`measure`]): measured whole, or, for an image of more than
-/// [`MOST_PIXELS`], over the parts of it that show the most edges
-/// ([`busiest_parts`]), at its own size. `None` where it shows no blur,
-/// or too few edges to say.
-pub fn spread_of(data: &[f32], width: usize, height: usize) -> Option<Spread> {
-    spread_of_values(Values::Cores(data), width, height)
+/// pixels, in `light` ([`measure`]): measured
+/// whole, or, for an image of more than [`MOST_PIXELS`], over the parts
+/// of it that show the most edges ([`busiest_parts`]), at its own size.
+/// `None` where it shows no blur, or too few edges to say.
+pub fn spread_of(data: &[f32], width: usize, height: usize, light: Light) -> Option<Spread> {
+    spread_of_values(Values::Cores(data), width, height, light)
 }
 
 /// [`spread_of`] of an image on the graphics card, or held by the cores.
-fn spread_of_values(image: Values<'_>, width: usize, height: usize) -> Option<Spread> {
+fn spread_of_values(image: Values<'_>, width: usize, height: usize, light: Light) -> Option<Spread> {
     if width * height <= MOST_PIXELS {
-        return measure_of(image, width, height);
+        return measure_of(image, width, height, light);
     }
     if width < 8 || height < 8 {
         return None;
     }
-    measured_over(image, width, height, &busiest_parts(image, width, height))
+    measured_over(image, width, height, &busiest_parts(image, width, height), light)
 }
 
 /// The parts of the image `width` by `height`, squares [`PART_SIDE`]
@@ -685,39 +964,44 @@ fn busiest_parts(image: Values<'_>, width: usize, height: usize) -> Vec<[usize; 
     parts
 }
 
-/// `data`, `width` by `height`, deblurred and at its own size, as the
-/// photo's Deblur filter shows it ([`super::adjust::Filter::Deblur`]):
-/// by `kernel`, where one is given, or by the blur the image shows,
+/// `data`, `width` by `height`, deblurred in `light` and stored again, at
+/// its own size, as the photo's Deblur filter shows it
+/// ([`super::adjust::Filter::Deblur`]): by `kernel`, where one is given,
+/// or by the blur the image shows,
 /// measured over the whole of it, either spread `strength` times as
 /// wide, however little that is, since the filter was asked for; at a
 /// size that holds it to [`MOST_SPREAD`] pixels and the copy to
 /// [`MOST_READ_PIXELS`] ([`Reduction`]), and enlarged back. With the deblurred
 /// image, the spread before its strength: `None`, and the image as it
-/// is, where it shows no blur, or too few edges to measure one; and the
+/// is, where it shows no blur, or too few edges to measure one, or a blur
+/// too wide to undo in so few pixels ([`LEAST_REDUCED_SIDE`]); and the
 /// image as it is at a strength of nought.
-pub fn undone_by(data: &[f32], width: usize, height: usize, kernel: Option<Spread>, strength: f64) -> (Vec<f32>, Option<Spread>) {
-    undone_within(data, width, height, kernel, strength, width * height)
+pub fn undone_by(data: &[f32], width: usize, height: usize, kernel: Option<Spread>, strength: f64, light: Light) -> (Vec<f32>, Option<Spread>) {
+    undone_within(data, width, height, kernel, strength, (width, height), light)
 }
 
-/// [`undone_by`] of an image that is a part of one of `whole` pixels, as
-/// the whole is deblurred: reduced as far as the whole is, on the grid
+/// [`undone_by`] of an image that is a part of one `whole` pixels across
+/// and down, as the whole is deblurred: reduced as far as the whole is, on the grid
 /// the whole is reduced on where the part begins a whole number of the
 /// reduction's steps into it ([`Reduction`]), so that, given as much of
 /// the whole about it as the deconvolution reads ([`reach`]), it comes
 /// out as the whole does there.
-pub fn undone_within(data: &[f32], width: usize, height: usize, kernel: Option<Spread>, strength: f64, whole: usize) -> (Vec<f32>, Option<Spread>) {
-    match undoing(kernel, strength, whole, || spread_of(data, width, height)) {
+pub fn undone_within(data: &[f32], width: usize, height: usize, kernel: Option<Spread>, strength: f64, whole: (usize, usize), light: Light) -> (Vec<f32>, Option<Spread>) {
+    match undoing(kernel, strength, whole, || spread_of(data, width, height, light)) {
         Undoing::Nothing(spread) => (data.to_vec(), spread),
-        Undoing::Undo { spread, undone, reduction: Reduction::NONE } => (deconvolve(data, width, height, &undone), Some(spread)),
+        Undoing::Undo { spread, undone, reduction: Reduction::NONE } => (deconvolved_stored(data, width, height, &undone, light), Some(spread)),
         Undoing::Undo { spread, undone, reduction } => {
-            // Reduced, undone and brought back on the card, handed it once
-            // and taken off it once, where it holds the image whole; and
-            // otherwise a step at a time.
-            let at_size = undone.scaled(reduction.factor());
+            // Made light, reduced, undone, brought back and stored again on
+            // the card, handed it once and taken off it once, where it holds
+            // the image whole; and otherwise a step at a time.
+            let (at_size, floor) = (undone.scaled(reduction.factor()), floor_in(light));
             let carried = reduction.carried(width, height);
-            let sharp = gpu::through(data, (width, height), carried, |image| reduced_deconvolved_on(&image, &at_size, reduction).resized_part(carried, (width, height))).unwrap_or_else(|| {
-                let (sharp, rw, rh) = reduced_deconvolved(data, width, height, &at_size, reduction);
-                restored(&sharp, (rw, rh), reduction, (width, height))
+            let sharp = gpu::through(data, (width, height), carried, |image| {
+                image_stored(reduced_deconvolved_on(&image_into_light(&image, light), &at_size, reduction, floor).resized_part(carried, (width, height)), light)
+            })
+            .unwrap_or_else(|| {
+                let (sharp, rw, rh) = reduced_deconvolved(&into_light(data, width, height, light), width, height, &at_size, reduction, floor);
+                stored(restored(&sharp, (rw, rh), reduction, (width, height)), width, height, light)
             });
             (sharp, Some(spread))
         }
@@ -728,16 +1012,19 @@ pub fn undone_within(data: &[f32], width: usize, height: usize, kernel: Option<S
 /// same steps and the same kernels, to the same values ([`gpu::Image`]).
 /// The blur it shows, where no kernel is `given`, is measured there too,
 /// and the image is not taken off the card.
-pub(crate) fn undone_on(image: &gpu::Image, given: Option<Spread>, strength: f64, whole: usize) -> (gpu::Image, Option<Spread>) {
+pub(crate) fn undone_on(image: &gpu::Image, given: Option<Spread>, strength: f64, whole: (usize, usize), light: Light) -> (gpu::Image, Option<Spread>) {
     let (width, height) = (image.width, image.height);
-    match undoing(given, strength, whole, || spread_of_values(Values::Card(image), width, height)) {
+    let floor = floor_in(light);
+    match undoing(given, strength, whole, || spread_of_values(Values::Card(image), width, height, light)) {
         Undoing::Nothing(spread) => (image.clone(), spread),
-        Undoing::Undo { spread, undone, reduction: Reduction::NONE } => (image.deconvolved(&kernel(&undone), ROUNDS, FLOOR), Some(spread)),
+        Undoing::Undo { spread, undone, reduction: Reduction::NONE } => {
+            (image_stored(image_into_light(image, light).deconvolved(&kernel(&undone), ROUNDS, floor), light), Some(spread))
+        }
         Undoing::Undo { spread, undone, reduction } => {
             // Brought back as [`restored`] brings it: enlarged to the size
             // it was carried to, of which only the image's own is made.
-            let sharp = reduced_deconvolved_on(image, &undone.scaled(reduction.factor()), reduction);
-            (sharp.resized_part(reduction.carried(width, height), (width, height)), Some(spread))
+            let sharp = reduced_deconvolved_on(&image_into_light(image, light), &undone.scaled(reduction.factor()), reduction, floor);
+            (image_stored(sharp.resized_part(reduction.carried(width, height), (width, height)), light), Some(spread))
         }
     }
 }
@@ -746,8 +1033,8 @@ pub(crate) fn undone_on(image: &gpu::Image, given: Option<Spread>, strength: f64
 /// touched ([`undoing`]).
 enum Undoing {
     /// Nothing: no blur shown, with too few edges to measure one, or one
-    /// so faint as next to none at the strength asked for; and the blur,
-    /// where there was one.
+    /// too wide to undo in so few pixels; or one so faint as next to none
+    /// at the strength asked for, and the blur, before its strength.
     Nothing(Option<Spread>),
     /// The blur `spread`, `undone` as far as the strength asks, at
     /// `reduction`.
@@ -756,21 +1043,34 @@ enum Undoing {
 
 /// What undoing the blur `given`, or that `measured` gives where none is
 /// given, `strength` times as wide, comes to in an image that is a part of
-/// one of `whole` pixels.
-fn undoing(given: Option<Spread>, strength: f64, whole: usize, measured: impl FnOnce() -> Option<Spread>) -> Undoing {
+/// one `whole` pixels across and down.
+fn undoing(given: Option<Spread>, strength: f64, (whole_width, whole_height): (usize, usize), measured: impl FnOnce() -> Option<Spread>) -> Undoing {
     let Some(spread) = given.or_else(measured) else { return Undoing::Nothing(None) };
     let undone = spread.scaled(strength.max(0.0));
     let (widest, _) = undone.extremes();
     if widest <= 0.0 || !widest.is_finite() {
         return Undoing::Nothing(Some(spread));
     }
-    Undoing::Undo { spread, undone, reduction: Reduction::for_blur(widest, whole, MOST_READ_PIXELS, 1.0) }
+    // An image undone at its own size is undone however small, as
+    // [`deblurred`] undoes one; only a reduction may leave too little, and
+    // then no blur is undone, and none said to be: the filter once showed
+    // the blur as undone over the image left as it was. A copy of it
+    // enlarged does no better, the reduction taking the copy back down to
+    // as few pixels as the blur grew wider. Its shorter side is the
+    // whole's own, as [`deblurred`] takes it: it was once taken as the
+    // side of a square of as many pixels, and a strip of a photo six
+    // thousand pixels by twenty was reduced to a copy four rows tall.
+    let reduction = Reduction::for_blur(widest, whole_width * whole_height, MOST_READ_PIXELS, 1.0);
+    if reduction != Reduction::NONE && !reduction.keeps(whole_width, whole_height) {
+        return Undoing::Nothing(None);
+    }
+    Undoing::Undo { spread, undone, reduction }
 }
 
 /// `data`, `width` by `height`, deblurred by the blur it shows, at full
-/// strength ([`undone_by`]).
-pub fn undone(data: &[f32], width: usize, height: usize) -> Vec<f32> {
-    undone_by(data, width, height, None, 1.0).0
+/// strength, in `light` ([`undone_by`]).
+pub fn undone(data: &[f32], width: usize, height: usize, light: Light) -> Vec<f32> {
+    undone_by(data, width, height, None, 1.0, light).0
 }
 
 #[cfg(test)]
@@ -789,19 +1089,111 @@ mod tests {
     }
 
     #[test]
+    fn a_dithered_grey_is_given_no_blur_wider_than_its_edges_say() {
+        // A grey dithered to checks a pixel apart, and to one dark pixel in
+        // four, as a print made in black alone or a screenshot of one lays
+        // it down: the first once measured as a blur a hundred thousand
+        // pixels wide, and the copy it was undone in as a hundred thousand
+        // a side, which the card could not hold; the second ran the
+        // processor out of memory carrying it.
+        let checks = |size: usize, dark: &dyn Fn(usize, usize) -> bool| -> Vec<f32> {
+            (0..size * size).map(|i| if dark(i % size, i / size) { 0.0 } else { 1.0 }).collect()
+        };
+        for size in [300, 1200] {
+            for (name, image) in [
+                ("checks", checks(size, &|x, y| (x + y) % 2 == 0)),
+                ("one in four", checks(size, &|x, y| x % 2 == 0 && y % 2 == 0)),
+            ] {
+                if let Some(spread) = measure(&image, size, size, Light::Linear) {
+                    assert!(spread.extremes().0 < 64.0, "{name} at {size}: {spread:?}");
+                }
+                if let Some((_, w, h, _, _)) = deblurred(&image, size, size, MOST_PIXELS, Light::Linear) {
+                    assert!(w <= size && h <= size && w.min(h) >= LEAST_REDUCED_SIDE, "{name} at {size}: {w} by {h}");
+                }
+            }
+        }
+        // However wide a blur is given, the copy it is undone in keeps some
+        // pixels, or it is not undone.
+        assert!(!Reduction::for_blur(1e5, 300 * 300, MOST_PIXELS, 1.0).keeps(300, 300));
+        assert!(Reduction::for_blur(16.0, 300 * 300, MOST_PIXELS, 1.0).keeps(300, 300));
+    }
+
+    /// `data` blurred by `taps` in the light its values stand for, as a
+    /// lens blurs what it photographs, and stored again.
+    fn blurred_in_light(data: &[f32], width: usize, height: usize, taps: &[(isize, isize, f32)]) -> Vec<f32> {
+        use crate::imaging::sample::{encoded_light, linear_light};
+        let light: Vec<f32> = data.iter().map(|&v| linear_light(v)).collect();
+        blurred(&light, width, height, taps).into_iter().map(encoded_light).collect()
+    }
+
+    #[test]
     fn a_blur_is_measured_as_it_was_laid() {
         let (size, cell) = (240, 8);
         let sharp = squares(size, cell);
-        assert_eq!(measure(&sharp, size, size), None, "a sharp field shows no spread");
+        assert_eq!(measure(&sharp, size, size, Light::Linear), None, "a sharp field shows no spread");
         for sigma in [2.0, 3.0] {
-            let blurred_image = blurred(&sharp, size, size, &kernel(&Spread::round(sigma)));
-            let (widest, narrowest) = measure(&blurred_image, size, size).unwrap().extremes();
+            let blurred_image = blurred_in_light(&sharp, size, size, &kernel(&Spread::round(sigma)));
+            let (widest, narrowest) = measure(&blurred_image, size, size, Light::Linear).unwrap().extremes();
             assert!((widest - sigma).abs() < 0.35 * sigma && (narrowest - sigma).abs() < 0.35 * sigma, "{sigma}: {widest} by {narrowest}");
         }
         // A shake across: wide that way, and narrow down.
-        let shaken = blurred(&sharp, size, size, &kernel(&Spread { xx: 9.0, xy: 0.0, yy: 0.36 }));
-        let spread = measure(&shaken, size, size).unwrap();
+        let shaken = blurred_in_light(&sharp, size, size, &kernel(&Spread { xx: 9.0, xy: 0.0, yy: 0.36 }));
+        let spread = measure(&shaken, size, size, Light::Linear).unwrap();
         assert!(spread.xx > 4.0 * spread.yy, "{spread:?}");
+    }
+
+    #[test]
+    fn a_blur_laid_as_stored_is_measured_and_undone_as_stored() {
+        // A blur a program laid on the values it stores, as one blurs an
+        // image, or as a photo inverted for its light symbol shows a lens's
+        // blur: worked as stored, it is measured as laid, and undone with
+        // no turn into light and back; taken as light, its edges read
+        // otherwise.
+        let (size, cell) = (240, 8);
+        let sharp = squares(size, cell);
+        let sigma = 2.0;
+        let soft = blurred(&sharp, size, size, &kernel(&Spread::round(sigma)));
+        let (widest, narrowest) = measure(&soft, size, size, Light::Encoded).unwrap().extremes();
+        assert!((widest - sigma).abs() < 0.35 * sigma && (narrowest - sigma).abs() < 0.35 * sigma, "{widest} by {narrowest}");
+        assert_ne!(measure(&soft, size, size, Light::Linear), measure(&soft, size, size, Light::Encoded));
+        let given = Spread::round(sigma);
+        let undone = undone_by(&soft, size, size, Some(given), 1.0, Light::Encoded).0;
+        assert_eq!(undone, super::gpu::deconvolved(&soft, size, size, &kernel(&given), ROUNDS, STORED_FLOOR));
+        assert_ne!(undone, undone_by(&soft, size, size, Some(given), 1.0, Light::Linear).0);
+    }
+
+    #[test]
+    fn an_image_too_small_to_reduce_is_undone_at_its_own_size() {
+        // Fifteen pixels a side, short of the least side a reduction keeps:
+        // undone at its own size, it keeps them all, and the filter undoes
+        // it as a copy is undone. It was once left as it was, its blur
+        // said to be undone all the same.
+        let size = 15;
+        assert!(size < LEAST_REDUCED_SIDE);
+        let given = Spread::round(1.0);
+        let soft = blurred(&squares(size, 3), size, size, &kernel(&given));
+        for light in [Light::Linear, Light::Encoded] {
+            let (undone, spread) = undone_by(&soft, size, size, Some(given), 1.0, light);
+            assert_eq!(spread, Some(given));
+            assert_eq!(undone, deconvolved_stored(&soft, size, size, &given, light), "{light:?}");
+            assert_ne!(undone, soft, "{light:?}");
+        }
+        // A blur so wide that the copy reduced for it would keep too few
+        // pixels is not undone, and no blur is said to be: it was once
+        // said to be undone over the image left as it was.
+        let (size, given) = (60, Spread::round(10.0));
+        let reduction = Reduction::for_blur(10.0, size * size, MOST_READ_PIXELS, 1.0);
+        assert!(reduction != Reduction::NONE && !reduction.keeps(size, size));
+        let soft = blurred(&squares(size, 6), size, size, &kernel(&given));
+        for light in [Light::Linear, Light::Encoded] {
+            assert_eq!(undone_by(&soft, size, size, Some(given), 1.0, light), (soft.clone(), None), "{light:?}");
+        }
+        // Nor in a part of a whole too narrow for it, however many pixels
+        // the whole holds: a strip six thousand pixels by twenty, reduced
+        // to a fifth, keeps four rows. Taken for a square of as many
+        // pixels, three hundred and forty-six a side, it once kept enough.
+        let undoes = |whole| matches!(undoing(Some(given), 1.0, whole, || None), Undoing::Undo { reduction: Reduction { p: 1, q: 5 }, .. });
+        assert!(!undoes((6000, 20)) && undoes((346, 346)));
     }
 
     #[test]
@@ -842,12 +1234,12 @@ mod tests {
         // asked for, undoes it all the same, by the blur it measures,
         // which it gives back.
         let little = blurred(&sharp, size, size, &kernel(&Spread::round(0.8)));
-        assert!(deblurred(&little, size, size, MOST_READ_PIXELS).is_none(), "a read leaves it");
-        let (undone, measured) = undone_by(&little, size, size, None, 1.0);
+        assert!(deblurred(&little, size, size, MOST_READ_PIXELS, Light::Linear).is_none(), "a read leaves it");
+        let (undone, measured) = undone_by(&little, size, size, None, 1.0, Light::Linear);
         let measured = measured.expect("edges enough to measure");
         assert!(measured.extremes().0 < LEAST_SPREAD, "{:?}", measured.extremes());
-        assert_eq!(undone, deconvolve(&little, size, size, &measured));
-        assert_eq!(super::undone(&little, size, size), undone);
+        assert_eq!(undone, deconvolved_stored(&little, size, size, &measured, Light::Linear));
+        assert_eq!(super::undone(&little, size, size, Light::Linear), undone);
         // A kernel given is undone in place of what the image shows, and
         // given back as it was; so many times as wide as the strength
         // asks; and at a strength of nought, not at all.
@@ -855,23 +1247,23 @@ mod tests {
         let wide = blurred(&sharp, size, size, &kernel(&spread));
         let given = Spread { xx: 1.2, xy: 0.3, yy: 0.8 };
         assert!(given.scaled(1.5).extremes().0 <= MOST_SPREAD, "undone at the image's own size");
-        assert_eq!(undone_by(&wide, size, size, Some(given), 1.0), (deconvolve(&wide, size, size, &given), Some(given)));
-        assert_eq!(undone_by(&wide, size, size, Some(given), 1.5).0, deconvolve(&wide, size, size, &given.scaled(1.5)));
-        assert_eq!(undone_by(&wide, size, size, Some(given), 0.0), (wide.clone(), Some(given)));
+        assert_eq!(undone_by(&wide, size, size, Some(given), 1.0, Light::Linear), (deconvolved_stored(&wide, size, size, &given, Light::Linear), Some(given)));
+        assert_eq!(undone_by(&wide, size, size, Some(given), 1.5, Light::Linear).0, deconvolved_stored(&wide, size, size, &given.scaled(1.5), Light::Linear));
+        assert_eq!(undone_by(&wide, size, size, Some(given), 0.0, Light::Linear), (wide.clone(), Some(given)));
         // The further, the sharper the squares' middles read.
         let far = |image: &[f32]| {
             let middles: Vec<f32> = (0..size / cell).flat_map(|cy| (0..size / cell).map(move |cx| (cy * cell + cell / 2) * size + cx * cell + cell / 2)).map(|i| (image[i] - 0.5).abs()).collect();
             middles.iter().sum::<f32>() / middles.len() as f32
         };
-        let fars: Vec<f32> = [0.0, 0.5, 1.0].iter().map(|&strength| far(&undone_by(&wide, size, size, Some(spread), strength).0)).collect();
+        let fars: Vec<f32> = [0.0, 0.5, 1.0].iter().map(|&strength| far(&undone_by(&wide, size, size, Some(spread), strength, Light::Linear).0)).collect();
         assert!(fars.windows(2).all(|pair| pair[0] < pair[1]), "{fars:?}");
         // With no edges to measure a blur off, the image as it is: of a
         // single grey, however its rounding leaves its pixels, a few
         // millionths apart, which the gradient reads as edges of no width.
         for grey in [0.6f32, 128.0 / 255.0, 0.5] {
             let flat = vec![grey; 64 * 64];
-            assert_eq!(measure(&flat, 64, 64), None, "{grey}");
-            assert_eq!(undone_by(&flat, 64, 64, None, 1.0), (flat.clone(), None), "{grey}");
+            assert_eq!(measure(&flat, 64, 64, Light::Linear), None, "{grey}");
+            assert_eq!(undone_by(&flat, 64, 64, None, 1.0, Light::Linear), (flat.clone(), None), "{grey}");
         }
     }
 
@@ -932,10 +1324,10 @@ mod tests {
     fn a_large_image_is_measured_at_its_own_size() {
         // A page of grainy paper, larger than is measured whole, with a
         // patch of squares six pixels a side blurred by three. Reduced to
-        // the pixels a measure takes, the squares come to two pixels and
-        // their blur to one, and the measure reads next to nothing; the
-        // parts of the page with the most edges, measured at its own
-        // size, read the blur as the patch alone does.
+        // the pixels a measure takes, the squares come to three pixels and
+        // their blur to one and a half, and the measure reads under two
+        // thirds of it; the parts of the page with the most edges,
+        // measured at its own size, read the blur as the patch alone does.
         let (w, h) = (2600, 2400);
         assert!(w * h > MOST_PIXELS);
         let (pw, ph, cell) = (900, 700, 6);
@@ -945,7 +1337,7 @@ mod tests {
                 if (x * 7 + y * 13 + x * y) % 3 == 0 { 0.1 } else { 0.9 }
             })
             .collect();
-        let patch = blurred(&squares, pw, ph, &kernel(&Spread::round(3.0)));
+        let patch = blurred_in_light(&squares, pw, ph, &kernel(&Spread::round(3.0)));
         let mut grain = 0x9E37_79B9u64;
         let mut page: Vec<f32> = (0..w * h)
             .map(|_| {
@@ -959,13 +1351,13 @@ mod tests {
         for y in 0..ph {
             page[(py + y) * w + px..(py + y) * w + px + pw].copy_from_slice(&patch[y * pw..(y + 1) * pw]);
         }
-        let alone = measure(&patch, pw, ph).expect("the patch shows its blur").extremes().0;
-        let widest = spread_of(&page, w, h).expect("the page shows the patch's blur").extremes().0;
+        let alone = measure(&patch, pw, ph, Light::Linear).expect("the patch shows its blur").extremes().0;
+        let widest = spread_of(&page, w, h, Light::Linear).expect("the page shows the patch's blur").extremes().0;
         assert!((widest - alone).abs() < 0.1 * alone, "{widest} against {alone} for the patch alone");
         let times = (MOST_PIXELS as f64 / (w * h) as f64).sqrt();
         let (rw, rh) = ((w as f64 * times).round() as usize, (h as f64 * times).round() as usize);
-        let reduced = measure(&resize(&page, w, h, 1, rw, rh), rw, rh);
-        assert!(reduced.is_none_or(|spread| spread.extremes().0 / times < 0.5 * alone), "{reduced:?} reduced");
+        let reduced = measure(&resize(&page, w, h, 1, rw, rh), rw, rh, Light::Linear);
+        assert!(reduced.is_none_or(|spread| spread.extremes().0 / times < 0.7 * alone), "{reduced:?} reduced");
     }
 
     #[test]
@@ -989,9 +1381,9 @@ mod tests {
         for y in 0..side {
             page[(500 + y) * w + 500..(500 + y) * w + 500 + side].copy_from_slice(&field[y * side..(y + 1) * side]);
         }
-        let alone = measure(&field, side, side).expect("the field shows its blur").extremes().0;
-        assert!(measure(&page, w, h).is_none(), "measured whole, the grain hides it");
-        let widest = spread_of(&page, w, h).expect("the page shows the field's blur").extremes().0;
+        let alone = measure(&field, side, side, Light::Linear).expect("the field shows its blur").extremes().0;
+        assert!(measure(&page, w, h, Light::Linear).is_none(), "measured whole, the grain hides it");
+        let widest = spread_of(&page, w, h, Light::Linear).expect("the page shows the field's blur").extremes().0;
         assert!((widest - alone).abs() < 0.1 * alone, "{widest} against {alone} for the field alone");
     }
 
@@ -1002,7 +1394,7 @@ mod tests {
         // fitted on, which once gave a spread all the same.
         let (size, side) = (40, 4);
         let dot: Vec<f32> = (0..size * size).map(|i| if (18..18 + side).contains(&(i % size)) && (18..18 + side).contains(&(i / size)) { 0.1 } else { 0.9 }).collect();
-        assert_eq!(measure(&blurred(&dot, size, size, &kernel(&Spread::round(1.5))), size, size), None);
+        assert_eq!(measure(&blurred(&dot, size, size, &kernel(&Spread::round(1.5))), size, size, Light::Linear), None);
     }
 
     #[test]
@@ -1043,11 +1435,11 @@ mod tests {
         };
         for normals in [[5.0, 20.0, 35.0], [2.0, 10.0, 20.0]] {
             let image = grainy(blurred(&stripes(normals), w, h, &kernel(&Spread::round(2.5))));
-            let (widest, narrowest) = measure(&image, w, h).expect("edges enough").extremes();
+            let (widest, narrowest) = measure(&image, w, h, Light::Linear).expect("edges enough").extremes();
             assert!(widest == narrowest && (widest - 2.5).abs() < 0.35 * 2.5, "{normals:?}: {widest} by {narrowest}");
         }
         let image = grainy(blurred(&stripes([0.0, 45.0, 90.0]), w, h, &kernel(&Spread::round(2.5))));
-        let (widest, narrowest) = measure(&image, w, h).expect("edges enough").extremes();
+        let (widest, narrowest) = measure(&image, w, h, Light::Linear).expect("edges enough").extremes();
         assert!(widest < 1.2 * narrowest && (widest - 2.5).abs() < 0.35 * 2.5, "a quarter turn: {widest} by {narrowest}");
     }
 
@@ -1061,15 +1453,17 @@ mod tests {
         // strength of nought.
         let wide = Spread { xx: 9.0, xy: 1.0, yy: 6.0 };
         assert!(Reduction::for_blur(wide.extremes().0, w * h, MOST_READ_PIXELS, 1.0).q > 1);
-        for (given, strength) in [(None, 1.0), (Some(Spread::round(1.5)), 1.0), (Some(wide), 1.0), (Some(Spread::round(2.0)), 0.0)] {
-            let (handed, spread) = undone_within(&data, w, h, given, strength, w * h);
-            let (on, on_spread) = undone_on(&card, given, strength, w * h);
-            assert_eq!(on_spread, spread, "{given:?} at {strength}");
-            assert!(on.read() == handed, "{given:?} at {strength}");
+        for light in [Light::Linear, Light::Encoded] {
+            for (given, strength) in [(None, 1.0), (Some(Spread::round(1.5)), 1.0), (Some(wide), 1.0), (Some(Spread::round(2.0)), 0.0)] {
+                let (handed, spread) = undone_within(&data, w, h, given, strength, (w, h), light);
+                let (on, on_spread) = undone_on(&card, given, strength, (w, h), light);
+                assert_eq!(on_spread, spread, "{given:?} at {strength} {light:?}");
+                assert!(on.read() == handed, "{given:?} at {strength} {light:?}");
+            }
         }
         // With no edges to measure a blur off, as it is.
         let flat = vec![0.6f32; 64 * 64];
-        let (on, spread) = undone_on(&gpu::Image::handed(&flat, 64, 64), None, 1.0, 64 * 64);
+        let (on, spread) = undone_on(&gpu::Image::handed(&flat, 64, 64), None, 1.0, (64, 64), Light::Linear);
         assert_eq!((on.read(), spread), (flat, None));
     }
 
@@ -1081,12 +1475,12 @@ mod tests {
         let at_size = Spread::round(1.4);
         for reduction in [Reduction { p: 1, q: 2 }, Reduction { p: 2, q: 3 }, Reduction { p: 1, q: 5 }] {
             let carried = reduction.carried(w, h);
-            let (stepped, rw, rh) = reduced_deconvolved(&data, w, h, &at_size, reduction);
+            let (stepped, rw, rh) = reduced_deconvolved(&data, w, h, &at_size, reduction, FLOOR);
             // Reduced and undone, as a search's copy is deblurred.
-            let card = gpu::through(&data, (w, h), carried, |image| reduced_deconvolved_on(&image, &at_size, reduction)).expect("on the card");
+            let card = gpu::through(&data, (w, h), carried, |image| reduced_deconvolved_on(&image, &at_size, reduction, FLOOR)).expect("on the card");
             assert!(card == stepped, "{reduction:?}");
             // And brought back, as the photo's Deblur filter is.
-            let card = gpu::through(&data, (w, h), carried, |image| reduced_deconvolved_on(&image, &at_size, reduction).resized_part(carried, (w, h))).expect("on the card");
+            let card = gpu::through(&data, (w, h), carried, |image| reduced_deconvolved_on(&image, &at_size, reduction, FLOOR).resized_part(carried, (w, h))).expect("on the card");
             assert!(card == restored(&stepped, (rw, rh), reduction, (w, h)), "{reduction:?} brought back");
         }
     }
@@ -1120,14 +1514,14 @@ mod tests {
         let spread = Spread { xx: 9.0, xy: 1.0, yy: 6.0 };
         let reduction = Reduction::for_blur(spread.extremes().0, size * size, MOST_READ_PIXELS, 1.0);
         assert!(reduction.q > 1, "{reduction:?}");
-        let whole = undone_by(&image, size, size, Some(spread), 1.0).0;
+        let whole = undone_by(&image, size, size, Some(spread), 1.0, Light::Linear).0;
         let pad = reach(&spread, 1.0, reduction).ceil() as usize;
         let wanted = [100, 90, 180, 170];
         let differs = |x0: usize, y0: usize| {
             let part = [x0, y0, (wanted[2] + pad).min(size), (wanted[3] + pad).min(size)];
             let (w, h) = (part[2] - part[0], part[3] - part[1]);
             let pixels: Vec<f32> = (part[1]..part[3]).flat_map(|y| image[y * size + part[0]..y * size + part[2]].iter().copied()).collect();
-            let undone = undone_within(&pixels, w, h, Some(spread), 1.0, size * size).0;
+            let undone = undone_within(&pixels, w, h, Some(spread), 1.0, (size, size), Light::Linear).0;
             (wanted[1]..wanted[3])
                 .flat_map(|y| (wanted[0]..wanted[2]).map(move |x| (x, y)))
                 .map(|(x, y)| (undone[(y - part[1]) * w + x - part[0]] - whole[y * size + x]).abs())
@@ -1263,18 +1657,39 @@ mod tests {
                             }
                             let (cx, cy) = (x as f64 + 0.5, y as f64 + 0.5);
                             let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-                            let steps = reach.ceil() as i64;
+                            let steps = (4.0 * reach).ceil() as i64;
+                            let at = |k: i64| read.light(cx + ux * k as f64 * reach / steps.max(1) as f64, cy + uy * k as f64 * reach / steps.max(1) as f64);
                             for k in -steps..=steps {
-                                let t = k as f64 * reach / steps.max(1) as f64;
-                                let v = read.light(cx + ux * t, cy + uy * t);
+                                let v = at(k);
                                 lo = lo.min(v);
                                 hi = hi.max(v);
                             }
                             if hi - lo < least_step {
                                 continue;
                             }
+                            // Outwards each way as far as the light turns back.
+                            let fall = TURN_SHARE * (hi - lo);
+                            let outwards = |sign: i64| {
+                                let (mut extreme, mut out, mut turned) = (at(0), 0, false);
+                                for k in 1..=steps {
+                                    let v = at(sign * k);
+                                    if (v - extreme) * sign as f32 > 0.0 {
+                                        (extreme, out) = (v, k);
+                                    } else if (extreme - v) * sign as f32 > fall {
+                                        turned = true;
+                                        break;
+                                    }
+                                }
+                                (extreme, (out as f64 * reach / steps.max(1) as f64) as f32, turned)
+                            };
+                            let ((lightest, beyond, far), (darkest, before, near)) = (outwards(1), outwards(-1));
+                            if lightest - darkest < least_step {
+                                continue;
+                            }
+                            let crossing = gpu::edges::Crossing { width: (lightest - darkest) / g, across: [ux as f32, uy as f32], out: [beyond, before], turned: [far, near] };
+                            let Some(w) = alone(&crossing).filter(|&w| w <= 2.0 * MOST_REACH + 2.0) else { continue };
                             let direction = uy.atan2(ux).rem_euclid(std::f64::consts::PI);
-                            out.push((f64::from((hi - lo) / g), direction));
+                            out.push((w, direction));
                         }
                     }
                     out
@@ -1288,7 +1703,7 @@ mod tests {
             let mut measured = widths(reach);
             for _ in 0..2 {
                 let typical = narrowest_share(measured.iter().map(|w| w.0).collect(), 0.5)?;
-                let wider = (1.3 * typical).clamp(4.0, 48.0);
+                let wider = (1.5 * typical).clamp(4.0, MOST_REACH);
                 if (wider - reach).abs() < 1.0 {
                     break;
                 }
@@ -1325,13 +1740,16 @@ mod tests {
             let round_again = rows.first().zip(rows.last()).map(|(first, last)| DIRECTIONS + first.0 - last.0);
             let fan = gaps.chain(round_again).max().map_or(0, |widest| DIRECTIONS - widest);
             let some = |spread: Spread| (spread.extremes().0 >= KERNEL_LEAST).then_some(spread);
-            if rows.len() < 3 || fan < LEAST_FAN {
-                // Too few directions, or too narrow a fan of them, to tell a
-                // shape: the same every way.
+            let round = || {
                 let all: Vec<f64> = measured.iter().map(|w| w.0).collect();
                 let w = narrowest_share(all, NARROWEST)?;
                 let variance = w * w / (2.0 * std::f64::consts::PI) - OWN_VARIANCE;
-                return (variance > 0.0).then(|| Spread::round(variance.sqrt())).and_then(some);
+                (variance > 0.0).then(|| Spread::round(variance.sqrt())).and_then(some)
+            };
+            if rows.len() < 3 || fan < LEAST_FAN {
+                // Too few directions, or too narrow a fan of them, to tell a
+                // shape: the same every way.
+                return round();
             }
             // Least squares, each direction weighed by its edges.
             let mut a = [[0.0f64; 3]; 3];
@@ -1352,6 +1770,10 @@ mod tests {
             let (big, small) = ((mean + half).max(0.0), (mean - half).max(0.0));
             if big <= 0.0 {
                 return None;
+            }
+            // A fit run off past twice the widest direction measured.
+            if big > 2.0 * rows.iter().map(|row| row.2).fold(0.0, f64::max) {
+                return round();
             }
             // The eigenvalues held at nought and above, the axes kept.
             let angle = 0.5 * (2.0 * spread.xy).atan2(spread.xx - spread.yy);
@@ -1411,12 +1833,14 @@ mod tests {
             parts
         }
 
-        /// `spread_of` on the cores.
-        pub(super) fn spread_of(data: &[f32], width: usize, height: usize) -> Option<Spread> {
+        /// `spread_of` on the cores: the busiest parts as stored, and their
+        /// edges in `light`.
+        pub(super) fn spread_of(data: &[f32], width: usize, height: usize, light: Light) -> Option<Spread> {
+            let light: Vec<f32> = data.iter().map(|&v| light.from_encoded(v)).collect();
             if width * height <= MOST_PIXELS {
-                return measured_over(data, width, height, &[[0, 0, width, height]]);
+                return measured_over(&light, width, height, &[[0, 0, width, height]]);
             }
-            measured_over(data, width, height, &busiest_parts(data, width, height))
+            measured_over(&light, width, height, &busiest_parts(data, width, height))
         }
     }
 
@@ -1439,11 +1863,13 @@ mod tests {
             (grainy(blurred(&squares(1400, 11)[..1400 * 1200], 1400, 1200, &kernel(&Spread::round(2.6)))), 1400, 1200),
         ];
         for (data, w, h) in cases {
-            let (card, cores) = (spread_of(&data, w, h).expect("a blur shown"), on_cores::spread_of(&data, w, h).expect("a blur shown"));
-            let ((cw, cn), (rw, rn)) = (card.extremes(), cores.extremes());
-            assert!((cw - rw).abs() < 0.01 * rw && (cn - rn).abs() < 0.01 * rw, "{w} by {h}: {card:?} against {cores:?}");
-            let on_card = gpu::Image::handed(&data, w, h);
-            assert_eq!(spread_of_values(Values::Card(&on_card), w, h), Some(card), "measured where it lies on the card");
+            for light in [Light::Linear, Light::Encoded] {
+                let (card, cores) = (spread_of(&data, w, h, light).expect("a blur shown"), on_cores::spread_of(&data, w, h, light).expect("a blur shown"));
+                let ((cw, cn), (rw, rn)) = (card.extremes(), cores.extremes());
+                assert!((cw - rw).abs() < 0.01 * rw && (cn - rn).abs() < 0.01 * rw, "{w} by {h} {light:?}: {card:?} against {cores:?}");
+                let on_card = gpu::Image::handed(&data, w, h);
+                assert_eq!(spread_of_values(Values::Card(&on_card), w, h, light), Some(card), "measured where it lies on the card");
+            }
         }
     }
 }

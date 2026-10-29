@@ -55,8 +55,16 @@ pub struct Luma {
     /// The blur the photo's Deblur filter undid, in the image's pixels
     /// and before its strength ([`adjust::Adjust::strength`]): the one
     /// set for it, or the one measured over the image; `None` where it
-    /// measured none, and left the image as it was.
+    /// measured none, or one too wide to undo in the image's pixels, and
+    /// left the image as it was.
     pub deblurred: Option<deblur::Spread>,
+    /// The light the image was made in ([`adjust::Adjust::light`]): as
+    /// light, it was enlarged or reduced, straightened and sharpened as
+    /// the light its values stand for, and so is every copy made of it
+    /// ([`Self::resized`], [`enhance::Enhanced`]), and its modules are
+    /// read as light ([`sample::Light`]). Its values are
+    /// stored as a photo stores them either way.
+    pub light: sample::Light,
 }
 
 /// The photo as loaded about the part of it an image is of, in its
@@ -126,8 +134,14 @@ const PIXELS_AT_ONCE: usize = 48_000_000;
 
 impl Luma {
     pub fn new(width: usize, height: usize, data: Vec<f32>) -> Self {
+        Self::new_in(width, height, data, sample::Light::Encoded)
+    }
+
+    /// [`Self::new`] of an image made in `light` ([`Self::light`]): a
+    /// copy of one so made, which keeps it.
+    pub fn new_in(width: usize, height: usize, data: Vec<f32>, light: sample::Light) -> Self {
         assert_eq!(data.len(), width * height);
-        Self { width, height, data, unenlarged: None, as_shot: None, deblurred: None }
+        Self { width, height, data, unenlarged: None, as_shot: None, deblurred: None, light }
     }
 
     /// How many copies of this image may be worked side by side: as many
@@ -164,6 +178,26 @@ impl Luma {
     /// around every sample.
     #[inline]
     pub fn sample(&self, x: f64, y: f64) -> Option<f32> {
+        self.sample_of(x, y, |v| v)
+    }
+
+    /// [`Self::sample`] in `light` ([`sample::Light`]): as light, each of
+    /// the four pixels is taken as the light it stands for
+    /// ([`sample::linear_light`]) before they are weighed together, as a
+    /// lens weighs the light of what lies under it. Weighed as stored and
+    /// taken as light after, a sample between ink and paper reads darker
+    /// than the light that falls there.
+    #[inline]
+    pub fn sample_in(&self, x: f64, y: f64, light: sample::Light) -> Option<f32> {
+        match light {
+            sample::Light::Encoded => self.sample(x, y),
+            sample::Light::Linear => self.sample_of(x, y, sample::linear_light),
+        }
+    }
+
+    /// [`Self::sample`] of the pixels each as `of` makes it.
+    #[inline(always)]
+    fn sample_of(&self, x: f64, y: f64, of: impl Fn(f32) -> f32) -> Option<f32> {
         let (fx, fy) = (x - 0.5, y - 0.5);
         if fx >= 0.0 && fy >= 0.0 && fx < self.width as f64 - 1.0 && fy < self.height as f64 - 1.0 {
             let (x0, y0) = (fx as usize, fy as usize);
@@ -171,17 +205,17 @@ impl Luma {
             let first = y0 * self.width + x0;
             let pixels = &self.data[first..first + self.width + 2];
             let (above, below) = (&pixels[..2], &pixels[self.width..]);
-            let top = above[0] * (1.0 - tx) + above[1] * tx;
-            let bottom = below[0] * (1.0 - tx) + below[1] * tx;
+            let top = of(above[0]) * (1.0 - tx) + of(above[1]) * tx;
+            let bottom = of(below[0]) * (1.0 - tx) + of(below[1]) * tx;
             return Some(top * (1.0 - ty) + bottom * ty);
         }
-        self.sample_by_border(x, y)
+        self.sample_by_border(x, y, of)
     }
 
-    /// [`Self::sample`] for a point within half a pixel of the image's
+    /// [`Self::sample_of`] for a point within half a pixel of the image's
     /// border, or off the image.
     #[inline]
-    fn sample_by_border(&self, x: f64, y: f64) -> Option<f32> {
+    fn sample_by_border(&self, x: f64, y: f64, of: impl Fn(f32) -> f32) -> Option<f32> {
         // An image with no pixels has no border to be within: the clamps
         // below would be asked for a range that ends before it begins.
         if self.width == 0 || self.height == 0 {
@@ -197,16 +231,25 @@ impl Luma {
         let y1 = (y0 + 1).min(self.height - 1);
         let tx = (fx - x0 as f64).clamp(0.0, 1.0) as f32;
         let ty = (fy - y0 as f64).clamp(0.0, 1.0) as f32;
-        let at = |x: usize, y: usize| self.data[y * self.width + x];
+        let at = |x: usize, y: usize| of(self.data[y * self.width + x]);
         let top = at(x0, y0) * (1.0 - tx) + at(x1, y0) * tx;
         let bottom = at(x0, y1) * (1.0 - tx) + at(x1, y1) * tx;
         Some(top * (1.0 - ty) + bottom * ty)
     }
 
     /// The image made `width` by `height`, larger or smaller, with Magic
-    /// Kernel Sharp 2013: see [`resize`].
+    /// Kernel Sharp 2013: see [`resize`]. An image made in light
+    /// ([`Self::light`]) is resized as the light its values stand for,
+    /// and stored again, as the photo was resized.
     pub fn resized(&self, width: usize, height: usize) -> Luma {
-        Luma::new(width, height, resize::resize(&self.data, self.width, self.height, 1, width, height))
+        let data = match self.light {
+            sample::Light::Encoded => resize::resize(&self.data, self.width, self.height, 1, width, height),
+            sample::Light::Linear => {
+                let light = gpu::in_light(&self.data, self.width, self.height);
+                gpu::encoded(&resize::resize(&light, self.width, self.height, 1, width, height), width, height)
+            }
+        };
+        Luma::new_in(width, height, data, self.light)
     }
 
     /// The image as opaque grey pixels, four bytes to each: what a
@@ -223,7 +266,7 @@ impl Luma {
     /// with it; the photo as loaded is kept as it lay, with the turn
     /// ([`AsShot::turned`]).
     pub fn rotated_cw(&self, quarters: u8) -> Luma {
-        let mut out = Luma::new(self.width, self.height, self.data.clone());
+        let mut out = Luma::new_in(self.width, self.height, self.data.clone(), self.light);
         for _ in 0..quarters % 4 {
             let (w, h) = (out.width, out.height);
             // Each column of the source becomes a row of the result, read
@@ -234,7 +277,7 @@ impl Luma {
                     data.push(out.data[(h - 1 - col) * w + row]);
                 }
             }
-            out = Luma::new(h, w, data);
+            out = Luma::new_in(h, w, data, self.light);
         }
         out.unenlarged = self.unenlarged.as_ref().map(|small| Arc::new(small.rotated_cw(quarters)));
         out.as_shot = self.as_shot.as_ref().map(|shot| Arc::new(AsShot { turned: (shot.turned + quarters % 4) % 4, ..(**shot).clone() }));
@@ -348,7 +391,7 @@ mod tests {
 
     #[test]
     fn the_larger_the_photo_the_fewer_copies_of_it_at_once() {
-        let of = |width: usize, height: usize| Luma { width, height, data: Vec::new(), unenlarged: None, as_shot: None, deblurred: None }.copies_at_once();
+        let of = |width: usize, height: usize| Luma { width, height, data: Vec::new(), unenlarged: None, as_shot: None, deblurred: None, light: sample::Light::Encoded }.copies_at_once();
         assert!(of(1280, 960) >= 8, "a small photo has every rung of the ladder at once");
         assert_eq!(of(4032, 3024), 3);
         assert_eq!(of(8064, 6048), 1);
@@ -363,7 +406,7 @@ mod tests {
             let own = enlarged.then(|| Arc::new(Luma::new(w, h, vec![0.0; w * h])));
             let shot: SharedRgba = Arc::new(vec![0u8; w * h * 4]);
             let as_shot = AsShot { rgba: shot, width: w, height: h, at: [0, 0], photo: [w, h], part: [0, 0, w, h], adjust: adjust::Adjust::default(), turned: 0 };
-            Luma { width, height, data: Vec::new(), unenlarged: own, as_shot: Some(Arc::new(as_shot)), deblurred: None }.copies_at_once()
+            Luma { width, height, data: Vec::new(), unenlarged: own, as_shot: Some(Arc::new(as_shot)), deblurred: None, light: sample::Light::Encoded }.copies_at_once()
         };
         assert_eq!(adjusted((4032, 3024), (4032, 3024), false), 1);
         assert_eq!(adjusted((2000, 1500), (2000, 1500), false), 8);

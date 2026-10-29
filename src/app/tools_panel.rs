@@ -5,14 +5,14 @@ use qr_forensics::decode::abp::{ABP_ROUNDS_LEAST, ABP_ROUNDS_MAX, round_tries};
 use qr_forensics::decode::list::{LIST_COST, LIST_COST_MAX, LIST_COST_MIN};
 use qr_forensics::decode::pipeline::DecodeOptions;
 use qr_forensics::decode::rs::{CHASE_MAX_BITS, TRIAL_SETS_MAX, TRIAL_SETS_MIN, tries_charge};
-use qr_forensics::imaging::adjust::{Adjust, Backdrop, Channel, Enlarge, Filter, K1_RANGE, LENS_MIN_PAIRS, MAX_ENLARGED_SIDE, STRENGTH_RANGE};
+use qr_forensics::imaging::adjust::{Adjust, Backdrop, Channel, EXPOSURE_RANGE, Enlarge, Filter, K1_RANGE, LENS_MIN_PAIRS, MAX_ENLARGED_SIDE, STRENGTH_RANGE};
 use qr_forensics::imaging::deblur::{self, Spread};
 use qr_forensics::imaging::binarize::{BinarizeParams, WINDOW_RADII};
 use qr_forensics::imaging::detect::{AnchorKind, Detection, anchor_sites};
 use qr_forensics::imaging::enhance::SHARPEN_RANGE;
 use qr_forensics::imaging::sample::{
-    BLUR_MIN_GAIN, DATA_GROSS, DATA_SPREAD, Kernel, MISREAD_FLOOR, POOR_SEPARABILITY, SAMPLED_MAX, SHARPEN_BELOW_PX, misread_odds,
-    reliability_bits,
+    BLUR_MIN_GAIN, DATA_GROSS, DATA_SPREAD, Kernel, Light, MISREAD_FLOOR, POOR_SEPARABILITY, SAMPLED_MAX, SHARPEN_BELOW_PX,
+    misread_odds, reliability_bits,
 };
 use qr_forensics::symbol::function_map::looks_inverted;
 use qr_forensics::symbol::grid::{CERTAIN, Module};
@@ -117,7 +117,10 @@ fn symbol_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
 /// read, which may have fixed the whole photo's blur as it then was.
 fn kernel_view(ui: &mut egui::Ui, spread: Option<Spread>, fixed: bool) {
     let Some(spread) = spread else {
-        ui.weak("No blur found: the photo is sharp or has too few edges to measure, so it's left as is.");
+        ui.weak(
+            "No blur undone: the photo is sharp, has too few edges to measure, or has too few pixels to undo its blur \
+             in, so it's left as is.",
+        );
         return;
     };
     ui.horizontal_top(|ui| {
@@ -219,9 +222,9 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         }
     };
     // The adjustments in the order the photo is put through them
-    // ([`Adjust::apply`]): what its transparent parts are filled with, its
-    // size and shape, its sharpness, the one curve of its tone, and what
-    // is read of it.
+    // ([`Adjust::apply`]): what its transparent parts are filled with, the
+    // light its pixels are mixed in, its size and shape, its sharpness,
+    // the one curve of its tone, and what is read of it.
     egui::Grid::new("adjust").num_columns(2).show(ui, |ui| {
         if transparent {
             ui.label("Transparent parts");
@@ -240,6 +243,30 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
             note(changed);
             ui.end_row();
         }
+        // Not an adjustment of its own place in the order, but how the
+        // three after it and the sampling mix the photo's pixels, and so
+        // first.
+        ui.label("");
+        let mut as_light = adjust.light == Light::Linear;
+        let light = ui.checkbox(&mut as_light, "Work in linear light").on_hover_text(
+            "Blend pixels in linear light, as a lens does, instead of as sRGB values. Applies to Enlarge, Lens, \
+             Sharpen, Deblur and Sampling, and to the copies the search and the reader retry on. Pixels are \
+             converted from sRGB before Enlarge and back before the tone adjustments; Deblur runs after those and \
+             converts on its own.\n\n\
+             In sRGB, a pixel that's half ink and half paper reads too light, so a blurred dark module among light \
+             ones can read light. In linear light it reads mid-grey.\n\n\
+             Turn it on for camera photos, especially blurry ones or with modules a few pixels across, when lone \
+             dark modules read light. Leave it off for screenshots and anything rendered or resized in software, \
+             and when using Invert photo or Contrast, which work on sRGB values. Exposure, Median and Close dots \
+             are unaffected. With nothing enlarged, straightened, sharpened or deblurred, the photo looks the same, \
+             but sampling changes, and so do the copies the search and the reader retry on. \
+             Loading a read restores the setting it was made with.",
+        );
+        if light.changed() {
+            adjust.light = if as_light { Light::Linear } else { Light::Encoded };
+        }
+        note(light.changed());
+        ui.end_row();
         ui.label("Enlarge");
         // The slider goes from step to step of those on offer for this
         // photo: each twice the last, with what the photo started at,
@@ -329,11 +356,17 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         ui.label("");
         note(ui.checkbox(&mut adjust.invert, "Invert photo").on_hover_text("For light symbols on a dark background").changed());
         ui.end_row();
+        ui.label("Exposure");
+        let exposure = ui.add(egui::Slider::new(&mut adjust.exposure, EXPOSURE_RANGE).suffix(" EV")).on_hover_text(
+            "Scale each pixel's intensity in stops: +1 doubles it and -1 halves it, like a longer or shorter \
+             exposure. Always computed in linear light, so shadows lift without the whites going grey, and it's safe \
+             to use with Work in linear light. Applied after Invert photo and before Contrast, so with high Contrast \
+             it shifts which tones end up dark and which light.",
+        );
+        note(exposure.changed());
+        ui.end_row();
         ui.label("Contrast");
         note(ui.add(egui::Slider::new(&mut adjust.contrast, -1.0..=1.0)).changed());
-        ui.end_row();
-        ui.label("Brightness");
-        note(ui.add(egui::Slider::new(&mut adjust.brightness, -1.0..=1.0)).changed());
         ui.end_row();
         ui.label("Channel");
         let mut changed = false;
@@ -359,7 +392,8 @@ fn photo_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
                 let measure = ui.button("Measure in outline").on_hover_text(
                     "Measure the blur inside the outline only (after the adjustments above) and undo that instead of \
                      the whole photo's blur. Use it when only the symbol is out of focus, or when the rest of the photo \
-                     throws off the measurement. It's rescaled if Enlarge changes.",
+                     throws off the measurement. Enlarge rescales it, and switching Work in linear light re-measures \
+                     it inside the outline it was first measured in.",
                 );
                 if measure.clicked() {
                     actions.push(Action::MeasureDeblur);
@@ -945,8 +979,8 @@ fn sampling_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
     })
     .response
     .on_hover_text(
-        "How each module's luminance is read. Find in outline tries every kernel, under every threshold rule, and \
-         keeps what decodes.",
+        "How each module's luminance is read (in linear light when Work in linear light, under Photo, is on). \
+         Find in outline tries every kernel with every threshold rule and keeps what decodes.",
     );
     ui.checkbox(&mut params.sharpen_modules, "Sharpen small or blurred modules").on_hover_text(format!(
         "Once the modules are read, take back out of each what blur put into it from its neighbours. How far the \
@@ -1284,30 +1318,30 @@ fn list_cost_time(cost: usize, used: usize) -> String {
 /// How far list decoding reaches in this symbol's blocks at `cost`
 /// constraints, said under its switch and in its hover ([`Reach::list`]).
 fn list_note(reach: &Reach, version: SymbolVersion, level: EcLevel, cost: usize) -> String {
-    let (blocks, standard) = (reach.blocks_phrase(), reach.standard);
-    // What plain decoding reaches as far as list decoding does: past the
-    // standard's limit, half the distance, spending the reserved
-    // codewords as list decoding would.
-    let plain = |list: usize| if list <= standard { standard } else { reach.half };
+    // What plain decoding confirms, which list decoding, run only where
+    // plain decoding finds nothing, is measured against: half the
+    // distance, spending the reserved codewords where there are any. It
+    // was once the standard's limit, a solution that spent them never
+    // being confirmed.
+    let (blocks, standard, plain) = (reach.blocks_phrase(), reach.standard, reach.plain);
     if !reach.list_gains() && !reach.list_default_gains() {
         let level = match version {
             SymbolVersion::Micro(1) => String::new(),
             _ => format!(" at level {}", level.letter()),
         };
-        let plain = plain(reach.list.max(reach.list_default));
         let mut text = format!(
             "No gain{level}: in this symbol's {blocks}, it's guaranteed to correct {}, the same as plain Reed-Solomon.",
             wrong_codewords(plain)
         );
         if plain > standard {
-            text.push_str(&format!(" Past {standard}, both use the reserved error-detection codewords, so neither is confirmed."));
+            text.push_str(&format!(" Past {standard}, both use the reserved error-detection codewords and are marked beyond the standard."));
         }
         return text;
     }
     let mut text = if reach.list_gains() {
-        format!("In this symbol's {blocks}: corrects at least {}, vs. {standard} for plain Reed-Solomon.", wrong_codewords(reach.list))
+        format!("In this symbol's {blocks}: corrects at least {}, vs. {plain} for plain Reed-Solomon.", wrong_codewords(reach.list))
     } else {
-        format!("In this symbol's {blocks}: at this budget, no gain over plain Reed-Solomon's {}.", wrong_codewords(plain(reach.list)))
+        format!("In this symbol's {blocks}: at this budget, no gain over plain Reed-Solomon's {}.", wrong_codewords(plain))
     };
     if reach.list_default > reach.list {
         let which = if cost > LIST_COST { "Fewer" } else { "More" };
@@ -1320,7 +1354,7 @@ fn list_note(reach: &Reach, version: SymbolVersion, level: EcLevel, cost: usize)
     if reach.reserved > 0 && reach.list.max(reach.list_default) > standard {
         text.push_str(&format!(
             " With every module certain, anything past {standard} uses the reserved error-detection codewords and is \
-             never confirmed."
+             marked beyond the standard."
         ));
     }
     text
@@ -1346,10 +1380,9 @@ fn joined(items: &[String]) -> String {
 }
 
 /// What the trials of erasures cover in this symbol's blocks at the
-/// budget set, and how far past the code that reaches within the
-/// standard's limit and past what plain decoding reaches, said below its
-/// slider, and what the next size of set would take ([`Reach::trials`],
-/// [`Reach::trials_within`]).
+/// budget set, and how far past what plain decoding reaches that goes,
+/// said below its slider, and what the next size of set would take
+/// ([`Reach::trials`], [`Reach::trials_past`]).
 fn trial_note(reach: &Reach) -> String {
     let trials = reach.trials;
     let (blocks, standard) = (reach.blocks_phrase(), reach.standard);
@@ -1363,20 +1396,26 @@ fn trial_note(reach: &Reach) -> String {
         (past, _) => {
             let sizes: Vec<String> = (0..past).map(|i| every_set(trials.first_size + 2 * i)).collect();
             let tried = format!("In this symbol's {blocks}: tries {} ({} sets)", joined(&sizes), grouped(trials.sets));
-            // Where the standard keeps any codewords, what the sets reach
-            // past it spends them, as the standard counts a solution's
-            // errors; and where it keeps none, in a small block what the
-            // sets reach may leave too little redundancy to confirm it,
-            // even as the block itself judges it, uncharged for the sets.
-            // It was once said to fall short for the sets' cost alone,
-            // where the block's own count confirmed it.
-            match reach.trials_within {
-                0 if reach.reserved > 0 => format!(
-                    "{tried}, but these only beat plain Reed-Solomon by using the reserved error-detection codewords, \
-                     so they are never confirmed."
-                ),
+            // In a small block what the sets reach may leave too little
+            // redundancy to confirm it, even as the block itself judges
+            // it, uncharged for the sets. It was once said to fall short
+            // for the sets' cost alone, where the block's own count
+            // confirmed it; and where the standard keeps any codewords,
+            // what the sets reach spends them, which was once said never
+            // to be confirmed.
+            match reach.trials_past {
                 0 => format!("{tried}, but anything they find past plain Reed-Solomon leaves too little redundancy to confirm it."),
-                within => format!("{tried}, correcting up to {}, vs. {standard} for plain Reed-Solomon.", wrong_codewords(standard + within)),
+                past => {
+                    let mut text =
+                        format!("{tried}, correcting up to {}, vs. {} for plain Reed-Solomon.", wrong_codewords(reach.half + past), reach.plain);
+                    if reach.reserved > 0 {
+                        text.push_str(&format!(
+                            " Anything past {standard} uses the reserved error-detection codewords and is marked beyond the \
+                             standard."
+                        ));
+                    }
+                    text
+                }
             }
         }
     };
@@ -1632,79 +1671,95 @@ mod tests {
         let opts = super::super::default_decode_options();
         // 1-H keeps one codeword: list decoding and the trials reach past
         // the code only by spending it, the codewords the trials erase
-        // being read and wrong as the standard counts a solution's errors.
-        // The triples were once said to reach nine within it.
+        // being read and wrong as the standard counts a solution's errors,
+        // and such a solution is marked beyond the standard, and
+        // confirmed all the same. The triples were once said to reach nine
+        // within it, and then never to be confirmed.
         let reach = Reach::of(SymbolVersion::Qr(1), EcLevel::H, &opts).unwrap();
         assert_eq!(
             list_note(&reach, SymbolVersion::Qr(1), EcLevel::H, opts.list_cost),
             "In this symbol's block of 26 codewords: corrects at least 11 wrong codewords, vs. 8 for plain \
              Reed-Solomon. With every module certain, anything past 8 uses the reserved error-detection codewords and \
-             is never confirmed."
+             is marked beyond the standard."
         );
         // 1-M keeps two: list decoding reaches six, a codeword past half
         // the distance, its codewords given a multiplicity of ten alike,
-        // but past four spends them. It was once said to correct five
-        // where plain decoding corrects four; and then, its codewords
-        // given the budget a unit at a time, to reach no further than
-        // half the distance, which plain decoding reaches too.
+        // against the five plain decoding reaches spending them. It was
+        // once said to correct five where plain decoding corrects four;
+        // then, its codewords given the budget a unit at a time, to reach
+        // no further than half the distance, which plain decoding reaches
+        // too; and then to beat the four plain decoding corrects within
+        // the standard.
         let one_m = Reach::of(SymbolVersion::Qr(1), EcLevel::M, &opts).unwrap();
         assert_eq!(
             list_note(&one_m, SymbolVersion::Qr(1), EcLevel::M, opts.list_cost),
-            "In this symbol's block of 26 codewords: corrects at least 6 wrong codewords, vs. 4 for plain Reed-Solomon. \
-             With every module certain, anything past 4 uses the reserved error-detection codewords and is never \
-             confirmed."
+            "In this symbol's block of 26 codewords: corrects at least 6 wrong codewords, vs. 5 for plain Reed-Solomon. \
+             With every module certain, anything past 4 uses the reserved error-detection codewords and is marked \
+             beyond the standard."
         );
         assert_eq!(
             trial_note(&reach),
-            "In this symbol's block of 26 codewords: tries every single codeword and every triple (2,626 sets), but \
-             these only beat plain Reed-Solomon by using the reserved error-detection codewords, so they are never \
-             confirmed. Adding every set of five would need a budget of 68,406."
+            "In this symbol's block of 26 codewords: tries every single codeword and every triple (2,626 sets), \
+             correcting up to 10 wrong codewords, vs. 8 for plain Reed-Solomon. Anything past 8 uses the reserved \
+             error-detection codewords and is marked beyond the standard. Adding every set of five would need a \
+             budget of 68,406."
         );
         // 3-L at the least budget tries the single codewords alone.
         let least = DecodeOptions { trial_sets: TRIAL_SETS_MIN, ..opts };
         let reach = Reach::of(SymbolVersion::Qr(3), EcLevel::L, &least).unwrap();
         assert_eq!(
             trial_note(&reach),
-            "In this symbol's block of 70 codewords: tries every single codeword (70 sets), but these only beat plain \
-             Reed-Solomon by using the reserved error-detection codewords, so they are never confirmed. Adding every \
-             triple would need a budget of 54,810."
+            "In this symbol's block of 70 codewords: tries every single codeword (70 sets), correcting up to 8 wrong \
+             codewords, vs. 7 for plain Reed-Solomon. Anything past 7 uses the reserved error-detection codewords and \
+             is marked beyond the standard. Adding every triple would need a budget of 54,810."
         );
-        // M2-L keeps three of five: even its triples beat plain
-        // Reed-Solomon only by spending them.
+        // M2-L keeps three of five: its triples reach three, past the two
+        // plain decoding reaches spending them.
         let reach = Reach::of(SymbolVersion::Micro(2), EcLevel::L, &opts).unwrap();
-        assert!(trial_note(&reach).ends_with("so they are never confirmed."), "{}", trial_note(&reach));
+        assert!(trial_note(&reach).contains("correcting up to 3 wrong codewords, vs. 2 for plain Reed-Solomon."), "{}", trial_note(&reach));
         // The curve reaches three wrong, a codeword past half the
         // distance, with what the block itself must show of a codeword
-        // to be verified, and a decode finds them there; but past the
-        // one the standard corrects it spends the reserve. Said once
+        // to be verified, and a decode finds them there. Said once
         // against three codewords' worth, it reached the one, as "1 wrong
         // codewords"; and then, held to what a fallback's own count must
         // show, the two plain decoding reaches.
         assert_eq!(
             list_note(&reach, SymbolVersion::Micro(2), EcLevel::L, opts.list_cost),
-            "In this symbol's block of 10 codewords: corrects at least 3 wrong codewords, vs. 1 for plain \
+            "In this symbol's block of 10 codewords: corrects at least 3 wrong codewords, vs. 2 for plain \
              Reed-Solomon. With every module certain, anything past 1 uses the reserved error-detection codewords and \
-             is never confirmed."
+             is marked beyond the standard."
         );
-        // 2-L keeps two of ten: the pairs reach five within the standard's
-        // limit, where plain decoding goes first by spending them, and six
-        // only by spending them too. It was once said to correct five.
+        // 2-L keeps two of ten: plain decoding reaches five by spending
+        // them, and the pairs six, which the block itself confirms. It was
+        // once said to correct five, and then nothing past plain decoding.
         let reach = Reach::of(SymbolVersion::Qr(2), EcLevel::L, &opts).unwrap();
         assert_eq!(
             trial_note(&reach),
-            "In this symbol's block of 44 codewords: tries every pair (946 sets), but these only beat plain \
-             Reed-Solomon by using the reserved error-detection codewords, so they are never confirmed. Adding every \
-             set of four would need a budget of 136,697."
+            "In this symbol's block of 44 codewords: tries every pair (946 sets), correcting up to 6 wrong codewords, \
+             vs. 5 for plain Reed-Solomon. Anything past 4 uses the reserved error-detection codewords and is marked \
+             beyond the standard. Adding every set of four would need a budget of 136,697."
         );
-        // 1-M keeps two of ten too: the sets of four reach six, but past
-        // the four the standard corrects, as it counts a solution's
-        // errors, the codewords erased among them. It was once said to
-        // correct up to six, and then to correct six.
+        // 1-M keeps two of ten too: the sets of four reach six, past the
+        // four the standard corrects, as it counts a solution's errors,
+        // the codewords erased among them. It was once said to correct up
+        // to six, then to correct six, and then nothing past plain
+        // decoding.
         assert_eq!(
             trial_note(&one_m),
-            "In this symbol's block of 26 codewords: tries every pair and every set of four (15,275 sets), but these \
-             only beat plain Reed-Solomon by using the reserved error-detection codewords, so they are never \
-             confirmed. Adding every set of six would need a budget of 245,505."
+            "In this symbol's block of 26 codewords: tries every pair and every set of four (15,275 sets), correcting \
+             up to 6 wrong codewords, vs. 5 for plain Reed-Solomon. Anything past 4 uses the reserved error-detection \
+             codewords and is marked beyond the standard. Adding every set of six would need a budget of 245,505."
         );
+        // M3-L keeps two of six: plain decoding reaches three, spending
+        // them, and the curve no further; what the sets reach past it the
+        // block cannot confirm.
+        let reach = Reach::of(SymbolVersion::Micro(3), EcLevel::L, &opts).unwrap();
+        assert_eq!(
+            list_note(&reach, SymbolVersion::Micro(3), EcLevel::L, opts.list_cost),
+            "No gain at level L: in this symbol's block of 17 codewords, it's guaranteed to correct 3 wrong codewords, \
+             the same as plain Reed-Solomon. Past 2, both use the reserved error-detection codewords and are marked \
+             beyond the standard."
+        );
+        assert!(trial_note(&reach).ends_with("but anything they find past plain Reed-Solomon leaves too little redundancy to confirm it."));
     }
 }

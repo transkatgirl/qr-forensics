@@ -84,6 +84,36 @@ fn repaired_symbols_match_the_encoder_exactly() {
 }
 
 #[test]
+fn a_solution_without_confirmation_is_not_written_back() {
+    // M1 has two codewords of error correction, both kept by the standard
+    // to detect a misread. With one codeword wrong in four of its modules,
+    // the plain decode corrects it by spending them. A block of noise
+    // lies within a codeword of some codeword once in fifty, and within
+    // four of its thirty-six modules of one nearly always: no read.
+    // Written back, the codeword would read as nothing wrong at all, and
+    // confirm. It was once 1-M with five codewords wrong, a module each,
+    // which was no read for the reserve it spent, and is now confirmed by
+    // how rarely noise lies so near.
+    let (version, ec, mask) = (SymbolVersion::Micro(1), EcLevel::L, 1);
+    let layout = layout(version, ec);
+    let clean = encode(version, ec, Some(mask), &[Segment::numeric("12345").unwrap()]).unwrap();
+    let mut grid = clean.clone();
+    for bit in 0..4 {
+        corrupt_codeword(&mut grid, &layout, layout.blocks[0].codewords[1], bit);
+    }
+    let report = decode_plain(&grid, &layout, mask);
+    assert!(report.blocks[0].is_solved() && report.blocks[0].is_beyond_standard() && !report.is_trustworthy(), "{:?}", report.blocks[0].outcome);
+    let repaired = repaired_grid(&grid, &layout, mask, &report);
+    for &cw in &layout.blocks[0].codewords {
+        for pos in layout.codeword_modules(cw) {
+            let (x, y) = (pos.x as usize, pos.y as usize);
+            assert_eq!(repaired.get(x, y), grid.get(x, y), "({x}, {y})");
+        }
+    }
+    assert!(!decode_plain(&repaired, &layout, mask).is_trustworthy());
+}
+
+#[test]
 fn unsolved_blocks_are_left_alone() {
     let (version, ec, mask) = (SymbolVersion::Qr(10), EcLevel::M, 3);
     let layout = layout(version, ec);

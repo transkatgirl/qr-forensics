@@ -179,7 +179,7 @@ mod tests {
         let rgba: Vec<u8> = (0..width * height * 4).map(|i| (i * 37 % 251) as u8).collect();
         let source = Source { rgba: &rgba, width, part: [0, 0, width, height], shared: None };
         let table: [u8; 256] = std::array::from_fn(|i| 255 - i as u8);
-        let toned = |tone: Tone| adjusted_within(usize::MAX, &source, &[], &table, None, tone).expect("fits");
+        let toned = |tone: Tone| adjusted_within(usize::MAX, &source, &[], &table, None, tone, Light::Encoded).expect("fits");
         let (shown, luma) = toned(Tone::Colours { padded: false }).taken(None, true);
         // In its colours laid out as a copy to a texture wants them, which
         // for a part this wide is not row after row, and row after row:

@@ -450,7 +450,7 @@ pub fn try_beginnings(
     // the evidence they move, reach: the rest are as the pins given had
     // them, and charged as those were ([`Decoding`]). Every beginning was
     // once a decode afresh, and charged every block holding a pin given.
-    let among = picked_among(pins) * tried.len();
+    let among = picked_among(pins).saturating_mul(tried.len());
     let mut decoding = Decoding::new(grid, layout, mask, opts);
     decoding.solve(pins);
     let mut best: Option<Beginning> = None;

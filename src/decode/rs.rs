@@ -58,7 +58,7 @@ pub const VERIFIED_BITS: u32 = 8;
 /// Spare equations the bit-level solvers keep a solution to at the
 /// least, before the charge for their tries: [`VERIFIED_BITS`], an
 /// equation to a bit.
-const SPARE_EQUATIONS: usize = VERIFIED_BITS as usize;
+pub(super) const SPARE_EQUATIONS: usize = VERIFIED_BITS as usize;
 
 /// How much nearer the block as read, in bits weighed by reliability
 /// ([`soft_distance`]), the solution a solver that tries many ways keeps
@@ -180,9 +180,11 @@ fn each_set(n: usize, size: usize, mut f: impl FnMut(&[usize])) {
 
 /// What a solution picked among `tries` is charged, in bits: one for
 /// each doubling of them, since each try is a fresh chance for a block
-/// of noise to pass.
+/// of noise to pass. Tries past the largest power of two, which picks
+/// compounded among pins found by other picks may come to, are charged
+/// every bit a count holds: they once overflowed.
 pub fn tries_charge(tries: usize) -> u32 {
-    tries.max(1).next_power_of_two().trailing_zeros()
+    tries.max(1).checked_next_power_of_two().map_or(usize::BITS, usize::trailing_zeros)
 }
 
 /// What overturning a bit read at `reliability` costs, in eighths of a
@@ -200,13 +202,52 @@ pub fn tries_charge(tries: usize) -> u32 {
 /// the colour they fell on has, told two codewords apart by a byte that
 /// nothing had read.
 pub fn bit_cost(reliability: u8) -> u32 {
+    bit_costs()[usize::from(reliability)]
+}
+
+/// A codeword read whole, on the scale of its bits' reliabilities: as
+/// likely to be wrong as any of its bits is, together, where a bit at
+/// reliability `r` is wrong once in `2^(1 + r/8)`. One faint bit among
+/// certain ones is that bit's reliability; eight alike are less than any
+/// one of them. [`CERTAIN`] where every bit is.
+///
+/// A codeword was once taken to be as reliable as its least reliable
+/// bit, and doubted in that order: a speck that left one bit of a
+/// codeword at twenty and the rest at fifty-six, wrong about one time in
+/// nine, was doubted before a codeword a blur or a fade left wholly at
+/// thirty, wrong about one time in four, which is what a faded or
+/// curved receipt leaves.
+pub fn codeword_reliability(bits: &[u8; 8]) -> u8 {
+    if bits.iter().all(|&r| r == CERTAIN) {
+        return CERTAIN;
+    }
+    let wrong = codeword_misread(bits).max(f64::MIN_POSITIVE);
+    (8.0 * (-wrong.log2() - 1.0)).round().clamp(0.0, f64::from(CERTAIN - 1)) as u8
+}
+
+/// How likely a codeword read whole is to be wrong, from its bits'
+/// reliabilities as [`codeword_reliability`] takes them: nought where
+/// every bit is [`CERTAIN`]. Unrounded, and not held at a coin's toss as
+/// that scale is: every codeword more likely wrong than right is a
+/// reliability of nought there, and doubted in that order the codewords
+/// faintest all through went in the order they lie in the block, a
+/// codeword with its every bit at a guess beside one read at two bits.
+pub fn codeword_misread(bits: &[u8; 8]) -> f64 {
+    // The log of the chance that every bit is right, summed, and taken
+    // from one without the loss the difference of two near ones has.
+    let right: f64 = bits.iter().filter(|&&r| r < CERTAIN).map(|&r| (-(-(1.0 + f64::from(r) / 8.0)).exp2()).ln_1p()).sum();
+    -right.exp_m1()
+}
+
+/// [`bit_cost`] of every reliability.
+fn bit_costs() -> &'static [u32; 256] {
     static COSTS: LazyLock<[u32; 256]> = LazyLock::new(|| {
         std::array::from_fn(|reliability| {
             let bits = reliability as f64 / 8.0 + 1.0;
             (8.0 * (bits.exp2() - 1.0).log2()).round() as u32
         })
     });
-    COSTS[usize::from(reliability)]
+    &COSTS
 }
 
 /// How far a solution lies from the block as read: the bits read as
@@ -993,11 +1034,20 @@ pub(super) fn rs_decode_core(
 /// of a codeword is unread that is the unit of the standard's own count.
 /// Within the standard's limit so, a solution changes no more codewords
 /// read in full than the plain decode of the block corrects with the
-/// reserve unused; what the other solvers bring a block that reserves
-/// codewords is what confirms such a codeword, the reach of solving bit
-/// by bit over modules unread, and a codeword past the limit, which never
-/// is confirmed. Nothing is reserved in most symbols, and there every
+/// reserve unused. Nothing is reserved in most symbols, and there every
 /// solution keeps the reserve.
+///
+/// What it says is said and not acted on: a solution that spends the
+/// reserve is marked as beyond the standard, and verified or not by its
+/// risk alone, as every other is ([`super::pipeline::BlockOutcome::risk_bits`]).
+/// The reserve is the standard's guard against a misdecode, fixed in
+/// advance and blind to what confirms the solution, and the risk
+/// measures the same chance for the solution in hand: a 1-L block three
+/// codewords wrong, the reserve spent, is confirmed by its slack and the
+/// errors it located as an M3-M block four wrong is, which keeps it. It
+/// once was acted on, and every solution that spent it was refused,
+/// however rarely noise would pass it, and the solvers each preferred a
+/// solution that kept it to a nearer one that did not.
 pub fn keeps_reserve(block: &[CwRead], ec_len: usize, reserved: usize, corrected: &[u8]) -> bool {
     if reserved == 0 {
         return true;
@@ -1008,28 +1058,6 @@ pub fn keeps_reserve(block: &[CwRead], ec_len: usize, reserved: usize, corrected
         .map(|(cw, &c)| if (cw.value ^ c) & cw.known != 0 { 16 } else { cw.known.count_zeros() as usize })
         .sum();
     spent + 8 * reserved <= 8 * ec_len
-}
-
-/// Whether every codeword that keeps the reserve against `read`, the
-/// block as the reserve counts it ([`keeps_reserve`]), lies within half
-/// the code's distance of `block`, the block a solver searches, as the
-/// plain decode reads it: so where `block` reads as `read` does, and
-/// every codeword of it is read whole or not at all. Such a codeword
-/// spends two codewords for each it changes and one for each unread, as
-/// the plain decode counts them, and the reserve unused leaves it within
-/// that decode's reach, where no other codeword lies. Where a codeword is
-/// read in part, its unread modules cost an eighth of a codeword each,
-/// where the plain decode erases the whole of it, and a codeword that
-/// keeps the reserve may lie past that decode's reach: a 1-Q block, one
-/// of its thirteen codewords of error correction reserved, six codewords
-/// a module short and four read wrong spends seventy of the ninety-six
-/// eighths it may, and the plain decode would need fourteen codewords of
-/// its thirteen. So too where `block` reads what `read` leaves unread,
-/// the modules read at a coin's toss or the message's evidence laid over
-/// it.
-pub(super) fn plain_reach_holds_the_reserve(block: &[CwRead], read: &[CwRead]) -> bool {
-    block.len() == read.len()
-        && block.iter().zip(read).all(|(b, r)| b.known == r.known && (b.value ^ r.value) & r.known == 0 && (r.known == 0xFF || r.known == 0))
 }
 
 /// A solution's accounts, from the block it corrected: whether it may
@@ -1288,17 +1316,18 @@ fn error_counts_reaching(read: usize, redundancy: usize, known: u32, score: i64)
 
 /// Decode by doubting: erase the least reliable fully read codewords, one
 /// more at a time, and keep the solution with the most confirmation,
-/// among those offered ([`Offering`]), every count tried charged for: one
-/// within the standard's limit when `reserved` codewords are kept for
-/// detection, or, when none is, one that spends them, which the caller
-/// marks as beyond the standard ([`RsSolution::within_standard`]). A
+/// among those offered ([`Offering`]), every count tried charged for. A
 /// codeword doubted is a codeword read, and one the solution changes is
 /// wrong as the standard counts errors ([`keeps_reserve`]), so that past
-/// what the standard corrects the doubting reaches the block only so.
-/// Returns how many codewords were doubted. Codewords at [`CERTAIN`]
+/// what the standard corrects, where `reserved` codewords are kept for
+/// detection, the solution is marked as beyond it
+/// ([`RsSolution::within_standard`]). Such a solution was once kept only
+/// where no count doubted reached one within the standard, however much
+/// less that one was confirmed. Returns how many codewords were doubted. Codewords at [`CERTAIN`]
 /// reliability and pinned codewords are never doubted. The soft count
 /// that may offer a solution takes each bit at its codeword's
-/// reliability, which is all this is given.
+/// reliability, which is all this is given; [`rs_decode_doubting_bits`]
+/// is given every bit's.
 ///
 /// The codeword of every count doubted that reaches one is noted in
 /// `seen`, the one returned among them and those refused for the known
@@ -1310,55 +1339,55 @@ pub fn rs_decode_doubting(
     reserved: usize,
     seen: &mut Sightings,
 ) -> Option<(usize, RsSolution)> {
-    rs_decode_doubting_against(block, block, reliability, ec_len, reserved, seen)
+    let bits: Vec<[u8; 8]> = reliability.iter().map(|&r| [r; 8]).collect();
+    rs_decode_doubting_against(block, block, &bits, ec_len, reserved, seen)
 }
 
-/// [`rs_decode_doubting`], what each solution spends of the reserve
-/// counted against `read` ([`counted_against`]).
-pub(super) fn rs_decode_doubting_against(
+/// [`rs_decode_doubting`] given the reliability of every bit of the block:
+/// the codewords doubted first are those likeliest wrong as a whole
+/// ([`codeword_misread`]), and the soft count takes each bit at its
+/// own.
+pub fn rs_decode_doubting_bits(
     block: &[CwRead],
-    read: &[CwRead],
-    reliability: &[u8],
+    bits: &[[u8; 8]],
     ec_len: usize,
     reserved: usize,
     seen: &mut Sightings,
 ) -> Option<(usize, RsSolution)> {
-    assert_eq!(block.len(), reliability.len());
+    rs_decode_doubting_against(block, block, bits, ec_len, reserved, seen)
+}
+
+/// [`rs_decode_doubting_bits`], what each solution spends of the reserve
+/// counted against `read` ([`counted_against`]).
+pub(super) fn rs_decode_doubting_against(
+    block: &[CwRead],
+    read: &[CwRead],
+    bits: &[[u8; 8]],
+    ec_len: usize,
+    reserved: usize,
+    seen: &mut Sightings,
+) -> Option<(usize, RsSolution)> {
+    assert_eq!(block.len(), bits.len());
+    let misread: Vec<f64> = bits.iter().map(codeword_misread).collect();
     let erasures = block.iter().filter(|c| c.is_erasure()).count();
     let mut doubtful: Vec<usize> = (0..block.len())
-        .filter(|&i| !block[i].is_erasure() && block[i].pinned == 0 && reliability[i] < CERTAIN)
+        .filter(|&i| !block[i].is_erasure() && block[i].pinned == 0 && misread[i] > 0.0)
         .collect();
-    doubtful.sort_by_key(|&i| (reliability[i], i));
+    doubtful.sort_by(|&a, &b| misread[b].total_cmp(&misread[a]).then(a.cmp(&b)));
     doubtful.truncate(ec_len.saturating_sub(erasures));
 
-    let bits: Vec<[u8; 8]> = reliability.iter().map(|&r| [r; 8]).collect();
-    let mut offering = Offering::new(block, &bits, ec_len, seen);
+    let mut offering = Offering::new(block, bits, ec_len, seen);
     let mut best: Option<(usize, RsSolution)> = None;
-    let mut beyond: Option<(usize, RsSolution)> = None;
     for k in 1..=doubtful.len() {
         if let Ok(solution) =
             rs_decode_doubted(block, &doubtful[..k], ec_len, reserved, offering.seen()).map(|s| counted_against(read, ec_len, s.among(doubtful.len())))
             && offering.offers_solution(&solution)
+            && best.as_ref().is_none_or(|(_, b)| solution.confidence_bits() > b.confidence_bits())
         {
-            let held = if solution.within_standard() { &mut best } else { &mut beyond };
-            if held.as_ref().is_none_or(|(_, b)| solution.confidence_bits() > b.confidence_bits()) {
-                *held = Some((k, solution));
-            }
+            best = Some((k, solution));
         }
     }
-    best.or(beyond)
-}
-
-/// Of solutions found many ways, those within the standard's limit
-/// when any is ([`RsSolution::within_standard`]), and all of them
-/// otherwise: a solution that spends the codewords the standard reserves
-/// for detection is offered only where none that keeps them was found.
-pub(super) fn preferring_the_standard<T>(found: Vec<(u32, T)>, solution: impl Fn(&T) -> &RsSolution) -> Vec<(u32, T)> {
-    if found.iter().any(|(_, t)| solution(t).within_standard()) {
-        found.into_iter().filter(|(_, t)| solution(t).within_standard()).collect()
-    } else {
-        found
-    }
+    best
 }
 
 /// Bits [`rs_decode_chasing`] flips at the most: every pattern of the
@@ -1405,9 +1434,7 @@ pub fn chase_bits_among(bits: usize, tries: usize) -> usize {
 ///
 /// Trying many patterns is list decoding, and a wrong pattern can land
 /// on a wrong codeword that verifies, so every pattern's solution that
-/// is offered ([`Offering`]) is kept, those within the standard over any
-/// that spend its
-/// reserve ([`preferring_the_standard`]), and where they name different
+/// is offered ([`Offering`]) is kept, and where they name different
 /// codewords the one nearest the block as read, in bits weighed by
 /// their reliability, is kept over the rest only when it is nearer by a
 /// clear margin ([`nearest`]): the patterns flip the faintest bits, and
@@ -1424,9 +1451,10 @@ pub fn chase_bits_among(bits: usize, tries: usize) -> usize {
 /// never flipped.
 ///
 /// A block whose every EC codeword the standard reserves for detection,
-/// as M1's two are, is not chased at all: flipping bits until the check
-/// passes is correction by another name, and with sixteen check bits and
-/// a thousand patterns to try it passes on noise once in sixty blocks.
+/// as M1's two are, was once not chased at all: with sixteen check bits
+/// and a thousand patterns to try, the check passes on noise once in
+/// sixty blocks. The patterns' charge is what keeps such a pass from
+/// being offered, there as in any block.
 pub fn rs_decode_chasing(
     block: &[CwRead],
     bit_reliability: &[[u8; 8]],
@@ -1471,9 +1499,6 @@ pub(super) fn rs_decode_chasing_bits_against(
     seen: &mut Sightings,
 ) -> Vec<(Vec<u8>, RsSolution)> {
     assert_eq!(block.len(), bit_reliability.len());
-    if reserved >= ec_len {
-        return Vec::new();
-    }
     let mut doubtful: Vec<(u8, usize, u8)> = block
         .iter()
         .enumerate()
@@ -1547,7 +1572,6 @@ pub(super) fn rs_decode_chasing_bits_against(
         let solution = counted_against(read, ec_len, restated(block, ec_len, solution));
         found.push((soft_distance(block, bit_reliability, &solution.corrected), (pattern, solution)));
     }
-    let found = preferring_the_standard(found, |(_, solution)| solution);
     nearest(found, |a, b| a.1.corrected == b.1.corrected, |a, b| a.1.confidence_bits() > b.1.confidence_bits())
         .into_iter()
         .map(|(pattern, solution)| {
@@ -1705,11 +1729,8 @@ fn restated(block: &[CwRead], ec_len: usize, mut solution: RsSolution) -> RsSolu
 /// ([`keeps_reserve`]), where the block a solver searched is another:
 /// one with the message's evidence laid over it, or with its modules
 /// sampled right on the threshold read at their lean, which the reserve
-/// counts as unread ([`super::pipeline`]). Each solver prefers a
-/// solution that keeps the reserve ([`preferring_the_standard`]), and
-/// counted against the block searched it could keep one the block as
-/// read says spends the reserve, which is never confirmed, over one the
-/// block as read lets stand.
+/// counts as unread ([`super::pipeline`]): the mark a solution carries is
+/// what the block as read says of it, whatever block found it.
 pub(super) fn counted_against(read: &[CwRead], ec_len: usize, mut solution: RsSolution) -> RsSolution {
     solution.reserve_kept = keeps_reserve(read, ec_len, solution.reserved, &solution.corrected);
     solution
@@ -1747,23 +1768,14 @@ pub(super) fn counted_against(read: &[CwRead], ec_len: usize, mut solution: RsSo
 /// kept only where it is offered ([`Offering`]), and where the
 /// sets reach different codewords the one nearest the block as read is
 /// kept by a clear margin, or every one within the margin is returned,
-/// nearest first ([`nearest`]). A size whose every solution spends the
-/// codewords the standard reserves for detection does not end the
-/// search: the sizes after it may reach the block within the standard,
-/// and its solutions are returned only when none of them does
-/// ([`preferring_the_standard`]). Where the block searched reads as the
-/// block as read does, every codeword of it read whole or not at all, a
-/// codeword that keeps the reserve is within what the plain decode
-/// corrects, and is its own, which the trials come after
-/// ([`plain_reach_holds_the_reserve`]): the sizes after the first to
-/// reach anything have nothing to bring, and are not tried. They once
-/// were, every size the budget let them, to return the first size's
-/// solutions all the same; and then they were not wherever the block as
-/// read was so, though the block searched read what it left unread,
-/// and a codeword that kept the reserve lay past the plain decode of the
-/// block searched, at a size after the first. Each
-/// comes with the codewords erased, restated against the block as read
-/// as a chased one is. A codeword pinned whole is never erased. `sets`
+/// nearest first ([`nearest`]). The first size to reach anything ends
+/// the search, and the sizes after it, which reach codewords further
+/// from the block as read, are not tried. They once were, every size the
+/// budget let them, to return the first size's solutions all the same;
+/// and then, where a size's every solution spent the codewords the
+/// standard reserves for detection, for a solution after it that kept
+/// them. Each comes with the codewords erased, restated against the
+/// block as read as a chased one is. A codeword pinned whole is never erased. `sets`
 /// is how many sets may be tried in all, [`TRIAL_SETS`] at the most: a
 /// decode that is one of many has less to spend on each
 /// ([`super::pipeline::DecodeOptions::trial_sets`]). Every set of the
@@ -1786,8 +1798,7 @@ pub fn rs_decode_trying(
 }
 
 /// [`rs_decode_trying`], what each solution spends of the reserve
-/// counted against `read` ([`counted_against`]): a size of set whose
-/// solutions all spend it so is no end to the trials.
+/// counted against `read` ([`counted_against`]).
 pub(super) fn rs_decode_trying_against(
     block: &[CwRead],
     read: &[CwRead],
@@ -1808,10 +1819,6 @@ pub(super) fn rs_decode_trying_against(
     let read_gamma = read_erased.iter().fold(vec![1u8], |gamma, &i| poly_mul(&gamma, &[1, exp(n - 1 - i)]));
     let mut locator = Locator::new(ec_len, n);
     let mut offering = Offering::new(block, bit_reliability, ec_len, seen);
-    let mut beyond: Vec<(Vec<usize>, RsSolution)> = Vec::new();
-    // No size of set past the first to reach anything reaches a codeword
-    // within the standard that the plain decode does not.
-    let within_plain_reach = plain_reach_holds_the_reserve(block, read);
     let first = if left % 2 == 1 { 1 } else { 2 };
     let budget = sets.max(sets_of(candidates.len(), first, TRIAL_SETS_MAX).unwrap_or(0)).min(TRIAL_SETS_MAX);
     // The sizes of set the budget lets the trials try, each with how
@@ -1862,20 +1869,15 @@ pub(super) fn rs_decode_trying_against(
             let solution = counted_against(read, ec_len, restated(block, ec_len, solution));
             found.push((soft_distance(block, bit_reliability, &solution.corrected), (erased, solution)));
         });
-        let within = found.iter().any(|(_, (_, solution))| solution.within_standard());
-        let found = preferring_the_standard(found, |(_, solution)| solution);
         let kept = nearest(found, |a, b| a.1.corrected == b.1.corrected, |a, b| a.1.confidence_bits() > b.1.confidence_bits());
-        if (within || within_plain_reach) && !kept.is_empty() {
+        if !kept.is_empty() {
             return kept;
-        }
-        if beyond.is_empty() {
-            beyond = kept;
         }
         if work::cancelled() {
             break;
         }
     }
-    beyond
+    Vec::new()
 }
 
 /// How far the trials of erasures ([`rs_decode_trying`]) go in a block
@@ -1908,13 +1910,12 @@ impl TrialReach {
         self.past.max(1) * self.largest.max(1)
     }
 
-    /// Of the wrong codewords past what the standard corrects, those the
+    /// Of the wrong codewords past half the code's distance, those the
     /// sets tried reach in a block of `n` read whole and certain, with
-    /// `ec_len` of error correction and `reserved` of it kept for
-    /// detection, and confirm: a set of `s` erased, every one of them
-    /// wrong, leaves the code half of `ec_len - s` more to locate, and
-    /// each it locates confirms less ([`located_error_bits`]) than the
-    /// redundancy it spends. A solution is confirmed as the trials count
+    /// `ec_len` of error correction, and confirm: a set of `s` erased,
+    /// every one of them wrong, leaves the code half of `ec_len - s` more
+    /// to locate, and each it locates confirms less
+    /// ([`located_error_bits`]) than the redundancy it spends. A solution is confirmed as the trials count
     /// it, with `needed` bits to spare besides what the sets cost, or as
     /// the block itself judges it, with `judged` to spare and nothing for
     /// the sets: how rarely noise has a codeword within all its wrong
@@ -1926,20 +1927,14 @@ impl TrialReach {
     /// Micro QR, the block's own count is the one that confirms them; the
     /// reach was once said without it, and M3-M, M4-M and M4-Q, whose
     /// blocks it confirms a codeword further, were said to reach a
-    /// codeword less. Nothing where any codeword is reserved: a codeword the
-    /// trials erased is one read, and wrong, as the standard counts a
-    /// solution's errors ([`keeps_reserve`]), and a solution past what
-    /// the standard corrects spends the reserve however it was reached.
-    /// The trials were once said to reach a codeword past it within the
-    /// reserve at 1-H and 3-L, and at 1-M two, the codewords they erased
-    /// counted as erasures; and the reach was once counted without what
-    /// confirms it, and blocks of a few dozen codewords, those of Micro QR
-    /// and the smallest rMQR among them, were said to be corrected by sets
-    /// whose count ate what their solutions had to spare.
-    pub fn within_standard(&self, n: usize, ec_len: usize, reserved: usize, needed: u32, judged: u32) -> usize {
-        if reserved > 0 {
-            return 0;
-        }
+    /// codeword less. Where the standard reserves codewords for detection,
+    /// what the sets reach spends them, and is confirmed all the same
+    /// ([`keeps_reserve`]): it was once said to reach nothing there. The
+    /// reach was once counted without what confirms it, and blocks of a
+    /// few dozen codewords, those of Micro QR and the smallest rMQR among
+    /// them, were said to be corrected by sets whose count ate what their
+    /// solutions had to spare.
+    pub fn confirmed(&self, n: usize, ec_len: usize, needed: u32, judged: u32) -> usize {
         let reached = (0..self.past)
             .map(|i| self.first_size + 2 * i)
             .filter(|&size| size <= ec_len && size <= n)
@@ -3358,6 +3353,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_pick_is_charged_a_bit_for_each_doubling_of_its_tries_however_many() {
+        assert_eq!([0, 1, 2, 3, 4, 5].map(tries_charge), [0, 0, 1, 2, 2, 3]);
+        // Past the largest power of two a count holds, every bit of it:
+        // the next power once overflowed.
+        assert_eq!(tries_charge(usize::MAX), usize::BITS);
+        assert_eq!(tries_charge((1 << (usize::BITS - 1)) + 1), usize::BITS);
+    }
+
+    #[test]
     fn the_trials_reach_said_is_the_one_they_go() {
         // A 1-H block, of odd error correction: every codeword and every
         // triple, and every set of five is past the default.
@@ -3374,8 +3378,8 @@ mod tests {
         use crate::symbol::SymbolVersion;
         let stage = DecodeOptions { erase_by_trial: true, ..DecodeOptions::default().first_stage() };
         let (needed, judged) = (verifying_bits(SymbolVersion::Qr(1), &stage, false), judged_verifying_bits(&stage));
-        assert_eq!(trial_reach(45, 30, TRIAL_SETS).within_standard(45, 30, 0, needed, judged), 1);
-        assert_eq!(trial_reach(33, 18, TRIAL_SETS).within_standard(33, 18, 0, needed, judged), 2);
+        assert_eq!(trial_reach(45, 30, TRIAL_SETS).confirmed(45, 30, needed, judged), 1);
+        assert_eq!(trial_reach(33, 18, TRIAL_SETS).confirmed(33, 18, needed, judged), 2);
         // In a small block the sets cost what their solutions have to
         // spare: at M3-M the pairs, fours and sixes reach three past the
         // code's four, and as the trials count them confirm none, which
@@ -3384,9 +3388,9 @@ mod tests {
         // so verifies it; six it does not. They were then said to confirm
         // none, as were M4-M's, and M4-Q's one where they confirm two.
         let m3_m = trial_reach(17, 8, TRIAL_SETS);
-        assert_eq!((m3_m.past, m3_m.within_standard(17, 8, 0, needed, u32::MAX), m3_m.within_standard(17, 8, 0, needed, judged)), (3, 0, 1));
-        assert_eq!(trial_reach(24, 10, TRIAL_SETS).within_standard(24, 10, 0, needed, judged), 1);
-        assert_eq!(trial_reach(24, 14, TRIAL_SETS).within_standard(24, 14, 0, needed, judged), 2);
+        assert_eq!((m3_m.past, m3_m.confirmed(17, 8, needed, u32::MAX), m3_m.confirmed(17, 8, needed, judged)), (3, 0, 1));
+        assert_eq!(trial_reach(24, 10, TRIAL_SETS).confirmed(24, 10, needed, judged), 1);
+        assert_eq!(trial_reach(24, 14, TRIAL_SETS).confirmed(24, 14, needed, judged), 2);
         // What the block itself makes of a codeword so many codewords
         // off, read whole and certain, is that count, less the choice's
         // bit ([`judged`]).
@@ -3399,22 +3403,23 @@ mod tests {
         let certain = vec![[CERTAIN; 8]; 17];
         let solution = super::judged(&block, &certain, 8, 0, codeword, 0).expect("the block judges it");
         assert_eq!(i64::from(solution.confidence_bits()), list_solution_balance(17, 8, 5) - 1);
-        // Where any codeword is reserved, nothing: the codewords a set
-        // erases are read, and wrong, as the standard counts errors
-        // ([`keeps_reserve`]), so a solution past what it corrects spends
-        // the reserve however it was reached. At 1-H the triples were once
-        // said to reach nine wrong within it, at 1-M the fours six, and at
-        // 3-L, where the least budget tries the single codewords alone,
-        // the triples a codeword past it, the codewords they erased taken
-        // for erasures.
-        assert_eq!(trial_reach(26, 17, TRIAL_SETS).within_standard(26, 17, 1, VERIFIED_BITS, VERIFIED_BITS), 0);
-        assert_eq!(trial_reach(26, 10, TRIAL_SETS).within_standard(26, 10, 2, VERIFIED_BITS, VERIFIED_BITS), 0);
-        assert_eq!(trial_reach(44, 10, TRIAL_SETS).within_standard(44, 10, 2, VERIFIED_BITS, VERIFIED_BITS), 0);
+        // Where the standard reserves codewords, what the sets reach
+        // spends them, and is confirmed by the same counts as anywhere:
+        // at 1-H the triples reach ten wrong, at 1-M and 2-L the pairs or
+        // fours six, at 3-L the single codewords eight and the triples
+        // nine, at M2-L the single codewords three, and at 1-L, with the
+        // most sets, four, each by what the block itself makes of it. It
+        // was once said to reach nothing past the standard's limit there,
+        // a solution that spent the reserve never being confirmed.
+        assert_eq!((needed, judged), (12, 9));
+        assert_eq!(trial_reach(26, 17, TRIAL_SETS).confirmed(26, 17, needed, judged), 2);
+        assert_eq!(trial_reach(26, 10, TRIAL_SETS).confirmed(26, 10, needed, judged), 1);
+        assert_eq!(trial_reach(44, 10, TRIAL_SETS).confirmed(44, 10, needed, judged), 1);
         let singles = trial_reach(70, 15, TRIAL_SETS_MIN);
-        assert_eq!((singles.past, singles.within_standard(70, 15, 1, VERIFIED_BITS, VERIFIED_BITS)), (1, 0));
-        assert_eq!(trial_reach(70, 15, TRIAL_SETS).within_standard(70, 15, 1, VERIFIED_BITS, VERIFIED_BITS), 0);
-        assert_eq!(trial_reach(10, 5, TRIAL_SETS).within_standard(10, 5, 3, VERIFIED_BITS, VERIFIED_BITS), 0);
-        assert_eq!(trial_reach(26, 7, TRIAL_SETS_MAX).within_standard(26, 7, 3, VERIFIED_BITS, VERIFIED_BITS), 0);
+        assert_eq!((singles.past, singles.confirmed(70, 15, needed, judged)), (1, 1));
+        assert_eq!(trial_reach(70, 15, TRIAL_SETS).confirmed(70, 15, needed, judged), 2);
+        assert_eq!(trial_reach(10, 5, TRIAL_SETS).confirmed(10, 5, needed, judged), 1);
+        assert_eq!(trial_reach(26, 7, TRIAL_SETS_MAX).confirmed(26, 7, needed, judged), 1);
         // The least budget reaches one codeword past the code in any
         // block that has room to erase in, Model 1's largest, of 238
         // codewords, among them.
@@ -3609,6 +3614,58 @@ mod tests {
             Err(failure) => assert!(matches!(failure, RsFailure::KnownBitConflict { .. }), "{failure:?}"),
             Ok(sol) => assert!(sol.corrected != block && sol.confidence_bits() < VERIFIED_BITS && sol.flipped_known_bits > 0, "{sol:?}"),
         }
+    }
+
+    #[test]
+    fn a_codeword_is_doubted_by_how_likely_it_is_wrong_as_a_whole() {
+        // One faint bit among certain ones is that bit; a codeword faint
+        // all through is less reliable than any of its bits.
+        assert_eq!(codeword_reliability(&[CERTAIN; 8]), CERTAIN);
+        let mut speck = [CERTAIN; 8];
+        speck[3] = 20;
+        assert_eq!(codeword_reliability(&speck), 20);
+        let mut speckled = [56; 8];
+        speckled[3] = 20;
+        let faded = [30; 8];
+        assert!(codeword_reliability(&faded) < codeword_reliability(&speckled), "{} {}", codeword_reliability(&faded), codeword_reliability(&speckled));
+        assert!(codeword_reliability(&faded) < 30);
+        // A block of 26 with 10 of error correction, five codewords wrong:
+        // the faded ones, read faint all through, and five more with one
+        // faint bit each, read right. Doubted as wholes, the faded five
+        // are erased and the block solves with five codewords to spare.
+        let data: Vec<u8> = (0..16).map(|i| (i * 37 + 11) as u8).collect();
+        let codeword: Vec<u8> = data.iter().copied().chain(rs_encode(&data, 10)).collect();
+        let mut read: Vec<CwRead> = codeword.iter().map(|&v| CwRead::known(v)).collect();
+        let mut bits = vec![[56u8; 8]; 26];
+        for i in [1, 6, 11, 16, 21] {
+            read[i].value ^= 0x24;
+            bits[i] = [30; 8];
+        }
+        for i in [3, 8, 13, 18, 23] {
+            bits[i][5] = 20;
+        }
+        let (doubted, solution) = rs_decode_doubting_bits(&read, &bits, 10, 0, &mut Sightings::default()).expect("the faded codewords doubted");
+        assert_eq!(solution.corrected, codeword);
+        // Doubted by their faintest bit, the five specks went first, and
+        // only all ten erased together reached the block, with nothing
+        // left to confirm it.
+        assert_eq!(doubted, 5);
+        // Codewords more likely wrong than right are told apart all the
+        // same: six read right at two bits a bit, ahead of five wrong with
+        // every bit at a guess and a bit. Held at a coin's toss, as their
+        // reliability is, all eleven were alike, and the ten doubted were
+        // the first ten of the block, one wrong codeword left out.
+        assert_eq!((codeword_reliability(&[16; 8]), codeword_reliability(&[8; 8])), (0, 0));
+        assert!(codeword_misread(&[8; 8]) > codeword_misread(&[16; 8]));
+        let mut read: Vec<CwRead> = codeword.iter().map(|&v| CwRead::known(v)).collect();
+        let mut bits = vec![[56u8; 8]; 26];
+        bits[..6].fill([16; 8]);
+        for i in 10..15 {
+            read[i].value ^= 0x24;
+            bits[i] = [8; 8];
+        }
+        let (doubted, solution) = rs_decode_doubting_bits(&read, &bits, 10, 0, &mut Sightings::default()).expect("the faintest codewords doubted");
+        assert_eq!((doubted, &solution.corrected), (5, &codeword));
     }
 
     #[test]
@@ -3974,19 +4031,22 @@ mod tests {
             let at_least: u32 = claimed[bits..].iter().sum();
             assert!(f64::from(at_least) <= 2.0 * f64::from(blocks) / 2f64.powi(bits as i32) + 3.0, "{at_least} of {blocks} claim {bits} bits or more");
         }
-        // M1's block has two codewords and the standard reserves both: a
-        // read of it is right or wrong, and no pattern of flips is tried.
-        // Without the reserve, flipping the one faint bit is one pattern,
-        // charged nothing, and the sixteen bits of the check confirm it;
-        // as one of a thousand patterns it would stand on six.
+        // M1's block has two codewords and the standard reserves both. The
+        // flips are tried there as anywhere, and the reserve only marks
+        // what they find: flipping the one faint bit is one pattern,
+        // charged nothing, and the sixteen bits of the check confirm it,
+        // beyond the standard; as one of a thousand patterns it stands on
+        // six, and is held back with the reserve or without it.
         let block = codeword(&mut rng, 5, 2);
         let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
         read[1].value ^= 0x04;
         let mut reliability = vec![[200u8; 8]; block.len()];
         reliability[1][2] = 3;
-        assert!(rs_decode_chasing(&read, &reliability, 2, 2, CHASE_BITS).is_empty());
-        assert!(only(rs_decode_chasing(&read, &reliability, 2, 0, 1)).is_some_and(|(_, s)| s.corrected == block && s.confidence_bits() == 16));
-        assert!(rs_decode_chasing(&read, &reliability, 2, 0, CHASE_BITS).is_empty());
+        for reserved in [0, 2] {
+            let alone = only(rs_decode_chasing(&read, &reliability, 2, reserved, 1));
+            assert!(alone.is_some_and(|(_, s)| s.corrected == block && s.confidence_bits() == 16 && s.reserve_kept == (reserved == 0)), "{reserved} reserved");
+            assert!(rs_decode_chasing(&read, &reliability, 2, reserved, CHASE_BITS).is_empty(), "{reserved} reserved");
+        }
     }
 
     #[test]
@@ -4623,8 +4683,8 @@ mod tests {
         // right on the threshold, those four were read as nothing, and the
         // reserve counts them so: four codewords unread, as much as it
         // allows. Counted against the block the trials searched, they are
-        // four read wrong, past it, and a solver that prefers what keeps
-        // the reserve would keep another solution over this one.
+        // four read wrong, past it, and the solution would be marked as
+        // beyond the standard.
         let mut rng = Rng(43);
         let block = codeword(&mut rng, 19, 7);
         let mut searched: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
@@ -4641,7 +4701,7 @@ mod tests {
     }
 
     #[test]
-    fn a_codeword_that_keeps_the_reserve_lies_within_the_plain_decode_only_of_a_block_read_whole_or_not_at_all() {
+    fn a_codeword_that_keeps_the_reserve_may_lie_past_the_plain_decode_of_a_block_read_in_part() {
         // A 1-Q block, thirteen codewords of error correction and one of
         // them kept: six codewords a module short and four read wrong
         // keep it, at seventy eighths of the ninety-six it leaves, where
@@ -4658,16 +4718,6 @@ mod tests {
         }
         assert!(keeps_reserve(&read, 13, 1, &block));
         assert!(!rs_decode_reserving(&read, 13, 1).is_ok_and(|s| s.corrected == block));
-        assert!(!plain_reach_holds_the_reserve(&read, &read));
-        // Read whole or not at all, it holds; and not of a block searched
-        // that reads a codeword the block as read leaves unread.
-        for &i in &picked[4..] {
-            read[i] = CwRead::unknown();
-        }
-        assert!(plain_reach_holds_the_reserve(&read, &read));
-        let mut searched = read.clone();
-        searched[picked[4]] = CwRead::known(block[picked[4]] ^ 1);
-        assert!(!plain_reach_holds_the_reserve(&searched, &read));
     }
 
     #[test]
@@ -4728,9 +4778,10 @@ mod tests {
         assert_eq!(sol.confidence_bits(), located_error_bits(17, 1));
         assert_eq!(sol.confidence_bits(), 3);
 
-        // Reserved codewords are reserved whatever was located: a 2-L
-        // block wrong in five codewords solves by spending the two the
-        // standard keeps for detection, and is beyond it.
+        // Reserved codewords are spent whatever was located: a 2-L block
+        // wrong in five codewords solves by spending the two the standard
+        // keeps for detection, and is beyond it, and the five it located
+        // among forty-four confirm it by nineteen bits all the same.
         let block = codeword(&mut rng, 34, 10);
         let mut read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
         for &i in &rng.distinct(5, block.len()) {
@@ -4738,7 +4789,9 @@ mod tests {
         }
         let sol = rs_decode_reserving(&read, 10, 2).unwrap();
         assert_eq!((sol.errors, sol.slack, sol.corrected == block), (5, 0, true));
-        assert!(sol.confidence_bits() >= VERIFIED_BITS && !sol.within_standard());
+        assert_eq!(sol.confidence_bits(), located_error_bits(44, 5));
+        assert_eq!(sol.confidence_bits(), 19);
+        assert!(!sol.within_standard());
     }
 
     #[test]

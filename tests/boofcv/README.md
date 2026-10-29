@@ -138,24 +138,43 @@ QR_BOOFCV_METRICS=1 QR_BOOFCV_ORACLE=1 QR_BOOFCV_REPORT=after.tsv cargo test --r
 
 BoofCV 1.5.0, with its detector configured by
 `FactoryFiducial.qrcode(null, GrayU8.class)`, reads 923 of the 1232
-symbols. As the record stands, the search here reads 1216, finds 11 more
-that it can't decode, and doesn't find 5. Two of the 11 found aren't QR
+symbols. As the record stands, the search here reads 1217, finds 10 more
+that it can't decode, and misses 5. Two of the 10 found aren't QR
 Codes: `nominal/image043.jpg` and `image044.jpg` mark a pictogram on a
-sign drawn to look like one (6-module finders around a 2-module stone,
-no timing patterns), so any read of it would be a misread. And
-`curved/image017.jpg` symbol 0, a 1-M symbol, used to read only through
-a solution that spent the two codewords its block reserves for error
-detection; it is now found but not confirmed.
+sign designed to look like one (6-module finders around a 2-module
+stone, no timing patterns), so any read of it would be a misread.
 
-Read through their hand-marked corners (`QR_BOOFCV_ORACLE`), 1 of the 5
-missed symbols reads and the other 4 are found, and 1 of the 11 found
-but not decoded reads. The missed one is `perspective/image016.jpg`,
-seen so steeply that its far finder is barely a pixel per module. The
-found one is `glare/image019.jpg`, which reads only through the marks
-exactly as given, not rounded to 0.1 px. Every other symbol missed is
-lost in the reading, not the search: the damaged ones are crumpled
-receipts beyond their error correction, and the blurred ones are too
-blurred to read even through their own corners.
+`curved/image011.jpg` and `image013.jpg` are 1-M symbols holding `New`,
+like `image012.jpg`. They read with their padding pinned, where the
+padding was found in a solution that spent the block's two reserved
+error-detection codewords. Pins the decoder finds in the very block
+they confirm count as read, so those solutions still spend the reserve
+and are marked beyond the standard. Like any solution, they're
+confirmed by their chance of being wrong: 1 in 2^30 and 1 in 2^37. They
+used to go unconfirmed, when a solution that spent the reserve never
+could be.
+`curved/image017.jpg` holds two 1-M symbols, and the search reads
+both: symbol 0, `hudson`, by spending its reserve.
+
+Read through their hand-marked corners (`QR_BOOFCV_ORACLE`), 2 of the 5
+missed symbols read and the other 3 are found, and 1 of the 10 found
+but undecoded reads. The two missed ones that read are:
+
+- `perspective/image016.jpg`, seen so steeply that its far finder is
+  barely a pixel per module. An outline drawn exactly on those corners
+  now reads it too.
+- `blurred/image040.jpg`.
+
+The found one is `glare/image019.jpg`, which reads through the marks as
+given, and through some placements a pixel or two off them, but not
+through the marks rounded to 0.1 px. Every other missed symbol is lost
+in reading, not search: the damaged ones are crumpled receipts beyond
+their error correction, and the blurred ones are too blurred to read
+even through their own corners.
+
+The harness reads as stored, without `--linear-light`. Through the same
+corners in linear light, both symbols `blurred/image005.jpg` misses read
+as well, and `glare/image019.jpg` doesn't.
 
 BoofCV takes a third of a second on a twelve-megapixel photo where this
 search takes tens of seconds, and when it finds a symbol's position

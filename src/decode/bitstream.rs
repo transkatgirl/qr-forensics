@@ -159,7 +159,10 @@ pub enum EndOfData {
 /// What trying the readings of a header with unreadable bits found. The
 /// readings are tried in order of how many bits they guess, and the search
 /// stops at the first depth where one parses cleanly, so the candidates
-/// are the most parsimonious readings of the stream. A reading counts
+/// are the most parsimonious readings of the stream, and besides them any
+/// deeper, by as much as one data segment's header runs past another's
+/// ([`rival_depth`]), that end at the same terminator in other modes,
+/// which nothing read tells from them ([`infer_headers`]). A reading counts
 /// only when the terminator it ends at was read, not guessed: the known
 /// bits it explains are what set it apart from the readings that merely
 /// stop somewhere consistent with the padding.
@@ -167,13 +170,15 @@ pub enum EndOfData {
 pub struct HeaderInference {
     /// Readings that parse cleanly to the end with a plausible tail.
     pub candidates: usize,
-    /// Header bits each candidate had to guess.
+    /// Header bits the most parsimonious candidates had to guess: a rival
+    /// counted among them guessed more.
     pub guessed_bits: usize,
     /// Every reading at that depth was tried. When false the search ran
     /// out of budget: `candidates` is a lower bound and nothing is inferred.
     pub complete: bool,
     /// Stream bits, as (position, value), that every candidate agrees on.
-    /// Empty unless the search is complete and found a candidate.
+    /// Empty unless the search is complete and found a candidate, and
+    /// empty where a rival was found, whose bits are not weighed.
     pub inferred: Vec<(usize, bool)>,
 }
 
@@ -196,11 +201,38 @@ const ALPHANUMERIC: &[u8; 45] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
 /// The pad codewords an encoder writes after the terminator, in turn.
 pub const PAD_BYTES: [u8; 2] = [0xEC, 0x11];
 
-/// Most header bits one reading may guess: a mode indicator, a count and
-/// a terminator come to sixteen in QR Code.
-const MAX_GUESSED_HEADER_BITS: usize = 16;
-/// Most parses one inference may run. Past this it gives up rather than
-/// stall a decode, which brute force runs once per EC level and mask.
+/// Most header bits one reading may guess: a mode indicator and the
+/// longest count come to twenty in QR Code, a byte segment's from
+/// version 10, whose header was once past guessing. The terminator is
+/// never guessed ([`survives`]).
+const MAX_GUESSED_HEADER_BITS: usize = 20;
+/// The width of a Hanzi segment's subset indicator, between its mode
+/// indicator and its count.
+const HANZI_SUBSET_BITS: usize = 4;
+
+/// How many bits deeper than the readings found first the search looks
+/// for a reading of other modes that ends where they do ([`infer_headers`]):
+/// as far as the longest header of a data segment in `spec` runs past the
+/// shortest. Below version 10 a byte header is twelve bits, an
+/// alphanumeric one thirteen and a numeric one fourteen, a Hanzi one
+/// sixteen; from version 10 a kanji header is fourteen and a byte one
+/// twenty. Two bits deeper, as the search once looked, a byte segment of
+/// version 10 or more, unread, was never weighed against the
+/// alphanumeric reading of the same bits, which was taken and pinned.
+fn rival_depth(spec: &StreamSpec) -> usize {
+    let headers: Vec<usize> = [Mode::Numeric, Mode::Alphanumeric, Mode::Byte, Mode::Kanji, Mode::Hanzi]
+        .into_iter()
+        .filter_map(|mode| {
+            let subset = if mode == Mode::Hanzi { HANZI_SUBSET_BITS } else { 0 };
+            spec.count_bits(mode).map(|count| usize::from(spec.mode_bits) + subset + usize::from(count))
+        })
+        .collect();
+    headers.iter().max().zip(headers.iter().min()).map_or(0, |(longest, shortest)| longest - shortest)
+}
+/// Most parses each search of an inference may run: the readings at the
+/// fewest bits guessed, and then their rivals ([`rival_readings`]), each
+/// counted afresh. Past this it gives up rather than stall a decode,
+/// which brute force runs once per EC level and mask.
 const MAX_HEADER_TRIALS: usize = 2048;
 /// Known bits beyond the terminator that a reading must explain as
 /// padding before it counts: a reading that swallows the padding as
@@ -625,6 +657,16 @@ type Reading = (Vec<(usize, bool)>, Parsed);
 /// first, stopping at the first depth where some reading parses cleanly.
 /// Returns what was found and, when exactly one reading parses, that
 /// reading with the bits it guessed.
+///
+/// A reading found first is one of as many as end where it does, in
+/// modes whose headers take more bits to guess ([`rival_depth`]):
+/// the same terminator, the same padding after it, and nothing in what
+/// is read to choose between them. The fewest bits guessed once chose:
+/// an alphanumeric segment's header, unread, was taken for a byte
+/// segment's whenever the data after it ran a whole number of bytes to
+/// the terminator, one time in eight, and its header bits pinned so.
+/// Such a reading is counted among the candidates now, and none of them
+/// is taken.
 fn infer_headers(stream: &StreamBits, spec: &StreamSpec, field: Range<usize>) -> (HeaderInference, Option<Reading>) {
     let mut trial = stream.clone();
     let mut search = Search { trials: 0, survivors: Vec::new(), cut: false, exhausted: false };
@@ -638,8 +680,17 @@ fn infer_headers(stream: &StreamBits, spec: &StreamSpec, field: Range<usize>) ->
             return (inference, None);
         }
         if candidates > 0 {
-            let inferred = agreed_bits(&search.survivors);
-            let unique = (candidates == 1).then(|| search.survivors.pop().expect("one survivor"));
+            let mut found = std::mem::take(&mut search.survivors);
+            let rivals = rival_readings(&mut trial, stream, spec, &field, &found, depth, &mut search);
+            if search.exhausted {
+                // A rival may lie past the trials run: the readings found
+                // are a lower bound, and none of them is taken.
+                let inference = HeaderInference { candidates: candidates + rivals, guessed_bits: depth, complete: false, inferred: Vec::new() };
+                return (inference, None);
+            }
+            let inferred = if rivals == 0 { agreed_bits(&found) } else { Vec::new() };
+            let candidates = candidates + rivals;
+            let unique = (candidates == 1).then(|| found.pop().expect("one survivor"));
             return (HeaderInference { candidates, guessed_bits: depth, complete: true, inferred }, unique);
         }
         if !search.cut {
@@ -653,9 +704,61 @@ fn infer_headers(stream: &StreamBits, spec: &StreamSpec, field: Range<usize>) ->
     (inference, None)
 }
 
+/// The readings up to [`rival_depth`] bits deeper than `depth` that end
+/// where one of `found` does, in other modes ([`infer_headers`]): how
+/// many there are. A search that runs out of trials meanwhile counts what
+/// it found by then, and says so ([`Search::exhausted`]).
+fn rival_readings(
+    trial: &mut StreamBits,
+    original: &StreamBits,
+    spec: &StreamSpec,
+    field: &Range<usize>,
+    found: &[Reading],
+    depth: usize,
+    search: &mut Search,
+) -> usize {
+    let modes = |parsed: &Parsed| parsed.segments.iter().map(|s| s.mode).collect::<Vec<Mode>>();
+    let ends = |parsed: &Parsed| match parsed.end {
+        EndOfData::At { bit, .. } => Some(bit),
+        EndOfData::Lost { .. } => None,
+    };
+    let mut rivals: Vec<Vec<(usize, bool)>> = Vec::new();
+    search.trials = 0;
+    for deeper in depth + 1..=(depth + rival_depth(spec)).min(MAX_GUESSED_HEADER_BITS) {
+        search.survivors.clear();
+        search.cut = false;
+        explore(trial, original, spec, field.clone(), &mut Vec::new(), deeper, search);
+        // A rival reads the same segments in other modes: one that lays
+        // more segments into stream it could not read only fills what
+        // nothing read speaks for, and four bits deeper, a header's
+        // mode alone, any reading with an unread stretch had one.
+        for (path, parsed) in &search.survivors {
+            let new = found.iter().all(|(guessed, _)| guessed != path);
+            let other_modes = |kept: &Parsed| modes(kept).len() == modes(parsed).len() && modes(kept) != modes(parsed);
+            let rival = new && found.iter().any(|(_, kept)| ends(kept) == ends(parsed) && other_modes(kept));
+            if rival && !rivals.contains(path) {
+                rivals.push(path.clone());
+            }
+        }
+        if search.exhausted || !search.cut {
+            break;
+        }
+    }
+    search.survivors.clear();
+    rivals.len()
+}
+
 /// Depth-first over the unreadable bits of `field`, then of whatever
 /// header blocks next, up to `depth` guessed bits in all. `original` is
 /// the stream as read, for telling guessed bits from known ones.
+///
+/// The readings of a field are tried in the order of the value they give
+/// it, its first bit the highest, and those of a count stop at the first
+/// whose payload runs past the end of the stream, as every larger count
+/// does: of the thousand readings of a numeric segment's count in a
+/// version 1 symbol, forty or so fit, and the thousand once ran the
+/// search out of trials before a reading of its mode and count together
+/// could be found.
 fn explore(
     trial: &mut StreamBits,
     original: &StreamBits,
@@ -665,6 +768,7 @@ fn explore(
     depth: usize,
     search: &mut Search,
 ) {
+    let field_end = field.end;
     let unknown: Vec<usize> = field.filter(|&i| trial.certainty[i] == Certainty::Unknown).collect();
     if path.len() + unknown.len() > depth {
         search.cut = true;
@@ -678,12 +782,21 @@ fn explore(
         }
         search.trials += 1;
         for (k, &i) in unknown.iter().enumerate() {
-            let value = assignment >> k & 1 != 0;
+            let value = assignment >> (unknown.len() - 1 - k) & 1 != 0;
             trial.values[i] = value;
             trial.certainty[i] = Certainty::Unverified;
             path.push((i, value));
         }
         let parsed = parse_with(trial, spec, false);
+        // A count whose payload runs past the stream, and every larger.
+        if parsed.segments.iter().any(|s| s.truncated && s.payload.start == field_end) {
+            path.truncate(base);
+            for &i in &unknown {
+                trial.values[i] = false;
+                trial.certainty[i] = Certainty::Unknown;
+            }
+            break;
+        }
         match parsed.blocked.clone() {
             Some(next) => explore(trial, original, spec, next, path, depth, search),
             None => {
@@ -1201,11 +1314,11 @@ mod tests {
 
         // Within the depth that is searched, the one reading of a whole
         // unknown header is found: eight bytes end at the terminator that
-        // can be seen, with the padding after it. No numeric, alphanumeric
-        // or kanji count ends there, and a count that runs on into the
-        // padding and stops near capacity explains none of it.
+        // can be seen, with the padding after it. No numeric, alphanumeric,
+        // kanji or Hanzi count ends there, and a count that runs on into
+        // the padding and stops near capacity explains none of it.
         let mut text = String::from("???? ???????? ");
-        text.push_str(&"????????".repeat(8));
+        text.push_str(&"01000001".repeat(8));
         text.push_str(" 0000 11101100 00010001 11101100");
         let report = parse(&bits(&text), &StreamSpec::new(SymbolVersion::Qr(1)));
         let inference = report.header_inference.as_ref().unwrap();
@@ -1213,9 +1326,21 @@ mod tests {
         assert_eq!(report.segments[0].mode, Mode::Byte);
         assert_eq!(report.segments[0].count, Some(8));
         assert_eq!(inference.inferred.len(), 12);
-        // Headers beyond the depth that is searched, or past the trial
-        // budget, give up rather than guess: the same stream in version
-        // 10, where a byte count is sixteen bits, is out of reach.
+        // The bytes unread too, a header may lie among them: readings that
+        // guess a few bits more end at the terminator as well, past the
+        // trials the search may run, and none is taken. Looked for two
+        // bits deeper, short of a Hanzi header, they went unseen.
+        let mut text = String::from("???? ???????? ");
+        text.push_str(&"????????".repeat(8));
+        text.push_str(" 0000 11101100 00010001 11101100");
+        let report = parse(&bits(&text), &StreamSpec::new(SymbolVersion::Qr(1)));
+        let inference = report.header_inference.as_ref().unwrap();
+        assert!(!inference.complete || inference.candidates > 1, "{inference:?}");
+        assert!(report.segments.is_empty() && inference.inferred.is_empty(), "{:?}", report.segments);
+        // Headers past the trial budget give up rather than guess: the
+        // same stream in version 10, where a byte count is sixteen bits,
+        // its mode unread too, is out of reach, every mode opening a tree
+        // of headers to guess after it.
         let mut text = String::from("???? ???????????????? ");
         text.push_str(&"????????".repeat(8));
         text.push_str(" 0000 11101100 00010001 11101100");
@@ -1224,6 +1349,70 @@ mod tests {
         assert!(!inference.complete, "{inference:?}");
         assert!(inference.inferred.is_empty());
         assert_eq!(report.end, EndOfData::Lost { bit: 0, reason: LostReason::UnknownHeader });
+    }
+
+    #[test]
+    fn a_long_count_unread_is_inferred_from_where_its_payload_ends() {
+        // Version 10, where a byte count is sixteen bits: the mode reads,
+        // the count does not, and eight bytes end at the terminator that
+        // can be seen. The counts are tried smallest first, and those past
+        // the end of the stream are not tried at all.
+        let mut text = String::from("0100 ???????????????? ");
+        text.push_str(&"01000001".repeat(8));
+        text.push_str(" 0000 11101100 00010001 11101100");
+        let report = parse(&bits(&text), &StreamSpec::new(SymbolVersion::Qr(10)));
+        let inference = report.header_inference.as_ref().unwrap();
+        assert_eq!((inference.candidates, inference.guessed_bits, inference.complete), (1, 16, true), "{inference:?}");
+        assert_eq!((report.segments[0].mode, report.segments[0].count), (Mode::Byte, Some(8)));
+        // A numeric segment's header unread whole in version 1, its mode
+        // and its ten bits of count: twelve digits end at the terminator,
+        // the zero bits after it filling the byte. So do readings of
+        // control segments that guess fewer bits, which nothing read tells
+        // from it: the search runs to its end within its trials, and takes
+        // none of them. With the pad bytes two bits short of the byte's
+        // end, as this stream once had them, no reading ended there, and
+        // nothing was asked of the twelve digits.
+        let mut text = String::from("???? ?????????? ");
+        text.push_str(&"0001111011".repeat(4));
+        text.push_str(" 0000 000000 11101100 00010001 11101100");
+        let report = parse(&bits(&text), &StreamSpec::new(SymbolVersion::Qr(1)));
+        let inference = report.header_inference.as_ref().unwrap();
+        assert!(inference.complete && inference.candidates >= 2 && inference.guessed_bits < 14, "{inference:?}");
+        assert!(report.segments.is_empty() && inference.inferred.is_empty(), "{:?}", report.segments);
+    }
+
+    #[test]
+    fn readings_of_other_modes_ending_alike_are_not_told_apart() {
+        // "HELLO WORLD 12345 QRCOD" in alphanumeric mode in version 1, its
+        // header unread: 127 bits of payload after a header of thirteen,
+        // ending at bit 140. Read as a byte header of twelve bits, sixteen
+        // bytes end at the same terminator, and both explain what is read
+        // after it alike: the fewer bits the byte header guesses once made
+        // it the reading, and its header bits were pinned so.
+        let text = "???? ????????? 01100001011 01111000110 10001011100 10110111000 10011010100 01001101101 00000101111 00010001011 00100000101 10010101101 01000110100 001101 0000 11101100";
+        let report = parse(&bits(text), &StreamSpec::new(SymbolVersion::Qr(1)));
+        let inference = report.header_inference.as_ref().unwrap();
+        assert!(inference.complete, "{inference:?}");
+        assert!(inference.candidates >= 2, "{inference:?}");
+        assert!(report.segments.is_empty(), "{:?}", report.segments);
+        // From version 10 a byte header is five bits past an alphanumeric
+        // one: eighteen bytes of "A", their header unread, end at the
+        // terminator read as twenty-seven alphanumeric characters too, and
+        // neither is taken. Looking two bits deeper, the alphanumeric
+        // reading stood alone, and its header bits were pinned.
+        let mut text = String::from("???? ???????????????? ");
+        text.push_str(&"01000001".repeat(18));
+        text.push_str(" 0000");
+        text.push_str(&" 11101100 00010001".repeat(2));
+        let report = parse(&bits(&text), &StreamSpec::new(SymbolVersion::Qr(10)));
+        let inference = report.header_inference.as_ref().unwrap();
+        assert!(inference.candidates >= 2 || !inference.complete, "{inference:?}");
+        assert!(report.segments.is_empty() && inference.inferred.is_empty(), "{:?}", report.segments);
+        // With the mode read, the alphanumeric reading stands alone.
+        let text = "0010 ????????? 01100001011 01111000110 10001011100 10110111000 10011010100 01001101101 00000101111 00010001011 00100000101 10010101101 01000110100 001101 0000 11101100";
+        let report = parse(&bits(text), &StreamSpec::new(SymbolVersion::Qr(1)));
+        assert_eq!((report.segments[0].mode, report.segments[0].count), (Mode::Alphanumeric, Some(23)));
+        assert_eq!(chars(&report.segments[0]), "HELLO WORLD 12345 QRCOD");
     }
 
     fn chars_of_bytes(segment: &Segment) -> String {

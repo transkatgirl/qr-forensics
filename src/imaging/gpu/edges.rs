@@ -1,11 +1,13 @@
 //! The edges of an image as the blur's measure reads them
-//! ([`super::super::deblur`]), on the graphics card: the image smoothed
-//! and its gradient, each part measured with the pixels about it as the
-//! whole image would read them; the steepest of its changes and its
-//! darkest and lightest few pixels, ranked among all of them; each edge's
-//! width and the way across it; and, for an image too large to measure
-//! whole, how much each part of it changes, by which the busiest parts are
-//! chosen.
+//! ([`super::super::deblur`]), on the graphics card: the image in the
+//! light it is worked in, as the light its values stand for
+//! ([`super::light_of`]) where that is linear light, which a blur mixes,
+//! and as stored otherwise; smoothed, and its gradient, each part measured with the pixels about
+//! it as the whole image would read them; the steepest of its changes and
+//! its darkest and lightest few pixels, ranked among all of them; each
+//! edge's width and the way across it; and, for an image too large to
+//! measure whole, how much each part of it changes as stored, by which
+//! the busiest parts are chosen.
 //!
 //! The photo's Deblur filter undoes the blur of a part of the photo
 //! adjusted on the card, and measured that blur by taking the whole part
@@ -206,13 +208,17 @@ fn rounded(value: f32) -> i32 {
 /// `(x0, y0)` of an image `width` by `height`: a pixel whose steepness
 /// comes to `floor`, and is the steepest of it and the pixels either side
 /// of it along its own direction, its gradient each way worked out from
-/// `smoothed` there; and across which the light read
-/// `reach` pixels either way, at `2 * steps + 1` places, steps by
-/// `least_step` or more. Its width, the step over its steepness, and the
-/// way across it, are written three values to an edge into the next slot
-/// of `out`, of `capacity`. A cube's edges count off their slots among
-/// themselves and claim them from `slots` at once, where each claiming its
-/// own had every edge of the image wait on the one count.
+/// `smoothed` there; and across which the light read `reach` pixels either
+/// way, at `2 * steps + 1` places, steps by `least_step` or more. From the
+/// edge outwards, the lightest the light comes to beyond it and the
+/// darkest before it, each as far as the light turns back from it by
+/// `turn` of that step, where a neighbouring edge begins, or to the reach:
+/// the step between the two over the steepness, the way across, how far
+/// out each lies, and whether the light turned back there, beyond and
+/// before, are written six values to an edge into the next slot of `out`,
+/// of `capacity`. A cube's edges count off their slots among themselves
+/// and claim them from `slots` at once, where each claiming its own had
+/// every edge of the image wait on the one count.
 #[cube(launch_unchecked)]
 fn widths_kernel(smoothed: &[f32], steep: &[f32], out: &mut [f32], slots: &mut [Atomic<u32>], frame: Frame, reach: f32, steps: u32, capacity: u32) {
     let (bx, by) = (ABSOLUTE_POS_X, ABSOLUTE_POS_Y);
@@ -220,6 +226,9 @@ fn widths_kernel(smoothed: &[f32], steep: &[f32], out: &mut [f32], slots: &mut [
     let mut wide = 0.0f32;
     let mut across = 0.0f32;
     let mut down = 0.0f32;
+    let mut beyond = 0.0f32;
+    let mut before = 0.0f32;
+    let mut turned = 0.0f32;
     if bx < frame.box_w && by < frame.box_h {
         let (x, y) = (frame.x0 + bx, frame.y0 + by);
         let at = y * frame.width + x;
@@ -242,10 +251,52 @@ fn widths_kernel(smoothed: &[f32], steep: &[f32], out: &mut [f32], slots: &mut [
                     hi = max(hi, value);
                 }
                 if hi - lo >= frame.least_step {
-                    found = true;
-                    wide = (hi - lo) / g;
-                    across = ux;
-                    down = uy;
+                    // Outwards from the edge each way, the light rising
+                    // beyond it and falling before it, as far as it turns
+                    // back by more than grain does.
+                    let fall = frame.turn * (hi - lo);
+                    let centre = light_at(smoothed, frame.width, frame.height, x, y, 0.0f32, 0.0f32);
+                    let mut lightest = centre;
+                    let mut darkest = centre;
+                    let mut beyond_turned = false.runtime();
+                    let mut before_turned = false.runtime();
+                    for k in 1..steps + 1 {
+                        let t = k as f32 * reach / each;
+                        if !beyond_turned {
+                            let value = light_at(smoothed, frame.width, frame.height, x, y, ux * t, uy * t);
+                            if value > lightest {
+                                lightest = value;
+                                beyond = t;
+                            } else {
+                                if lightest - value > fall {
+                                    beyond_turned = true;
+                                }
+                            }
+                        }
+                        if !before_turned {
+                            let value = light_at(smoothed, frame.width, frame.height, x, y, -ux * t, -uy * t);
+                            if value < darkest {
+                                darkest = value;
+                                before = t;
+                            } else {
+                                if value - darkest > fall {
+                                    before_turned = true;
+                                }
+                            }
+                        }
+                    }
+                    if lightest - darkest >= frame.least_step {
+                        found = true;
+                        wide = (lightest - darkest) / g;
+                        across = ux;
+                        down = uy;
+                        if beyond_turned {
+                            turned += 1.0f32;
+                        }
+                        if before_turned {
+                            turned += 2.0f32;
+                        }
+                    }
                 }
             }
         }
@@ -272,16 +323,49 @@ fn widths_kernel(smoothed: &[f32], steep: &[f32], out: &mut [f32], slots: &mut [
     if found {
         let slot = tally[1].load() + own;
         if slot < capacity {
-            out[(3 * slot) as usize] = wide;
-            out[(3 * slot + 1) as usize] = across;
-            out[(3 * slot + 2) as usize] = down;
+            let first = (CROSSING * slot) as usize;
+            out[first] = wide;
+            out[first + 1] = across;
+            out[first + 2] = down;
+            out[first + 3] = beyond;
+            out[first + 4] = before;
+            out[first + 5] = turned;
         }
     }
 }
 
+/// Values written for each edge measured ([`widths_kernel`]).
+const CROSSING: u32 = 6;
+/// Places the light across an edge is read at to a pixel of the reach
+/// ([`Edges::widths`]): a quarter of a pixel apart, so that where it turns
+/// back is had to within one; a pixel apart, the place a band of a few
+/// pixels was read at came half a pixel either way, and its width with it.
+const PLACES_PER_PIXEL: f64 = 4.0;
+
+/// An edge as the blur's measure reads it across ([`widths_kernel`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Crossing {
+    /// The step in light from the darkest before the edge to the lightest
+    /// beyond it, each as far as the light turns back from it, over the
+    /// edge's steepness.
+    pub width: f32,
+    /// The way across it, from dark to light, as the x and y of a unit
+    /// vector.
+    pub across: [f32; 2],
+    /// How far, in pixels, the lightest lies beyond the edge and the
+    /// darkest before it.
+    pub out: [f32; 2],
+    /// Whether the light turned back there, beyond and before: where it
+    /// did, a neighbouring edge lies about as far again past it, and the
+    /// step stops short of what the edge alone would come to; where it did
+    /// not, the light was still rising, or level, at the reach.
+    pub turned: [bool; 2],
+}
+
 /// Where in an image `width` by `height` the edges are looked for: the
-/// box `box_w` by `box_h` beginning at `(x0, y0)`; and how steep and how
-/// far across an edge must step ([`widths_kernel`]).
+/// box `box_w` by `box_h` beginning at `(x0, y0)`; how steep and how far
+/// across an edge must step; and the share of that the light must turn
+/// back by for a neighbouring edge to be taken to begin ([`widths_kernel`]).
 #[derive(CubeLaunch, CubeType)]
 struct Frame {
     width: u32,
@@ -292,6 +376,7 @@ struct Frame {
     box_h: u32,
     floor: f32,
     least_step: f32,
+    turn: f32,
 }
 
 /// How far the light changes at every other pixel of every other row of a
@@ -482,7 +567,9 @@ struct PartRead {
 
 /// The parts of an image `width` by `height` read on the card for the
 /// blur's measure, each with `margin` pixels about it within the image,
-/// smoothed by `smoothing` ([`super::super::deblur::kernel`]).
+/// in the light the image is worked in, and smoothed by `smoothing`
+/// ([`super::super::deblur::kernel`]): their steepness, and their darkest
+/// and lightest pixels, are of that light.
 pub(crate) struct Edges {
     width: usize,
     height: usize,
@@ -490,9 +577,11 @@ pub(crate) struct Edges {
 }
 
 impl Edges {
-    /// The boxes `parts` of `image`, `width` by `height`, each read with
-    /// `margin` pixels about it, within the image.
-    pub(crate) fn of(image: Values<'_>, (width, height): (usize, usize), parts: &[Part], margin: usize, smoothing: &[(isize, isize, f32)]) -> Self {
+    /// The boxes `parts` of `image`, `width` by `height`, its values
+    /// stored as a photo stores them, each read with `margin` pixels about
+    /// it, within the image, as light where `to_light`, and otherwise as
+    /// stored.
+    pub(crate) fn of(image: Values<'_>, (width, height): (usize, usize), parts: &[Part], margin: usize, smoothing: &[(isize, isize, f32)], to_light: bool) -> Self {
         let client = client();
         let across = Held::owned(client, smoothing.iter().map(|&(dx, _, _)| dx as i32).collect::<Vec<i32>>());
         let down = Held::owned(client, smoothing.iter().map(|&(_, dy, _)| dy as i32).collect::<Vec<i32>>());
@@ -508,6 +597,7 @@ impl Edges {
                     Values::Card(on_card) => on_card.carried_from([held[0], held[1]], (w, h), false).values,
                     Values::Cores(values) => Held::owned(client, cut(values, width, 1, held)),
                 };
+                let values = if to_light { lit_on(client, &values, w * h, true, false) } else { values };
                 let (smoothed, steep) = (Held::empty(client, w * h), Held::empty(client, w * h));
                 let (every, unit) = (cubes(w, h, [SIDE; 2]), CubeDim::new_2d(SIDE, SIDE));
                 // SAFETY: every place read and written is within its
@@ -553,10 +643,9 @@ impl Edges {
 
     /// Each edge of the parts' pixels at least two from the image's own
     /// edges whose steepness comes to `floor` and whose step, read `reach`
-    /// pixels either side of it, comes to `least_step`
-    /// ([`widths_kernel`]): its width, and the way across it, as the x and
-    /// y of a unit vector.
-    pub(crate) fn widths(&self, reach: f64, floor: f32, least_step: f32) -> Vec<(f32, f32, f32)> {
+    /// pixels either side of it, comes to `least_step`, read across as far
+    /// as the light turns back by `turn` of that step ([`widths_kernel`]).
+    pub(crate) fn widths(&self, reach: f64, floor: f32, least_step: f32, turn: f32) -> Vec<Crossing> {
         let client = client();
         let margin = 2;
         let boxes: Vec<(usize, Part)> = self
@@ -574,14 +663,14 @@ impl Edges {
         if capacity == 0 {
             return Vec::new();
         }
-        let (out, slots) = (Held::empty(client, 3 * capacity), Held::owned(client, vec![0u32; 1]));
-        let steps = reach.ceil() as u32;
+        let (out, slots) = (Held::empty(client, CROSSING as usize * capacity), Held::owned(client, vec![0u32; 1]));
+        let steps = (PLACES_PER_PIXEL * reach).ceil() as u32;
         for &(i, part) in &boxes {
             let read = &self.parts[i];
             let (w, h) = (read.held[2] - read.held[0], read.held[3] - read.held[1]);
             let [x0, y0, x1, y1] = inside(part, read.held);
             assert!(x0 >= 1 && y0 >= 1 && x1 < w && y1 < h, "an edge is measured a pixel or more within the box held about it");
-            let frame = FrameLaunch::new(w as u32, h as u32, x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32, floor, least_step);
+            let frame = FrameLaunch::new(w as u32, h as u32, x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32, floor, least_step, turn);
             // Unchecked, the edges were measured in seven eighths of the
             // time.
             //
@@ -593,8 +682,8 @@ impl Edges {
             // pixel along a unit of the way across, held there; the light
             // across it is read at places held within the box held
             // ([`light_at`]); and an edge is written only into a slot below
-            // `capacity`, three values to a slot, of which `out` holds as
-            // many.
+            // `capacity`, [`CROSSING`] values to a slot, of which `out`
+            // holds as many.
             unsafe {
                 widths_kernel::launch_unchecked(
                     client,
@@ -618,8 +707,14 @@ impl Edges {
         if found == 0 {
             return Vec::new();
         }
-        let filled = off_card(client.read_one(out.handle.clone().offset_end((3 * (capacity - found) * size_of::<f32>()) as u64)));
-        f32::from_bytes(&filled)[..3 * found].as_chunks::<3>().0.iter().map(|&[w, ux, uy]| (w, ux, uy)).collect()
+        let per = CROSSING as usize;
+        let filled = off_card(client.read_one(out.handle.clone().offset_end((per * (capacity - found) * size_of::<f32>()) as u64)));
+        f32::from_bytes(&filled)[..per * found]
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .map(|&[width, ux, uy, beyond, before, turned]| Crossing { width, across: [ux, uy], out: [beyond, before], turned: [turned as u32 & 1 != 0, turned as u32 & 2 != 0] })
+            .collect()
     }
 }
 

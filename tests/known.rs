@@ -135,18 +135,20 @@ fn the_unread_high_bit_of_every_byte_leans_toward_ascii_without_a_pin() {
     // detecting misreads. Ninety bits besides the high ones are past its
     // hundred and twenty equations as they were past 3-M's, and the
     // leans leave thirty to spare as they did there: the block solves to
-    // the message, but as the standard counts what was read, the high
-    // bits taken at their lean are unread, a hundred and twenty-nine
-    // eighths and the reserve's eight past the hundred and twenty, and
-    // it is never confirmed. It was once, the leaned bits counted as
-    // read where the solution bore them out.
+    // the message, confirmed as 3-M's is. As the standard counts what was
+    // read, the high bits taken at their lean are unread, a hundred and
+    // twenty-nine eighths and the reserve's eight past the hundred and
+    // twenty, and it is marked as beyond the standard. It was once marked
+    // within it, the leaned bits counted as read where the solution bore
+    // them out; and then never confirmed.
     let (version, ec) = (SymbolVersion::Qr(3), EcLevel::L);
     let reserving = layout(version, ec);
     let clean = encode(version, ec, Some(mask), &[Segment::bytes(text)]).unwrap();
     let grid = unread(&reserving, text, &clean, 90);
     assert_eq!(decode(&grid, &reserving, mask, &Pins::new(), &without).blocks_solved(), 0);
     let after = decode_plain(&grid, &reserving, mask);
-    assert!(after.blocks[0].is_beyond_standard() && !after.is_trustworthy(), "{:?}", after.blocks[0].outcome);
+    assert!(after.blocks[0].is_beyond_standard() && after.is_trustworthy(), "{:?}", after.blocks[0].outcome);
+    assert!(matches!(after.blocks[0].outcome, BlockOutcome::Solved { risk_bits: 8..=29, .. }), "{:?}", after.blocks[0].outcome);
     assert_eq!(after.text.plain(), text);
     assert!(after.blocks[0].message_evidence >= text.len(), "{}", after.blocks[0].message_evidence);
 

@@ -553,7 +553,7 @@ pub fn recover_padding_with(
     let (mut passes, mut decoded) = (0, pins.clone());
     let mut redecode = |pins: &mut Pins| {
         passes += 1;
-        stamp(pins, &decoded, given * pass_tries(passes));
+        stamp(pins, &decoded, given.saturating_mul(pass_tries(passes)));
         decoded = pins.clone();
         redecode(pins)
     };

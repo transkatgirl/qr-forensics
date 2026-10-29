@@ -222,6 +222,95 @@ fn padding_misread_as_data_is_corrected_for_free() {
 }
 
 #[test]
+fn padding_the_decoder_pins_spends_the_reserve_as_a_misread_does() {
+    // 1-M: sixteen data codewords and ten of error correction, two of
+    // them reserved for detection, so the standard corrects four. "HELLO"
+    // in bytes fills seven, and leaves nine of padding. Five codewords
+    // wrong, some of them pad codewords: the plain decode corrects them
+    // with the reserve spent, marked as beyond the standard and confirmed
+    // by how rarely noise lies so near.
+    let (version, ec) = (SymbolVersion::Qr(1), EcLevel::M);
+    let layout = layout(version, ec);
+    let at_stream = |k: usize| (0..layout.codewords.len()).find(|&cw| layout.stream_index(cw) == Some(k)).unwrap();
+    let ecs: Vec<usize> = (0..layout.codewords.len()).filter(|&cw| layout.stream_index(cw).is_none()).collect();
+    for pads in 1..=3 {
+        for mask in [0, 3, 6] {
+            let mut grid = encode(version, ec, Some(mask), &[Segment::bytes("HELLO")]).unwrap();
+            let mut wrong: Vec<usize> = (0..pads).map(|i| at_stream(9 + 2 * i)).collect();
+            wrong.extend([at_stream(2), at_stream(4), ecs[1], ecs[5]].into_iter().take(5 - pads));
+            for (i, &cw) in wrong.iter().enumerate() {
+                corrupt_codeword(&mut grid, &layout, cw, i);
+            }
+            let plain = decode_plain(&grid, &layout, mask);
+            assert!(plain.blocks[0].is_beyond_standard() && plain.is_trustworthy(), "{pads} pads, mask {mask}: {:?}", plain.blocks[0].outcome);
+        }
+    }
+    // Eight or nine wrong, four to six of them pad codewords: past what
+    // the decode reaches alone, and solved once the padding the stream
+    // shows is pinned. Those pins are the solution's own word for the pad
+    // codewords, and count as read: the wrong ones among them are spent
+    // of the reserve as misreads are, and the solution is beyond the
+    // standard. The same padding known by hand is the user's word for it,
+    // and costs the reserve nothing. Five wrong, the plain decode was
+    // trusted already, and the decode that might pin the padding never
+    // did, which once left this half of the test asking nothing.
+    let deriving = DecodeOptions { derive_pins: true, ..DecodeOptions::default() };
+    for (total, pads) in [(8, 4), (8, 5), (9, 5), (9, 6)] {
+        for mask in [0, 3, 6] {
+            let what = format!("{total} wrong, {pads} pads, mask {mask}");
+            let mut grid = encode(version, ec, Some(mask), &[Segment::bytes("HELLO")]).unwrap();
+            let mut wrong: Vec<usize> = (0..pads).map(|i| at_stream(7 + i)).collect();
+            wrong.extend(ecs.iter().copied().step_by(2).take(total - pads));
+            for (i, &cw) in wrong.iter().enumerate() {
+                corrupt_codeword(&mut grid, &layout, cw, i);
+            }
+            assert!(!decode_plain(&grid, &layout, mask).is_trustworthy(), "{what}");
+            let derived = decode(&grid, &layout, mask, &Pins::new(), &deriving);
+            assert!(!derived.derived_pins.is_empty(), "{what}");
+            assert!(derived.is_trustworthy() && derived.blocks[0].is_beyond_standard(), "{what}: {:?}", derived.blocks[0].outcome);
+            assert_eq!(derived.text.plain(), "HELLO", "{what}");
+            let known: Pins = derived.derived_pins.iter().map(|(&cw, pin)| (cw, Pin { source: PinSource::Manual, among: 1, ..*pin })).collect();
+            let given = decode(&grid, &layout, mask, &known, &DecodeOptions::default());
+            assert!(given.is_trustworthy() && !given.blocks[0].is_beyond_standard(), "{what}: {:?}", given.blocks[0].outcome);
+            assert_eq!(given.text.plain(), "HELLO", "{what}");
+        }
+    }
+    // The padding pinned so, and the rest of the data and two codewords of
+    // error correction pinned by hand: the block is named by its pins
+    // alone, and the decode of them counts the reserve as every other
+    // solution does, the pad codewords the decoder pinned over misreads
+    // spending it. It was once kept by those pins, counted as given, and
+    // every other solution of the codeword said to keep it too. Every pin
+    // given by hand, it is kept.
+    let (mask, pads) = (3, 5);
+    let clean = encode(version, ec, Some(mask), &[Segment::bytes("HELLO")]).unwrap();
+    let truth = decode_plain(&clean, &layout, mask);
+    let mut grid = clean.clone();
+    let mut wrong: Vec<usize> = (0..pads).map(|i| at_stream(7 + i)).collect();
+    wrong.extend(ecs.iter().copied().step_by(2).take(3));
+    for (i, &cw) in wrong.iter().enumerate() {
+        corrupt_codeword(&mut grid, &layout, cw, i);
+    }
+    let mut pins = decode(&grid, &layout, mask, &Pins::new(), &deriving).derived_pins;
+    assert!((7..16).all(|k| pins.get(&at_stream(k)).is_some_and(|pin| pin.mask == 0xFF && pin.among > 1)), "{pins:?}");
+    for cw in (0..7).map(at_stream).chain([ecs[1], ecs[3]]) {
+        pins.insert(cw, Pin { mask: 0xFF, value: truth.codewords[cw].final_value.unwrap(), source: PinSource::Manual, among: 1 });
+    }
+    // Three more codewords of error correction wrong, six in all, past
+    // what any decode of the block as read reaches: the pins alone say.
+    for (i, &cw) in [ecs[5], ecs[7], ecs[9]].iter().enumerate() {
+        corrupt_codeword(&mut grid, &layout, cw, i);
+    }
+    let found = decode(&grid, &layout, mask, &pins, &DecodeOptions::default());
+    assert!(matches!(found.blocks[0].outcome, BlockOutcome::Solved { method: SolveMethod::PinnedOnly, .. }), "{:?}", found.blocks[0].outcome);
+    assert!(found.is_trustworthy() && found.blocks[0].is_beyond_standard(), "{:?}", found.blocks[0].outcome);
+    assert_eq!(found.text.plain(), "HELLO");
+    let by_hand: Pins = pins.iter().map(|(&cw, pin)| (cw, Pin { source: PinSource::Manual, among: 1, ..*pin })).collect();
+    let given = decode(&grid, &layout, mask, &by_hand, &DecodeOptions::default());
+    assert!(given.is_trustworthy() && !given.blocks[0].is_beyond_standard(), "{:?}", given.blocks[0].outcome);
+}
+
+#[test]
 fn pure_pad_blocks_solve_from_pins_even_with_ruined_error_correction() {
     let (version, ec, mask) = (SymbolVersion::Qr(10), EcLevel::M, 1);
     let layout = layout(version, ec);

@@ -58,6 +58,14 @@
 //! the same order, are an adjustment of the whole photo besides, in
 //! colour ([`super::adjust::Adjust::sharpen`] and its `enlarge`), and
 //! what a read saw through a copy the photo so adjusted shows again.
+//!
+//! A photo worked in linear light ([`super::adjust::Adjust::light`]) is
+//! copied in it: made again from the photo as loaded, however little
+//! else it was adjusted, the light of each of its colours enlarged and
+//! sharpened as the photo's was; and an image made in light that keeps
+//! no photo beside it, as the copy a search of a large photo reduces it
+//! to, is enlarged and sharpened as the light of its grey
+//! ([`Luma::light`]).
 
 use std::fmt;
 
@@ -66,6 +74,7 @@ use super::deblur::{self, Reduction, Spread, deblurred};
 use super::{AsShot, Luma};
 use super::projection::Project;
 use super::gpu::{self, Made, Samples};
+use super::sample::Light;
 
 /// Longest side a copy of the photo made for one look at it may have.
 pub(crate) const MAX_VIEW_SIDE: usize = 4096;
@@ -303,7 +312,24 @@ impl Enhanced {
     }
 
     /// [`Self::window`], deblurred at no more than `most_pixels`.
-    fn window_within(image: &Luma, [x0, y0, x1, y1]: [usize; 4], enhance: Enhance, most_pixels: usize) -> Option<Self> {
+    ///
+    /// A copy is a rung of a ladder of retries, of the search or of a
+    /// read, and one the graphics card fails to make, out of memory or
+    /// with its device lost, is a rung that found nothing: the card's
+    /// failure stops the work that asked for it ([`super::gpu`]), and
+    /// short of this it stopped the whole search, which a deblurred copy
+    /// of a dithered grey once did, and lost the symbols already read in
+    /// the photo with it. The card's message is still printed as the
+    /// failure happens.
+    fn window_within(image: &Luma, window: [usize; 4], enhance: Enhance, most_pixels: usize) -> Option<Self> {
+        if enhance.is_none() {
+            return Self::window_made(image, window, enhance, most_pixels);
+        }
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Self::window_made(image, window, enhance, most_pixels))).unwrap_or(None)
+    }
+
+    /// [`Self::window_within`], however the card fares.
+    fn window_made(image: &Luma, [x0, y0, x1, y1]: [usize; 4], enhance: Enhance, most_pixels: usize) -> Option<Self> {
         let (x1, y1) = (x1.min(image.width), y1.min(image.height));
         if x1 <= x0 || y1 <= y0 {
             return None;
@@ -317,7 +343,7 @@ impl Enhanced {
         // place of the photo's, and deblurred in place of its filter.
         if let Some(shot) = image.as_shot.as_deref() {
             if enhance.is_none() {
-                return Some(Self { luma: Luma::new(x1 - x0, y1 - y0, cut(&image.data, image.width, 1, [x0, y0, x1, y1])), origin: [x0 as f64, y0 as f64], factor: [1.0; 2] });
+                return Some(Self { luma: Luma::new_in(x1 - x0, y1 - y0, cut(&image.data, image.width, 1, [x0, y0, x1, y1]), image.light), origin: [x0 as f64, y0 as f64], factor: [1.0; 2] });
             }
             let mask = enhance.sharpen.mask();
             let to = shot.adjust.enlarge.by(enlarge as u8);
@@ -328,7 +354,7 @@ impl Enhanced {
                     filter: if deblur { Filter::None } else { adjust.filter },
                     ..adjust
                 })?;
-                if deblur { Self::deblurred(copy.luma.data, (copy.luma.width, copy.luma.height), copy.origin, copy.factor, most_pixels) } else { Some(copy) }
+                if deblur { Self::deblurred(copy.luma.data, (copy.luma.width, copy.luma.height), copy.origin, copy.factor, most_pixels, copy.luma.light) } else { Some(copy) }
             });
         }
         // The pixels the photo had, each `times` of those it has now.
@@ -347,15 +373,19 @@ impl Enhanced {
         if vw.max(vh) > MAX_VIEW_SIDE {
             // The photo too large to copy at its size may yet be
             // deblurred, at the smaller size the blur leaves it.
-            return if deblur && factor == 1 { Self::deblurred(cut(&image.data, image.width, 1, [sx0, sy0, sx1, sy1]), (w, h), origin, [1.0; 2], most_pixels) } else { None };
+            return if deblur && factor == 1 { Self::deblurred(cut(&image.data, image.width, 1, [sx0, sy0, sx1, sy1]), (w, h), origin, [1.0; 2], most_pixels, image.light) } else { None };
         }
         let window = [sx0, sy0, sx1, sy1];
+        let lit = image.light == Light::Linear;
         let luma = match enhance.sharpen.mask() {
             // Enlarged and then sharpened, by a mask as many times as
             // wide, as the photo's Enlarge and Sharpen make the whole
             // photo: with as much of the photo about the window as the
             // mask reaches into, and as the enlargement draws on past
-            // that, so that the window comes out as it does there.
+            // that, so that the window comes out as it does there. In the
+            // light the image was made in ([`Luma::light`]): as light, the
+            // part is taken as the light its values stand for, mixed so,
+            // and stored again.
             Some((sigma, amount)) => {
                 let pad = (3.0 * sigma).ceil() as usize + DRAWN_ON_PX;
                 let around = [sx0.saturating_sub(pad), sy0.saturating_sub(pad), (sx1 + pad).min(source.width), (sy1 + pad).min(source.height)];
@@ -369,25 +399,30 @@ impl Enhanced {
                 let (pw, ph) = (aw * factor, ah * factor);
                 let weights = gaussian(sigma * factor as f64);
                 let on_card = gpu::through(&part.data, (aw, ah), (pw, ph), |image| {
+                    let image = if lit { image.in_light() } else { image };
                     let image = if factor > 1 { image.resized(pw, ph) } else { image };
-                    image.sharpened(&weights, amount).held_part(window)
+                    let sharp = image.sharpened(&weights, amount).held_part(window);
+                    if lit { sharp.encoded() } else { sharp }
                 });
                 let data = on_card.unwrap_or_else(|| {
+                    // The light as values, mixed as they are.
+                    let part = if lit { Luma::new(aw, ah, gpu::in_light(&part.data, aw, ah)) } else { part };
                     let part = if factor > 1 { part.resized(pw, ph) } else { part };
                     let sharp = unsharp(&part.data, part.width, part.height, 1, sigma * factor as f64, amount);
-                    cut(&sharp, part.width, 1, window).into_iter().map(|v| v.clamp(0.0, 1.0)).collect()
+                    let held: Vec<f32> = cut(&sharp, part.width, 1, window).into_iter().map(|v| v.clamp(0.0, 1.0)).collect();
+                    if lit { gpu::encoded(&held, vw, vh) } else { held }
                 });
-                Luma::new(vw, vh, data)
+                Luma::new_in(vw, vh, data, image.light)
             }
             None => {
-                let part = Luma::new(w, h, cut(&source.data, source.width, 1, window));
+                let part = Luma::new_in(w, h, cut(&source.data, source.width, 1, window), image.light);
                 if (vw, vh) == (w, h) { part } else { part.resized(vw, vh) }
             }
         };
         // Deblurred last, as the photo's Deblur filter deblurs the photo
         // after it is enlarged.
         if deblur {
-            return Self::deblurred(luma.data, (vw, vh), origin, [enlarge as f64; 2], most_pixels);
+            return Self::deblurred(luma.data, (vw, vh), origin, [enlarge as f64; 2], most_pixels, image.light);
         }
         Some(Self { luma, origin, factor: [enlarge as f64; 2] })
     }
@@ -478,12 +513,12 @@ impl Enhanced {
         // reduction its Deblur filter undoes the blur at there, and how
         // far about the window, in the photo's own pixels, the
         // deconvolution reads.
-        let whole = size(pw) * size(ph);
+        let whole = (size(pw), size(ph));
         let deblurring = match (adjust.filter, adjust.kernel) {
             (Filter::Deblur, Some(kernel)) => {
                 let strength = f64::from(adjust.strength);
                 let at_copy = kernel.scaled(to);
-                let reduction = Reduction::for_blur(at_copy.scaled(strength.max(0.0)).extremes().0, whole, deblur::MOST_READ_PIXELS, 1.0);
+                let reduction = Reduction::for_blur(at_copy.scaled(strength.max(0.0)).extremes().0, whole.0 * whole.1, deblur::MOST_READ_PIXELS, 1.0);
                 Some((reduction, deblur::reach(&at_copy, strength, reduction) / to))
             }
             _ => None,
@@ -525,7 +560,7 @@ impl Enhanced {
         let made = adjust.made(from, [px + around[0], py + around[1], around[2] - around[0], around[3] - around[1]], out, whole, false, false).1;
         let (cx, cy) = (offset(ox0 - around[0]).min(out.0 - 1), offset(oy0 - around[1]).min(out.1 - 1));
         let (vw, vh) = (vw.min(out.0 - cx), vh.min(out.1 - cy));
-        let luma = Luma::new(vw, vh, cut(&made.data, made.width, 1, [cx, cy, cx + vw, cy + vh]));
+        let luma = Luma::new_in(vw, vh, cut(&made.data, made.width, 1, [cx, cy, cx + vw, cy + vh]), made.light);
         Some(Self { luma, origin: [ox0 as f64 * at[0], oy0 as f64 * at[1]], factor: [to / at[0], to / at[1]] })
     }
 
@@ -543,7 +578,7 @@ impl Enhanced {
             Some(shot) if shot.adjust.filter != Filter::None => Self::upright(image, shot, [x0, y0, x1, y1], |frame, window| {
                 Self::remade(frame, shot, window, shot.adjust.enlarge.factor(), true, |adjust| Adjust { filter: Filter::None, ..adjust })
             }),
-            _ => Some(Self { luma: Luma::new(x1 - x0, y1 - y0, cut(&image.data, image.width, 1, [x0, y0, x1, y1])), origin: [x0 as f64, y0 as f64], factor: [1.0; 2] }),
+            _ => Some(Self { luma: Luma::new_in(x1 - x0, y1 - y0, cut(&image.data, image.width, 1, [x0, y0, x1, y1]), image.light), origin: [x0 as f64, y0 as f64], factor: [1.0; 2] }),
         }
     }
 
@@ -578,13 +613,14 @@ impl Enhanced {
     /// Deblur filter deblurs the photo, but at the size the blur was
     /// undone at, where that is smaller, since a blur many pixels wide
     /// leaves nothing that the pixels it was undone in do not hold. `None`
-    /// where the copy shows no blur worth undoing, or no edges to say.
+    /// where the copy shows no blur worth undoing, or no edges to say, or
+    /// is too small to undo it in reduced as far as it asks.
     /// The copy says what blur it undid, in its own pixels
     /// ([`Luma::deblurred`]), for the photo's Deblur filter to undo the
-    /// same.
-    fn deblurred(data: Vec<f32>, (width, height): (usize, usize), origin: [f64; 2], factor: [f64; 2], most_pixels: usize) -> Option<Self> {
-        let (sharp, w, h, scale, spread) = deblurred(&data, width, height, most_pixels)?;
-        let mut luma = Luma::new(w, h, sharp);
+    /// same, and keeps the light the image it is of was made in.
+    fn deblurred(data: Vec<f32>, (width, height): (usize, usize), origin: [f64; 2], factor: [f64; 2], most_pixels: usize, light: Light) -> Option<Self> {
+        let (sharp, w, h, scale, spread) = deblurred(&data, width, height, most_pixels, light)?;
+        let mut luma = Luma::new_in(w, h, sharp, light);
         luma.deblurred = Some(spread);
         Some(Self { luma, origin, factor: factor.map(|factor| factor * scale) })
     }

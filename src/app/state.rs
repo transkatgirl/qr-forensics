@@ -153,12 +153,17 @@ pub struct ReadUnder {
     /// The blur the photo's Deblur filter measured over the whole of it
     /// then, in its pixels, when it measured one ([`Luma::deblurred`]).
     pub measured: Option<deblur::Spread>,
+    /// Where the blur set for the Deblur filter then (`adjust.kernel`)
+    /// was measured ([`Document::kernel_outline`]), carried with the
+    /// photo as it is enlarged since: a read that sets that blur back
+    /// sets back where it was measured with it.
+    pub kernel_outline: Option<[[f64; 2]; 4]>,
 }
 
 impl ReadUnder {
-    /// The photo as it is adjusted now.
-    pub fn of(photo: &Photo) -> Self {
-        Self { adjust: photo.adjust, measured: photo.luma.deblurred }
+    /// The photo as it is adjusted now, under `doc`.
+    pub fn of(photo: &Photo, doc: &Document) -> Self {
+        Self { adjust: photo.adjust, measured: photo.luma.deblurred, kernel_outline: doc.kernel_outline }
     }
 }
 
@@ -217,6 +222,19 @@ pub struct Document {
     /// texture were last built under; meaningless while no photo is
     /// loaded.
     pub adjust: Adjust,
+    /// The outline the blur set for the Deblur filter (`adjust.kernel`)
+    /// was measured inside, in photo pixels as `corners` are, and carried
+    /// with them as the photo is enlarged, cut or straightened: where the
+    /// blur is measured again when Work in linear light changes, however
+    /// far the outline has moved since. A blur a read undid about its
+    /// symbol is taken as measured inside the outline on that symbol, and
+    /// one a read was made under as measured where it was then. `None`
+    /// where no blur is set, and where the blur set was measured over the
+    /// whole photo, as the filter measures one where none is set: the
+    /// blur a read holds the filter to ([`super::App::adjust_as_read`]).
+    /// Such a blur was once taken as measured inside the read's outline,
+    /// and measured again there, on the symbol alone.
+    pub kernel_outline: Option<[[f64; 2]; 4]>,
 }
 
 impl Document {
@@ -231,6 +249,7 @@ impl Document {
             corners: [[0.0; 2]; 4],
             anchors: Vec::new(),
             adjust: Adjust::default(),
+            kernel_outline: None,
         }
     }
 
@@ -241,7 +260,7 @@ impl Document {
     /// name modules of their version, and do not carry over to another.
     pub fn blank_like(&self, version: SymbolVersion) -> Self {
         let anchors = if version == self.version { self.anchors.clone() } else { Vec::new() };
-        Self { corners: self.corners, anchors, adjust: self.adjust, ..Self::blank(version) }
+        Self { corners: self.corners, anchors, adjust: self.adjust, kernel_outline: self.kernel_outline, ..Self::blank(version) }
     }
 
     /// `opts` for a decode of the document: one of the decodes the grid
@@ -304,7 +323,7 @@ impl Document {
     /// modules of the same version.
     fn on_photo_of(self, other: &Document) -> Document {
         let anchors = if self.version == other.version { other.anchors.clone() } else { Vec::new() };
-        Document { corners: other.corners, anchors, adjust: other.adjust, ..self }
+        Document { corners: other.corners, anchors, adjust: other.adjust, kernel_outline: other.kernel_outline, ..self }
     }
 
     /// Module coordinates to photo pixels: the corner homography bent
@@ -614,6 +633,12 @@ impl Photo {
         let side = 0.7 * w.min(h);
         let (x0, y0) = ((w - side) / 2.0, (h - side) / 2.0);
         [[x0, y0], [x0 + side, y0], [x0 + side, y0 + side], [x0, y0 + side]]
+    }
+
+    /// An outline round the whole photo.
+    pub fn bounds(&self) -> [[f64; 2]; 4] {
+        let (w, h) = (self.width as f64, self.height as f64);
+        [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]]
     }
 }
 

@@ -25,7 +25,9 @@
 //! A photo stays on the card while it is adjusted: handed it once, made
 //! by every step and toned there, its filter laid over its luminance
 //! there, and what is shown and read taken off it once ([`adjusted`],
-//! [`Image`]). A photo whose bytes are shared, as a window that shows it
+//! [`Image`]). Worked in linear light, its colours are made the light
+//! they stand for as it is handed the card, and stored again as bytes
+//! before it is toned, with every step between in light. A photo whose bytes are shared, as a window that shows it
 //! holds them, stays on the card from one adjustment of it to the next,
 //! and the part a copy is made of is cut from it there ([`photo_on`]).
 //! Handed the card afresh each time, a photo of twelve megapixels toned
@@ -101,6 +103,7 @@ use cubecl::Device;
 use super::SharedRgba;
 use super::adjust::{cut, drawn_on};
 use super::resize::Taps;
+use super::sample::{Light, linear_light};
 use crate::work;
 
 /// Side of the square of units a cube is: as many units as WebGPU
@@ -216,6 +219,55 @@ fn clamped_kernel(values: &mut [f32], count: u32) {
     let i = line_place();
     if i < count {
         values[i as usize] = clamp(values[i as usize], 0.0f32, 1.0f32);
+    }
+}
+
+/// The light a value stored as sRGB stores it stands for, held between
+/// black and white, as [`super::sample::linear_light`] takes it.
+#[cube]
+fn light_of(value: f32) -> f32 {
+    let v = clamp(value, 0.0f32, 1.0f32);
+    let mut light = v / 12.92f32;
+    if v > 0.04045f32 {
+        light = ((v + 0.055f32) / 1.055f32).powf(2.4f32);
+    }
+    light
+}
+
+/// The value sRGB stores `light` as, held between black and white
+/// ([`light_of`] undone), as [`super::sample::encoded_light`] makes it.
+#[cube]
+fn encoded_of(light: f32) -> f32 {
+    let l = clamp(light, 0.0f32, 1.0f32);
+    let mut value = 12.92f32 * l;
+    if l > 0.0031308f32 {
+        value = 1.055f32 * l.powf(1.0f32 / 2.4f32) - 0.055f32;
+    }
+    value
+}
+
+/// `count` values of `input` into `output`: as light where `to_light`
+/// ([`light_of`]), and otherwise light stored again ([`encoded_of`]).
+/// Where `bytes`, the values stored are bytes as values: the light of a
+/// byte, and light stored again as a byte holds it ([`rounded_byte`]).
+#[cube(launch)]
+fn lit_kernel(input: &[f32], output: &mut [f32], count: u32, #[comptime] to_light: bool, #[comptime] bytes: bool) {
+    let i = line_place();
+    if i < count {
+        let value = input[i as usize];
+        if comptime!(to_light) {
+            let mut stored = value;
+            if comptime!(bytes) {
+                stored = value / 255.0f32;
+            }
+            output[i as usize] = light_of(stored);
+        } else {
+            let mut stored = encoded_of(value);
+            if comptime!(bytes) {
+                stored = rounded_byte(stored * 255.0f32) as f32;
+            }
+            output[i as usize] = stored;
+        }
     }
 }
 
@@ -1462,7 +1514,8 @@ impl Source<'_> {
 }
 
 /// A step a part of a photo is made by, in its colours, before it is
-/// toned ([`adjusted`]).
+/// toned ([`adjusted`]): in the colours as stored, or in the light they
+/// stand for.
 pub(crate) enum Step {
     /// Resized by the taps across and down ([`resized`]).
     Resized { across: Taps, down: Taps },
@@ -1574,15 +1627,32 @@ impl Toned {
 /// card is given to hold at once ([`most_values`]) or [`PIECE_SIDE`]
 /// either way.
 ///
+/// In `light` as light, the steps are made of the light the bytes stand
+/// for ([`light_of`]), each value held between black and white as a step
+/// made alone hands it on, and the light stored again as bytes before it
+/// is toned ([`encoded_of`]): a resize, a lens and a mask mix the light
+/// as a lens mixed it. Held as bytes between the steps, the light would
+/// keep four levels of the darkest thirty-two stored ones, and run the
+/// shadows of a dark photo into bands.
+///
 /// Taken off the card between steps, a photo of twelve megapixels
 /// enlarged twice, straightened and sharpened spent most of its time going
 /// to the card and back, and took longer than the cores had; made on the
 /// card from first to last, it took three fifths as long as they did.
-pub(crate) fn adjusted(source: &Source<'_>, steps: &[Step], table: &[u8; 256], pick: Option<usize>, tone: Tone) -> Option<Toned> {
-    adjusted_within(most_values(client()), source, steps, table, pick, tone)
+pub(crate) fn adjusted(source: &Source<'_>, steps: &[Step], table: &[u8; 256], pick: Option<usize>, tone: Tone, light: Light) -> Option<Toned> {
+    adjusted_within(most_values(client()), source, steps, table, pick, tone, light)
 }
 
-fn adjusted_within(most: usize, source: &Source<'_>, steps: &[Step], table: &[u8; 256], pick: Option<usize>, tone: Tone) -> Option<Toned> {
+/// The light of `fill`, a byte, that a part straightened in light
+/// fills with where it falls off the frame ([`Step::Straightened`]): the
+/// same value for the whole part on the card and for a part a step at a
+/// time ([`stepped`]), which store it again as the same byte.
+fn fill_light(fill: u8) -> f32 {
+    linear_light(f32::from(fill) / 255.0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn adjusted_within(most: usize, source: &Source<'_>, steps: &[Step], table: &[u8; 256], pick: Option<usize>, tone: Tone, light: Light) -> Option<Toned> {
     // The images along the way, three colours to a pixel, and the most
     // values any holds at once.
     let (width, height) = source.size();
@@ -1612,17 +1682,30 @@ fn adjusted_within(most: usize, source: &Source<'_>, steps: &[Step], table: &[u8
         let (words, across, at) = source.words(client);
         toned_words_on(client, &words, across, at, (w, h), table, pick, tone)
     } else {
+        let lit = light == Light::Linear;
+        let fill = |fill: u8| if lit { fill_light(fill) } else { f32::from(fill) };
         let mut image = source.on(client);
+        if lit {
+            image = lit_on(client, &image, width * height * 3, true, true);
+        }
         for (step, pair) in steps.iter().zip(sizes.windows(2)) {
             let [(w, h), (to_w, to_h)] = [pair[0], pair[1]];
-            // Bytes, as a step made alone hands on.
+            // Bytes, as a step made alone hands on; or light, held
+            // between black and white as it does.
             image = match step {
-                Step::Resized { across, down } => resized_on(client, &image, [0, 0, w, h], 3, across, down, [0, 0, to_w, to_h], true),
-                Step::Straightened { place, lens, out_at, fill, .. } => {
-                    straightened_on(client, &image, [0, 0, w, h], (w, h), 3, *place, lens, *out_at, [0, 0, to_w, to_h], &[f32::from(*fill); 3], true)
+                Step::Resized { across, down } => resized_on(client, &image, [0, 0, w, h], 3, across, down, [0, 0, to_w, to_h], !lit),
+                Step::Straightened { place, lens, out_at, fill: by, .. } => {
+                    straightened_on(client, &image, [0, 0, w, h], (w, h), 3, *place, lens, *out_at, [0, 0, to_w, to_h], &[fill(*by); 3], !lit)
                 }
-                Step::Sharpened { weights, amount } => unsharp_on(client, &image, (w, h), 3, weights, *amount, true),
+                Step::Sharpened { weights, amount } => unsharp_on(client, &image, (w, h), 3, weights, *amount, !lit),
             };
+            if lit {
+                let count = to_w * to_h * 3;
+                clamped_kernel::launch(client, line_cubes(count), CubeDim::new_1d(LINE), image.arg(), count as u32);
+            }
+        }
+        if lit {
+            image = lit_on(client, &image, w * h * 3, false, true);
         }
         toned_on(client, &image, (w, h), 3, table, pick, tone)
     };
@@ -1633,12 +1716,18 @@ fn adjusted_within(most: usize, source: &Source<'_>, steps: &[Step], table: &[u8
 /// memory, and taken off the card: the pixels shown, four bytes to each,
 /// where they are `shown`, and otherwise none ([`Toned::taken`]), and
 /// their luminance. For a part too large for the card to hold at once.
-pub(crate) fn stepped(source: &Source<'_>, steps: &[Step], table: &[u8; 256], pick: Option<usize>, shown: bool) -> (Vec<u8>, Vec<f32>) {
-    stepped_within(most_values(client()), source, steps, table, pick, shown)
+pub(crate) fn stepped(source: &Source<'_>, steps: &[Step], table: &[u8; 256], pick: Option<usize>, shown: bool, light: Light) -> (Vec<u8>, Vec<f32>) {
+    stepped_within(most_values(client()), source, steps, table, pick, shown, light)
 }
 
-fn stepped_within(most: usize, source: &Source<'_>, steps: &[Step], table: &[u8; 256], pick: Option<usize>, shown: bool) -> (Vec<u8>, Vec<f32>) {
+#[allow(clippy::too_many_arguments)]
+fn stepped_within(most: usize, source: &Source<'_>, steps: &[Step], table: &[u8; 256], pick: Option<usize>, shown: bool, light: Light) -> (Vec<u8>, Vec<f32>) {
     let mut image = source.bytes().into_owned();
+    if light == Light::Linear && !steps.is_empty() {
+        image = stepped_in_light(most, &image, source.size(), steps);
+        let luma = toned_within(most, &mut image, table, pick, shown);
+        return (if shown { image } else { Vec::new() }, luma);
+    }
     let mut size = source.size();
     for step in steps {
         image = match step {
@@ -1665,6 +1754,71 @@ fn stepped_within(most: usize, source: &Source<'_>, steps: &[Step], table: &[u8;
     }
     let luma = toned_within(most, &mut image, table, pick, shown);
     (if shown { image } else { Vec::new() }, luma)
+}
+
+/// The steps of [`stepped_within`] in light, of the part's bytes `rgba`,
+/// four to a pixel, `width` by `height`: its colours as the light they
+/// stand for, three values to a pixel, made by each step in tiles and
+/// held between black and white, and stored again as opaque bytes, as
+/// [`adjusted`] makes them in light on the card whole.
+fn stepped_in_light(most: usize, rgba: &[u8], (width, height): (usize, usize), steps: &[Step]) -> Vec<u8> {
+    let mut light = light_of_bytes_within(most, rgba);
+    let mut size = (width, height);
+    for step in steps {
+        light = match step {
+            Step::Resized { across, down } => {
+                let made = resized_within(most, Samples::Values(&light), size, 3, across, down, false);
+                size = (across.first.len(), down.first.len());
+                made.into_values()
+            }
+            Step::Straightened { place, lens, out_at, size: part, fill } => {
+                let fill = [fill_light(*fill); 3];
+                let made = if size.0 == 0 || size.1 == 0 {
+                    fill.repeat(part.0 * part.1)
+                } else {
+                    straightened_within(most, Samples::Values(&light), size, 3, *place, lens, *out_at, *part, &fill, false).into_values()
+                };
+                size = *part;
+                made
+            }
+            Step::Sharpened { weights, amount } => {
+                let mut made = unsharp_within(most, Samples::Values(&light), size, [3, 3], weights, *amount, false).into_values();
+                for value in &mut made {
+                    *value = value.clamp(0.0, 1.0);
+                }
+                made
+            }
+        };
+    }
+    bytes_of_light_within(most, &light)
+}
+
+/// The colours of `rgba`, four bytes to a pixel, as the light they stand
+/// for, three values to a pixel ([`lit_kernel`]): a run of pixels at a
+/// time, each pixel's word, colours and light held on the card at once.
+fn light_of_bytes_within(most: usize, rgba: &[u8]) -> Vec<f32> {
+    let count = rgba.len() / 4;
+    let mut light = vec![0.0f32; count * 3];
+    in_runs_within(most / 7, count, |client, run| {
+        let n = run.len();
+        let colours = values_on(client, Piece::Whole(Samples::Bytes(&rgba[run.start * 4..run.end * 4])), n, 4, 3);
+        light[run.start * 3..run.end * 3].copy_from_slice(&lit_on(client, &colours, n * 3, true, true).read(client));
+    });
+    light
+}
+
+/// `light`, three values to a pixel, stored again as opaque bytes, four
+/// to a pixel ([`lit_kernel`]): a run of pixels at a time, as
+/// [`light_of_bytes_within`] takes them.
+fn bytes_of_light_within(most: usize, light: &[f32]) -> Vec<u8> {
+    let count = light.len() / 3;
+    let mut rgba = vec![0u8; count * 4];
+    in_runs_within(most / 7, count, |client, run| {
+        let n = run.len();
+        let stored = lit_on(client, &Held::of(client, &light[run.start * 3..run.end * 3]), n * 3, false, true);
+        rgba[run.start * 4..run.end * 4].copy_from_slice(&taken(client, stored, n, 3, Out::Bytes(4)).into_bytes());
+    });
+    rgba
 }
 
 /// An image of a channel on the card, `width` by `height`: the luminance
@@ -1782,6 +1936,40 @@ impl Image {
     pub(crate) fn sharpened(&self, weights: &[f32], amount: f32) -> Image {
         Image::of(unsharp_on(client(), &self.values, self.size(), 1, weights, amount, false), self.size())
     }
+
+    /// The image, its values stored as a photo stores them, as the light
+    /// they stand for ([`light_of`]).
+    pub(crate) fn in_light(&self) -> Image {
+        Image::of(lit_on(client(), &self.values, self.width * self.height, true, false), self.size())
+    }
+
+    /// The image, its values light, stored again as a photo stores them
+    /// ([`encoded_of`]).
+    pub(crate) fn encoded(&self) -> Image {
+        Image::of(lit_on(client(), &self.values, self.width * self.height, false, false), self.size())
+    }
+}
+
+/// `count` values on the card as light where `to_light`, and otherwise
+/// light stored again, the values stored bytes as values where `bytes`
+/// ([`lit_kernel`]).
+fn lit_on(client: &Client, values: &Held, count: usize, to_light: bool, bytes: bool) -> Held {
+    let out = Held::empty(client, count);
+    lit_kernel::launch(client, line_cubes(count), CubeDim::new_1d(LINE), values.arg(), out.arg(), count as u32, to_light, bytes);
+    out
+}
+
+/// `data`, `width` by `height`, stored as a photo stores it, as the light
+/// it stands for, as [`Image::in_light`] makes it, tile by tile where it
+/// must be.
+pub(crate) fn in_light(data: &[f32], width: usize, height: usize) -> Vec<f32> {
+    filtered(data, width, height, 0, |client, piece, (w, h)| lit_on(client, piece, w * h, true, false))
+}
+
+/// `data`, `width` by `height`, light, stored again as a photo stores it,
+/// as [`Image::encoded`] makes it.
+pub(crate) fn encoded(data: &[f32], width: usize, height: usize) -> Vec<f32> {
+    filtered(data, width, height, 0, |client, piece, (w, h)| lit_on(client, piece, w * h, false, false))
 }
 
 /// `filter` of `data`, `width` by `height`, where a pixel of what it makes
@@ -2319,26 +2507,27 @@ mod tests {
             Source { rgba: &rgba, width, part, shared: None },
             Source { rgba: &shared, width, part, shared: Some(&shared) },
         ];
-        for pick in [None, Some(2)] {
+        // As stored, and in light.
+        for (light, pick) in [Light::Encoded, Light::Linear].into_iter().flat_map(|light| [(light, None), (light, Some(2))]) {
             for (s, source) in sources.iter().enumerate() {
                 for (i, steps) in chains(source.size()).iter().enumerate() {
                     let on_card = |shown: bool| {
                         let tone = if shown { Tone::Colours { padded: false } } else { Tone::Nothing };
-                        adjusted_within(usize::MAX, source, steps, &table, pick, tone).expect("the part fits the card whole").taken(None, shown)
+                        adjusted_within(usize::MAX, source, steps, &table, pick, tone, light).expect("the part fits the card whole").taken(None, shown)
                     };
                     let whole = on_card(true);
                     // A step at a time, through the cores' memory, and in
                     // tiles.
-                    let stepped = stepped_within(1 << 12, source, steps, &table, pick, true);
-                    assert!(whole == stepped, "chain {i}, {pick:?}, source {s}");
+                    let stepped = stepped_within(1 << 12, source, steps, &table, pick, true, light);
+                    assert!(whole == stepped, "chain {i}, {light:?}, {pick:?}, source {s}");
                     // And not shown, the same luminance alone, both ways.
                     let unshown = (Vec::new(), whole.1.clone());
-                    assert!(on_card(false) == unshown && stepped_within(1 << 12, source, steps, &table, pick, false) == unshown, "chain {i}, {pick:?}, source {s}, not shown");
+                    assert!(on_card(false) == unshown && stepped_within(1 << 12, source, steps, &table, pick, false, light) == unshown, "chain {i}, {light:?}, {pick:?}, source {s}, not shown");
                 }
             }
-            let made = |source: &Source<'_>, steps: &[Step]| adjusted_within(usize::MAX, source, steps, &table, pick, Tone::Colours { padded: false }).expect("fits").taken(None, true);
+            let made = |source: &Source<'_>, steps: &[Step]| adjusted_within(usize::MAX, source, steps, &table, pick, Tone::Colours { padded: false }, light).expect("fits").taken(None, true);
             for (i, steps) in chains(sources[1].size()).iter().enumerate() {
-                assert!(made(&sources[1], steps) == made(&sources[2], steps), "chain {i}, {pick:?}: a part cut on the card is the part handed it");
+                assert!(made(&sources[1], steps) == made(&sources[2], steps), "chain {i}, {light:?}, {pick:?}: a part cut on the card is the part handed it");
             }
         }
     }
@@ -2402,7 +2591,7 @@ mod tests {
         // The grey of a luminance filtered there, shown as a filter shows the photo.
         let rgba = colours(width, height);
         let source = Source { rgba: &rgba, width, part: [0, 0, width, height], shared: None };
-        let toned = || adjusted_within(usize::MAX, &source, &[], &std::array::from_fn(|i| i as u8), None, Tone::Nothing).expect("fits");
+        let toned = || adjusted_within(usize::MAX, &source, &[], &std::array::from_fn(|i| i as u8), None, Tone::Nothing, Light::Encoded).expect("fits");
         let toned = (toned(), toned());
         let filtered = toned.0.luma.median(1);
         let luma = filtered.read();

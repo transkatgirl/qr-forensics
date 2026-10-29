@@ -239,7 +239,7 @@ use super::homography::{Homography, Model};
 use super::projection::{ControlPoint, Project, Projection};
 use super::refine::{MOVES, SHIFT, Scorer, Template, descend_by, fixed_threshold};
 use super::sample::{
-    BINS, INNER_FRACTION, Kernel, NOISE_RANGE, POINTS, SampleParams, classify, histogram_of, otsu, otsu_of, otsu_split, robust_spread_of, sample_modules_as,
+    BINS, INNER_FRACTION, Kernel, NOISE_RANGE, POINTS, SampleParams, classify_in, histogram_of, otsu, otsu_of, otsu_split, robust_spread_of, sample_modules_as,
     sample_positions,
 };
 use crate::decode::bch;
@@ -1128,6 +1128,18 @@ pub struct Detection {
     /// ([`Self::decoded_charge`]). `None` for one anything else vouched
     /// for.
     pub decoded_at: Option<usize>,
+    /// How many decodes of its outline's own readings the placement was
+    /// picked among: two for a render read off its pixels on the second
+    /// of its readings, dark on light and then light on dark, after the
+    /// first was decoded and failed, and for a placement at full size a
+    /// trial decode alone chose over the one a shrunk copy gave
+    /// ([`refit_vouched`]), and one for any other. A read of it
+    /// is charged for that pick ([`Self::decoded_charge`]) as for a place
+    /// among the search's trial decodes, whoever reads it. Its place among
+    /// the two was once kept as that, and a pick from the list of
+    /// placements was charged as the second of a search's trial decodes,
+    /// one of six.
+    pub picked_among: usize,
 }
 
 impl Detection {
@@ -1143,9 +1155,10 @@ impl Detection {
     /// such a placement was once read as any symbol found, uncharged, one
     /// of the eight decodes a copy of the photo may make of each family and
     /// the dozen copies and more a search looks at. One for a detection
-    /// anything else vouched for.
+    /// anything else vouched for. Times the decodes of its outline's
+    /// readings it was picked among ([`Self::picked_among`]).
     pub fn decoded_charge(&self) -> usize {
-        self.decoded_at.map_or(1, |k| (k + 1).saturating_mul(k + 2))
+        self.decoded_at.map_or(1, |k| (k + 1).saturating_mul(k + 2)).saturating_mul(self.picked_among)
     }
 
     pub fn count(&self, kind: AnchorKind) -> usize {
@@ -1377,9 +1390,12 @@ pub(crate) fn detect_candidates_by(
     // trial decodes to be charged by ([`Detection::decoded_at`]): the
     // read of an outline charges what it fits by its place among the
     // outline's placements, whether through Find in outline or a pick
-    // from the list of placements.
+    // from the list of placements. All but one taken on the second of
+    // its readings, dark on light and then light on dark, after the first
+    // was decoded and failed: that read is the pick of the two decodes,
+    // and is charged for it ([`Detection::picked_among`]).
     if let Some(found) = detect_pure(image, version.family(), region, params) {
-        return vec![Detection { decoded_at: None, ..found }];
+        return vec![Detection { decoded_at: None, picked_among: found.decoded_at.map_or(1, |k| k + 1), ..found }];
     }
     // A small outline holds small modules, which the scan cannot see
     // below a pixel and a half: the photo around it is enlarged first.
@@ -1554,11 +1570,17 @@ fn ranked_candidates_in(
     local_radius: Option<f64>,
     longest: f64,
 ) -> Vec<Detection> {
-    let Some(rect) = Rectified::with_longest(image, region, longest).map(|rect| rect.narrowed(local_radius).ruled(params.binarizer)) else {
+    let family = version.family();
+    // A square symbol's outline rectified square where it lies far longer
+    // one way than the other ([`Frame::squared`], [`SQUARED_ASPECT`]).
+    let (across, down) = (distance(region[0], region[1]).max(distance(region[3], region[2])), distance(region[0], region[3]).max(distance(region[1], region[2])));
+    let elongated = across.max(down) >= SQUARED_ASPECT * across.min(down);
+    let square = family != Family::Rmqr && elongated;
+    let rectified = if square { Rectified::squared_with_longest(image, region, longest) } else { Rectified::with_longest(image, region, longest) };
+    let Some(rect) = rectified.map(|rect| rect.narrowed(local_radius).ruled(params.binarizer)) else {
         return Vec::new();
     };
     let threshold = fixed_threshold(params);
-    let family = version.family();
     let all = collect_capstones(image, &rect, threshold, family);
     if all.is_empty() {
         return Vec::new();
@@ -1586,7 +1608,7 @@ fn ranked_candidates_in(
         if work::cancelled() {
             break;
         }
-        let Some(geometry) = Frame::new(frame, longest) else { continue };
+        let Some(geometry) = (if square { Frame::squared(frame, longest) } else { Frame::new(frame, longest) }) else { continue };
         let capstones: Vec<Capstone> = all.iter().map(|c| c.reframed(&geometry)).collect();
         let mut settled = false;
         for (mut fit, ranked) in detect_in_frame(image, version, &geometry, &capstones, threshold, params) {
@@ -1799,7 +1821,7 @@ fn detect_pure_counting(image: &Luma, family: Family, region: [[f64; 2]; 4], par
             trials += 1;
         }
         if let Some(found) = found {
-            let decoded_at = (decoded == Some(true)).then_some(trials - 1);
+            let decoded_at = (decoded == Some(true)).then(|| trials - 1);
             return (Some(Detection { decoded_at, ..found }), trials);
         }
     }
@@ -1844,6 +1866,7 @@ fn pure_detection(
         decodes: None,
         bloom: 0.0,
         decoded_at: None,
+        picked_among: 1,
     };
     // A square symbol seen from the back reads as its transpose; the
     // format bits decide, as they do for a fitted symbol.
@@ -1908,6 +1931,7 @@ pub fn placed_by_hand(image: &Luma, version: SymbolVersion, corners: [[f64; 2]; 
         decodes: None,
         bloom: 0.0,
         decoded_at: None,
+        picked_among: 1,
     };
     if version.family() != Family::Rmqr {
         let swapped = [corners[0], corners[3], corners[2], corners[1]];
@@ -1969,6 +1993,22 @@ pub fn version_named_beside_finders(image: &Luma, version: SymbolVersion, corner
         }
     }
     None
+}
+
+/// Whether the format information read through `corners`, as a symbol
+/// of `version` lays it, spells a word beyond doubt ([`bch::FormatVerdict`]),
+/// dark on light or light on dark, read as given or in mirror order: what
+/// tells the turn of a symbol placed by hand that the fixed patterns leave
+/// open. A quarter turn out, the right version reads most of its fixed
+/// modules right all the same, and the format bits are read off data,
+/// which spells no word over both copies at odds of 256 to one.
+pub(crate) fn format_reads_through(image: &Luma, version: SymbolVersion, corners: [[f64; 2]; 4], params: &SampleParams) -> bool {
+    let func = FunctionMap::new(version);
+    let threshold = fixed_threshold(params);
+    let mirrored = [corners[0], corners[3], corners[2], corners[1]];
+    [corners, mirrored]
+        .into_iter()
+        .any(|corners| [false, true].into_iter().any(|inverted| read_info(image, &func, corners, inverted, threshold, params.band).format.valid == Some(true)))
 }
 
 /// How far from where the corners put it, in modules, a finder is looked
@@ -2116,7 +2156,7 @@ fn grid_as_found(image: &Luma, func: &FunctionMap, found: &Detection, params: &S
         _ => Enhance::NONE,
     };
     let sampled = sample_modules_as(image, &map, func.width, func.height, &SampleParams { kernel: Kernel::Area, enhance, ..*params });
-    let grid = classify(&sampled, params).to_grid(func.width, func.height);
+    let grid = classify_in(&sampled, params, image.light).to_grid(func.width, func.height);
     Some(if found.inverted { grid.inverted() } else { grid })
 }
 
@@ -2362,15 +2402,46 @@ struct Frame {
     scale: f64,
 }
 
+/// How many times longer one way than the other the outline of a square
+/// symbol must lie in the photo to be rectified square ([`Frame::squared`]):
+/// two and a half. Seen that steeply, its modules lie too long one way for
+/// the scan to read a finder's rings as such. Short of that, the outline
+/// is the search's guess as often as the symbol's shape, from finders on
+/// a bottle or a curled page, and rectified square every outline lost
+/// two symbols wrapped round tubes and one on a curved card, which read
+/// rectified as they lay.
+const SQUARED_ASPECT: f64 = 2.5;
+
 impl Frame {
     /// The frame through `region`, with the longest side of the rectified
     /// image capped at `longest` pixels.
     fn new(region: [[f64; 2]; 4], longest: f64) -> Option<Self> {
+        Self::shaped(region, longest, false)
+    }
+
+    /// [`Self::new`] of the outline of a square symbol: rectified square,
+    /// its shorter way given as many pixels as its longer.
+    ///
+    /// Each way of the rectified image is given the pixels the outline's
+    /// longer side that way has in the photo, which keeps the photo's own
+    /// aspect; an outline of a symbol seen steeply from one side is then
+    /// rectified as long as it lies, its modules three and four times as
+    /// long one way as the other, and the scan, which reads a finder's
+    /// rings at like widths each way, finds none of its finders. The
+    /// outline exactly on the corners marked for such a symbol of BoofCV's
+    /// benchmark, a hundred and forty-eight pixels by fifty-one, read
+    /// nothing so, where read through the same corners it read at once.
+    fn squared(region: [[f64; 2]; 4], longest: f64) -> Option<Self> {
+        Self::shaped(region, longest, true)
+    }
+
+    fn shaped(region: [[f64; 2]; 4], longest: f64, square: bool) -> Option<Self> {
         let w = distance(region[0], region[1]).max(distance(region[3], region[2]));
         let h = distance(region[0], region[3]).max(distance(region[1], region[2]));
         if !(w >= 8.0 && h >= 8.0 && w.is_finite() && h.is_finite()) {
             return None;
         }
+        let (w, h) = if square { (w.max(h), w.max(h)) } else { (w, h) };
         let scale = (longest / ((1.0 + 2.0 * MARGIN) * w.max(h))).min(1.0);
         let size = [w * scale, h * scale];
         let origin = [MARGIN * size[0], MARGIN * size[1]];
@@ -2442,7 +2513,17 @@ impl Rectified {
     /// to the region, with the longest side of the result capped at
     /// `longest` pixels: a larger region comes out reduced.
     fn with_longest(image: &Luma, region: [[f64; 2]; 4], longest: f64) -> Option<Self> {
-        let frame = Frame::new(region, longest)?;
+        Self::through(image, Frame::new(region, longest)?)
+    }
+
+    /// [`Self::with_longest`] through the outline of a square symbol,
+    /// rectified square ([`Frame::squared`]).
+    fn squared_with_longest(image: &Luma, region: [[f64; 2]; 4], longest: f64) -> Option<Self> {
+        Self::through(image, Frame::squared(region, longest)?)
+    }
+
+    /// The photo resampled through `frame`.
+    fn through(image: &Luma, frame: Frame) -> Option<Self> {
         let (w, h) = (frame.width, frame.height);
         // On the cores, a band of rows to each, each place in the photo in
         // double precision. Resampled on the graphics card, in single, a
@@ -2592,11 +2673,11 @@ impl View {
         let crop = || -> Vec<f32> { (y0..y1).flat_map(|y| (x0..x1).map(move |x| at(x, y))).collect() };
         let mut local_radius = None;
         let (luma, scale) = match step {
-            Retry::Closed { radius } => (Luma::new(w, h, Filter::Close.apply(&crop(), w, h, radius as usize)), 1.0),
+            Retry::Closed { radius } => (Luma::new_in(w, h, Filter::Close.apply(&crop(), w, h, radius as usize, image.light), image.light), 1.0),
             // The photo as it is: only the scan's threshold changes.
             Retry::Thresholded { radius } => {
                 local_radius = Some(f64::from(radius));
-                (Luma::new(w, h, crop()), 1.0)
+                (Luma::new_in(w, h, crop(), image.light), 1.0)
             }
             Retry::Downscaled { factor } => {
                 let k = factor as usize;
@@ -2608,7 +2689,7 @@ impl View {
                 // the photo's on a side: what is left over at the far
                 // edges is left out.
                 let whole: Vec<f32> = (y0..y0 + vh * k).flat_map(|y| (x0..x0 + vw * k).map(move |x| at(x, y))).collect();
-                (Luma::new(vw * k, vh * k, whole).resized(vw, vh), k as f64)
+                (Luma::new_in(vw * k, vh * k, whole, image.light).resized(vw, vh), k as f64)
             }
             Retry::Upscaled { .. } => unreachable!("an upscaled view is an enlarged copy"),
             // Sharpened and enlarged from the pixels the photo had, and
@@ -6362,7 +6443,8 @@ pub(crate) fn leads_left(leads: Vec<Lead>, found: &[Detection]) -> Vec<Lead> {
 
 /// The copy of a photo that a search of the whole of it looks at, when
 /// that is not the photo itself: the photo reduced, smoothly, so that
-/// its longer side is [`SEARCH_SIDE`]. `None` for a photo no larger.
+/// its longer side is [`SEARCH_SIDE`], in the light it was made in
+/// ([`Luma::resized`]). `None` for a photo no larger.
 fn reduced_for_search(image: &Luma) -> Option<Luma> {
     let longest = image.width.max(image.height);
     if longest <= SEARCH_SIDE {
@@ -6509,7 +6591,7 @@ fn search_deblurred(
         return Vec::new();
     }
     let smallest = known.iter().map(module_size_of).fold(f64::INFINITY, f64::min);
-    let Some(spread) = super::deblur::spread_of(&image.data, image.width, image.height) else { return Vec::new() };
+    let Some(spread) = super::deblur::spread_of(&image.data, image.width, image.height, image.light) else { return Vec::new() };
     let (widest, _) = spread.extremes();
     if widest < super::deblur::LEAST_SPREAD || widest < super::deblur::WORTH_UNDOING * smallest {
         return Vec::new();
@@ -6948,7 +7030,9 @@ fn module_size_of(found: &Detection) -> f64 {
 /// the refinement of its corners and anchors takes the rest of the way.
 /// Either way it keeps the place of the trial decode that vouched for it
 /// in the copy, where one did ([`Detection::decoded_at`]): a decode made
-/// here is of a symbol found already, and only picks its placement.
+/// here is of a symbol found already, and only picks its placement, and a
+/// placement it alone vouched for is charged as that pick
+/// ([`refit_vouched`]).
 fn refine_found(image: &Luma, coarse: Detection, params: &SampleParams) -> Detection {
     // A mirrored symbol's corners run anticlockwise round the photo. An
     // outline runs clockwise, and one given the other way round would
@@ -6958,7 +7042,69 @@ fn refine_found(image: &Luma, coarse: Detection, params: &SampleParams) -> Detec
     // as any outline does: the coarse search runs no rung of the ladder.
     let fine = best_candidate_in(image, coarse.version, clockwise(coarse.corners), params, None, MAX_RECTIFIED);
     let decoded_at = coarse.decoded_at;
-    fine.and_then(|fine| vouched(image, fine, params, true)).map_or(coarse, |fine| Detection { decoded_at, ..fine })
+    let refit = fine.and_then(|fine| refit_vouched(image, fine, params)).map_or(coarse, |fine| Detection { decoded_at, ..fine });
+    fuller_placement(image, &refit, params).map_or(refit, |fuller| Detection { decoded_at, ..fuller })
+}
+
+/// A placement at full size of a symbol a shrunk copy found, where the
+/// search would vouch for it, a trial decode as a last word ([`vouching`]);
+/// and where that decode alone vouched for it, charged as the pick of two
+/// placements ([`Detection::picked_among`]), as a mirror image a decode
+/// chose is ([`settle_mirror_by_decode`]): a decode chose it over the
+/// placement it takes the place of, which is read where it does not
+/// decode. Such a placement was once read uncharged, the trial decodes the
+/// search counts left uncounted here.
+fn refit_vouched(image: &Luma, fit: Detection, params: &SampleParams) -> Option<Detection> {
+    let (found, decoded) = vouching(image, fit, params, true);
+    let picks = if decoded == Some(true) { 2 } else { 1 };
+    found.map(|found| Detection { picked_among: found.picked_among.saturating_mul(picks), ..found })
+}
+
+/// How far about a QR Code placed on fewer of its finders than it has a
+/// look for the rest reaches, in shares of its width each way
+/// ([`fuller_placement`]): the copy put a version 3 symbol on one finder
+/// of a version 7, its width two thirds of the symbol's.
+const FULLER_REACH: f64 = 0.6;
+
+/// A QR Code a shrunk copy placed on fewer of its three finders than it
+/// has, placed again at full size on more of them, where a fit in a frame
+/// the finders about it propose stands on the finders it stood on and
+/// more, and the search would vouch for it ([`vouched`]); `None` where
+/// none does, or where it stood on all three, charged as [`refit_vouched`]
+/// says.
+///
+/// Its own word vouches for a placement on one finder or two, and the
+/// format word beside the first finder is the symbol's whatever version
+/// is fitted to it: a QR Code's format word does not say how large the
+/// symbol is. A copy of a sheet of nine symbols of version 7 placed one
+/// of them as a version 3 on its first finder alone, its word reading
+/// outright; and its finders, a symbol's found, were no longer offered
+/// at full size or in any copy after, so that the three never stood
+/// together, and the symbol was read as a version 6 on two of them, none
+/// of its blocks solved. The fit at full size was made in the copy's
+/// outline, where the other two finders were not to be had.
+fn fuller_placement(image: &Luma, found: &Detection, params: &SampleParams) -> Option<Detection> {
+    if found.version.family() != Family::Qr || found.measured_corners.len() >= 3 || work::cancelled() {
+        return None;
+    }
+    let (w, h) = (found.version.width() as f64, found.version.height() as f64);
+    let map = Homography::rect_to_quad(w, h, found.corners)?;
+    let centre_at = |corner: usize| match corner {
+        0 => Some([3.5, 3.5]),
+        1 => Some([w - 3.5, 3.5]),
+        3 => Some([3.5, h - 3.5]),
+        _ => None,
+    };
+    let own: Vec<[f64; 2]> = found.measured_corners.iter().filter_map(|&i| centre_at(i)).map(|[x, y]| map.apply(x, y)).collect();
+    if own.is_empty() {
+        return None;
+    }
+    let around = outline_around(found.corners, FULLER_REACH);
+    let mut fuller = ranked_candidates_in(image, found.version, around, params, true, None, MAX_RECTIFIED)
+        .into_iter()
+        .find(|fit| fit.measured_corners.len() > found.measured_corners.len() && own.iter().all(|&at| on_own_finder(fit, at)))?;
+    settle_mirror_by_decode(image, &mut fuller, fixed_threshold(params), params);
+    refit_vouched(image, fuller, params)
 }
 
 /// A placement a shrunk copy of the photo kept aside for a read
@@ -7206,7 +7352,7 @@ fn blurred_about(image: &Luma, found: &Detection) -> bool {
         return false;
     }
     let part = super::adjust::cut(&image.data, image.width, 1, window);
-    super::deblur::spread_of(&part, w, h).is_some_and(|spread| spread.extremes().0 >= RUNS_TOGETHER * module_size_of(found))
+    super::deblur::spread_of(&part, w, h, image.light).is_some_and(|spread| spread.extremes().0 >= RUNS_TOGETHER * module_size_of(found))
 }
 
 /// Whether the patterns of a symbol that are none of its finders read in
@@ -8709,7 +8855,7 @@ fn decodes_through_finder(image: &Luma, capstone: &Capstone, placement: &Placeme
     let Some(site) = sites.iter().find(|s| s.kind == AnchorKind::Finder) else { return false };
     let Some(map) = finder_map(capstone, site, placement.turns, placement.mirrored, &func) else { return false };
     let sampled = sample_modules_as(image, &map, func.width, func.height, &SampleParams { kernel: Kernel::Area, enhance: Enhance::NONE, ..*params });
-    let grid = classify(&sampled, params).to_grid(func.width, func.height);
+    let grid = classify_in(&sampled, params, image.light).to_grid(func.width, func.height);
     let grid = if capstone.inverted { grid.inverted() } else { grid };
     let opts = DecodeOptions { reliability: false, ..DecodeOptions::default() };
     brute_force(&grid, &func, None, &opts).first().is_some_and(|attempt| attempt.report.score.all_verified && attempt.report.score.stream_valid)
@@ -11258,6 +11404,7 @@ fn finish_assignment(
         decodes: None,
         bloom: 0.0,
         decoded_at: None,
+        picked_among: 1,
     };
     // A square symbol seen from the back reads as its transpose, which
     // swaps the top-right and bottom-left corners. Its fixed patterns fit
@@ -13090,6 +13237,7 @@ mod tests {
             decodes: None,
             bloom: 0.0,
             decoded_at: None,
+            picked_among: 1,
         };
         assert_eq!(found.found_with(), None);
         // The turn alone, the copy alone, and a symbol found turned
@@ -13130,6 +13278,7 @@ mod tests {
             decodes: None,
             bloom: 0.0,
             decoded_at: None,
+            picked_among: 1,
         };
         let upright = placement(square, 0);
         let turned = placement([square[2], square[3], square[0], square[1]], 2);
@@ -13159,6 +13308,7 @@ mod tests {
             decodes: None,
             bloom: 0.0,
             decoded_at: None,
+            picked_among: 1,
         };
         assert!(named(SymbolVersion::Micro(4), Some(0)).version_confirmed());
         // Within correction range of the word, as the bits beside most
@@ -13580,7 +13730,8 @@ mod tests {
         // and charged so; read in an outline, it has no such place.
         assert_eq!(found.decoded_at, Some(0));
         let outlined = detect_candidates(&draw(&grid), SymbolVersion::Qr(3), whole, &params);
-        assert_eq!(outlined.iter().map(|found| found.decoded_at).collect::<Vec<_>>(), [None]);
+        assert_eq!(outlined.iter().map(|found| (found.decoded_at, found.picked_among, found.decoded_charge())).collect::<Vec<_>>(), [(None, 1, 1)]);
+
         let func = FunctionMap::new(SymbolVersion::Qr(3));
         let mut state = 10u64.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         for y in 0..n {
@@ -13766,6 +13917,12 @@ mod tests {
         assert_eq!((found[0].decoded_charge(), found[1].decoded_charge()), (30, 1));
         let shares: f64 = (0..1000).map(|k| 1.0 / Detection { decoded_at: Some(k), ..placed(version, corners) }.decoded_charge() as f64).sum();
         assert!(shares < 1.0 && shares > 0.99, "{shares}");
+        // A render of an outline taken on the second of its readings is the
+        // pick of those two, with no place among the search's: charged as
+        // one of two by whoever reads it, and not as the second of a
+        // search's trial decodes, one of six.
+        let picked = Detection { picked_among: 2, ..placed(version, corners) };
+        assert_eq!(picked.decoded_charge(), 2);
     }
 
     #[test]
@@ -13824,6 +13981,7 @@ mod tests {
             decodes: None,
             bloom: 0.0,
             decoded_at: None,
+            picked_among: 1,
         }
     }
 

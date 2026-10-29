@@ -306,8 +306,10 @@ fn result_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>) {
         if ui
             .button("Apply corrections")
             .on_hover_text(
-                "Write the corrected modules into the grid and redraw the fixed patterns and version information. \
-                 The format information is redrawn too once a solved block or its own bits confirm it. Undoable.",
+                "Write the corrected modules of confirmed blocks, and of blocks whose data codewords are all pinned by \
+                 hand, into the grid, and redraw the fixed patterns and version information. Unconfirmed blocks are \
+                 left as read, since writing them in would make them look confirmed. Format information is redrawn too \
+                 once its own bits, a confirmed block or a block pinned by hand confirm it. Undoable.",
             )
             .clicked()
         {
@@ -584,7 +586,7 @@ fn sequence_section(ui: &mut egui::Ui, app: &mut App, actions: &mut Vec<Action>)
     if let Some(bits) = sequence.risk_bits().filter(|&bits| bits > 0) {
         ui.weak(format!("At most a 1 in 2^{bits} chance the assembled message is wrong, summed over its {} parts.", sequence.len()));
     }
-    let assembled = sequence.assembled();
+    let assembled = sequence.assembled_in(app.opts.charset);
     egui::Frame::new().fill(visuals.extreme_bg_color).inner_margin(8.0).corner_radius(4.0).show(ui, |ui| {
         ui.set_min_width(ui.available_width());
         let area = egui::ScrollArea::vertical().id_salt("sequence_text").max_height(180.0);
@@ -621,15 +623,15 @@ fn info_bits(read: &InfoRead) -> String {
 /// What `level` gives `version` to correct with, as the format section
 /// says it ([`level_capacity`]).
 struct Capacity {
-    /// How many wrong or unknown codewords each block takes, less those
-    /// the standard reserves for detecting misreads
-    /// ([`misdecode_protection`]), and how much further list decoding
-    /// and the trials of erasures go where the options have them on
-    /// ([`Reach`]).
+    /// How many wrong or unknown codewords each block takes, and how
+    /// much further list decoding and the trials of erasures go where
+    /// the options have them on ([`Reach`]).
     summary: String,
     /// How many codewords are error correction, what share of the symbol
-    /// they correct, and what the standard reserves: for the summary's
-    /// hover.
+    /// they correct, what the standard reserves for detecting misreads
+    /// ([`misdecode_protection`]), and how many wrong or unknown
+    /// codewords plain decoding confirms where that is fewer: for the
+    /// summary's hover.
     details: String,
 }
 
@@ -641,50 +643,62 @@ fn level_capacity(version: SymbolVersion, level: EcLevel, opts: &DecodeOptions, 
     let total = shape.total_codewords;
     let blocks = if shape.blocks > 1 { format!(", in {} blocks of {per_block}", shape.blocks) } else { String::new() };
     let mut details = format!("{} of the {total} codewords are error correction{blocks}.", shape.blocks * per_block);
-    if usable == 0 {
-        let summary = "Corrects nothing: the standard reserves all its error correction for error detection.";
-        return Capacity { summary: summary.to_owned(), details };
-    }
     let share = |n: usize| 100.0 * (shape.blocks * n) as f64 / total as f64;
     details.push_str(&format!(
         " A wrong codeword costs as much as two unknown ones, so about {:.0}% of the symbol can be wrong, or \
          {:.0}% unknown, or a mix of both.",
-        share(usable / 2),
-        share(usable)
+        share(per_block / 2),
+        share(per_block)
     ));
+    // What the standard reserves is said, and what spends it marked; the
+    // risk of each solution says whether it is confirmed, as everywhere.
+    // It was once left out of what the level corrects, and anything that
+    // spent it said never to be confirmed.
     if reserved > 0 {
         let of = if shape.blocks > 1 { "each block's" } else { "them" };
+        let limit = if usable == 0 {
+            "so it allows no correction".to_owned()
+        } else {
+            format!("so it allows correcting up to {} or {usable} unknown", wrong_codewords(usable / 2))
+        };
         details.push_str(&format!(
-            " The standard reserves {reserved} of {of} for error detection; a solution that uses them is never \
-             confirmed."
+            " The standard reserves {reserved} of {of} for error detection, {limit}. Solutions past that are marked \
+             beyond the standard, but confirmed like any other: by how rarely random data would pass them."
         ));
-        // What list decoding reaches here it reaches only so, and the
-        // summary leaves it out.
-        if let Some(reach) = reach
-            && opts.list_decode
-            && reach.list_gains()
-        {
-            details.push_str(&format!(
-                " List decoding corrects at least {} wrong, but with every module certain, anything past {} uses the \
-                 reserved ones.",
-                reach.list, reach.standard
-            ));
+    }
+    // What the code corrects and plain decoding confirms differ: a
+    // solution that fills in every codeword of error correction leaves
+    // none to confirm it. The summary once said the code's count of
+    // unknown alone, as if every one of them were confirmed.
+    if let Some(reach) = reach {
+        let certain = "With every module that was read certain, a solution with";
+        let short = "leaves too little redundancy to confirm it";
+        let unknown = (reach.unknown < per_block).then(|| format!("more than {} unknown", reach.unknown));
+        let wrong = (reach.plain < reach.half)
+            .then(|| if reach.plain == 0 { "any wrong codeword".to_owned() } else { format!("more than {}", wrong_codewords(reach.plain)) });
+        // Wrong codewords are counted whole, and a block's risk by its
+        // modules: M1's one wrong codeword, with a single module of it
+        // wrong, is confirmed all the same. It was once said never to be,
+        // and then said so and taken back in the sentence after.
+        let unless = "unless just one of its modules is wrong, which may still be confirmed";
+        match (unknown, wrong) {
+            (Some(unknown), Some(wrong)) => details.push_str(&format!(" {certain} {unknown} {short}. So does one with {wrong}, {unless}.")),
+            (Some(unknown), None) => details.push_str(&format!(" {certain} {unknown} {short}.")),
+            (None, Some(wrong)) => details.push_str(&format!(" {certain} {wrong} {short}, {unless}.")),
+            (None, None) => {}
         }
     }
     let subject = if shape.blocks > 1 { format!("Each of its {} blocks corrects", shape.blocks) } else { "Corrects".to_owned() };
-    let mut summary = format!("{subject} up to {} or {usable} unknown.", wrong_codewords(usable / 2));
-    // What list decoding and the trials reach within the standard's
-    // limit, which a solution must keep to to be confirmed, and past
-    // what plain decoding reaches, where they are not run.
+    let mut summary = format!("{subject} up to {} or {per_block} unknown.", wrong_codewords(per_block / 2));
+    // What list decoding and the trials reach past what plain decoding
+    // reaches, where they are not run.
     let mut further = Vec::new();
     if let Some(reach) = reach {
-        if opts.list_decode && reach.list_gains_within_standard() {
+        if opts.list_decode && reach.list_gains() {
             further.push(format!("with list decoding, at least {} wrong", reach.list));
         }
-        // Nothing where any codewords are reserved: what the sets reach
-        // past plain decoding spends them ([`Reach::trials_within`]).
-        if opts.erase_by_trial && reach.trials_within > 0 {
-            further.push(format!("with erasing by trial, up to {} wrong", reach.standard + reach.trials_within));
+        if opts.erase_by_trial && reach.trials_past > 0 {
+            further.push(format!("with erasing by trial, up to {} wrong", reach.half + reach.trials_past));
         }
     }
     if let Some(first) = further.first_mut() {
@@ -1033,14 +1047,14 @@ fn outcome_text(block: &BlockReport) -> (String, bool) {
             } else {
                 text.push_str(" — nothing confirms it");
             }
+            if !block.is_verified() && risk_bits > 0 {
+                text.push_str(" — unconfirmed");
+            }
             if beyond_standard {
                 text.push_str(&format!(
-                    " — beyond the standard's limit: {} of the EC codewords are reserved for detection, not correction, \
-                     and this solution spent them",
+                    " — beyond the standard: dips into the {} EC codewords reserved for error detection",
                     block.reserved
                 ));
-            } else if !block.is_verified() && risk_bits > 0 {
-                text.push_str(" — unconfirmed");
             }
             if block.half_padded_with_ones {
                 text.push_str(
@@ -1675,6 +1689,13 @@ fn segments_section(ui: &mut egui::Ui, app: &mut App) {
                 "A segment header has unreadable bits, and one reading of them alone makes the message parse, guessing \
                  {bits}: it is the one shown, and Pin the padding pins those bits."
             ),
+            // Readings of other modes that end where these do guessed
+            // more, and leave nothing inferred.
+            (true, found) if inference.inferred.is_empty() => format!(
+                "A segment header has unreadable bits, and {found} readings of them make the message parse, the fewest \
+                 guessing {bits}: nothing read tells them apart, nothing is inferred, and the header stays unread. Paint \
+                 or pin the header to settle it."
+            ),
             (true, found) => format!(
                 "A segment header has unreadable bits, and {found} readings of them make the message parse, each guessing \
                  {bits}: they agree on {} of the unreadable bits, which Pin the padding pins, and the header stays unread.",
@@ -1745,65 +1766,98 @@ mod tests {
     fn a_level_says_what_it_corrects_and_how_much_further_the_decoder_goes() {
         let opts = super::super::default_decode_options();
         let capacity = |version, level, opts: &DecodeOptions| level_capacity(version, level, opts, Reach::of(version, level, opts).as_ref());
-        // 1-H: 17 of error correction in one block, 1 of them kept. List
-        // decoding reaches 11 wrong only by spending it, and is said in
-        // the hover alone; the trials reach past the code only so too,
-        // the codewords they erase being read and wrong as the standard
-        // counts a solution's errors. Both were once said in the summary
-        // as reaching 11 and two past the code, which no solution
-        // confirmed, and the trials then as reaching one past it.
+        // 1-H: 17 of error correction in one block, 1 of them kept. The
+        // decoder corrects what the code does, 8 wrong or 17 unknown, and
+        // list decoding and the trials reach past it, spending the one
+        // kept, which marks a solution as beyond the standard and is
+        // confirmed all the same. The summary once left the one kept out
+        // of what the level corrects, and what spent it out of what list
+        // decoding and the trials reach, a solution past the standard
+        // never being confirmed; before that they were said there as
+        // reaching 11 and two past the code, which no solution confirmed.
         let Capacity { summary, details } = capacity(SymbolVersion::Qr(1), EcLevel::H, &opts);
-        assert_eq!(summary, "Corrects up to 8 wrong codewords or 16 unknown.");
+        assert_eq!(
+            summary,
+            "Corrects up to 8 wrong codewords or 17 unknown. With list decoding, at least 11 wrong; with erasing by trial, up \
+             to 10 wrong."
+        );
         assert!(details.starts_with("17 of the 26 codewords are error correction. A wrong codeword costs as much as two"), "{details}");
         assert!(
             details.ends_with(
-                "The standard reserves 1 of them for error detection; a solution that uses them is never confirmed. List \
-                 decoding corrects at least 11 wrong, but with every module certain, anything past 8 uses the reserved \
-                 ones."
+                "The standard reserves 1 of them for error detection, so it allows correcting up to 8 wrong codewords or \
+                 16 unknown. Solutions past that are marked beyond the standard, but confirmed like any other: by how \
+                 rarely random data would pass them. With every module that was read certain, a solution with more than \
+                 16 unknown leaves too little redundancy to confirm it."
             ),
             "{details}"
         );
-        // Where nothing is kept, list decoding's reach is said.
-        let summary = capacity(SymbolVersion::Qr(40), EcLevel::H, &opts).summary;
+        // Where nothing is kept, list decoding's reach is said, and nothing
+        // of the standard.
+        let Capacity { summary, details } = capacity(SymbolVersion::Qr(40), EcLevel::H, &opts);
         assert!(summary.starts_with("Each of its 81 blocks corrects up to 15 wrong codewords or 30 unknown. With list decoding, at least "), "{summary}");
         assert!(summary.ends_with("wrong; with erasing by trial, up to 16 wrong."), "{summary}");
+        assert!(!details.contains("standard"), "{details}");
+        // Every one of the code's unknown is corrected, and one fewer
+        // confirmed, by the codeword left to spare.
+        assert!(details.ends_with("a solution with more than 29 unknown leaves too little redundancy to confirm it."), "{details}");
         // Neither is said while it is off, nor list decoding where it
         // gains nothing, as at level L.
         let off = DecodeOptions { list_decode: false, erase_by_trial: false, ..opts };
-        assert_eq!(capacity(SymbolVersion::Qr(1), EcLevel::H, &off).summary, "Corrects up to 8 wrong codewords or 16 unknown.");
+        assert_eq!(capacity(SymbolVersion::Qr(1), EcLevel::H, &off).summary, "Corrects up to 8 wrong codewords or 17 unknown.");
         let summary = capacity(SymbolVersion::Qr(5), EcLevel::L, &opts).summary;
         assert!(summary.starts_with("Corrects up to 13 wrong codewords or 26 unknown. With erasing by trial, up to "), "{summary}");
         assert!(!summary.contains("list decoding"), "{summary}");
-        // A level of many blocks says so, and M1 that it corrects nothing.
+        // A level of many blocks says so.
         let summary = capacity(SymbolVersion::Qr(5), EcLevel::H, &opts).summary;
         assert!(summary.starts_with("Each of its 4 blocks corrects up to 11 wrong codewords or 22 unknown."), "{summary}");
-        let summary = capacity(SymbolVersion::Micro(1), EcLevel::L, &opts).summary;
-        assert!(summary.starts_with("Corrects nothing"), "{summary}");
-        // M2-L keeps three of its five: the trials reach past its one wrong
-        // codeword only by spending them, and are not said to. The one was
-        // once said to be "1 wrong codewords".
-        let summary = capacity(SymbolVersion::Micro(2), EcLevel::L, &opts).summary;
+        // M1 keeps both of its two: the standard corrects nothing, and
+        // the code's one wrong codeword is not confirmed by its codewords,
+        // noise lying so near once in fifty blocks, while one unknown is,
+        // by the other's eight bits. Counted by its modules, one wrong
+        // codeword with a single module wrong is (tests/damage.rs). It
+        // was once said to correct nothing at all, then a wrong codeword
+        // never to be confirmed, and then that, taken back in the sentence
+        // after.
+        let Capacity { summary, details } = capacity(SymbolVersion::Micro(1), EcLevel::L, &opts);
         assert_eq!(summary, "Corrects up to 1 wrong codeword or 2 unknown.");
-        // 2-L keeps two of ten: the pairs reach five within the standard's
-        // limit, but plain decoding reaches five first, spending them, and
-        // the trials never see such a block. 1-M keeps two of ten too, and
-        // its sets of four reach six, but not five, which plain decoding
-        // solves first, and a solution of them is one of thirty thousand
-        // sets, which eat what it has to spare. Both were once said to
-        // reach every count up to what the sets reach, and no solution
-        // confirmed five; and 1-M to correct six, which none confirms.
-        // List decoding reaches six too, its codewords given one
-        // multiplicity alike, and is said to only in the details, as it
-        // spends the two.
-        assert_eq!(capacity(SymbolVersion::Qr(2), EcLevel::L, &opts).summary, "Corrects up to 4 wrong codewords or 8 unknown.");
-        let Capacity { summary, details } = capacity(SymbolVersion::Qr(1), EcLevel::M, &opts);
-        assert_eq!(summary, "Corrects up to 4 wrong codewords or 8 unknown.");
         assert!(
             details.ends_with(
-                "The standard reserves 2 of them for error detection; a solution that uses them is never confirmed. List \
-                 decoding corrects at least 6 wrong, but with every module certain, anything past 4 uses the reserved \
-                 ones."
+                "The standard reserves 2 of them for error detection, so it allows no correction. Solutions past that \
+                 are marked beyond the standard, but confirmed like any other: by how rarely random data would pass \
+                 them. With every module that was read certain, a solution with more than 1 unknown leaves too little \
+                 redundancy to confirm it. So does one with any wrong codeword, unless just one of its modules is \
+                 wrong, which may still be confirmed."
             ),
+            "{details}"
+        );
+        // M2-L keeps three of its five: the code corrects two wrong, and
+        // the trials and the curve reach three, each past the one the
+        // standard corrects. The one was once said to be "1 wrong
+        // codewords".
+        assert_eq!(
+            capacity(SymbolVersion::Micro(2), EcLevel::L, &opts).summary,
+            "Corrects up to 2 wrong codewords or 5 unknown. With list decoding, at least 3 wrong; with erasing by trial, up to 3 wrong."
+        );
+        assert!(capacity(SymbolVersion::Micro(2), EcLevel::L, &opts).details.contains("so it allows correcting up to 1 wrong codeword or 2 unknown."));
+        // 2-L keeps two of ten: plain decoding reaches five, spending
+        // them, and the pairs six, which the block itself confirms; the
+        // curve reaches five as plain decoding does, and is not said. 1-M
+        // keeps two of ten too, and the curve and the fours reach six.
+        // Both were once said to reach every count up to what the sets
+        // reach, and no solution confirmed five; then to correct four,
+        // a solution past it never being confirmed.
+        assert_eq!(
+            capacity(SymbolVersion::Qr(2), EcLevel::L, &opts).summary,
+            "Corrects up to 5 wrong codewords or 10 unknown. With erasing by trial, up to 6 wrong."
+        );
+        let Capacity { summary, details } = capacity(SymbolVersion::Qr(1), EcLevel::M, &opts);
+        assert_eq!(
+            summary,
+            "Corrects up to 5 wrong codewords or 10 unknown. With list decoding, at least 6 wrong; with erasing by trial, up \
+             to 6 wrong."
+        );
+        assert!(
+            details.contains("The standard reserves 2 of them for error detection, so it allows correcting up to 4 wrong codewords or 8 unknown."),
             "{details}"
         );
     }

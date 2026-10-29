@@ -53,8 +53,8 @@ use std::collections::BinaryHeap;
 
 use super::gf256::{self, Scale, div, exp, mul, poly_eval};
 use super::rs::{
-    CwRead, Offering, RsSolution, Sightings, counted_against, doubted_agreement, list_solution_balance, list_solution_bits, nearest,
-    preferring_the_standard, settle, soft_distance,
+    CwRead, Offering, RsSolution, SPARE_EQUATIONS, Sightings, counted_against, doubted_agreement, judged, list_solution_balance,
+    list_solution_bits, nearest, settle, soft_distance,
 };
 use crate::symbol::grid::{CERTAIN, misread_chance};
 use crate::work;
@@ -714,14 +714,15 @@ fn y_roots(curve: &Curve, k: usize) -> Vec<Vec<u8>> {
 /// constraints to spend on the curve ([`LIST_COST`]): every codeword of
 /// the code the curve through the block's points, weighed by their
 /// reliability, passes through, each restated against the block as read
-/// as any solution is, kept when it is offered ([`Offering`]),
-/// those within the standard over any that spend its reserve
-/// ([`preferring_the_standard`]), and of those the nearest the
-/// block as read by a clear margin, or every one within the margin,
-/// nearest first ([`nearest`]). Each comes with the greatest
-/// multiplicity any point was given. A pinned bit is never overturned.
-/// Nothing for a block whose every EC codeword the standard reserves,
-/// or that has no redundancy left after its erasures.
+/// as any solution is, kept when it is offered ([`Offering`]), and of
+/// those the nearest the block as read by a clear margin, or every one
+/// within the margin, nearest first ([`nearest`]). Each comes with the
+/// greatest multiplicity any point was given. A pinned bit is never
+/// overturned. A block with as many codewords a module short as it has
+/// of error correction is judged by its known bits, and nothing for one
+/// whose unread bits leave no more than [`SPARE_EQUATIONS`] of its
+/// equations to hold a solution to. A block whose every EC codeword the
+/// standard reserves, as M1's, was once not decoded so either.
 ///
 /// What confirms a solution is counted as the doubting solvers count
 /// it. The bits whose other colour was given a point are the doubted
@@ -767,13 +768,21 @@ pub(super) fn rs_decode_listing_against(
 ) -> Vec<(usize, RsSolution)> {
     assert_eq!(block.len(), bit_reliability.len());
     let n = block.len();
-    if cost == 0 || ec_len == 0 || ec_len >= n || reserved >= ec_len {
+    if cost == 0 || ec_len == 0 || ec_len >= n {
         return Vec::new();
     }
     let k = n - ec_len;
     let erased: Vec<usize> = (0..n).filter(|&i| block[i].is_erasure()).collect();
     let f = erased.len();
-    if f >= ec_len {
+    // As many codewords a module short as the block has of error
+    // correction leave the codewords' count nothing to stand on, but
+    // those with a few bits unread still give the curve points
+    // ([`UNKNOWN_BITS_MAX`]), and each codeword it reaches is judged by
+    // the bits ([`judged`]), as the propagation judges what it finds:
+    // the list decoder once gave up there, a hundred equations to spare.
+    let by_bits = f >= ec_len;
+    let unread: usize = block.iter().map(|c| c.known.count_zeros() as usize).sum();
+    if by_bits && unread + SPARE_EQUATIONS >= 8 * ec_len {
         return Vec::new();
     }
     let pts = points(block, bit_reliability);
@@ -803,12 +812,21 @@ pub(super) fn rs_decode_listing_against(
     let multiplicity = constraints.iter().map(|c| c.2).max().unwrap_or(0);
     let (list_size, _) = list_size(total, k - 1);
     let Some(curve) = interpolate(&constraints, k - 1, list_size) else { return Vec::new() };
-    let (read, redundancy) = (n - f, ec_len - f);
+    let (read, redundancy) = (n - f, ec_len.saturating_sub(f));
     let mut offering = Offering::new(block, bit_reliability, ec_len, seen);
     let mut found: Vec<(u32, (usize, RsSolution))> = Vec::new();
     for h in y_roots(&curve, k) {
         let corrected: Vec<u8> = (0..n).map(|i| mul(grs[i].1, poly_eval(&h, grs[i].0))).collect();
         offering.seen().see_unless_pinned(block, &corrected);
+        if by_bits {
+            let Some(solution) = judged(block, bit_reliability, ec_len, reserved, corrected, 0).map(|solution| counted_against(as_read, ec_len, solution)) else {
+                continue;
+            };
+            if offering.offers_solution(&solution) {
+                found.push((soft_distance(block, bit_reliability, &solution.corrected), (multiplicity, solution)));
+            }
+            continue;
+        }
         let (mut hard, mut errors, mut agreeing, mut flipped) = (0usize, 0usize, 0u32, 0u32);
         for i in 0..n {
             if block[i].is_erasure() {
@@ -852,7 +870,6 @@ pub(super) fn rs_decode_listing_against(
         }
         found.push((soft_distance(block, bit_reliability, &solution.corrected), (multiplicity, solution)));
     }
-    let found = preferring_the_standard(found, |(_, solution)| solution);
     nearest(found, |a, b| a.1.corrected == b.1.corrected, |a, b| a.1.confidence_bits() > b.1.confidence_bits())
 }
 
@@ -870,12 +887,12 @@ pub(super) fn rs_decode_listing_against(
 /// points whose multiplicities sum past the curve's weighted degree is a
 /// factor of the curve; the wrong codewords are put where the
 /// multiplicities are greatest. Unknown codewords and faint bits, which
-/// take it less far or further, are left out. The codewords the standard
-/// reserves for detecting misreads are left out too: past half the
-/// distance a block read certain has none of its redundancy to spare,
-/// so where any are reserved, a solution reached past what the standard
-/// corrects spends them, and is never confirmed however much else
-/// confirms it ([`super::rs::RsSolution::within_standard`]).
+/// take it less far or further, are left out. So are the codewords the
+/// standard reserves for detecting misreads: past half the distance a
+/// block read certain has none of its redundancy to spare, and where
+/// any are reserved a solution so far out spends them: it is marked as
+/// beyond the standard, and confirmed all the same
+/// ([`super::rs::RsSolution::within_standard`]).
 pub fn hard_reach(n: usize, ec_len: usize, cost: usize, needed: u32) -> usize {
     if cost == 0 || ec_len == 0 || ec_len >= n {
         return 0;
@@ -997,6 +1014,34 @@ mod tests {
             }
         }
         curves.into_iter().min_by_key(|c| c.leading(w))
+    }
+
+    #[test]
+    fn codewords_a_bit_short_past_the_redundancy_still_list() {
+        // A block of 26 with 10 of error correction: twelve codewords each
+        // with one module unread, more than the block has of error
+        // correction were each an erasure, and two read wrong in faint
+        // bits. The curve has the twelve as points, and the codeword it
+        // reaches is judged by the bits, which a hundred equations left
+        // after the twelve unread confirm.
+        let mut rng = Rng(0x5EED);
+        let data: Vec<u8> = (0..16).map(|_| rng.byte()).collect();
+        let codeword: Vec<u8> = data.iter().copied().chain(rs_encode(&data, 10)).collect();
+        let mut block: Vec<CwRead> = codeword.iter().map(|&v| CwRead::known(v)).collect();
+        let mut bits = vec![[CERTAIN; 8]; 26];
+        for i in 0..12 {
+            let at = 2 * i;
+            block[at].known &= !(1 << (i % 8));
+            block[at].value &= block[at].known;
+            bits[at][i % 8] = 0;
+        }
+        for (i, bit) in [(1usize, 2usize), (5, 6)] {
+            block[i].value ^= 1 << bit;
+            bits[i][bit] = 4;
+        }
+        assert!(block.iter().filter(|c| c.is_erasure()).count() >= 10);
+        let found = rs_decode_listing(&block, &bits, 10, 0, LIST_COST, &mut Sightings::default());
+        assert!(found.iter().any(|(_, solution)| solution.corrected == codeword), "{found:?}");
     }
 
     #[test]
@@ -1125,12 +1170,15 @@ mod tests {
         let found = rs_decode_listing(&read, &vec![[CERTAIN; 8]; 26], 17, 0, LIST_COST, &mut Sightings::default());
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!((found[0].1.corrected == block, found[0].1.errors, found[0].1.erasures), (true, 8, 4));
-        // A pinned codeword is never overturned, and a block with its
-        // every EC codeword reserved is not decoded so.
+        // A pinned codeword is never overturned. A block with its every
+        // EC codeword reserved was once not decoded so; it is now, and
+        // the solution is marked as beyond the standard.
         let mut pinned = read.clone();
         pinned[picked[4]].pinned = 0xFF;
         assert!(rs_decode_listing(&pinned, &vec![[CERTAIN; 8]; 26], 17, 0, LIST_COST, &mut Sightings::default()).is_empty());
-        assert!(rs_decode_listing(&read, &vec![[CERTAIN; 8]; 26], 17, 17, LIST_COST, &mut Sightings::default()).is_empty());
+        let found = rs_decode_listing(&read, &vec![[CERTAIN; 8]; 26], 17, 17, LIST_COST, &mut Sightings::default());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].1.corrected == block && !found[0].1.within_standard());
     }
 
     #[test]

@@ -306,7 +306,7 @@ curved/image015.jpg 0 read
 curved/image015.jpg 1 read
 curved/image016.jpg 0 read
 curved/image016.jpg 1 read
-curved/image017.jpg 0 found
+curved/image017.jpg 0 read
 curved/image017.jpg 1 read
 curved/image018.jpg 0 read
 curved/image018.jpg 1 read

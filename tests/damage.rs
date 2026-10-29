@@ -5,7 +5,7 @@ mod common;
 
 use common::*;
 use qr_forensics::decode::bitstream::Certainty;
-use qr_forensics::decode::codewords::Pins;
+use qr_forensics::decode::codewords::{Pin, PinSource, Pins};
 use qr_forensics::decode::pipeline::{
     BlockOutcome, CwStatus, DecodeOptions, Harder, SolveMethod, brute_force, brute_force_mirrored, brute_force_mirrored_whole, brute_force_whole,
     decode, decode_keeping, decode_trying_harder,
@@ -132,8 +132,8 @@ fn a_block_corrected_to_the_limit_of_its_error_correction_is_confirmed() {
     // codeword more in a block is past the code, and no read, but for
     // the trials of erasures, which reach one more in any block, by
     // the smallest set of erasures that goes past the code or the next
-    // where the standard's reserve refuses that one, when enough is
-    // located to confirm it.
+    // where the smallest locates too little to be offered, when enough
+    // is located to confirm it.
     let mut rng = Rng(0x11A17);
     for (version, ec) in SAMPLES {
         let mask = rng.below(version.mask_count() as usize) as u8;
@@ -195,7 +195,7 @@ fn the_limit_confirms_in_every_symbol_the_standard_reserves_nothing_in() {
     // limit are evidence enough: the least of them, the four an M3-M
     // symbol corrects among its seventeen codewords, are found in one
     // block of noise in nearly two million. Where the standard reserves
-    // codewords it is the reserve that speaks, not this.
+    // codewords, see the test after this one.
     let mut least = (u32::MAX, String::new());
     for family in Family::ALL {
         for version in family.versions() {
@@ -215,22 +215,140 @@ fn the_limit_confirms_in_every_symbol_the_standard_reserves_nothing_in() {
 }
 
 #[test]
-fn every_block_but_m1s_can_be_verified_with_codewords_filled_in() {
-    // A block some of whose codewords were filled in by its plain decode
-    // is verified with a codeword to spare, as one read whole is, and
-    // every block has one, within what the standard lets it spend, with
-    // one codeword unknown at the least. All but M1's: both of its two
-    // are reserved for detection, it fills in nothing, and is verified
-    // read whole or not at all, by the sixteen bits they are.
+fn the_limit_confirms_where_the_standard_reserves_codewords_but_at_m1() {
+    // Where the standard reserves codewords for detection, the code's
+    // own limit, half its distance, spends them, and what the plain
+    // decode locates there confirms it all the same: the least, the
+    // three an M3-L symbol's six reach among its seventeen codewords, are
+    // found in one block of noise in twenty-five thousand, and 1-L's
+    // three with a codeword to spare in one in nearly two million, as
+    // M3-M's four are.
+    // All but M1's one among five, which noise shows once in fifty
+    // blocks. It was once the reserve that spoke there, and every such
+    // solution was refused, however rarely noise would pass it.
+    let mut least = (u32::MAX, String::new());
     for family in Family::ALL {
         for version in family.versions() {
             for &ec in version.ec_levels() {
-                for block in &layout(version, ec).blocks {
-                    let fillable = block.ec_len.saturating_sub(block.reserved.max((VERIFIED_BITS / 8) as usize));
-                    assert_eq!(fillable == 0, version == SymbolVersion::Micro(1), "{version}-{ec:?}: {} EC codewords, {} reserved", block.ec_len, block.reserved);
+                let layout = layout(version, ec);
+                for block in layout.blocks.iter().filter(|block| block.reserved > 0) {
+                    let slack = block.ec_len % 2;
+                    let bits = 8 * slack as u32 + located_error_bits(block.codewords.len(), block.ec_len / 2);
+                    if version == SymbolVersion::Micro(1) {
+                        assert_eq!(bits, 5, "{version}-{ec:?}");
+                        continue;
+                    }
+                    assert!(bits >= VERIFIED_BITS, "{version}-{ec:?}: {bits} bits");
+                    if version == SymbolVersion::Qr(1) && ec == EcLevel::L {
+                        assert_eq!(bits, 20);
+                    }
+                    if bits < least.0 {
+                        least = (bits, format!("{version}-{ec:?}"));
+                    }
                 }
             }
         }
+    }
+    assert_eq!(least, (14, "M3-L".to_owned()));
+    // And decoded so: the code's limit in every block, the reserve spent,
+    // marks each solution beyond the standard and confirms it, at the
+    // least of them and the levels the standard keeps most of. It was
+    // once only counted here, and no decode spent a reserve this way.
+    let mut rng = Rng(0x5E5E);
+    for (version, ec) in [(SymbolVersion::Micro(3), EcLevel::L), (SymbolVersion::Qr(1), EcLevel::L), (SymbolVersion::Qr(2), EcLevel::L)] {
+        let mask = rng.below(version.mask_count() as usize) as u8;
+        let (layout, clean, text) = sample(version, ec, mask, &mut rng);
+        let mut grid = clean.clone();
+        for block in &layout.blocks {
+            for i in rng.distinct(block.ec_len / 2, block.codewords.len()) {
+                corrupt_codeword(&mut grid, &layout, block.codewords[i], rng.below(8));
+            }
+        }
+        let what = format!("{version}-{ec:?}");
+        let report = decode_plain(&grid, &layout, mask);
+        for (b, block) in layout.blocks.iter().enumerate() {
+            match report.blocks[b].outcome {
+                BlockOutcome::Solved { method: SolveMethod::ReedSolomon, errors, slack, confidence_bits, beyond_standard: true, .. } => {
+                    assert_eq!((errors, slack), (block.ec_len / 2, block.ec_len % 2), "{what} block {b}");
+                    let counted = 8 * slack as u32 + located_error_bits(block.codewords.len(), errors);
+                    assert!(confidence_bits == counted && counted >= VERIFIED_BITS, "{what} block {b}: {confidence_bits} bits");
+                }
+                other => panic!("{what} block {b}: {other:?}"),
+            }
+            assert!(report.blocks[b].is_verified(), "{what} block {b}: {:?}", report.blocks[b].outcome);
+        }
+        assert!(report.is_trustworthy(), "{what}");
+        assert_eq!(report.text.plain(), text, "{what}");
+    }
+    // M1's one wrong codeword is corrected, its five bits short of the
+    // eight, and with four of its modules wrong, as near as noise lies
+    // too often, not confirmed (tests/repair.rs). One module wrong is
+    // rarer, and the block's risk, counted by its modules, says so.
+    let (layout, text) = (layout(SymbolVersion::Micro(1), EcLevel::L), "12345");
+    let mut grid = encode(SymbolVersion::Micro(1), EcLevel::L, Some(2), &[Segment::numeric(text).unwrap()]).unwrap();
+    for bit in 0..4 {
+        corrupt_codeword(&mut grid, &layout, layout.blocks[0].codewords[0], bit);
+    }
+    let report = decode(&grid, &layout, 2, &Pins::new(), &unguided());
+    match report.blocks[0].outcome {
+        BlockOutcome::Solved { method: SolveMethod::ReedSolomon, errors: 1, confidence_bits: 5, beyond_standard: true, .. } => {}
+        other => panic!("M1: {other:?}"),
+    }
+    assert!(!report.blocks[0].is_verified(), "M1: {:?}", report.blocks[0].outcome);
+    assert_eq!(report.text.plain(), text);
+    let mut grid = encode(SymbolVersion::Micro(1), EcLevel::L, Some(2), &[Segment::numeric(text).unwrap()]).unwrap();
+    corrupt_codeword(&mut grid, &layout, layout.blocks[0].codewords[0], 0);
+    let report = decode(&grid, &layout, 2, &Pins::new(), &unguided());
+    match report.blocks[0].outcome {
+        BlockOutcome::Solved { method: SolveMethod::ReedSolomon, errors: 1, confidence_bits: 5, risk_bits, beyond_standard: true, .. } => {
+            assert!(risk_bits > 5, "M1, one module wrong: {risk_bits}");
+        }
+        other => panic!("M1, one module wrong: {other:?}"),
+    }
+    assert!(report.blocks[0].is_verified() && report.is_trustworthy(), "M1, one module wrong: {:?}", report.blocks[0].outcome);
+    assert_eq!(report.text.plain(), text);
+    // Two are not, as the format section says (src/app/inspector.rs).
+    corrupt_codeword(&mut grid, &layout, layout.blocks[0].codewords[0], 1);
+    let report = decode(&grid, &layout, 2, &Pins::new(), &unguided());
+    assert!(!report.blocks[0].is_verified(), "M1, two modules wrong: {:?}", report.blocks[0].outcome);
+}
+
+#[test]
+fn every_block_can_be_verified_with_a_codeword_filled_in() {
+    // A block some of whose codewords were filled in by its plain decode
+    // is verified with a codeword to spare, as one read whole is, and
+    // every block has one with one codeword unknown at the least. M1's
+    // among them: both of its two are reserved for detection, and one
+    // filled in spends the reserve, which marks the solution as beyond
+    // the standard and leaves it the eight bits of the other. It was once
+    // never verified so, and M1 was verified read whole or not at all.
+    // Decoded so in the symbol of each family whose blocks have the
+    // fewest codewords of error correction: one codeword of each block
+    // filled in, and every block verified. Model 1 is left out, the
+    // encoder making none. It was once only counted that every block has
+    // two at the least, which every table gives it.
+    let mut rng = Rng(0xF111);
+    for family in [Family::Qr, Family::Micro, Family::Rmqr] {
+        let least_ec = |version: SymbolVersion, ec: EcLevel| layout(version, ec).blocks.iter().map(|block| block.ec_len).min().unwrap_or(usize::MAX);
+        let (version, ec) = family
+            .versions()
+            .into_iter()
+            .flat_map(|version| version.ec_levels().iter().map(move |&ec| (version, ec)))
+            .min_by_key(|&(version, ec)| least_ec(version, ec))
+            .expect("a family has symbols");
+        let layout = layout(version, ec);
+        let text = rng.digits(byte_capacity(&layout, 1).max(1));
+        let mask = rng.below(version.mask_count() as usize) as u8;
+        let mut grid = encode(version, ec, Some(mask), &[Segment::numeric(&text).unwrap()]).unwrap();
+        for block in &layout.blocks {
+            erase_codeword(&mut grid, &layout, block.codewords[rng.below(block.codewords.len())]);
+        }
+        let what = format!("{version}-{ec:?}");
+        let report = decode_plain(&grid, &layout, mask);
+        for b in 0..layout.blocks.len() {
+            assert!(report.blocks[b].is_verified(), "{what} block {b}: {:?}", report.blocks[b].outcome);
+        }
+        assert_eq!(report.text.plain(), text, "{what}");
     }
     let (layout, text) = (layout(SymbolVersion::Micro(1), EcLevel::L), "12345");
     let mut grid = encode(SymbolVersion::Micro(1), EcLevel::L, Some(1), &[Segment::numeric(text).unwrap()]).unwrap();
@@ -243,7 +361,12 @@ fn every_block_but_m1s_can_be_verified_with_codewords_filled_in() {
     assert_eq!(report.text.plain(), text);
     erase_codeword(&mut grid, &layout, layout.blocks[0].codewords[0]);
     let report = decode_plain(&grid, &layout, 1);
-    assert!(report.blocks[0].is_beyond_standard() && !report.is_trustworthy(), "{:?}", report.blocks[0].outcome);
+    match report.blocks[0].outcome {
+        BlockOutcome::Solved { method: SolveMethod::ReedSolomon, errors: 0, erasures: 1, slack: 1, risk_bits: 8, beyond_standard: true, .. } => {}
+        other => panic!("{other:?}"),
+    }
+    assert!(report.is_trustworthy());
+    assert_eq!(report.text.plain(), text);
 }
 
 #[test]
@@ -490,9 +613,13 @@ fn scattered_unknown_modules_are_solved_bit_by_bit() {
         }
         assert_eq!(report.text.plain(), text, "{what}");
 
-        // With the fallback off the same grid does not decode.
+        // With the fallback off the same grid does not decode, nor with
+        // the list decoder and the propagation, which reach the block too
+        // where its unread bits leave equations to spare: the curve takes
+        // the codewords a module short as points, and the beliefs solve
+        // for the bits unread, each judged by the bits.
         if layout.blocks.iter().any(|b| 2 * b.ec_len <= b.codewords.len() && b.ec_len > 0) {
-            let strict = DecodeOptions { bit_level: false, ..Default::default() };
+            let strict = DecodeOptions { bit_level: false, list_decode: false, belief_propagation: false, ..Default::default() };
             assert!(!decode(&grid, &layout, mask, &Pins::new(), &strict).is_complete(), "{what}");
         }
     }
@@ -608,14 +735,11 @@ fn doubting_recovers_from_misread_sampled_modules() {
         let report = decode_plain(&grid, &layout, mask);
         // Past what a block that reserves codewords corrects, as the
         // standard counts errors, the faint misreads among them however
-        // they were reached: the message, never confirmed. Such a block
-        // of 1-H was once confirmed, the codewords doubted, or the bits
-        // flipped, costing the reserve nothing.
-        if block.reserved > 0 {
-            assert!(report.blocks[0].is_beyond_standard() && !report.is_trustworthy(), "{what}: {:?}", report.blocks[0].outcome);
-            assert_eq!(report.text.plain(), text, "{what}");
-            continue;
-        }
+        // they were reached: marked as beyond the standard, and confirmed
+        // as any other block is, by its risk. Such a block of 1-H was
+        // once marked within it, the codewords doubted, or the bits
+        // flipped, costing the reserve nothing; and then never confirmed.
+        assert_eq!(report.blocks[0].is_beyond_standard(), block.reserved > 0, "{what}: {:?}", report.blocks[0].outcome);
         // Doubting the faint codewords, doubting the faint bits, flipping
         // them and doubting some while flipping the rest all reach the
         // answer; whichever is confirmed by more bits is kept.
@@ -834,7 +958,13 @@ fn erasing_by_trial_frees_a_wrong_codeword_among_scattered_unknown_bits() {
             let what = format!("{version}-{ec:?} with {unknown} unknown bits and {stains} stained codewords");
             let no_trial = DecodeOptions { erase_by_trial: false, list_decode: false, ..unguided() };
             assert!(!decode(&grid, &layout, mask, &Pins::new(), &no_trial).blocks[0].is_solved(), "{what}");
-            let report = decode(&grid, &layout, mask, &Pins::new(), &unguided());
+            // The list decoder reaches such a block too, its curve taking
+            // the codewords a module short as points, and may be first to:
+            // with everything on, the block is confirmed either way, and
+            // the trials are asked alone.
+            let everything = decode(&grid, &layout, mask, &Pins::new(), &unguided());
+            let trial = DecodeOptions { list_decode: false, ..unguided() };
+            let report = decode(&grid, &layout, mask, &Pins::new(), &trial);
             match report.blocks[0].outcome {
                 BlockOutcome::Solved { method: SolveMethod::BitTrial { doubted_bits: 0, erased }, errors, .. } => {
                     assert_eq!((erased, errors), (stains, stains), "{what}");
@@ -846,6 +976,11 @@ fn erasing_by_trial_frees_a_wrong_codeword_among_scattered_unknown_bits() {
             }
             assert!(report.blocks[0].is_verified(), "{what}: {:?}", report.blocks[0].outcome);
             assert_eq!(report.text.plain(), text, "{what}");
+            // What the trials confirm alone, everything on confirms, the
+            // curve or the trials first. It was once only read where it
+            // happened to confirm.
+            assert!(everything.blocks[0].is_verified(), "{what}: with everything on, {:?}", everything.blocks[0].outcome);
+            assert_eq!(everything.text.plain(), text, "{what}");
             let truth = decode_plain(&clean, &layout, mask);
             for (got, want) in report.codewords.iter().zip(&truth.codewords) {
                 assert_eq!(got.final_value, want.final_value, "{what}");
@@ -900,14 +1035,11 @@ fn doubting_bits_recovers_faint_modules_in_more_codewords_than_erasures_allow() 
         let report = decode_plain(&grid, &layout, mask);
         // Past what a block that reserves codewords corrects, as the
         // standard counts errors, the faint misreads among them however
-        // they were reached: the message, never confirmed. Such a block
-        // of 1-H was once confirmed, the codewords doubted, or the bits
-        // flipped, costing the reserve nothing.
-        if block.reserved > 0 {
-            assert!(report.blocks[0].is_beyond_standard() && !report.is_trustworthy(), "{what}: {:?}", report.blocks[0].outcome);
-            assert_eq!(report.text.plain(), text, "{what}");
-            continue;
-        }
+        // they were reached: marked as beyond the standard, and confirmed
+        // as any other block is, by its risk. Such a block of 1-H was
+        // once marked within it, the codewords doubted, or the bits
+        // flipped, costing the reserve nothing; and then never confirmed.
+        assert_eq!(report.blocks[0].is_beyond_standard(), block.reserved > 0, "{what}: {:?}", report.blocks[0].outcome);
         match report.blocks[0].outcome {
             BlockOutcome::Solved { method: SolveMethod::BitReliability { doubted_bits }, errors, confidence_bits, .. } => {
                 assert!(doubted_bits >= wrong && doubted_bits < 8 * block.ec_len, "{what}: doubted {doubted_bits} bits");
@@ -997,14 +1129,11 @@ fn chasing_flips_faint_bits_where_erasing_them_costs_too_much() {
         let report = decode_plain(&grid, &layout, mask);
         // Past what a block that reserves codewords corrects, as the
         // standard counts errors, the faint misreads among them however
-        // they were reached: the message, never confirmed. Such a block
-        // of 1-H was once confirmed, the codewords doubted, or the bits
-        // flipped, costing the reserve nothing.
-        if block.reserved > 0 {
-            assert!(report.blocks[0].is_beyond_standard() && !report.is_trustworthy(), "{what}: {:?}", report.blocks[0].outcome);
-            assert_eq!(report.text.plain(), text, "{what}");
-            continue;
-        }
+        // they were reached: marked as beyond the standard, and confirmed
+        // as any other block is, by its risk. Such a block of 1-H was
+        // once marked within it, the codewords doubted, or the bits
+        // flipped, costing the reserve nothing; and then never confirmed.
+        assert_eq!(report.blocks[0].is_beyond_standard(), block.reserved > 0, "{what}: {:?}", report.blocks[0].outcome);
         match report.blocks[0].outcome {
             BlockOutcome::Solved { method: SolveMethod::Chase { flipped_bits }, errors, slack, .. } => {
                 assert_eq!((flipped_bits, errors, slack), (faint, solid + faint, block.ec_len - 2 * solid), "{what}");
@@ -1089,6 +1218,23 @@ fn a_block_tried_harder_is_searched_at_the_most_and_kept_while_it_reads_the_same
     corrupt_codeword(&mut changed, &layout, layout.blocks[0].codewords[layout.blocks[0].codewords.len() - 1], 0);
     let again = decode_keeping(&changed, &layout, mask, &Pins::new(), &opts, &harder);
     assert!(!again.blocks[0].tried_harder && !again.blocks[0].is_verified());
+}
+
+#[test]
+fn a_block_holding_pins_the_decoder_found_is_found_searched_harder() {
+    // The pins padding recovery places are picked among its tries, and
+    // count as read where the reserve is counted: the block is searched
+    // as heard so, and was once looked for as pinned, never found, and
+    // offered again to be tried harder however often it was.
+    let (version, ec) = (SymbolVersion::Qr(1), EcLevel::M);
+    let layout = layout(version, ec);
+    let grid = ModuleGrid::new(layout.func.width, layout.func.height);
+    let last = *layout.data_stream.last().unwrap();
+    for (source, among) in [(PinSource::Padding, 1), (PinSource::Padding, 2), (PinSource::Manual, 2)] {
+        let pins: Pins = [(last, Pin { among, ..Pin::full(0xEC, source) })].into_iter().collect();
+        let (report, _) = decode_trying_harder(&grid, &layout, 0, &pins, &DecodeOptions::default(), &Harder::default(), &[0]);
+        assert!(report.blocks[0].tried_harder, "{source:?} among {among}: {:?}", report.blocks[0].outcome);
+    }
 }
 
 #[test]
@@ -1405,9 +1551,12 @@ fn rivals_the_block_as_read_lies_as_near_to_are_told_apart_by_the_message() {
     // the other the header reads as noise. Each lies nine codewords from
     // the block as read, past the eight a 1-H symbol corrects as the
     // standard counts errors, the codewords the trials erase among them,
-    // so the one the message tells from the other is the message but is
-    // never confirmed: it was once, the codewords erased counted as
-    // erasures, which left the one codeword the standard keeps unspent.
+    // so the one the message tells from the other is the message, marked
+    // as beyond the standard, and not confirmed: the other lies as near
+    // the block as read, and holds its risk down whatever the message
+    // says. It was once confirmed, the codewords erased counted as
+    // erasures, which left the one codeword the standard keeps unspent;
+    // and then refused for spending it.
     use qr_forensics::decode::rs::{rs_generator, soft_distance};
     let (version, ec, mask) = (SymbolVersion::Qr(1), EcLevel::H, 0);
     let layout = layout(version, ec);
@@ -1569,11 +1718,13 @@ fn a_fallback_spends_the_reserve_as_the_plain_decoder_does() {
     // reserved for detection, so the standard corrects eight. Eleven
     // wrong codewords are past the plain decoder, past the trials of
     // erasures within their budget, and within the curve of list
-    // decoding, whose solution is held to spend every codeword of the
-    // redundancy, the reserve among them. The curve offers it as the
-    // plain decoder offers a solution that spends the reserve: marked
-    // beyond the standard, never confirmed, and the message read off it
-    // all the same.
+    // decoding, whose solution spends every codeword of the redundancy,
+    // the reserve among them. The curve offers it as the plain decoder
+    // offers a solution that spends the reserve: marked beyond the
+    // standard, and verified or not by its risk alone. Each of the
+    // eleven is wrong in one module, and noise lies so few bits from a
+    // codeword once in two to the seventy and more, which verifies it.
+    // It was once never confirmed, the message read off it all the same.
     let mut rng = Rng(0x5E5E);
     let (version, ec) = (SymbolVersion::Qr(1), EcLevel::H);
     let mask = rng.below(version.mask_count() as usize) as u8;
@@ -1586,14 +1737,15 @@ fn a_fallback_spends_the_reserve_as_the_plain_decoder_does() {
     }
     let report = decode_plain(&grid, &layout, mask);
     match report.blocks[0].outcome {
-        BlockOutcome::Solved { method: SolveMethod::List { .. }, errors: 11, erasures: 0, slack: 0, beyond_standard: true, .. } => {}
+        BlockOutcome::Solved { method: SolveMethod::List { .. }, errors: 11, erasures: 0, slack: 0, risk_bits, beyond_standard: true, .. } => {
+            assert!(risk_bits >= 70, "{risk_bits}");
+        }
         other => panic!("{other:?}"),
     }
-    assert!(report.blocks[0].is_beyond_standard() && !report.blocks[0].is_verified());
+    assert!(report.blocks[0].is_verified() && report.is_trustworthy());
     assert_eq!(report.text.plain(), text);
-    assert!(!report.is_trustworthy());
-    // Eight wrong are within the plain decoder, which spends the
-    // reserve itself: the same marking, from it.
+    // Eight wrong are within the plain decoder, which leaves the reserve
+    // unspent.
     let mut grid = clean.clone();
     for i in rng.distinct(8, block.codewords.len()) {
         corrupt_codeword(&mut grid, &layout, block.codewords[i], rng.below(8));
@@ -1602,22 +1754,24 @@ fn a_fallback_spends_the_reserve_as_the_plain_decoder_does() {
     assert!(matches!(report.blocks[0].outcome, BlockOutcome::Solved { method: SolveMethod::ReedSolomon, errors: 8, slack: 1, beyond_standard: false, .. }), "{:?}", report.blocks[0].outcome);
     assert!(report.blocks[0].is_verified());
     // Nine wrong are past the eight the standard corrects however they
-    // are reached: the trials erasing three of them leave two codewords
-    // of the decode's redundancy unspent, but the three erased were read,
-    // and wrong, and count as the standard counts errors. Such a solution
-    // was once within the standard's limit, and verified; it is the
-    // message all the same, marked beyond the standard.
+    // are reached: the curve reaches them, and erasing three of them by
+    // trial would leave two codewords of the decode's redundancy unspent,
+    // but the three erased were read, and wrong, and count as the
+    // standard counts errors. Such a solution was once within the
+    // standard's limit, and verified; and then marked beyond it and never
+    // verified. It is marked so, and verified by its risk.
     let mut grid = clean.clone();
     for i in rng.distinct(9, block.codewords.len()) {
         corrupt_codeword(&mut grid, &layout, block.codewords[i], rng.below(8));
     }
     let report = decode_plain(&grid, &layout, mask);
     assert!(matches!(report.blocks[0].outcome, BlockOutcome::Solved { errors: 9, beyond_standard: true, .. }), "{:?}", report.blocks[0].outcome);
-    assert!(report.blocks[0].is_beyond_standard() && !report.blocks[0].is_verified());
+    assert!(report.blocks[0].is_verified() && report.is_trustworthy());
     assert_eq!(report.text.plain(), text);
-    // A block whose every EC codeword is reserved is held to the
-    // reserve still: an M1 symbol wrong in two codewords, past the one
-    // its two EC codewords detect, has no solution from anyone.
+    // A block whose every EC codeword is reserved is searched as any
+    // other now, by the curve and the chase as well: an M1 symbol wrong
+    // in two codewords, past the one its two EC codewords correct, has
+    // no solution from anyone all the same.
     let (layout, text) = (common::layout(SymbolVersion::Micro(1), EcLevel::L), "12345");
     let mut grid = encode(SymbolVersion::Micro(1), EcLevel::L, Some(1), &[Segment::numeric(text).unwrap()]).unwrap();
     for cw in [0, 1] {

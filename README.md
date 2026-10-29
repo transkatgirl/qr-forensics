@@ -36,23 +36,24 @@ cargo run --release
 
 A release build is recommended: searching a photo for symbols is heavy work.
 
-You also need a graphics card that wgpu can use: Metal on macOS, and
-Vulkan, DirectX 12 or OpenGL elsewhere. Every adjustment in the Photo
-section runs on it (Enlarge, Lens, Sharpen, the tone and Channel, and the
-median, dot-closing and **Deblur** filters), as do the enlarged,
-reduced, sharpened, deblurred and closed copies of the photo the search
-and the reader make, the measure of the blur that Deblur undoes, and
-the search's reading of the photo as dark and light every way the
-finder scan reads it, which the binarised view shows. The photo is
-resampled through an outline for the search on the processor, in double
-precision, and handed the card to be read. The window is drawn by the
-same card, and what an adjustment makes to be shown is laid into the
-window's textures there. There is no fallback to the processor: without
-a card, QR Forensics says so and exits. A photo too large for one of the
-card's buffers is worked on in tiles, with the same result. The card
-still needs room for the photo and the copies made of it at once: one
-that runs out of memory stops QR Forensics with the graphics driver's
-message.
+You also need a GPU that wgpu supports: Metal on macOS, and Vulkan,
+DirectX 12 or OpenGL elsewhere. The GPU runs every Photo adjustment
+(Enlarge, Lens, Sharpen, the linear-light conversion, tone, Channel, and
+the median, dot-closing and **Deblur** filters). It also makes the
+enlarged, reduced, sharpened, deblurred and closed copies of the photo
+that the search and the reader use, estimates the blur for Deblur, and
+binarises the photo for the finder scan (what the binarised view shows).
+Resampling the photo through an outline for the search runs on the CPU,
+in double precision, and the result goes back to the GPU to be read. The
+window is rendered on the same GPU, and adjusted previews are written
+straight into its textures.
+
+There is no CPU fallback: without a GPU, QR Forensics prints an error
+and exits. A photo too large for a GPU buffer is processed in tiles,
+with identical results. The GPU still needs room for the photo and its
+copies at once. If it runs out of memory, QR Forensics stops with the
+driver's error, except when making the enlarged, sharpened and deblurred
+copies for retries: then that retry is skipped and the error is printed.
 
 To open an image at startup, give its path:
 
@@ -157,16 +158,22 @@ When detection fails or lands slightly off, place the grid yourself.
 The **Photo** section adjusts what is read. Its controls are listed in
 the order they are applied:
 
-1. **Enlarge**.
-2. **Lens**: radial lens correction, applied to the enlarged pixels, with
+1. **Work in linear light**: whether Enlarge, Lens, Sharpen, Deblur and
+   sampling blend pixels in linear light or as sRGB values (see below).
+2. **Enlarge**.
+3. **Lens**: radial lens correction, applied to the enlarged pixels, with
    an **Estimate** from the corners and anchors.
-3. **Sharpen**: an unsharp mask, sized in the photo's own pixels however
+4. **Sharpen**: an unsharp mask, sized in the photo's own pixels however
    far it's enlarged (or in the reduced pixels, if it's reduced). Below 0
    it becomes a Gaussian blur up to 4 px wide, for grain and halftone
    screens.
-4. **Invert photo**, for light symbols on a dark background.
-5. **Contrast**, **Brightness** and **Channel**.
-6. **Filter**, run last on the enlarged photo: median, dot-closing, or
+5. **Invert photo**, for light symbols on a dark background.
+6. **Exposure**, in stops: +1 doubles each pixel's intensity and -1
+   halves it. It's always computed in linear light, whatever **Work in
+   linear light** is set to. It comes before Contrast, so with high
+   Contrast it shifts which tones end up dark and which light.
+7. **Contrast** and **Channel**.
+8. **Filter**, run last on the enlarged photo: median, dot-closing, or
    **Deblur**.
 
 A photo with transparency also has **Transparent parts**, which fills
@@ -178,19 +185,82 @@ edges with the same colour (white for a photo without transparency).
 Loading a read made under a different setting switches back to that
 setting.
 
-**Deblur** measures the blur's width and direction from edges in the
-photo and deconvolves it, for a photo that is out of focus or shaken.
-It measures over the whole photo (on a photo over 1.5 megapixels, the
-parts of it with the most edges, at full resolution), or only inside
-the outline if you press **Measure in outline**. The kernel is drawn
-under the filter. The direction of a shake is measured from edges
-that run every way, such as print around the symbol; the symbol's own
-modules only have edges two ways, so a shake slanting across them is
-measured as a rounder blur along them. If the edges all run within less
-than a quarter turn of each other, as on a barcode or ruled paper, they
-say nothing about the blur along them, and it's taken to be round.
-**Strength** scales it: 1 undoes the blur as measured, lower undoes
-less, and higher undoes more but adds ringing around edges.
+**Work in linear light** sets how pixels are blended. Off (the default),
+they're blended as sRGB values. On, each pixel is converted to linear
+light before Enlarge, Lens and Sharpen, and back to sRGB before the tone
+adjustments. This matches how a lens blends light: 1 px stripes of black
+and grey (200) reduced to half size average to 100 in sRGB, but 146 in
+linear light.
+
+When it's on, these also work in linear light:
+
+- **Deblur**, which converts on its own, since it runs after the tone
+  adjustments (see below);
+- the enlarged, reduced, sharpened, deblurred and closed copies that the
+  search and the reader retry on;
+- the reduced copy used to search a photo over 4096 pixels;
+- sampling. sRGB spends more of its levels on dark tones, so in sRGB a
+  pixel that's half ink and half paper reads too light, and a blurred
+  dark module among light ones can read light. In linear light it reads
+  mid-grey, and the blur learnt from the fixed patterns matches the data.
+
+**Turn it on** for camera photos, especially blurry ones (out of focus,
+shaken, or modules a few pixels across), when lone dark modules read
+light or the timing patterns read mostly light.
+
+**Leave it off** for:
+
+- screenshots, rendered symbols, and anything blurred or resized in
+  software, which blends in sRGB;
+- photos adjusted with **Invert photo** or **Contrast**. These work on
+  sRGB values and push them off the sRGB curve that sampling and Deblur
+  assume when converting. **Channel** and **Exposure** are fine.
+
+A sharp photo reads much the same either way, and Median and
+dot-closing are unaffected. If nothing is enlarged, straightened,
+sharpened or deblurred, the photo itself looks the same, but sampling
+differs, and so do the reduced, enlarged and sharpened copies the search
+and the reader retry on. A read uses the current
+setting and never retries with the other, so it can always be reproduced
+from the photo as configured. Loading a read made under the other
+setting switches it to match.
+
+**Deblur** estimates the blur's width and direction from edges in the
+photo and deconvolves it, for photos that are out of focus or shaken.
+It measures the whole photo (above 1.5 megapixels, only the regions
+with the most edges, at full resolution), or only inside the outline if
+you press **Measure in outline**. The estimated kernel is drawn under
+the filter.
+
+- Measuring shake direction needs edges running every way, such as
+  print around the symbol. A symbol's modules only have edges in two
+  directions, so diagonal shake across them measures as a rounder blur.
+  If the edges span less than 90° (a barcode, ruled paper), the blur is
+  assumed round.
+- When the blur is wide compared with the modules, neighbouring edges
+  overlap. The estimate accounts for this instead of underestimating.
+- **Strength** scales the correction: 1 undoes the measured blur, lower
+  undoes less, and higher undoes more but adds ringing around edges.
+
+Deblur follows **Work in linear light**. On, it converts the photo to
+linear light, measures and deconvolves, then converts back. Use this for
+camera blur: a lens blurs in linear light, and on sRGB values edges
+measure about an eighth wider than the real blur, and thin dark modules
+are restored less than thin light ones. Off, it works on the sRGB values
+directly, which matches blur added in software. Off is also right after
+**Invert photo** or **Contrast**, whose output is no longer on the sRGB
+curve the conversion assumes.
+
+Switching **Work in linear light** re-measures a blur set with **Measure
+in outline** inside the outline it was first measured in, even if you've
+moved the outline since. That outline follows the photo when it's
+enlarged, cropped or straightened. A blur set by loading a read is
+re-measured where it was measured: inside the read's outline if the
+read measured it around its symbol, over the whole photo if it's the
+whole photo's blur that Deblur was held to, and inside the original
+outline if it's the blur the read was made under. If no blur can be
+measured there, Deblur goes back to the whole photo's blur. This
+happens even while another filter is selected.
 
 ### 4. Sample the modules
 
@@ -213,22 +283,28 @@ Sampling reads a colour for each module off the photo.
   learnt, the modules are sharpened by a guess at the blur. The section
   says which was done. Off, the modules are taken as they read, which
   suits a clean print with specks in it.
-- Each module's reliability is learnt from the photo itself. The fixed
-  patterns, whose colours are known, show how far correctly read dark
-  and light modules sit from the threshold, how widely each colour's
-  readings spread, and how many readings are wrong by more than that
-  spread explains (specks and stains). However clear a reading is, it's
-  taken to be wrong at least once in 256 times (8 bits). That's roughly
-  how often readings that looked like 1 in a million were wrong on
-  BoofCV's benchmark photos: a logo, a stain, a crease or a grid
-  slipping on curled paper can make a reading wrong without making it
-  faint. If one colour spreads wider, as unevenly read ink does against
-  clean paper, a reading near the threshold is more likely that colour,
-  so the threshold moves toward the other. That only happens once the
-  blur is undone or found to be slight, because blur greys the fixed
-  patterns' thin light rings but leaves their solid dark blocks alone.
-  The section reports the fit, and the decoder doubts the least reliable
-  modules first.
+- Modules are sampled in linear light when **Work in linear light**
+  (under Photo) is on, and as sRGB values otherwise.
+- **Reliability.** Each module's reliability is calibrated per photo
+  from the fixed patterns, whose colours are known. They show how far
+  correct dark and light readings sit from the threshold, how widely
+  each colour spreads, and how many readings are wrong by more than that
+  spread explains (specks and stains). The section reports the fit, and
+  the decoder doubts the least reliable modules first.
+  - No reading is trusted past 8 bits (wrong 1 time in 256). On BoofCV's
+    benchmark photos, readings that looked like 1 in a million were
+    wrong about that often: a logo, a stain, a crease or a grid slipping
+    on curled paper can make a reading wrong without making it faint.
+  - If one colour spreads wider (uneven ink on clean paper, say), a
+    reading near the threshold is more likely that colour, so the
+    threshold moves toward the other. This waits until the blur is
+    undone or found slight, since blur greys the fixed patterns' thin
+    light rings but not their solid dark blocks.
+  - Near misread fixed-pattern modules (under a stain or glare),
+    reliability can be lowered locally, never raised.
+  - With the five-point vote, a module is only as reliable as its
+    second-weakest point, and only a guess if that point is across the
+    threshold.
 - **Kernel** chooses how a module's luminance is taken: the average over its
   middle, its centre point alone, or a vote of five points.
 
@@ -389,10 +465,11 @@ the best-confirmed result is kept:
   can't all be right, it also flips up to three solidly misread bits the
   equations point to (if flipping is on), and erases a codeword or two
   by trial (if erasing by trial is on).
-- **Doubt the least reliable modules** marks the faintest codewords, or
-  single bits, as unknown, a few at a time. Single bits needs the option
-  above. Modules painted by hand are never doubted unless they were
-  painted below certain.
+- **Doubt the least reliable modules** marks the codewords most likely
+  to be wrong as unknown, a few at a time; a codeword faint in every bit
+  goes before one with a single faint bit. With the option above on, it
+  can doubt single bits instead. Hand-painted modules are only doubted
+  if they were painted below certain.
 
 The second group runs in order, and stops once the block is confirmed:
 
@@ -408,14 +485,11 @@ The second group runs in order, and stops once the block is confirmed:
   codeword close enough to the block as read, weighting each codeword by
   its reliability. It gains more at higher levels: up to 19 wrong
   codewords in a 40-H block instead of 15. At level L it gains nothing.
-  In symbols that reserve codewords for error detection (below), it
-  can't confirm more wrong codewords than plain Reed-Solomon can.
-- **Erase codewords by trial** erases every set of codewords of the
-  smallest size that gets past plain Reed-Solomon, then the next size
-  up, regardless of reliability. It reaches a hand-painted block with
-  one codeword too many wrong (two in a small block), or a block whose
-  unknown bits solve except for a stain over a few codewords, in
-  symbols that reserve no codewords for error detection.
+- **Erase codewords by trial** tries erasing every set of codewords of
+  the smallest size that gets past plain Reed-Solomon, then the next
+  size up, ignoring reliability. It can recover a hand-painted block
+  with one wrong codeword too many (two in a small block), or a block
+  whose unknown bits would solve but for a stain over a few codewords.
 
 List decoding and erasing by trial run only when plain Reed-Solomon
 finds no solution at all.
@@ -446,30 +520,44 @@ to every codeword a solver comes across, including ones it passed over
 without offering: if the block alone confirms one, it becomes a
 solution in its own right, and Blocks says so.
 
-In the smallest symbols (some levels of versions 1 to 3 and of Micro
-QR) the standard reserves some error correction codewords for detecting
-misreads rather than correcting them. A solution that uses them is
-marked as beyond the standard and is never confirmed, whichever solver
-found it, and each fallback prefers a solution that leaves them unused.
+In the smallest symbols (some levels of versions 1 to 3, and of Micro QR),
+ISO/IEC 18004 Table 9 reserves some error correction codewords for
+detecting misreads rather than correcting them. A solution that uses
+them is marked *beyond the standard*, but is otherwise judged like any
+other. The reserve is a fixed, worst-case margin against misreads,
+while the confirmation above measures that risk for each actual
+solution. A 1-L block with three wrong codewords spends the reserve,
+yet is as well confirmed as an M3-M block with four, which doesn't.
+Only M1, which reserves both of its error correction codewords, can't
+confirm a corrected codeword, unless just one of its modules was wrong.
 
-Every solution's use of error correction is measured against the block
-as read. Each changed codeword that had a module read costs two
-codewords, and each unknown module filled in costs an eighth of one.
-A module sampled right on the threshold says nothing either way and
-counts as unknown. Doubted codewords count as read, since doubting
-only chooses after the fact which modules to treat as unknown. Modules
-filled in by **Use the message as a prior** count as unknown. So in
-these symbols, no solver can confirm more wrong codewords than plain
-Reed-Solomon corrects without the reserve. The one exception is a
-block with enough codewords pinned whole to be solved from its pins
-alone: that decode reads none of the block's other modules, so it is
-measured against its pins, with every other codeword unknown. The
-other solvers can still add confirmation to such a solution, and
-solving scattered unknown modules bit by bit costs far less than
-erasing their whole codewords.
-Anything further is an unconfirmed last resort. The capacity line
-under the EC level counts only what can be confirmed, and the notes
-under Decoding flag what can't be.
+Whether a solution spends the reserve is measured against the block as
+read, whichever solver found it. Anything past what plain Reed-Solomon
+corrects without the reserve is marked, counting as follows:
+
+- A changed codeword that had any module read costs two codewords; an
+  unknown module filled in costs an eighth of one.
+- Modules sampled exactly on the threshold, and modules filled in by
+  **Use the message as a prior**, count as unknown.
+- Doubted codewords count as read, since doubting only decides after
+  the fact which modules to treat as unknown.
+- Padding, terminator and header pins the decoder finds in the stream
+  itself (**Pin the padding and headers found**, or a photo read pinning
+  its padding) count as read, since in these single-block symbols they
+  come from the very solution being judged. Pins you place, known text
+  and common beginnings count as pins.
+- A block solved from its pins alone (enough whole codewords pinned)
+  reads none of its other modules, so it's measured against its pins,
+  with every other codeword unknown. Other solvers can still add
+  confirmation to that solution, and solving scattered unknown modules
+  bit by bit costs far less than erasing their whole codewords.
+
+The capacity line under the EC level shows what the code corrects (half
+its error correction codewords wrong, or all of them unknown), and how
+much further list decoding and erasing by trial go. Its tooltip adds
+what the standard allows where it reserves codewords, and the most plain
+decoding can correct while still confirming the result. The notes under
+Decoding show how far past plain decoding each solver goes.
 
 Every attempt is another chance for random data to pass, so a solution
 needs one more bit of confirmation for each doubling of the attempts
@@ -575,7 +663,9 @@ Three more fallbacks use the rest of the symbol:
   solutions equally close to the block as read, the stream is parsed
   under each and the one that parses best is kept, rather than giving
   up on the block. The pick is confirmed by how rarely random data
-  would parse as well where the candidates differ.
+  would parse as well where the candidates differ, minus a bit for each
+  doubling of how often the parse is consulted (per decode round, per
+  set of pins tried, per decode of the grid).
 - **Error clustering.** A confirmed block shows exactly which of its
   modules were misread. Stains and tears hit neighbouring modules
   together, so when unconfirmed blocks are retried, modules next to a
@@ -594,15 +684,23 @@ Blocks says when a block was solved in any of these ways.
 
 - **Copy** copies the message as shown, and **Save bytes…** writes its raw
   bytes to a file.
-- **Apply corrections** writes the corrected modules and regenerated fixed
-  patterns back into the grid.
+- **Apply corrections** writes the corrected modules of every confirmed
+  block, and of every block whose data codewords are all pinned by hand,
+  plus regenerated fixed patterns, back into the grid. Unconfirmed
+  blocks are left as read, since writing them in as certain would make
+  them decode cleanly and look confirmed.
 - **Export PNG…** and **Export SVG…** save the repaired symbol with its
   quiet zone. Modules still unknown are drawn grey.
-- **Structured append.** For a message split over several symbols, decode
-  each and press **Add to sequence**. The parts are assembled, and the
-  parity byte checked once all are in. Once every part is solved, it
-  also shows the chance the assembled message is wrong: the parts'
-  chances added up.
+- **Structured append.** For a message split across several symbols,
+  decode each one and press **Add to sequence**. Once all parts are in,
+  the parity byte is checked and the parts are decoded as one stream, in
+  the character set chosen under Result. That way a character split
+  across two symbols, or an ECI declared in the first, comes out right.
+  If a part's stream was cut short by an unreadable header, the parts'
+  texts are joined as read instead, with the gap marked, since the bytes
+  on either side of it aren't one run. Once every part is solved, it
+  also shows the chance the assembled message is wrong (the sum of the
+  parts' chances).
 
 ## Keys and mouse
 

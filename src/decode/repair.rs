@@ -1,6 +1,6 @@
-//! Writing back what decoding established: the grid with every solved
-//! codeword's modules set to their corrected values and the function
-//! patterns regenerated, and a rendering of it that an ordinary reader can
+//! Writing back what decoding established: the grid with the modules of
+//! every confirmed block, and of every block written in by hand, set to
+//! their corrected values and the function patterns regenerated, and a rendering of it that an ordinary reader can
 //! scan.
 
 use super::bch;
@@ -37,27 +37,46 @@ fn format_established(grid: &ModuleGrid, layout: &SymbolLayout, mask: u8, report
     if report.blocks.iter().any(BlockReport::is_verified) {
         return true;
     }
-    let written_by_hand = |block: &BlockSpec| {
-        block.codewords[..block.data_len].iter().all(|&cw| {
-            let exists = codeword_bit_mask(layout, cw);
-            report.codewords[cw].pin.is_some_and(|pin| pin.source.is_by_hand() && pin.mask & exists == exists)
-        })
-    };
-    if layout.blocks.iter().any(written_by_hand) {
+    if layout.blocks.iter().any(|block| written_by_hand(layout, report, block)) {
         return true;
     }
     let format = bch::analyze_format(grid, &layout.func);
     format.is_reliable() && format.best().is_some_and(|b| b.fields.ec == layout.ec && b.fields.mask == mask)
 }
 
+/// Whether every data codeword of `block` is pinned whole by hand: a
+/// message the user wrote in, which nothing read can verify and nothing
+/// need, as a symbol built from its data for a test or a print is.
+fn written_by_hand(layout: &SymbolLayout, report: &DecodeReport, block: &BlockSpec) -> bool {
+    block.codewords[..block.data_len].iter().all(|&cw| {
+        let exists = codeword_bit_mask(layout, cw);
+        report.codewords[cw].pin.is_some_and(|pin| pin.source.is_by_hand() && pin.mask & exists == exists)
+    })
+}
+
+/// Whether a block's solution is written back as the symbol: verified,
+/// or the user's own message written in by hand ([`written_by_hand`]).
+/// A block solved without confirmation is the solver's best guess, past
+/// the standard's limit or with too little to bear it out, and its
+/// modules written back as certain read as a block of no errors at all:
+/// the decode of the grid then confirms it, with the reserve kept and the
+/// whole redundancy to spare, and a symbol exported from it reads so
+/// with every other reader. 2-L with five codewords wrong, which the
+/// standard leaves unconfirmed, was one press of Apply corrections from
+/// a confirmed read.
+pub fn written_back(layout: &SymbolLayout, report: &DecodeReport, block: usize) -> bool {
+    report.blocks[block].is_verified() || written_by_hand(layout, report, &layout.blocks[block])
+}
+
 /// The grid as error correction says it should be: fixed patterns and
 /// version information regenerated, the format information regenerated
 /// for the layout in effect once it is vouched for (a block verified
 /// under it, a message written in by hand under it, or the grid's own
-/// format bits naming it), the modules of every solved codeword set to
-/// their corrected values, and
-/// remainder bits cleared. Modules of unsolved codewords are left as they
-/// are, so the result is complete exactly when the decode was.
+/// format bits naming it), the modules of every codeword of a block
+/// written back ([`written_back`]) set to their corrected values, and
+/// remainder bits cleared. Modules of the other codewords are left as
+/// they are, unsolved or solved without confirmation, so the result is
+/// complete exactly when every block is confirmed or written in by hand.
 ///
 /// The codeword slots a Model 1 symbol's blocks leave unused at some
 /// levels ([`SymbolLayout::unused_modules`]) hold no codeword, and are
@@ -79,7 +98,11 @@ pub fn repaired_grid(grid: &ModuleGrid, layout: &SymbolLayout, mask: u8, report:
     {
         paint_info(&mut out, &func.version_info, bch::info18(v as u32));
     }
+    let writing: Vec<bool> = (0..layout.blocks.len()).map(|b| written_back(layout, report, b)).collect();
     for (cw, item) in report.codewords.iter().enumerate() {
+        if !writing[layout.codewords[cw].block as usize] {
+            continue;
+        }
         let Some(value) = item.final_value else { continue };
         let offset = layout.codewords[cw].bit_offset as usize;
         for (bit, pos) in layout.codeword_modules(cw).iter().enumerate() {

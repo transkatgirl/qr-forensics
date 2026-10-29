@@ -167,7 +167,7 @@ use super::enhance::{Enhance, Enhanced, Sharpen};
 use super::patches::with_patches;
 use super::projection::{ControlPoint, Project, Projection};
 use super::refine::{MOVES, Moved, Scorer, Shifted, Template, Warp, descend_by, fixed_threshold, refine_corners_expecting};
-use super::sample::{Kernel, Rule, SampleParams, classify, read_modules, sample_modules_noting, suggest_versions};
+use super::sample::{Kernel, Rule, SampleParams, classify_in, read_modules, sample_modules_noting, suggest_versions};
 use super::{Luma, rotate_outline_cw, unrotate_point_cw};
 use crate::decode::bch::{FormatAnalysis, FormatCandidate, QUIRK_REACH};
 use crate::decode::codewords::Pins;
@@ -238,7 +238,8 @@ pub struct ReadResult {
 /// One way of reading a placement: the kernel its modules are sampled
 /// with, the threshold rule they are judged by, and whether the modules
 /// the unsure band would leave unknown are kept at the colour they fell
-/// on instead.
+/// on instead. The light they are read in is the image's
+/// ([`Luma::light`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Variant {
     kernel: Kernel,
@@ -498,6 +499,13 @@ impl Reads {
         Self { first: if self.asked { self.first } else { again }, again, ..self }
     }
 
+    /// These reads of a placement that was itself the pick of `n` decodes,
+    /// the first read too: a decode chose it, and noise that passed that
+    /// decode passes the read of the same pixels as often as not.
+    fn picked_among(self, n: usize) -> Self {
+        Self { first: self.first.one_of(n), again: self.again.one_of(n), ..self }
+    }
+
     /// The reads past the first way tried at a turn: none of them asked
     /// for, at this turn or any beneath it.
     fn past(self) -> Self {
@@ -595,7 +603,7 @@ fn worth_deblurring(image: &Luma, region: [[f64; 2]; 4], best: Option<&ReadResul
     let Some([x0, y0, x1, y1]) = Enhanced::window_about(image, region) else { return false };
     let (w, h) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
     let part = super::adjust::cut(&image.data, image.width, 1, [x0, y0, x1, y1]);
-    let Some(spread) = super::deblur::spread_of(&part, w, h) else { return false };
+    let Some(spread) = super::deblur::spread_of(&part, w, h, image.light) else { return false };
     let (widest, _) = spread.extremes();
     let module = match best {
         Some(read) => {
@@ -683,6 +691,10 @@ fn read_outline_plain(
         if work::cancelled() {
             return reads;
         }
+        // A render read off its pixels on the second of its readings, the
+        // first decoded and failed, is the pick of both decodes
+        // ([`Detection::decoded_charge`]).
+        let counted = counted.picked_among(found.decoded_charge());
         if let Some(prepared) = prepare(image, found.clone(), params) {
             read_placement(image, &prepared, &variants, params, counted, &mut |result| {
                 let settled = result.is_trustworthy();
@@ -712,7 +724,14 @@ fn read_outline_plain(
         let turned = image.rotated_cw(quarters);
         let turned_region = rotate_outline_cw(region, quarters, image.width, image.height);
         let Some(found) = detect_candidates_by(&turned, version, turned_region, params, climb).into_iter().next() else { return reads };
+        // Charged for its pick as a placement in the photo as it is is.
+        let charge = found.decoded_charge();
         let Some(prepared) = prepare(&turned, seat(&turned, found, params), params) else { return reads };
+        // A mirror image a decode chose is the pick of two decodes, as
+        // [`read_placement`] charges it; read through the turn it was once
+        // charged as the photo's own pick alone, and passed noise twice as
+        // often as the same placement in the photo as it is.
+        let charge = if prepared.detection.mirrored_by_decode { charge.saturating_mul(2) } else { charge };
         // Read as a placement in the photo as it is is read, and, short of
         // a read that settles the search, without its patches of data the
         // ways that lead with the kernel asked for ([`read_placement`]):
@@ -720,7 +739,7 @@ fn read_outline_plain(
         let patched = prepared.detection.anchors.len() != prepared.plain.anchors.len();
         let few = &variants[..variants.len().min(params.rules().count())];
         let ways = variants.len() + usize::from(patched) * few.len();
-        let turned_reads = all.nth_of(candidates.len() + usize::from(quarters) - 1, placings).sharing(ways);
+        let turned_reads = all.nth_of(candidates.len() + usize::from(quarters) - 1, placings).picked_among(charge).sharing(ways);
         let mut keep = |result: Option<ReadResult>| {
             let Some(mut result) = result else { return false };
             unturn(&mut result.detection, quarters, image.width, image.height, region);
@@ -751,21 +770,24 @@ fn read_outline_plain(
 
 /// The ways of sampling a placement a read tries, in order: the kernel
 /// and threshold rule asked for, then the other rules with that kernel
-/// ([`SampleParams::rules`]); then, when the unsure band would leave
-/// any module unknown, the kernel asked for under every rule again with
-/// those modules kept at the colour they fell on
+/// ([`SampleParams::rules`]); then, when the unsure band would leave any
+/// module unknown, the kernel asked for under every rule again with those
+/// modules kept at the colour they fell on
 /// ([`Classified::to_grid_as_decided`]); then each other kernel under
-/// every rule. The rule comes before the kernels because it decides more
-/// often: see the module's account. The unsure modules come between
-/// because keeping them changes the least of what is read: a module in
-/// the band is unknown to the exact decoder either way, as a codeword it
-/// erases or as a bit the fallbacks doubt before any other, and what
-/// differs is that the erasure spends a unit of redundancy on the whole
-/// codeword where the doubt spends an equation on the bit. Over blocks
-/// of simulated noise the band read no more than the colours kept, and
-/// with a stain beside the noise far less; on the photographs it is
-/// tried second, since what the band leaves unknown on them is often a
-/// module the grid straddles, which reads as nothing in either colour.
+/// every rule. Every way is in the light the photo was worked in
+/// ([`super::sample::Light`]), and none in the other, which a read made
+/// so would not be the photo read again. The rule comes before the
+/// kernels because it decides more often: see the module's account. The
+/// unsure modules come between because keeping them changes the least of
+/// what is read: a module in the band is unknown to the exact decoder
+/// either way, as a codeword it erases or as a bit the fallbacks doubt
+/// before any other, and what differs is that the erasure spends a unit
+/// of redundancy on the whole codeword where the doubt spends an equation
+/// on the bit. Over blocks of simulated noise the band read no more than
+/// the colours kept, and with a stain beside the noise far less; on the
+/// photographs it is tried second, since what the band leaves unknown on
+/// them is often a module the grid straddles, which reads as nothing in
+/// either colour.
 fn variants_of(params: &SampleParams) -> Vec<Variant> {
     let under = |kernel: Kernel, unsure_kept: bool| params.rules().map(move |rule| Variant { kernel, rule, unsure_kept });
     let mut variants: Vec<Variant> = under(params.kernel, false).collect();
@@ -923,6 +945,7 @@ pub fn read_placed(image: &Luma, family: Family, corners: [[f64; 2]; 4], params:
     let corners = clockwise(corners);
     let mut fits: Vec<(f32, SymbolVersion, [[f64; 2]; 4])> = Vec::new();
     let mut named: Vec<(f32, SymbolVersion, [[f64; 2]; 4])> = Vec::new();
+    let mut formatted: Vec<(f32, SymbolVersion, [[f64; 2]; 4])> = Vec::new();
     for turn in 0..4 {
         let mut turned = corners;
         turned.rotate_left(turn);
@@ -939,15 +962,36 @@ pub fn read_placed(image: &Luma, family: Family, corners: [[f64; 2]; 4], params:
         {
             named.push((guess.score(), version, turned));
         }
+        // And the format information, which every version has: the best
+        // fitting version of the few at a turn it spells a word at.
+        if let Some(guess) = guesses.iter().take(PLACED_VERSIONS).find(|guess| super::detect::format_reads_through(image, guess.version, turned, params)) {
+            formatted.push((guess.score(), guess.version, turned));
+        }
         fits.extend(guesses.into_iter().map(|guess| (guess.score(), guess.version, turned)));
     }
     // The versions and turns the symbol's own version information names
-    // come first, best fitting first; then the rest, by their fit.
+    // come first, best fitting first; then the best fitting of those its
+    // format information reads at; then the rest, by their fit. By the fit
+    // alone, the right version a quarter turn out, which reads three
+    // quarters of its fixed modules right, came before the symbol as it
+    // lay where glare left it reading barely more: under glare, a symbol
+    // of BoofCV's benchmark read through the corners marked for it, and
+    // with the marks a twentieth of a pixel off, a quarter turn out. One
+    // and no more: the format information lies about the first finder at
+    // every version, and a turn whose modules there happen to spell a
+    // word, blurred out of telling, spells it at every version, which
+    // taken all together put the turn the fit chose out of reach.
     named.sort_by(|a, b| b.0.total_cmp(&a.0));
+    formatted.sort_by(|a, b| b.0.total_cmp(&a.0));
     fits.sort_by(|a, b| b.0.total_cmp(&a.0));
-    fits.retain(|fit| !named.iter().any(|n| n.1 == fit.1 && n.2 == fit.2));
+    let listed = |list: &[(f32, SymbolVersion, [[f64; 2]; 4])], fit: &(f32, SymbolVersion, [[f64; 2]; 4])| list.iter().any(|n| n.1 == fit.1 && n.2 == fit.2);
     named.truncate(PLACED_VERSIONS);
-    fits.truncate(PLACED_VERSIONS - named.len());
+    if let Some(first) = formatted.into_iter().find(|fit| !listed(&named, fit)) {
+        named.push(first);
+    }
+    fits.retain(|fit| !listed(&named, fit));
+    fits.truncate(PLACED_VERSIONS.saturating_sub(named.len()));
+    named.truncate(PLACED_VERSIONS);
     named.extend(fits);
     let fits = named;
     let around = outline_around(corners, AROUND_FOUND);
@@ -1093,6 +1137,13 @@ fn read_placement(
     let doubted_at = behind_at + few;
     let bled_at = doubted_at + DOUBT_LIMIT * few;
     let ways = bled_at + bled_ways;
+    // A placement whose mirror image a decode of it both ways round chose,
+    // its format bits saying nothing ([`super::detect`]'s
+    // `settle_mirror_by_decode`), is the pick of two decodes, and a block
+    // of noise that verified mirrored chose it and verifies again in the
+    // read. Read as asked, uncharged, it passed noise twice as often as a
+    // read is let; its own retry in mirror order, below, is charged.
+    let reads = if found.mirrored_by_decode { reads.picked_among(2) } else { reads };
     let reads = reads.sharing(ways);
     let at = |k: usize| reads.nth_of(k, ways);
     let mut verified = 0;
@@ -1264,7 +1315,7 @@ fn seat(image: &Luma, found: Detection, params: &SampleParams) -> Detection {
     let func = FunctionMap::new(found.version);
     let Some(projection) = found.projection() else { return found };
     let sampled = sample_modules_noting(image, &projection, func.width, func.height, params.kernel, params.sharpen_modules).0;
-    let mut grid = classify(&sampled, params).to_grid(func.width, func.height);
+    let mut grid = classify_in(&sampled, params, image.light).to_grid(func.width, func.height);
     if found.inverted {
         grid = grid.inverted();
     }
@@ -2117,6 +2168,7 @@ mod tests {
             decodes: None,
             bloom: 0.0,
             decoded_at: None,
+            picked_among: 1,
         }
     }
 

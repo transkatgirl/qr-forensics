@@ -566,6 +566,15 @@ impl Markers {
     fn fnc1(&self) -> bool {
         self.fnc1_first || self.fnc1_second
     }
+}
+
+/// Whether `segments` put the group-separator convention of FNC1 on their
+/// alphanumeric data, in either position ([`decode_text`]).
+pub fn under_fnc1(segments: &[Segment]) -> bool {
+    Markers::of(segments).fnc1()
+}
+
+impl Markers {
 
     /// ISO/IEC 18004 Table 3 (ISO/IEC 15424). Modifier 0 is a Model 1
     /// symbol, as zxing-cpp reports one; Model 1 has neither FNC1 nor

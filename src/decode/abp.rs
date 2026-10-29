@@ -54,7 +54,7 @@ use std::f32::consts::LN_2;
 
 use super::gf256::{exp, mul};
 use super::rs::{
-    CHASE_MAX_BITS, CwRead, RsSolution, Sightings, Trials, counted_against, judged, nearest, preferring_the_standard,
+    CHASE_MAX_BITS, CwRead, RsSolution, SPARE_EQUATIONS, Sightings, Trials, counted_against, judged, nearest,
     rs_decode_chasing_bits_against, rs_decode_core, rs_syndromes, soft_distance, solve_bit_erasures_doubting, tries_charge,
 };
 use crate::symbol::grid::CERTAIN;
@@ -362,8 +362,9 @@ fn account(
 /// margin, nearest first ([`nearest`]). Each comes with the rounds it
 /// took and the bits of each codeword the propagation overturned.
 /// Pinned bits and bits painted by hand are never moved; nothing for a
-/// block with no other, whose every EC codeword the standard reserves,
-/// or that has no redundancy left after its erasures.
+/// block with no other, or whose unread bits leave it too few equations
+/// to spare. A block whose every EC codeword the standard reserves, as
+/// M1's, was once not propagated either.
 ///
 /// The rounds, the doubting and the chase are each a fresh chance for
 /// a block of noise to pass, and each is given an equal share of the
@@ -431,12 +432,17 @@ fn propagating_damped(
 ) -> Vec<Propagated> {
     assert_eq!(block.len(), bit_reliability.len());
     let n = block.len();
-    if rounds == 0 || ec_len == 0 || ec_len >= n || reserved >= ec_len {
+    if rounds == 0 || ec_len == 0 || ec_len >= n {
         return Vec::new();
     }
-    let erased: Vec<usize> = (0..n).filter(|&i| block[i].is_erasure()).collect();
-    let f = erased.len();
-    if f >= ec_len {
+    // What the propagation has to work with is the equations its unread
+    // bits leave: the beliefs, the doubting and the chase all solve for
+    // bits, and a codeword a module short is one bit unread, not a
+    // codeword erased. It once gave up wherever as many codewords as the
+    // block has of error correction were each a module short, seven in
+    // eight of their bits read and a hundred equations to spare.
+    let unread: usize = block.iter().map(|c| c.known.count_zeros() as usize).sum();
+    if unread + SPARE_EQUATIONS >= 8 * ec_len {
         return Vec::new();
     }
     let mut found: Vec<(u32, Propagated)> = Vec::new();
@@ -474,7 +480,6 @@ fn propagating_damped(
         // never add to what it found.
         !found.is_empty() || syndromes.iter().all(|&s| s == 0)
     });
-    let found = preferring_the_standard(found, |(_, _, solution)| solution);
     nearest(found, |a, b| a.2.corrected == b.2.corrected, |a, b| a.2.confidence_bits() > b.2.confidence_bits())
 }
 
@@ -865,11 +870,9 @@ mod tests {
                 assert!(solution.confidence_bits() < 3 * VERIFIED_BITS, "partly unread, round {round}: {solution:?}");
             }
         }
-        // A block painted by hand has nothing to move, and a block with
-        // every EC codeword reserved nothing to offer.
+        // A block painted by hand has nothing to move.
         let block = codeword(&mut rng, 15, 18);
         let read: Vec<CwRead> = block.iter().map(|&v| CwRead::known(v)).collect();
         assert!(rs_decode_propagating(&read, &vec![[CERTAIN; 8]; 33], 18, 0, ABP_ROUNDS, Trials::ALL, 10, &mut Sightings::default()).is_empty());
-        assert!(rs_decode_propagating(&read, &vec![[100; 8]; 33], 18, 18, ABP_ROUNDS, Trials::ALL, 10, &mut Sightings::default()).is_empty());
     }
 }

@@ -75,12 +75,13 @@ impl Kernel {
     }
 
     /// The luminance of the module at column `mx`, row `my`, read as this
-    /// kernel reads one; `None` where the module lies off the image.
-    pub fn sample(self, image: &Luma, map: &impl Project, mx: usize, my: usize) -> Option<f32> {
+    /// kernel reads one, in `light`; `None` where the module lies off the
+    /// image.
+    pub fn sample(self, image: &Luma, map: &impl Project, mx: usize, my: usize, light: Light) -> Option<f32> {
         match self {
-            Kernel::Area => sample_module_inner(image, map, mx, my, INNER_FRACTION, POINTS),
-            Kernel::Centre => sample_module_inner(image, map, mx, my, INNER_FRACTION, 1),
-            Kernel::Vote => sample_module_vote(image, map, mx, my),
+            Kernel::Area => sample_module_inner(image, map, mx, my, INNER_FRACTION, POINTS, light),
+            Kernel::Centre => sample_module_inner(image, map, mx, my, INNER_FRACTION, 1, light),
+            Kernel::Vote => sample_module_vote(image, map, mx, my, light),
         }
     }
 }
@@ -115,10 +116,108 @@ pub struct Sampled {
     pub luma: Vec<Option<f32>>,
 }
 
+/// How the values of a reading stand for light: as a photo stores them,
+/// encoded as sRGB encodes them, which spends its levels where the eye
+/// tells shades apart, or as the light itself, which a blur mixes.
+///
+/// A lens and a sensor mix the light of neighbouring modules, not their
+/// stored values: half of a module of paper and half of ink, 0.94 and 0.16
+/// as stored, mix to 0.70 as stored, where the midpoint is 0.55, and the
+/// light wins every module a blur greys. A dark module among light ones
+/// reads right on its threshold as stored, and a fifth of the contrast
+/// below it as light; and each dark neighbour a module has moves it by
+/// less as stored the more of them there are, where as light each moves
+/// it alike, which is what a blur learnt from the fixed patterns' solid
+/// blocks and undone in the data takes it to do ([`Blur`]). Read as light,
+/// three symbols of BoofCV's benchmark blurred past reading read, and one
+/// under glare. What says whether a neighbourhood has any contrast at all
+/// is the sensor's noise, which is in stored levels, and so is a threshold
+/// set by hand: those are judged as stored whichever the reading is.
+///
+/// Read as light, every point a kernel takes is light before the kernel
+/// takes them together, and so is every pixel a point is weighed from
+/// ([`Luma::sample_in`]): the kernel's mixing is then the lens's. Taken
+/// together as stored and made light after, as they once were, the middle
+/// of a module half paper and half ink averaged 28% of the way from ink to
+/// paper, where its light lies midway, and every module the grid straddled
+/// leant to dark. The vote's median and its split are the same either
+/// way, a curve that only rises keeping their order; the area's average
+/// and the weighing of the four pixels about a point are not.
+///
+/// Light is the reading for a photograph of a symbol on paper or a
+/// screen that the camera blurred, out of focus, shaken, or a module only
+/// a few pixels across, so that each module's light is mixed with its
+/// neighbours': as stored, a dark module among light ones reads too
+/// light, and a light one among dark reads about right. Stored is the
+/// reading for an image no lens mixed: a screenshot, a symbol rendered or
+/// scaled by a program, which mixed what it stores; a photograph sharp to
+/// a pixel, where nothing is mixed and the two read alike; and a photo
+/// toned by hand ([`super::adjust::Adjust`]: inverted, or its contrast
+/// moved), whose values no longer lie on sRGB's curve. A single channel
+/// still does, being one colour's light as stored, and so does a photo
+/// whose exposure alone was moved, which is its light scaled and stored
+/// again. The photo deblurred ([`super::deblur`]) has its blur undone
+/// in the same light, and reads much alike either way.
+///
+/// The reading is in the light the photo is worked in
+/// ([`super::adjust::Adjust::light`]), which the image it is read off says
+/// ([`Luma::light`]), and in no other. Worked in light, the photo was
+/// enlarged or reduced, straightened and sharpened or blurred as the
+/// light its bytes stand for, and so is every copy of it a search or a
+/// read makes: a reading as stored would mix its pixels otherwise again.
+/// Worked as stored, the default, every mixing before the reading was of
+/// what is stored. Most photographs are sharp enough that the two agree.
+/// Reading in light was once a setting of the sampling's own, off a photo
+/// worked as stored, and a read that did not decode tried the other
+/// light: of three symbols of BoofCV's benchmark read through the corners
+/// marked for them, that read one that had not. A read decoded so was not
+/// the photo as it was worked read again, and the light is the photo's
+/// alone now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Light {
+    /// As stored.
+    Encoded,
+    /// As the light itself ([`linear_light`]).
+    Linear,
+}
+
+impl Light {
+    /// A value of a reading in this light, as stored.
+    pub fn encoded(self, v: f32) -> f32 {
+        match self {
+            Light::Encoded => v,
+            Light::Linear => encoded_light(v),
+        }
+    }
+
+    /// A value as stored, in this light.
+    pub fn from_encoded(self, v: f32) -> f32 {
+        match self {
+            Light::Encoded => v,
+            Light::Linear => linear_light(v),
+        }
+    }
+}
+
+/// The light a value stored as sRGB encodes it stands for, both from
+/// nought to one: the standard's curve, a line near black and a power of
+/// 2.4 above.
+pub fn linear_light(v: f32) -> f32 {
+    let v = v.clamp(0.0, 1.0);
+    if v <= 0.040_45 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+}
+
+/// The value sRGB stores `light` as ([`linear_light`] undone).
+pub fn encoded_light(light: f32) -> f32 {
+    let light = light.clamp(0.0, 1.0);
+    if light <= 0.003_130_8 { 12.92 * light } else { 1.055 * light.powf(1.0 / 2.4) - 0.055 }
+}
+
 /// Mean luminance over the middle `inner` of the module at column `mx`,
-/// row `my`, from `points` × `points` samples; `None` when it lies mostly
-/// off the image, since that is not evidence of anything. The map's local
-/// correction is taken once, at the module's centre.
+/// row `my`, from `points` × `points` samples, each in `light`
+/// ([`Luma::sample_in`]); `None` when it lies mostly off the image, since
+/// that is not evidence of anything. The map's local correction is taken
+/// once, at the module's centre.
 pub fn sample_module_inner(
     image: &Luma,
     map: &impl Project,
@@ -126,6 +225,7 @@ pub fn sample_module_inner(
     my: usize,
     inner: f64,
     points: usize,
+    light: Light,
 ) -> Option<f32> {
     let [dx, dy] = map.displacement(mx as f64 + 0.5, my as f64 + 0.5);
     let (mut sum, mut count) = (0.0f32, 0u32);
@@ -144,7 +244,7 @@ pub fn sample_module_inner(
     for &oy in offsets {
         for &ox in offsets {
             let [px, py] = map.base(mx as f64 + ox, my as f64 + oy);
-            if let Some(value) = image.sample(px + dx, py + dy) {
+            if let Some(value) = image.sample_in(px + dx, py + dy, light) {
                 sum += value;
                 count += 1;
             }
@@ -156,7 +256,7 @@ pub fn sample_module_inner(
 /// Mean luminance of the module at column `mx`, row `my`, keeping clear of
 /// its edges.
 pub fn sample_module(image: &Luma, map: &impl Project, mx: usize, my: usize) -> Option<f32> {
-    sample_module_inner(image, map, mx, my, INNER_FRACTION, POINTS)
+    sample_module_inner(image, map, mx, my, INNER_FRACTION, POINTS, Light::Encoded)
 }
 
 /// How far from the centre of a module the vote's four outer points lie,
@@ -165,10 +265,17 @@ pub const VOTE_OFFSET: f64 = 0.2;
 
 /// The median luminance of five points about the centre of the module at
 /// column `mx`, row `my`: the centre and [`VOTE_OFFSET`] to each side of
-/// it. Against a threshold the median falls as the majority of the five
-/// do, which is how BoofCV votes them. `None` when fewer than three lie
-/// on the image.
-pub fn sample_module_vote(image: &Luma, map: &impl Project, mx: usize, my: usize) -> Option<f32> {
+/// it, each in `light` ([`Luma::sample_in`]). Against a threshold the
+/// median falls as the majority of the five do, which is how BoofCV votes
+/// them. `None` when fewer than three lie on the image.
+pub fn sample_module_vote(image: &Luma, map: &impl Project, mx: usize, my: usize, light: Light) -> Option<f32> {
+    sample_module_voting(image, map, mx, my, light).map(|(median, _)| median)
+}
+
+/// [`sample_module_vote`], with the second and the fourth of the five
+/// points in order of their light, or of as many as lie on the photo:
+/// how far the vote was split, which the median alone does not say.
+pub fn sample_module_voting(image: &Luma, map: &impl Project, mx: usize, my: usize, light: Light) -> Option<(f32, [f32; 2])> {
     let (cx, cy) = (mx as f64 + 0.5, my as f64 + 0.5);
     let [dx, dy] = map.displacement(cx, cy);
     let offsets = [
@@ -182,7 +289,7 @@ pub fn sample_module_vote(image: &Luma, map: &impl Project, mx: usize, my: usize
         .iter()
         .filter_map(|[ox, oy]| {
             let [px, py] = map.base(cx + ox, cy + oy);
-            image.sample(px + dx, py + dy)
+            image.sample_in(px + dx, py + dy, light)
         })
         .collect();
     if values.len() < 3 {
@@ -190,11 +297,24 @@ pub fn sample_module_vote(image: &Luma, map: &impl Project, mx: usize, my: usize
     }
     values.sort_by(f32::total_cmp);
     let n = values.len();
-    Some(if n % 2 == 1 {
-        values[n / 2]
-    } else {
-        (values[n / 2 - 1] + values[n / 2]) / 2.0
-    })
+    let median = if n % 2 == 1 { values[n / 2] } else { (values[n / 2 - 1] + values[n / 2]) / 2.0 };
+    Some((median, [values[1], values[n - 2]]))
+}
+
+/// The modules of a symbol `width` by `height` placed by `map` read by
+/// the vote of five points in `light` ([`sample_module_voting`]), with how
+/// far each vote was split; the module's size as [`sample_modules_noting`]
+/// gives it, its modules left as read.
+fn sample_modules_voting(image: &Luma, map: &impl Project, width: usize, height: usize, light: Light) -> (Sampled, Vec<Option<[f32; 2]>>, Sharpening) {
+    let (luma, split): (Vec<Option<f32>>, Vec<Option<[f32; 2]>>) = (0..height)
+        .flat_map(|my| (0..width).map(move |mx| (mx, my)))
+        .map(|(mx, my)| match sample_module_voting(image, map, mx, my, light) {
+            Some((median, split)) => (Some(median), Some(split)),
+            None => (None, None),
+        })
+        .unzip();
+    let module_px = module_px_at_middle(map, width, height);
+    (Sampled { width, height, luma }, split, Sharpening { module_px: module_px as f32, ..Sharpening::default() })
 }
 
 /// Below this many pixels a module, the modules are sharpened against
@@ -255,7 +375,12 @@ impl Sharpening {
 /// says so, and with what the sharpening came to: a reading is otherwise
 /// sharpened with nothing to show that it was, and one that reads worse
 /// for it, as specks in a clean print read once they are set against
-/// their neighbours, cannot be had as it was read.
+/// their neighbours, cannot be had as it was read. Read in the light the
+/// image was made in ([`Luma::light`]), as [`read_modules`] reads it, to
+/// be classified in it ([`classify_in`]): the search vouched for what it
+/// placed by a reading as stored where the read that followed was made
+/// as light, and a blurred symbol whose lone dark modules read light as
+/// stored was dropped, or turned, for a read that would have decoded it.
 pub fn sample_modules_noting(
     image: &Luma,
     map: &impl Project,
@@ -264,20 +389,22 @@ pub fn sample_modules_noting(
     kernel: Kernel,
     sharpen: bool,
 ) -> (Sampled, Sharpening) {
-    let luma = (0..height)
-        .flat_map(|my| (0..width).map(move |mx| (mx, my)))
-        .map(|(mx, my)| kernel.sample(image, map, mx, my))
-        .collect();
-    let sampled = Sampled {
-        width,
-        height,
-        luma,
-    };
+    let sampled = sampled_in(image, map, width, height, kernel, image.light);
     let module_px = module_px_at_middle(map, width, height);
     if !sharpen {
         return (sampled, Sharpening { module_px: module_px as f32, ..Sharpening::default() });
     }
-    sampled.sharpened_as_guessed(module_px)
+    sampled.sharpened_as_guessed(module_px, image.light)
+}
+
+/// The modules of a symbol `width` by `height` placed by `map`, each read
+/// by `kernel` in `light` ([`Kernel::sample`]), as they read.
+fn sampled_in(image: &Luma, map: &impl Project, width: usize, height: usize, kernel: Kernel, light: Light) -> Sampled {
+    let luma = (0..height)
+        .flat_map(|my| (0..width).map(move |mx| (mx, my)))
+        .map(|(mx, my)| kernel.sample(image, map, mx, my, light))
+        .collect();
+    Sampled { width, height, luma }
 }
 
 /// The size of a module in the photo, in pixels, at the middle of a
@@ -341,8 +468,21 @@ fn read_modules_as_they_lie(
     expected: &[Option<bool>],
     inverted: bool,
 ) -> (Classified, Sharpening) {
-    let (read, mut sharpening) = sample_modules_noting(image, map, width, height, params.kernel, false);
-    let mut classified = classify(&read, params);
+    // Read in the light the image was made in ([`Luma::light`]), which as
+    // light is the light the blur mixed ([`Light`]), pixel by pixel: the
+    // threshold falls where half of each colour reads, and the blur learnt
+    // from the fixed patterns is the one the data was blurred by. By the
+    // vote of five points, with how far each vote was split
+    // ([`Classified::lean`]).
+    let light = image.light;
+    let (read, split, mut sharpening) = if params.kernel == Kernel::Vote {
+        let (read, split, sharpening) = sample_modules_voting(image, map, width, height, light);
+        (read, Some(split), sharpening)
+    } else {
+        let module_px = module_px_at_middle(map, width, height);
+        (sampled_in(image, map, width, height, params.kernel, light), None, Sharpening { module_px: module_px as f32, ..Sharpening::default() })
+    };
+    let mut classified = classify_split(&read, params, light, split.as_deref());
     if !params.sharpen_modules {
         // Left as read, but with the blur known, which says whether the
         // colours may be fitted apart.
@@ -351,9 +491,10 @@ fn read_modules_as_they_lie(
         // A reading the guess sharpens is classified afresh and knows no
         // blur: the guess rings about the fixed patterns' thin rings as a
         // blur greys them, and the colours are fitted alike.
-        let (sharpened, guessed) = read.sharpened_as_guessed(module_px_at_middle(map, width, height));
+        let (sharpened, guessed) = read.sharpened_as_guessed(module_px_at_middle(map, width, height), light);
         if guessed.any() {
-            classified = classify(&sharpened, params);
+            let lean = std::mem::take(&mut classified.lean);
+            classified = classify_in(&sharpened, params, light).leaning(lean);
         }
         sharpening = guessed;
     }
@@ -399,12 +540,21 @@ impl Sampled {
         separability(self.luma.iter().flatten().copied())
     }
 
+    /// [`Self::separability`] of a reading made in `light`, told as
+    /// stored, as [`classify_in`] tells it: the band about the threshold
+    /// that counts a module as neither colour, and
+    /// [`POOR_SEPARABILITY`] with it, are measures of stored values.
+    pub fn separability_in(&self, light: Light) -> f32 {
+        separability(self.luma.iter().flatten().map(|&v| light.encoded(v)))
+    }
+
     /// The reading sharpened against its neighbours by the guess
     /// [`sample_modules_noting`] makes at the blur, its modules
     /// `module_px` pixels across: the more the smaller they are under
     /// [`SHARPEN_BELOW_PX`], and again where it separates poorly
-    /// ([`Self::sharpened_for_separation`]); with what was done.
-    pub fn sharpened_as_guessed(self, module_px: f64) -> (Self, Sharpening) {
+    /// ([`Self::sharpened_for_separation`]), as read in `light`; with
+    /// what was done.
+    pub fn sharpened_as_guessed(self, module_px: f64, light: Light) -> (Self, Sharpening) {
         let mut done = Sharpening { module_px: module_px as f32, ..Sharpening::default() };
         let sampled = if module_px < SHARPEN_BELOW_PX {
             done.for_size = SHARPEN_GAIN * (1.0 - module_px / SHARPEN_BELOW_PX) as f32;
@@ -412,7 +562,7 @@ impl Sampled {
         } else {
             self
         };
-        let (sampled, gain) = sampled.sharpened_for_separation_by();
+        let (sampled, gain) = sampled.sharpened_for_separation_by(light);
         done.for_separation = gain;
         (sampled, done)
     }
@@ -424,22 +574,28 @@ impl Sampled {
     /// better than the reading as it is. A reading that already separates
     /// well, or that no sharpening helps, is returned as it is: a grid
     /// that straddles module boundaries reads grey too, and sharpening
-    /// does not place it.
-    pub fn sharpened_for_separation(self) -> Self {
-        self.sharpened_for_separation_by().0
+    /// does not place it. Read in `light`, it is sharpened as read, and
+    /// how well it separates is told as stored ([`Self::separability_in`]),
+    /// as the reading is classified. It was once told in the light it was
+    /// read in, by a band about a threshold the classifying never draws:
+    /// a reading in linear light, its dark modules crowded near nought,
+    /// was sharpened, or left as read, otherwise than the classifying
+    /// would judge it.
+    pub fn sharpened_for_separation(self, light: Light) -> Self {
+        self.sharpened_for_separation_by(light).0
     }
 
     /// [`Self::sharpened_for_separation`], with the gain of the
     /// sharpening kept: zero for a reading returned as it is.
-    pub fn sharpened_for_separation_by(self) -> (Self, f32) {
-        let before = self.separability();
+    pub fn sharpened_for_separation_by(self, light: Light) -> (Self, f32) {
+        let before = self.separability_in(light);
         if before >= SHARPEN_FOR_SEPARABILITY {
             return (self, 0.0);
         }
         let mut best: Option<(f32, f32, Sampled)> = None;
         for &gain in &SHARPEN_TRIAL_GAINS {
             let trial = self.sharpened(gain);
-            let after = trial.separability();
+            let after = trial.separability_in(light);
             if after >= before + SHARPEN_SEPARATION_GAIN
                 && best.as_ref().is_none_or(|(b, _, _)| after > *b)
             {
@@ -495,7 +651,7 @@ pub fn sample_positions(
 ) -> Vec<Option<f32>> {
     positions
         .iter()
-        .map(|p| sample_module_inner(image, map, p.x as usize, p.y as usize, inner, points))
+        .map(|p| sample_module_inner(image, map, p.x as usize, p.y as usize, inner, points, Light::Encoded))
         .collect()
 }
 
@@ -644,6 +800,25 @@ pub struct Classified {
     /// colour was known. Nought where the module could not be sampled or
     /// its neighbourhood had no contrast.
     pub reliability: Vec<u8>,
+    /// How far toward its threshold each module's reading would lie were
+    /// it the second of its vote's five points from its side rather than
+    /// the middle one, as a share of half the local contrast: the fourth
+    /// point's lead over the middle, for the module dark, and the middle's
+    /// over the second, for it light ([`Classified::toward`]), both kept
+    /// since equalising or a fitted threshold may move a module to the
+    /// other side. Nought for a module read by any other kernel, and
+    /// where the points tie with the middle one; a vote all of a mind
+    /// leans too, as far as its points spread, but stops short of the
+    /// threshold. A module the grid straddles, or one on the edge of a
+    /// speck, reads some of its points one colour and some the other,
+    /// and the median of them may lie as far into its colour as a clean
+    /// one's. Its reliability is no more than that second point's would
+    /// be ([`Classified::leant`]), and nothing where that point lies
+    /// across: of a symbol's modules read with one point of five across
+    /// the threshold, a tenth were wrong, and with two, a fifth, where
+    /// with none one in fifty was; in a copy sharpened and clipped, half
+    /// of those with two were wrong, read as surely as any.
+    pub lean: Vec<[f32; 2]>,
     /// The misread model the reliabilities were calibrated with, once
     /// they were.
     pub calibration: Option<Calibration>,
@@ -659,7 +834,8 @@ pub struct Classified {
     /// half the local contrast ([`SampleParams::band`]), kept so that a
     /// module moved by equalising or calibration is judged by it again.
     pub band: f32,
-    /// The global threshold, automatic or as given.
+    /// The global threshold, automatic or as given, as stored ([`Light`])
+    /// whatever light the reading was classified in.
     pub threshold: f32,
     /// How clearly the module luminances fall into two groups: how empty
     /// the valley between the two peaks of their histogram is, 0 to 1. A
@@ -762,13 +938,66 @@ impl Classified {
             .collect();
         let apart = self.blur.is_some_and(|blur| self.equalised || !blur.is_worth_undoing());
         let calibration = Calibration::fit(&labelled, apart)?;
+        let gross = self.local_gross(expected, inverted, &calibration);
         for i in 0..self.offset.len() {
             if self.decided[i] != Module::Unknown {
-                self.judge(i, calibration.threshold, &calibration);
+                self.judge(i, calibration.threshold, &Calibration { gross: gross[i], ..calibration });
             }
         }
         self.calibration = Some(calibration);
         Some(calibration)
+    }
+
+    /// The share of each module taken to be read wrong whatever its
+    /// reading ([`Calibration::gross`]), as the fixed patterns about it
+    /// show it: the labelled modules read wrong by more than their noise
+    /// explains, as [`Calibration::fit`] counts them, smoothed over about
+    /// a quarter of the symbol ([`LOCAL_GROSS_SPREAD`]) against all the
+    /// labelled modules there, with [`CALIBRATION_PRIOR`] modules' worth of
+    /// the symbol's own rate besides, and taken [`DATA_GROSS`] times for
+    /// the data as the symbol's is. Never less than the symbol's: what a
+    /// clean corner says does not vouch for the data beside it, which a
+    /// stain may cover that no fixed pattern does.
+    ///
+    /// A stain, glare or a tear reads every module under it wrong, and
+    /// the fixed patterns under it with them, where the rest read clean:
+    /// one rate for the whole symbol spread those few over all of it, and
+    /// believed the modules under the glare as far as any. Under glare, a
+    /// symbol of BoofCV's benchmark read through the corners marked for
+    /// it had a hundred of its modules believed to seven bits, twenty-one
+    /// of them wrong where the bits expected one, and five hundred to
+    /// eight bits, sixteen wrong where they expected two; the wrong ones
+    /// lay together, under the glare, its alignment pattern among them.
+    fn local_gross(&self, expected: &[Option<bool>], inverted: bool, calibration: &Calibration) -> Vec<f32> {
+        let n = self.offset.len();
+        let (w, h) = (self.width.max(1), n / self.width.max(1));
+        let mut labelled = vec![0.0f32; n];
+        let mut wrong = vec![0.0f32; n];
+        let threshold = calibration.threshold;
+        let [own_dark, own_light] = calibration.own_sigma;
+        for i in 0..n {
+            let Some(want) = expected.get(i).copied().flatten() else { continue };
+            if self.decided[i] == Module::Unknown {
+                continue;
+            }
+            let (offset, is_dark) = (self.offset[i], want != inverted);
+            labelled[i] = 1.0;
+            let gross = if is_dark { offset > threshold + 2.0 * own_dark } else { offset < threshold - 2.0 * own_light };
+            wrong[i] = f32::from(u8::from(gross));
+        }
+        let total: f32 = labelled.iter().sum();
+        if total == 0.0 || calibration.grossly_misread == 0 || w * h != n {
+            return vec![calibration.gross; n];
+        }
+        let rate = calibration.grossly_misread as f32 / total;
+        let spread = (w.min(h) as f32 * LOCAL_GROSS_SPREAD).max(2.0);
+        let (labelled, wrong) = (smoothed(&labelled, w, h, spread), smoothed(&wrong, w, h, spread));
+        (0..n)
+            .map(|i| {
+                let local = (wrong[i] + CALIBRATION_PRIOR * rate) / (labelled[i] + CALIBRATION_PRIOR);
+                (DATA_GROSS * local).min(0.5).max(calibration.gross)
+            })
+            .collect()
     }
 
     /// Undo the blur the photo shows, as the modules whose colour is
@@ -854,7 +1083,42 @@ impl Classified {
         self.margin[i] = (offset - threshold).abs();
         self.decided[i] = side;
         self.modules[i] = if self.margin[i] < self.band { Module::Unknown } else { side };
-        self.reliability[i] = calibration.reliability(offset);
+        let lean = Self::toward(self.lean.get(i).copied().unwrap_or_default(), offset < threshold);
+        let weaker = if offset < threshold { offset + lean } else { offset - lean };
+        let crossed = (weaker < threshold) != (offset < threshold) || weaker == threshold;
+        self.reliability[i] = if crossed { 0 } else { calibration.reliability(offset).min(calibration.reliability(weaker)) };
+    }
+
+    /// The reliability of a module `margin` from its threshold under
+    /// `calibration`, whose threshold it is, its vote leaning `lean`
+    /// toward it ([`Self::lean`]): no more than the lesser of the two,
+    /// and nothing where the lean reaches across.
+    fn leant(margin: f32, lean: f32, calibration: &Calibration) -> u8 {
+        let weaker = margin - lean;
+        if weaker <= 0.0 { 0 } else { calibration.reliability(margin).min(calibration.reliability(weaker)) }
+    }
+
+    /// Of a module's [lean](Self::lean), the share toward its threshold
+    /// were the module read `dark`, or else light.
+    fn toward([up, down]: [f32; 2], dark: bool) -> f32 {
+        if dark { up } else { down }
+    }
+
+    /// This reading with its vote split as `lean` ([`Self::lean`]), each
+    /// module believed no further than its second point from its side:
+    /// what the reading the guess sharpened ([`Sampled::sharpened_as_guessed`])
+    /// was split as. The guess moves a module's points with its middle,
+    /// and their spread with the contrast, and the lean is a share of the
+    /// contrast. Classified afresh without it, a module the grid straddles
+    /// was believed in the sharpened reading as surely as a clean one.
+    fn leaning(mut self, lean: Vec<[f32; 2]>) -> Self {
+        for (i, &lean) in lean.iter().enumerate() {
+            if self.decided[i] != Module::Unknown {
+                self.reliability[i] = Self::leant(self.margin[i], Self::toward(lean, self.offset[i] < 0.0), &Calibration::DEFAULT);
+            }
+        }
+        self.lean = lean;
+        self
     }
 }
 
@@ -896,6 +1160,37 @@ pub const CALIBRATION_MIN_EACH: usize = 12;
 /// modules keeps near the noise of both, one with hundreds speaks for
 /// itself.
 const CALIBRATION_PRIOR: f32 = 16.0;
+/// The spread, as a share of the symbol's shorter side, over which the
+/// fixed patterns read wrong say how often the modules about them are
+/// ([`Classified::local_gross`]): an eighth each way, so that the
+/// patterns within about a quarter of the symbol speak for a module.
+const LOCAL_GROSS_SPREAD: f32 = 0.125;
+
+/// `values`, a grid `width` by `height`, each summed with its neighbours
+/// weighed by a Gaussian of `sigma` modules about it, its peak one: what
+/// a share of them is taken over.
+fn smoothed(values: &[f32], width: usize, height: usize, sigma: f32) -> Vec<f32> {
+    let reach = (3.0 * sigma).ceil() as isize;
+    let weights: Vec<f32> = (-reach..=reach).map(|d| (-(d * d) as f32 / (2.0 * sigma * sigma)).exp()).collect();
+    let pass = |values: &[f32], along: bool| -> Vec<f32> {
+        let mut out = vec![0.0f32; values.len()];
+        for y in 0..height {
+            for x in 0..width {
+                let mut sum = 0.0;
+                for (k, &weight) in weights.iter().enumerate() {
+                    let d = k as isize - reach;
+                    let (nx, ny) = if along { (x as isize + d, y as isize) } else { (x as isize, y as isize + d) };
+                    if nx >= 0 && ny >= 0 && (nx as usize) < width && (ny as usize) < height {
+                        sum += weight * values[ny as usize * width + nx as usize];
+                    }
+                }
+                out[y * width + x] = sum;
+            }
+        }
+        out
+    };
+    pass(&pass(values, true), false)
+}
 /// How many times as many of the data's modules read wrong beyond what
 /// the noise explains as of the fixed patterns' ([`Calibration::gross`]):
 /// two. The fixed patterns are a symbol's edges and corners, and a logo
@@ -1524,12 +1819,6 @@ pub fn separability(values: impl Iterator<Item = f32>) -> f32 {
     (1.0 - middle as f32 / smaller as f32).clamp(0.0, 1.0)
 }
 
-/// Reliability for a relative margin from the threshold, before any
-/// calibration.
-fn quantize(margin: f32) -> u8 {
-    Calibration::DEFAULT.reliability(margin)
-}
-
 /// Otsu's split of `values`, with how well it separates them: the
 /// threshold, the means of the two groups, and the share of variance that
 /// lies between the groups. Returns a half-grey split with zero
@@ -1618,6 +1907,42 @@ pub fn otsu_split_of(histogram: &[u32; BINS]) -> (f32, [f32; 2], f32) {
 /// groups. Returns 0.5 when there is nothing to separate.
 pub fn otsu(values: impl Iterator<Item = f32>) -> f32 {
     otsu_split(values).0
+}
+
+/// [`otsu`] of the values of a reading in `light`: in linear light, the
+/// values split as Otsu splits them, counted in bins of their values as
+/// stored ([`histogram_of`]) and each bin weighed as the light it stands
+/// for, and the threshold midway between the light of the two groups,
+/// where a module of half of each reads. Counted in bins of the light,
+/// the dark end of the scale gathered into the first few of [`BINS`], and
+/// the ink and paper of a dim symbol, stored 0.04 and 0.12 apart, lay
+/// three bins apart against twenty stored: the threshold was only as near
+/// as a bin's edge, as much as a third of half the contrast off.
+pub fn otsu_in(values: impl Iterator<Item = f32>, light: Light) -> f32 {
+    if light == Light::Encoded {
+        return otsu(values);
+    }
+    let histogram = histogram_of(values.map(|v| light.encoded(v)));
+    let level = |i: usize| f64::from(light.from_encoded(i as f32 / (BINS - 1) as f32));
+    let total: f64 = histogram.iter().map(|&n| f64::from(n)).sum();
+    let sum_all: f64 = histogram.iter().enumerate().map(|(i, &n)| level(i) * f64::from(n)).sum();
+    let (mut weight_low, mut sum_low) = (0.0f64, 0.0f64);
+    let (mut best_variance, mut best_means) = (0.0f64, None);
+    for (i, &n) in histogram.iter().enumerate() {
+        weight_low += f64::from(n);
+        sum_low += level(i) * f64::from(n);
+        let weight_high = total - weight_low;
+        if weight_low == 0.0 || weight_high == 0.0 {
+            continue;
+        }
+        let means = [sum_low / weight_low, (sum_all - sum_low) / weight_high];
+        let variance = weight_low * weight_high * (means[1] - means[0]).powi(2);
+        if variance > best_variance {
+            best_variance = variance;
+            best_means = Some(means);
+        }
+    }
+    best_means.map_or(light.from_encoded(0.5), |[low, high]| ((low + high) / 2.0) as f32)
 }
 
 /// [`otsu`] of the values `histogram` counts ([`histogram_of`]).
@@ -1730,6 +2055,11 @@ impl ThresholdSurface {
     /// its own, and `flat_range` the least spread of luminance that is
     /// any contrast at all.
     pub fn new(sampled: &Sampled, level: (f32, f32), flat_range: f32) -> Self {
+        Self::new_in(sampled, level, flat_range, Light::Encoded)
+    }
+
+    /// [`Self::new`] of a reading in `light`, `flat_range` as stored.
+    pub fn new_in(sampled: &Sampled, level: (f32, f32), flat_range: f32, light: Light) -> Self {
         let (w, h) = (sampled.width, sampled.height);
         let (ww, wh) = (SURFACE_WINDOW.min(w), SURFACE_WINDOW.min(h));
         let corner = |x0: usize, y0: usize| {
@@ -1741,7 +2071,7 @@ impl ThresholdSurface {
                 return level;
             }
             let (low, high) = robust_range(&mut values);
-            if high - low < flat_range { level } else { ((low + high) / 2.0, (high - low) / 2.0) }
+            if light.encoded(high) - light.encoded(low) < flat_range { level } else { ((low + high) / 2.0, (high - low) / 2.0) }
         };
         let (x1, y1) = (w - ww, h - wh);
         Self {
@@ -1769,21 +2099,38 @@ impl ThresholdSurface {
 }
 
 pub fn classify(sampled: &Sampled, params: &SampleParams) -> Classified {
-    let (auto_threshold, _, _) = otsu_split(sampled.luma.iter().flatten().copied());
-    let separability = separability(sampled.luma.iter().flatten().copied());
-    let global = params.threshold.unwrap_or(auto_threshold);
+    classify_in(sampled, params, Light::Encoded)
+}
+
+/// [`classify`] of a reading in `light`: each module against its
+/// threshold in that light, and whether a neighbourhood has any contrast,
+/// and a threshold set by hand, as stored ([`Light`]). How cleanly dark
+/// and light separate is told as stored too, as the photo shows it.
+pub fn classify_in(sampled: &Sampled, params: &SampleParams, light: Light) -> Classified {
+    classify_split(sampled, params, light, None)
+}
+
+/// [`classify_in`] of a reading by the vote of five points, `split` the
+/// second and fourth of each module's points ([`sample_module_voting`]),
+/// in the reading's light: each module's [lean](Classified::lean) toward
+/// its threshold from how far its vote was split.
+fn classify_split(sampled: &Sampled, params: &SampleParams, light: Light, split: Option<&[Option<[f32; 2]>]>) -> Classified {
+    let auto_threshold = otsu_in(sampled.luma.iter().flatten().copied(), light);
+    let separability = separability(sampled.luma.iter().flatten().map(|&v| light.encoded(v)));
+    let global = params.threshold.map_or(auto_threshold, |threshold| light.from_encoded(threshold));
     let global_means = means_about(sampled.luma.iter().flatten().copied(), global);
     let global_half = ((global_means[1] - global_means[0]) / 2.0).max(1e-3);
-    let flat_range = (FLAT_SHARE * (global_means[1] - global_means[0])).max(NOISE_RANGE);
+    let flat_range = (FLAT_SHARE * (light.encoded(global_means[1]) - light.encoded(global_means[0]))).max(NOISE_RANGE);
     let (w, h) = (sampled.width, sampled.height);
     let surface = (params.surface && !params.local && params.threshold.is_none() && w > 0 && h > 0)
-        .then(|| ThresholdSurface::new(sampled, (global, global_half), flat_range));
+        .then(|| ThresholdSurface::new_in(sampled, (global, global_half), flat_range, light));
 
     let mut modules = Vec::with_capacity(w * h);
     let mut decided = Vec::with_capacity(w * h);
     let mut margins = Vec::with_capacity(w * h);
     let mut offsets = Vec::with_capacity(w * h);
     let mut reliability = Vec::with_capacity(w * h);
+    let mut leans = vec![[0.0f32; 2]; w * h];
     let mut flat = 0;
     let mut neighbourhood: Vec<f32> = Vec::new();
     for i in 0..w * h {
@@ -1810,7 +2157,7 @@ pub fn classify(sampled: &Sampled, params: &SampleParams) -> Classified {
                 (global, global_half)
             } else {
                 let (low, high) = robust_range(&mut neighbourhood);
-                if high - low < flat_range {
+                if light.encoded(high) - light.encoded(low) < flat_range {
                     // Nothing around here has contrast: no evidence either way.
                     modules.push(Module::Unknown);
                     decided.push(Module::Unknown);
@@ -1831,11 +2178,16 @@ pub fn classify(sampled: &Sampled, params: &SampleParams) -> Classified {
         };
         let margin = (value - threshold).abs() / half;
         let side = Module::from_dark(value < threshold);
+        // The second of the vote's points from each side, how far short of
+        // the median toward the threshold were the module that side.
+        if let Some([second, fourth]) = split.and_then(|split| split.get(i).copied().flatten()) {
+            leans[i] = [(fourth - value).max(0.0) / half, (value - second).max(0.0) / half];
+        }
         modules.push(if margin < params.band { Module::Unknown } else { side });
         decided.push(side);
         margins.push(margin);
         offsets.push((value - threshold) / half);
-        reliability.push(quantize(margin));
+        reliability.push(Classified::leant(margin, Classified::toward(leans[i], value < threshold), &Calibration::DEFAULT));
     }
     Classified {
         modules,
@@ -1843,12 +2195,13 @@ pub fn classify(sampled: &Sampled, params: &SampleParams) -> Classified {
         margin: margins,
         offset: offsets,
         reliability,
+        lean: leans,
         calibration: None,
         blur: None,
         equalised: false,
         width: w,
         band: params.band,
-        threshold: global,
+        threshold: light.encoded(global),
         separability,
         flat,
     }
@@ -1894,7 +2247,7 @@ pub fn suggest_versions(
             let func = FunctionMap::new(version);
             let h = Homography::rect_to_quad(func.width as f64, func.height as f64, corners)?;
             let sampled = sample_modules(image, &h, func.width, func.height);
-            let grid = classify(&sampled, params).to_grid(func.width, func.height);
+            let grid = classify_in(&sampled, params, image.light).to_grid(func.width, func.height);
             let (matching, known) = func.fixed_agreement(&grid);
             let inverted = looks_inverted((matching, known));
             let matching = if inverted { known - matching } else { matching };
@@ -1941,6 +2294,20 @@ mod tests {
         );
         assert!(eta > 0.95, "{eta}");
         assert_eq!(otsu(std::iter::empty()), 0.5);
+        // As stored, the same. In linear light, midway between the light
+        // of ink and paper, where a module of half of each reads, as near
+        // as a stored grey level, however dim: the ink and paper of a dim
+        // symbol, stored 0.03 and 0.08, came a bin apart counted in linear
+        // light, and the threshold a third of half the contrast off.
+        assert_eq!(otsu_in(values.iter().copied(), Light::Encoded), t);
+        let stored = [0.032f32, 0.033, 0.031, 0.082, 0.083, 0.081];
+        let dim: Vec<f32> = stored.iter().map(|&v| linear_light(v)).collect();
+        let (ink, paper) = (dim[..3].iter().sum::<f32>() / 3.0, dim[3..].iter().sum::<f32>() / 3.0);
+        let (mixed, half) = ((ink + paper) / 2.0, (paper - ink) / 2.0);
+        let split = otsu_in(dim.iter().copied(), Light::Linear);
+        assert!((split - mixed).abs() < 0.05 * half, "{split} against {mixed}");
+        assert!((otsu(dim.iter().copied()) - mixed).abs() > 0.3 * half);
+        assert_eq!(otsu_in(std::iter::empty(), Light::Linear), linear_light(0.5));
         assert_eq!(otsu([0.4f32; 5].into_iter()), 0.5);
         // Two clean groups leave the valley between them empty; one blob
         // of noise has no valley at all, and neither has a grid that
@@ -2312,6 +2679,63 @@ mod tests {
     }
 
     #[test]
+    fn a_module_read_as_light_is_the_light_that_falls_on_it() {
+        // A module of 10 px, its left half ink and its right half paper, as
+        // a grid that straddles two modules reads one. The area's middle
+        // column of points, and the vote's centre and the two above and
+        // below it, fall between an ink pixel and a paper one.
+        let (ink, paper, px) = (0.16f32, 0.94f32, 10);
+        let image = Luma::new(px, px, (0..px * px).map(|i| if i % px < px / 2 { ink } else { paper }).collect());
+        let h = Homography::rect_to_quad(1.0, 1.0, [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]).unwrap();
+        let (dark, light) = (linear_light(ink), linear_light(paper));
+        let share = |v: f32| (v - dark) / (light - dark);
+        for kernel in [Kernel::Area, Kernel::Vote] {
+            // As light, each pixel is light before it is weighed: the module
+            // reads midway, as much ink as paper.
+            let as_light = kernel.sample(&image, &h, 0, 0, Light::Linear).unwrap();
+            assert!((share(as_light) - 0.5).abs() < 0.01, "{kernel:?}: {}", share(as_light));
+            // Weighed as stored and made light after, it read 28% of the
+            // way from ink to paper, and leant to dark.
+            let after = linear_light(kernel.sample(&image, &h, 0, 0, Light::Encoded).unwrap());
+            assert!((share(after) - 0.28).abs() < 0.01, "{kernel:?}: {}", share(after));
+        }
+        // A pixel's own light is read as light whatever the weighing.
+        assert_eq!(image.sample_in(2.5, 2.5, Light::Linear), Some(dark));
+        assert_eq!(image.sample_in(2.5, 2.5, Light::Encoded), Some(ink));
+    }
+
+    #[test]
+    fn modules_are_read_in_the_light_their_image_was_made_in() {
+        // Modules of ink and paper, checked, and in the middle one a lens
+        // greyed to half of each, the light of the two mixed and stored
+        // again: 0.70, where the stored values' midway is 0.55. Off an
+        // image made as stored it reads well toward the paper; off the same
+        // values made in light, on its threshold, as much ink as paper.
+        let (ink, paper, px, side) = (0.16f32, 0.94f32, 8, 5);
+        let grey = encoded_light((linear_light(ink) + linear_light(paper)) / 2.0);
+        let data: Vec<f32> = (0..side * px * side * px)
+            .map(|i| {
+                let (mx, my) = (i % (side * px) / px, i / (side * px) / px);
+                if (mx, my) == (2, 2) {
+                    grey
+                } else if (mx + my) % 2 == 0 {
+                    ink
+                } else {
+                    paper
+                }
+            })
+            .collect();
+        let corners = [[0.0, 0.0], [(side * px) as f64, 0.0], [(side * px) as f64, (side * px) as f64], [0.0, (side * px) as f64]];
+        let map = Homography::rect_to_quad(side as f64, side as f64, corners).unwrap();
+        let params = SampleParams { sharpen_modules: false, ..SampleParams::default().under(Rule::Level) };
+        let expected = vec![None; side * side];
+        let middle = |image: &Luma| read_modules(image, &map, side, side, &params, &expected, false).0.offset[2 * side + 2];
+        let (stored, lit) = (Luma::new(side * px, side * px, data.clone()), Luma::new_in(side * px, side * px, data, Light::Linear));
+        assert!(middle(&stored) > 0.3, "{}", middle(&stored));
+        assert!(middle(&lit).abs() < 0.1, "{}", middle(&lit));
+    }
+
+    #[test]
     fn a_poorly_separated_reading_is_sharpened_and_a_clean_one_left_alone() {
         // A random pattern of modules, blurred so that each reads half its
         // own colour and half the mean of its four neighbours: a dark
@@ -2336,7 +2760,7 @@ mod tests {
             luma: truth.iter().map(|&d| Some(level(d))).collect(),
         };
         assert!(clean.separability() > 0.99);
-        assert_eq!(clean.clone().sharpened_for_separation(), clean);
+        assert_eq!(clean.clone().sharpened_for_separation(Light::Encoded), clean);
         let at = |x: i64, y: i64| {
             (x >= 0 && y >= 0 && x < w as i64 && y < h as i64)
                 .then(|| level(truth[y as usize * w + x as usize]))
@@ -2371,13 +2795,41 @@ mod tests {
         let before = smeared.separability();
         assert!(before < SHARPEN_FOR_SEPARABILITY, "{before}");
         assert!(wrong(&smeared) > 0);
-        let sharpened = smeared.clone().sharpened_for_separation();
+        let sharpened = smeared.clone().sharpened_for_separation(Light::Encoded);
         let after = sharpened.separability();
         assert!(
             after >= before + SHARPEN_SEPARATION_GAIN,
             "{before} -> {after}"
         );
         assert_eq!(wrong(&sharpened), 0, "{} wrong before", wrong(&smeared));
+        // The same reading made in linear light separates as poorly told
+        // as stored, as it is classified, and is sharpened as the stored
+        // one is.
+        let lit = Sampled { luma: smeared.luma.iter().map(|v| v.map(|v| Light::Linear.from_encoded(v))).collect(), ..smeared.clone() };
+        assert!((lit.separability_in(Light::Linear) - before).abs() < 1e-3, "{}", lit.separability_in(Light::Linear));
+        assert!(lit.clone().sharpened_for_separation_by(Light::Linear).1 > 0.0);
+        // Ink at 0.16 and paper at 0.94 as stored, each module half its
+        // own light and half its neighbours', mixed as a lens mixes it, in
+        // linear light. Told as stored, the greyed modules fill the middle
+        // and the reading separates poorly; told in light, the dark ones
+        // crowd near nought, the band about the threshold misses the light
+        // modules greyed among them, and it separated well enough to be
+        // left as read.
+        let lin = |dark: bool| Light::Linear.from_encoded(if dark { 0.16 } else { 0.94 });
+        let at = |x: i64, y: i64| (x >= 0 && y >= 0 && x < w as i64 && y < h as i64).then(|| lin(truth[y as usize * w + x as usize]));
+        let luma = (0..w * h)
+            .map(|i| {
+                let (x, y) = ((i % w) as i64, (i / w) as i64);
+                let around: Vec<f32> = [at(x - 1, y), at(x + 1, y), at(x, y - 1), at(x, y + 1)].into_iter().flatten().collect();
+                Some(0.5 * lin(truth[i]) + 0.5 * around.iter().sum::<f32>() / around.len() as f32)
+            })
+            .collect();
+        let blurred_in_light = Sampled { width: w, height: h, luma };
+        let before = blurred_in_light.separability_in(Light::Linear);
+        assert!(before < SHARPEN_FOR_SEPARABILITY && blurred_in_light.separability() >= SHARPEN_FOR_SEPARABILITY, "{before}");
+        let (sharpened, gain) = blurred_in_light.sharpened_for_separation_by(Light::Linear);
+        let after = sharpened.separability_in(Light::Linear);
+        assert!(gain > 0.0 && after >= before + SHARPEN_SEPARATION_GAIN, "{before} -> {after} at {gain}");
     }
 
     #[test]
@@ -2396,7 +2848,7 @@ mod tests {
         assert_eq!(none, Sharpening { module_px: 2.0, ..Sharpening::default() });
         assert!(!none.any());
         for (i, value) in plain.luma.iter().enumerate() {
-            assert_eq!(*value, Kernel::Area.sample(&small, &map, i % mw, i / mw), "module {i} is as the kernel read it");
+            assert_eq!(*value, Kernel::Area.sample(&small, &map, i % mw, i / mw, Light::Encoded), "module {i} is as the kernel read it");
         }
         // Sharpened, as it is unless that is turned off, and by how much
         // is told: half the strength a vanishing module is given.
@@ -2414,6 +2866,70 @@ mod tests {
         let (read, done) = sample_modules_noting(&large, &map, mw, mh, Kernel::Area, true);
         assert_eq!(done, Sharpening { module_px: 10.0, ..Sharpening::default() });
         assert_eq!(read, sample_modules_noting(&large, &map, mw, mh, Kernel::Area, false).0);
+    }
+
+    #[test]
+    fn a_stain_over_part_of_a_symbol_lowers_belief_there_and_not_elsewhere() {
+        // A version 5 symbol read cleanly but for a stain over the corner
+        // of its top-left finder, where every module reads the other
+        // colour: the modules about the stain are believed less than those
+        // far from it, which keep the belief the symbol as a whole allows.
+        let func = FunctionMap::new(SymbolVersion::Qr(5));
+        let (w, h) = (func.width, func.height);
+        let expected = func.expected_modules().to_vec();
+        let truth: Vec<bool> = (0..w * h).map(|i| expected[i].unwrap_or((i * 7 + i / w) % 3 == 0)).collect();
+        let stained = |i: usize| i % w < 4 && i / w < 4;
+        let luma: Vec<Option<f32>> = (0..w * h)
+            .map(|i| {
+                let dark = truth[i] != stained(i);
+                Some(if dark { 0.15 } else { 0.85 } + 0.03 * ((i * 37 % 11) as f32 / 10.0 - 0.5))
+            })
+            .collect();
+        let sampled = Sampled { width: w, height: h, luma };
+        let params = SampleParams { local: false, band: 0.0, threshold: Some(0.5), ..SampleParams::default() };
+        let mut classified = classify(&sampled, &params);
+        let calibration = classified.calibrate(&expected, false).expect("enough fixed modules to calibrate on");
+        assert!(calibration.grossly_misread > 0, "{calibration:?}");
+        let mean = |pick: &dyn Fn(usize) -> bool| {
+            let picked: Vec<f32> = (0..w * h).filter(|&i| expected[i].is_none() && pick(i)).map(|i| f32::from(classified.reliability[i])).collect();
+            picked.iter().sum::<f32>() / picked.len() as f32
+        };
+        let (near, far) = (mean(&|i| i % w < 12 && i / w < 6), mean(&|i| i % w > w - 10 && i / w > h - 10));
+        assert!(near + 4.0 < far, "beside the stain {near}, far from it {far}");
+        let far_module = (0..w * h).find(|&i| expected[i].is_none() && i % w > w - 6 && i / w > h - 6).unwrap();
+        assert_eq!(classified.reliability[far_module], calibration.reliability(classified.offset[far_module]));
+    }
+
+    #[test]
+    fn a_vote_split_across_the_threshold_is_believed_no_more_than_its_weaker_points() {
+        // Two modules read alike by the median of their five points, one
+        // of a mind and one with two of its points across the threshold:
+        // the split one is believed nothing, and one leaning only part of
+        // the way less than the one of a mind.
+        let sampled = Sampled { width: 6, height: 1, luma: vec![Some(0.2), Some(0.2), Some(0.2), Some(0.8), Some(0.8), Some(0.8)] };
+        let split = [Some([0.18, 0.22]), Some([0.18, 0.7]), Some([0.18, 0.42]), None, None, None];
+        let params = SampleParams { local: false, band: 0.0, threshold: Some(0.5), ..SampleParams::default() };
+        let classified = classify_split(&sampled, &params, Light::Encoded, Some(&split));
+        let [whole, across, partly] = [0, 1, 2].map(|i| classified.reliability[i]);
+        assert_eq!(across, 0, "{:?}", classified.lean);
+        assert!(partly < whole && partly > 0, "{whole} {partly}");
+        assert_eq!(classified.decided[..3], [Module::Dark; 3]);
+        // The split carried over to a reading classified afresh, as the
+        // guess sharpens one, caps it as it capped the reading split.
+        let afresh = classify_in(&sampled, &params, Light::Encoded);
+        assert_eq!(afresh.reliability[1], Calibration::DEFAULT.reliability(afresh.offset[1]));
+        assert_eq!(afresh.leaning(classified.lean.clone()).reliability, classified.reliability);
+        // A module moved to the other side, as equalising or a fitted
+        // threshold moves one, is believed no further than its second
+        // point from that side: read dark at 0.45 with its second point
+        // at 0.1, it is nothing once the threshold falls below it. Leant
+        // as when dark, by its fourth point at 0.46, it was believed.
+        let sampled = Sampled { width: 4, height: 1, luma: vec![Some(0.45), Some(0.2), Some(0.8), Some(0.8)] };
+        let mut classified = classify_split(&sampled, &params, Light::Encoded, Some(&[Some([0.1, 0.46]), None, None, None]));
+        assert!(classified.reliability[0] > 0 && classified.decided[0] == Module::Dark, "{:?}", classified.lean);
+        let threshold = classified.offset[0] - 0.4;
+        classified.judge(0, threshold, &Calibration { threshold, ..Calibration::DEFAULT });
+        assert_eq!((classified.decided[0], classified.reliability[0]), (Module::Light, 0), "{:?}", classified.lean);
     }
 
     #[test]
@@ -2486,13 +3002,15 @@ mod tests {
         assert_eq!(cap, ((bits - 1.0) * 8.0).round() as u8, "{calibration:?}");
         assert_eq!(calibration.reliability(-10.0), cap);
         assert!(classified.reliability.iter().all(|&r| r <= cap));
-        for dark in [true, false] {
-            let mut by_margin: Vec<(f32, u8)> = (0..w * h)
-                .filter(|&i| classified.decided[i] == Module::from_dark(dark))
-                .map(|i| (classified.margin[i], classified.reliability[i]))
-                .collect();
-            by_margin.sort_by(|a, b| a.0.total_cmp(&b.0));
-            assert!(by_margin.windows(2).all(|pair| pair[0].1 <= pair[1].1), "monotone in the margin");
+        // The symbol's model grows with the margin on either side, and no
+        // module is believed more than it says: where the fixed patterns
+        // about a module read specks, less ([`Classified::local_gross`]).
+        let mut margins: Vec<f32> = (0..=40).map(|k| k as f32 * 0.05).collect();
+        margins.sort_by(f32::total_cmp);
+        assert!(margins.windows(2).all(|pair| calibration.reliability(pair[0]) <= calibration.reliability(pair[1])), "monotone in the margin");
+        assert!(margins.windows(2).all(|pair| calibration.reliability(-pair[0]) <= calibration.reliability(-pair[1])), "monotone in the margin");
+        for i in (0..w * h).filter(|&i| classified.decided[i] != Module::Unknown) {
+            assert!(classified.reliability[i] <= calibration.reliability(classified.offset[i]), "module {i}");
         }
         assert_ne!(classified.reliability, before);
         // A photo with less noise believes the same margin more; the
@@ -2535,7 +3053,9 @@ mod tests {
         assert!((fit.own_sigma[0] - calibration.own_sigma[1]).abs() < 1e-3 && (fit.own_sigma[1] - calibration.own_sigma[0]).abs() < 1e-3, "{fit:?} vs {calibration:?}");
         assert_eq!(fit.grossly_misread, calibration.grossly_misread);
         assert!(inverted.calibrate(&expected, false).is_none(), "read the wrong way round, the fixed patterns are not where they should be");
-        // Too few labelled modules, and nothing is fitted.
+        // Too few labelled modules, and nothing is fitted: the modules are
+        // believed as they were read, under the model for a photo not yet
+        // fitted.
         let few: Vec<Option<bool>> = expected.iter().enumerate().map(|(i, &e)| e.filter(|_| i < 40)).collect();
         let mut sparse = classify(&sampled, &params);
         assert_eq!(sparse.calibrate(&few, false), None);
